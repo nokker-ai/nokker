@@ -1,0 +1,180 @@
+# Images de Nokker Lokkal sur ghcr.io/nokker-ai, signées par cosign (signature sans clé, identité OIDC de ce workflow),
+# avec SBOM et provenance. Déclenché par un tag `lokkal-vX.Y.Z` ; le paquet d'installation (bundle.sh) part en pièce
+# jointe de la release GitHub, signé lui aussi. Rien n'est construit chez le client (docs/LOKKAL.md §3).
+#
+# Vérifier une image :
+#   cosign verify ghcr.io/nokker-ai/nokker:<ver>-lokkal \
+#     --certificate-identity-regexp '^https://github\.com/nokker-ai/nokker/\.github/workflows/lokkal-images\.yml@refs/tags/lokkal-v' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+name: lokkal-images
+on:
+  push:
+    tags: ["lokkal-v*"]
+  workflow_dispatch:
+    inputs:
+      version: {description: "Version sans le préfixe (ex. 0.1.0) ; défaut : le tag", required: false}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  ORG: nokker-ai
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write          # cosign sans clé
+      attestations: write
+    strategy:
+      fail-fast: false   # un échec ne masque pas les autres ; bundle attend tout de toute façon
+      matrix:
+        include:
+          - {name: nokker,   context: ".",                       file: Dockerfile,                         target: lokkal, suffix: "-lokkal", hermes: true}
+          - {name: sandboxd, context: deploy/lokkal/sandboxd,    file: deploy/lokkal/sandboxd/Dockerfile,  target: "",     suffix: "",        hermes: false}
+          - {name: sandbox,  context: deploy/lokkal/sandbox,     file: deploy/lokkal/sandbox/Dockerfile,   target: "",     suffix: "",        hermes: false}
+          - {name: nokker-web, context: apps-src,                file: apps-src/deploy/web/Dockerfile,     target: "",     suffix: "",        hermes: false, apps: true}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: v
+        env: {INPUT_VERSION: "${{ inputs.version }}"}
+        run: |
+          V="$INPUT_VERSION"; [ -n "$V" ] || V="${GITHUB_REF_NAME#lokkal-v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "version invalide : $V"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      # hermes-nokker (Hermes patché, MIT) : dépôt public de l'organisation (24.10), cloné sans clé.
+      - name: Hermes épinglé
+        if: matrix.hermes
+        uses: actions/checkout@v4
+        with:
+          repository: nokker-ai/hermes-nokker
+          ref: nokker-hermes-v0.22.2-n1
+          path: hermes-src
+          persist-credentials: false
+      - run: rm -rf hermes-src/.git
+        if: matrix.hermes
+      # nokker-apps (web + CLI) à la révision épinglée dans deploy/lokkal/APPS_REF : même code que nokker.ai
+      - id: apps
+        if: matrix.apps
+        run: |
+          R=$(cat deploy/lokkal/APPS_REF); [[ "$R" =~ ^[0-9a-f]{40}$ ]] || { echo "APPS_REF : sha complet attendu"; exit 1; }
+          echo "ref=$R" >> "$GITHUB_OUTPUT"
+      - name: nokker-apps épinglé
+        if: matrix.apps
+        uses: actions/checkout@v4
+        with:
+          repository: nokker-ai/nokker-apps
+          ref: ${{ steps.apps.outputs.ref }}
+          path: apps-src
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: "${{ env.REGISTRY }}", username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - name: Construire et pousser (amd64 + arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.name }}:${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - uses: sigstore/cosign-installer@v3
+      - name: Signer (cosign, sans clé)
+        run: cosign sign --yes "${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}"
+      - name: Contrôle de la signature
+        run: |
+          cosign verify "${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}" \
+            --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+
+  # Commande `nokker` : binaires autonomes (bun --compile) de nokker-apps, 6 cibles, sha256 + signature cosign.
+  cli:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env: {INPUT_VERSION: "${{ inputs.version }}"}
+        run: |
+          V="$INPUT_VERSION"; [ -n "$V" ] || V="${GITHUB_REF_NAME#lokkal-v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "version invalide : $V"; exit 1; }
+          R=$(cat deploy/lokkal/APPS_REF); [[ "$R" =~ ^[0-9a-f]{40}$ ]] || { echo "APPS_REF : sha complet attendu"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"; echo "ref=$R" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: nokker-ai/nokker-apps
+          ref: ${{ steps.v.outputs.ref }}
+          path: apps-src
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with: {bun-version: "1.4.3"}
+      - uses: pnpm/action-setup@v4
+        with: {package_json_file: apps-src/package.json}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - name: Construire les 6 binaires
+        working-directory: apps-src
+        env: {NOKKER_RELEASE_VERSION: "${{ steps.v.outputs.version }}"}
+        run: pnpm install --frozen-lockfile && pnpm -C apps/cli build:bin && ls -l apps/cli/dist
+      - name: Contrôle (linux-x64)
+        run: apps-src/apps/cli/dist/nokker-linux-x64 --version | grep -F "${{ steps.v.outputs.version }}"
+      - uses: sigstore/cosign-installer@v3
+      - name: Signer
+        run: |
+          cd apps-src/apps/cli/dist
+          for f in nokker-*; do case "$f" in *.sha256|*.sigstore.json) continue;; esac
+            sha256sum "$f" > "$f.sha256"; cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" >/dev/null; done
+      - uses: actions/upload-artifact@v4
+        with: {name: cli, path: apps-src/apps/cli/dist/nokker-*}
+
+  sandboxd-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -q pytest && python -m pytest -q deploy/lokkal/sandboxd/tests
+      - name: Recette contre le démon docker du runner
+        run: cd deploy/lokkal/sandboxd && ./tests/e2e.sh
+
+  bundle:
+    needs: [images, cli, sandboxd-tests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env: {INPUT_VERSION: "${{ inputs.version }}"}
+        run: |
+          V="$INPUT_VERSION"; [ -n "$V" ] || V="${GITHUB_REF_NAME#lokkal-v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "version invalide : $V"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - run: deploy/lokkal/bundle.sh "${{ steps.v.outputs.version }}" dist
+      - uses: actions/download-artifact@v4
+        with: {name: cli, path: dist}
+      - uses: sigstore/cosign-installer@v3
+      - name: Signer le paquet
+        run: |
+          for f in dist/nokker-lokkal-*.tar.gz dist/install.sh dist/install.ps1; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" >/dev/null; done
+      - name: Release
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --prerelease \
+            --title "Nokker Lokkal ${{ steps.v.outputs.version }}" --notes "Images : ghcr.io/nokker-ai (signées cosign)."

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nokker"
+version = "0.0.1"
+description = "Nokker — harness multi-modèle (noyau) : contexte dynamique CortHeXis, juge Nina QA, multi-modèle. Hermes en dépendance épinglée."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.14"   # hermes-agent pin core deps en python_version >= 3.14, rien en dessous (voir Dockerfile)
+dependencies = [
+  "mcp==2.0.0",
+  "psycopg[binary]>=3.2",
+  "httpx>=0.28",   # providers/sokkan.py — client synchrone du Router (F2)
+  "httpcore>=1.0",   # nokker/previews/ssrf.py — NetworkBackend pinglé (sinon transitif via httpx,
+                      # mais on importe directement `httpcore.SyncBackend` : déclaré en direct)
+  "pyyaml>=6.0",   # F6 (ledger, repli de prices.yaml) + config.py (F2) — jamais de secret dans le YAML
+  "cryptography>=42",   # P1 approbations fortes — ECDSA P-256/SHA-256 (nokker/approvals/crypto.py),
+                         # Fernet pour le secret TOTP au repos (nokker/approvals/pg.py)
+  "websockets>=15",   # nokker/local/tunnel.py — tunnel sortant de la passerelle nokker.app (Lokkal, §7.5). BSD-3 ;
+                       # déjà tiré par hermes-agent dans l'image, déclaré parce qu'on l'importe en direct.
+  "trafilatura>=2.3",   # nokker/previews/parse.py — extrait ≤ 1 200 car. des aperçus (docs/BUBBLES.md
+                         # §5). Apache-2.0 ; licence vérifiée (lui + ses dépendances transitives
+                         # courlan/htmldate/justext/lxml/urllib3/charset_normalizer/certifi) dans
+                         # docs/LICENSES-DEPENDENCIES.md.
+]
+
+# hermes-agent (branche patchée hermes-nokker, D0 : notre harness, pas un fork ; Hermes
+# fournit des briques derrière nos interfaces — gateway/canaux, STT, client MCP) n'est PAS
+# déclaré ci-dessus : upstream bloque volontairement tout build de wheel/sdist pour ce paquet
+# (hermes-nokker/setup.py — "Hermes is distributed via the shell installer, Docker image, or
+# Nix. [...] use an editable install instead"), donc un simple `… @ git+…` dans `dependencies`
+# échoue toujours (pip tente un build de wheel même pour une URL VCS, et un `#egg=name[extras]`
+# est rejeté par pip récent : "invalid-egg-fragment"). La seule install qui marche est un clone
+# PUIS un install éditable LOCAL avec extras (`build_editable`, jamais `bdist_wheel`) :
+#
+#   git clone --depth 1 --branch nokker-hermes-v0.22.2-n1 \
+#     https://github.com/nokker-ai/hermes-nokker.git /opt/hermes-src
+#   pip install -e "/opt/hermes-src[messaging,stt-whisper]"
+#
+# Voir Dockerfile (étape de build) et docs/REPO.md pour la procédure en dev local. Extras réels
+# du pyproject de hermes-agent (vérifiés dans hermes-nokker@nokker-hermes-v0.22.2-n1) :
+# messaging (adaptateurs de canaux — gateway) et stt-whisper (faster-whisper, STT local gardé
+# derrière interface, §3 PLAN-P1). Monter de version = changer le tag ci-dessus (UPSTREAM.md de
+# hermes-nokker), jamais un rebase ici.
+
+# PAS de [project.scripts] : `nokker` est déjà le nom du binaire fourni par la dépendance épinglée
+# hermes-agent (alias de couche de marque, docs/BRAND.md, `/opt/hermes/bin/nokker` dans l'image) — un
+# entry_point `nokker.cli:main` du même nom ÉCRASERAIT ce binaire à l'install (pip régénère
+# `/usr/local/bin/nokker`, « le dernier paquet installé gagne »), cassant le contrat de sortie actuel
+# de l'image (`CMD ["gateway", "run"]`) — RÉGRESSION TROUVÉE EN RÉEL (smoke CI, build job échoué le
+# 17.10.2026 : le conteneur crashait au démarrage, `ModuleNotFoundError: mcp`, parce que `nokker`
+# pointait vers `nokker.cli:main` au lieu du binaire Hermes). `nokker/cli.py` reste appelable par
+# `python -m nokker` (voir `nokker/__main__.py`) tant que F7 ne bascule pas la CMD de l'image.
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.15",
+  "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["nokker*"]
+
+[tool.setuptools.package-data]
+nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*.sql", "bubbles/migrations/*.sql",
+          "approvals/migrations/*.sql", "store/migrations/*.sql", "agents/migrations/*.sql",
+          "api/miniapp/*.html", "api/miniapp/*.js", "api/miniapp/*.css", "prompts/*.md", "onboarding/terms/*.md",
+          "tools/browser_pool_tools.json",
+          "admin/ui/*.html"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: nécessite un service réel (Postgres, MCP, Router…) ; non exécuté par CI par défaut.",
+]

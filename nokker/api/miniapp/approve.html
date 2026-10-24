@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Approbations Nokker</title>
+<meta name="description" content="Mini App Telegram d'approbation forte pour Nokker." />
+<link rel="stylesheet" href="style.css" />
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div id="app" class="app" aria-live="polite">
+
+  <!-- Écran générique de chargement -->
+  <section id="screen-loading" class="screen" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted" id="loading-label">Chargement…</p>
+  </section>
+
+  <!-- Enrôlement : étape 1, explication + action -->
+  <section id="screen-enroll-intro" class="screen" hidden>
+    <h1>Activer l'approbation biométrique</h1>
+    <p>
+      Cet appareil n'a pas encore de clé d'approbation. Nina va générer une paire de clés
+      <strong>sur cet appareil</strong> ; la clé privée ne le quittera jamais et sera protégée par
+      Face&nbsp;ID / Touch&nbsp;ID / l'empreinte de ton téléphone.
+    </p>
+    <ul class="bullets">
+      <li>Génération de la clé (WebCrypto, ECDSA P-256)</li>
+      <li>Verrouillage derrière la biométrie du téléphone</li>
+      <li>Envoi de la clé <em>publique</em> seule à Nokker</li>
+      <li>Confirmation de l'appareil (code à valider)</li>
+    </ul>
+    <button id="btn-enroll-start" class="btn btn-primary" type="button">Activer la biométrie</button>
+    <p class="muted small" id="enroll-intro-note"></p>
+  </section>
+
+  <!-- Enrôlement : attente de confirmation (code d'appairage) -->
+  <section id="screen-enroll-pending" class="screen" hidden>
+    <h1>Confirme cet appareil</h1>
+    <p class="muted">La clé publique a été envoyée à Nokker. Il reste à confirmer cet appareil :</p>
+    <div class="pairing-code" id="pairing-code">----</div>
+    <p class="muted small" id="pairing-device-id"></p>
+    <div class="card">
+      <p>
+        Confirme avec un code <strong>TOTP</strong> valide depuis un client déjà de confiance,
+        <strong>ou</strong> demande à l'hôte :
+      </p>
+      <pre class="code-block" id="pairing-host-cmd">python -m nokker devices approve &lt;code&gt;</pre>
+    </div>
+    <button id="btn-enroll-refresh" class="btn btn-secondary" type="button">J'ai confirmé — vérifier</button>
+    <p class="muted small">Cette page vérifie aussi automatiquement toutes les quelques secondes.</p>
+  </section>
+
+  <!-- Pas de cible : ouverte hors d'une carte -->
+  <section id="screen-no-target" class="screen" hidden>
+    <h1>Aucune approbation à afficher</h1>
+    <p class="muted">
+      Ouvre cette page depuis le bouton d'une carte d'approbation envoyée par Nina sur Telegram.
+    </p>
+  </section>
+
+  <!-- Carte d'approbation -->
+  <section id="screen-card" class="screen" hidden>
+    <header class="card-header">
+      <span class="badge" id="badge-level"></span>
+      <span class="badge badge-effect" id="badge-effect"></span>
+    </header>
+
+    <h1 id="card-tool">—</h1>
+
+    <div class="field">
+      <div class="field-label">Arguments</div>
+      <details id="args-details" class="args-details">
+        <summary id="args-summary">Afficher</summary>
+        <pre class="code-block" id="card-arguments"></pre>
+      </details>
+    </div>
+
+    <div class="field" id="field-reason-wrap">
+      <div class="field-label">Raison</div>
+      <p id="card-reason" class="field-value"></p>
+    </div>
+
+    <div class="field" id="field-advice-wrap" hidden>
+      <div class="advice-box">
+        <div class="advice-title">Avis de Nina</div>
+        <p id="card-advice" class="field-value"></p>
+      </div>
+    </div>
+
+    <div class="field">
+      <div class="field-label">Expire</div>
+      <p id="card-expiry" class="field-value countdown">—</p>
+    </div>
+
+    <p id="card-error" class="error-text" hidden></p>
+
+    <!-- Bouton de secours si Telegram.WebApp.SecondaryButton n'est pas disponible (Bot API < 7.10) -->
+    <div id="fallback-actions" class="fallback-actions" hidden>
+      <button id="btn-reject-fallback" class="btn btn-danger" type="button">Refuser</button>
+      <button id="btn-approve-fallback" class="btn btn-primary" type="button">Approuver</button>
+    </div>
+  </section>
+
+  <!-- Biométrie demandée (le système affiche son propre prompt ; on affiche juste un statut) -->
+  <section id="screen-biometric-wait" class="screen" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted" id="biometric-wait-label">Confirme avec Face ID / Touch ID / ton empreinte…</p>
+  </section>
+
+  <!-- Résultat -->
+  <section id="screen-result" class="screen" hidden>
+    <div class="result-icon" id="result-icon">✓</div>
+    <h1 id="result-title">—</h1>
+    <p class="muted" id="result-detail"></p>
+    <button id="btn-close" class="btn btn-secondary" type="button">Fermer</button>
+  </section>
+
+  <!-- Erreur bloquante -->
+  <section id="screen-error" class="screen" hidden>
+    <div class="result-icon result-icon-error" aria-hidden="true">⚠</div>
+    <h1 id="error-title">Un problème est survenu</h1>
+    <p class="muted" id="error-detail"></p>
+    <button id="btn-error-retry" class="btn btn-primary" type="button" hidden>Réessayer</button>
+  </section>
+
+</div>
+<script type="module" src="approve.js"></script>
+</body>
+</html>

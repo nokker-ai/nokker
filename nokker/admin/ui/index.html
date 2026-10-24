@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Nokker — console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%238a5a14%27/%3E%3Ctext x=%2716%27 y=%2723%27 font-family=%27Georgia,serif%27 font-size=%2720%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3EN%3C/text%3E%3C/svg%3E">
+<style>
+:root { --bg:#f6f6f4; --panel:#fff; --ink:#1b1b1a; --mute:#6b6b66; --line:#e2e1dc; --accent:#8a5a14; --chip:#efe9dd; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141413; --panel:#1d1d1b; --ink:#ecebe6; --mute:#9a9992; --line:#2e2d2a; --accent:#e0a84a; --chip:#2b2720; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; }
+header b { font-size:15px; } header .me { margin-left:auto; color:var(--mute); font-size:12px; }
+main { padding:12px 16px; max-width:1200px; margin:0 auto; }
+.stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+.card .n { font-size:20px; font-weight:600; } .card .l { color:var(--mute); font-size:12px; }
+.chips span { display:inline-block; background:var(--chip); border-radius:10px; padding:1px 8px; margin:2px 4px 2px 0; font-size:12px; }
+.bar { display:flex; gap:8px; margin:8px 0; } .bar input, .bar select { flex:1; padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); }
+.bar select { flex:0 0 auto; }
+button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--chip); color:var(--ink); cursor:pointer; }
+button:disabled { opacity:.5; cursor:default; }
+table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--mute); font-weight:500; font-size:12px; } tr.row { cursor:pointer; } tr.row:hover { background:var(--chip); }
+td.task { color:var(--mute); max-width:420px; }
+.fiche dl { display:grid; grid-template-columns:180px 1fr; gap:4px 12px; margin:0; } .fiche dt { color:var(--mute); }
+.fiche dd { margin:0; white-space:pre-wrap; word-break:break-word; } a { color:var(--accent); }
+.err { color:#c0392b; padding:16px; }
+@media (max-width: 640px) { .hide-sm { display:none; } .fiche dl { grid-template-columns:1fr; } .fiche dt { margin-top:6px; } }
+</style>
+</head>
+<body>
+<header><b>Nokker · console</b><a href="#/">Candidatures</a><span class="me" id="me"></span></header>
+<main id="view"></main>
+<script>
+"use strict";
+const $ = (tag, attrs = {}, ...kids) => {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) k === "onclick" ? el.addEventListener("click", v) : el.setAttribute(k, v);
+  for (const k of kids) el.append(k instanceof Node ? k : document.createTextNode(k ?? ""));
+  return el;
+};
+async function api(path, opts = {}) {
+  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  if (!r.ok) {
+    let code = "";
+    try { code = (await r.json()).error || ""; } catch (_) { /* corps vide */ }
+    throw new Error(r.status === 403 && !code ? "Cet e-mail n'est pas opérateur." : `Erreur ${r.status}${code ? " : " + code : ""}`);
+  }
+  return r.json();
+}
+let ME = { role: "" };
+const INVITE_ERRORS = {
+  template_not_approved: "Le modèle de mail n'est pas encore approuvé (INVITE_TEMPLATE_SHA sur front1).",
+  onboarding_url_missing: "ONBOARDING_URL manque sur front1.", send_failed: "L'envoi du mail a échoué.",
+  unknown_candidature: "front1 ne connaît pas cette candidature.", unavailable: "front1 injoignable.",
+};
+const day = (iso) => iso ? new Date(iso).toLocaleString("fr-CH", { dateStyle: "short", timeStyle: "short" }) : "";
+const view = document.getElementById("view");
+let filter = { q: "", statut: "" };
+
+function chips(obj) {
+  const box = $("div", { class: "chips" });
+  for (const [k, n] of Object.entries(obj)) box.append($("span", {}, `${k} ${n}`));
+  return box;
+}
+
+async function list() {
+  const [stats, data] = await Promise.all([
+    api("/admin/v1/stats"),
+    api(`/admin/v1/applications?limit=500&q=${encodeURIComponent(filter.q)}&statut=${encodeURIComponent(filter.statut)}`),
+  ]);
+  const head = $("div", { class: "stats" },
+    $("div", { class: "card" }, $("div", { class: "n" }, String(stats.emails)), $("div", { class: "l" }, `candidat·es (${stats.total} envois)`)),
+    $("div", { class: "card" }, $("div", { class: "l" }, "profils"), chips(stats.by_profil)),
+    $("div", { class: "card" }, $("div", { class: "l" }, "langue"), chips(stats.by_lang)),
+    $("div", { class: "card" }, $("div", { class: "l" }, "par jour"), chips(stats.by_day)),
+    $("div", { class: "card" }, $("div", { class: "l" }, "nous a connus par"), chips(stats.by_connu_par)));
+  const q = $("input", { type: "search", placeholder: "Rechercher (nom, tâches, outils…)", value: filter.q });
+  q.addEventListener("change", () => { filter.q = q.value; render(); });
+  const st = $("select", {}, ...["", ...Object.keys(stats.by_statut)].map((s) => $("option", { value: s }, s || "tous statuts")));
+  st.value = filter.statut; st.addEventListener("change", () => { filter.statut = st.value; render(); });
+  const rows = data.items.map((a) => {
+    const tr = $("tr", { class: "row", onclick: () => { location.hash = `#/a/${a.id}`; } },
+      $("td", {}, day(a.received_at)), $("td", {}, `${a.prenom} ${a.nom}`.trim()),
+      $("td", { class: "hide-sm" }, a.profil), $("td", { class: "hide-sm" }, a.pays),
+      $("td", { class: "task" }, (a.taches || "").slice(0, 160)), $("td", { class: "hide-sm" }, a.statut));
+    return tr;
+  });
+  const table = $("table", {}, $("thead", {}, $("tr", {}, $("th", {}, "Reçue"), $("th", {}, "Nom"),
+    $("th", { class: "hide-sm" }, "Profil"), $("th", { class: "hide-sm" }, "Pays"), $("th", {}, "Tâches"),
+    $("th", { class: "hide-sm" }, "Statut"))), $("tbody", {}, ...rows));
+  view.replaceChildren(head, $("div", { class: "bar" }, q, st), table,
+    $("p", { class: "l" }, `${data.total} candidature(s)`));
+}
+
+async function fiche(id) {
+  const a = await api(`/admin/v1/applications/${id}`);
+  const fields = [["Reçue", day(a.received_at)], ["Prénom", a.prenom], ["Nom", a.nom], ["E-mail", a.email],
+    ["Pays", a.pays], ["Langue", a.lang], ["Profil", a.profil + (a.profil_detail ? ` — ${a.profil_detail}` : "")],
+    ["Tâches à déléguer", a.taches], ["Outils IA", a.outils], ["Disponibilité", a.dispo], ["Appareils", a.appareils],
+    ["Nous a connus par", a.connu_par], ["UTM", a.utm], ["Référent", a.referrer], ["Consentement", day(a.consent_at)],
+    ["Statut", a.statut], ["Autres envois (même adresse)", (a.duplicates || []).map((d) => `#${d}`).join(", ") || "—"]];
+  const dl = $("dl");
+  for (const [k, v] of fields) dl.append($("dt", {}, k), $("dd", {}, v || "—"));
+  const hist = $("dl");
+  for (const h of a.history || []) hist.append($("dt", {}, day(h.at)), $("dd", {}, `${h.action} — ${h.actor}`));
+  const invite = $("div", { class: "card fiche" });
+  view.replaceChildren($("p", {}, $("a", { href: "#/" }, "← Candidatures")),
+    $("div", { class: "card fiche" }, $("h2", {}, `#${a.id} ${a.prenom} ${a.nom}`.trim()), dl),
+    $("h3", {}, "Invitation"), invite,
+    $("h3", {}, "Historique"), $("div", { class: "card fiche" }, hist));
+  if (ME.role === "owner" || ME.role === "ops") inviteBox(a, invite);
+  else invite.append($("p", {}, "Réservé aux rôles owner et ops."));
+}
+
+async function inviteBox(a, box) {
+  const say = (msg) => box.append($("p", { class: "l" }, msg));
+  try {
+    const { items } = await api(`/admin/v1/applications/${a.id}/invitations`);
+    const dl = $("dl");
+    for (const i of items) dl.append($("dt", {}, day(i.sent_at || i.created_at)), $("dd", {}, `${i.state} (${i.lang}) — ${i.actor || ""}`));
+    box.append(items.length ? dl : $("p", {}, "Aucune invitation envoyée."));
+  } catch (e) { say(e.message); }
+  const lang = $("select", {}, $("option", { value: "" }, "langue de la candidature"), $("option", { value: "fr" }, "FR"),
+    $("option", { value: "en" }, "EN"));
+  const preview = $("div");
+  const show = $("button", { onclick: async () => {
+    preview.replaceChildren();
+    try {
+      const p = await api(`/admin/v1/applications/${a.id}/invite/preview?lang=${lang.value}`);
+      preview.append($("p", {}, $("b", {}, "À : "), p.to), $("p", {}, $("b", {}, "Objet : "), p.subject),
+        $("pre", { style: "white-space:pre-wrap" }, p.text));
+      send.disabled = false;
+    } catch (e) { preview.append($("p", { class: "err" }, INVITE_ERRORS[e.message.split(" : ")[1]] || e.message)); }
+  } }, "Aperçu du mail");
+  const send = $("button", { onclick: async () => {
+    if (!confirm(`Envoyer l'invitation à ${a.prenom} (${a.email}) ? Le lien est valable 7 jours.`)) return;
+    send.disabled = true;
+    try {
+      const r = await api(`/admin/v1/applications/${a.id}/invite`, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Nokker-Console": "1" }, body: JSON.stringify({ lang: lang.value || null }) });
+      preview.replaceChildren($("p", {}, `Invitation envoyée (${r.lang}), valable jusqu'au ${day(r.expires_at)}.`));
+    } catch (e) { send.disabled = false; preview.append($("p", { class: "err" }, INVITE_ERRORS[e.message.split(" : ")[1]] || e.message)); }
+  } }, "Envoyer l'invitation");
+  send.disabled = true;
+  box.append($("div", { class: "bar" }, lang, show, send), preview);
+}
+
+async function render() {
+  try {
+    const m = location.hash.match(/^#\/a\/(\d+)$/);
+    await (m ? fiche(m[1]) : list());
+  } catch (e) { view.replaceChildren($("div", { class: "err" }, e.message)); }
+}
+window.addEventListener("hashchange", render);
+api("/admin/v1/me").then((me) => { ME = me; document.getElementById("me").textContent = `${me.email} · ${me.role}`; })
+  .catch(() => {}).finally(render);
+</script>
+</body>
+</html>

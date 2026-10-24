@@ -1,0 +1,211 @@
+# Nokker Lokkal — l'installation locale (docs/LOKKAL.md §3). Une commande (install.sh / install.ps1) pose ce fichier,
+# un .env (secrets générés sur la machine) et lance `docker compose up -d`. Images préconstruites et signées
+# (ghcr.io/nokker-ai, cosign), jamais de build chez le client.
+#
+# Services :
+#   core        noyau (API /v1 + boucle), mémoire CortHeXis en direct sur `postgres` + `embed`
+#   web         l'interface web (même code que nokker.ai), /v1 relayé vers `core` : http://127.0.0.1:${NOKKER_PORT}
+#   postgres    pgvector ; deux bases (nokker, corthexis), rôles de deploy/postgres/roles.sql (RLS comme en bêta)
+#   embed       llama.cpp CPU, EmbeddingGemma-300M Q8_0 (même modèle que la mémoire de nokker.ai : index compatibles)
+#   dockerproxy seule voie du noyau vers docker : n'accepte que les bacs à sable étiquetés nokker.sandbox (sandboxd/)
+#   egress      seule sortie des bacs à sable ; plages privées refusées (box, LAN, Postgres, métadonnées cloud)
+#   roles, migrate, grants   à chaque démarrage : rôles SQL (admin), migrations (propriétaire), droits de nouveau
+#
+# Réseaux (aucun port publié hors 127.0.0.1) :
+#   internal    core, web, postgres, embed, init — interne : pas d'Internet
+#   dockerapi   core ↔ dockerproxy seulement — interne
+#   sandbox     `nokker-sandbox` : bacs à sable ↔ egress seulement — interne ; nom fixe, le noyau le passe à docker
+#   front       web seul : publie 127.0.0.1:${NOKKER_PORT} (docker ne publie pas depuis un réseau interne)
+#   outbound    core (modèles : Router Nokker ou fournisseur choisi), egress, embed (téléchargement du modèle)
+name: nokker
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  core:
+    <<: *hardening
+    image: ${NOKKER_IMAGE:-ghcr.io/nokker-ai/nokker}:${NOKKER_VERSION:?NOKKER_VERSION absent du .env}-lokkal
+    # entrypoint et pas command (l'ENTRYPOINT de l'image lance la gateway Hermes, comme `command:` du chart en k8s)
+    entrypoint: ["python3", "-m", "nokker", "--config", "/etc/nokker/config.yaml", "serve"]
+    init: true
+    depends_on:
+      grants: {condition: service_completed_successfully}
+      embed: {condition: service_healthy}
+      dockerproxy: {condition: service_started}
+    # Sous l'uid de l'utilisateur (posé par l'installeur) : il possède le dossier d'état et ses dossiers de travail.
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    environment:
+      NOKKER_CONFIG: /etc/nokker/config.yaml
+      # Un seul dossier d'état (jeton local, réglages, coffre, skills, points de retour) : ~/.nokker/state de l'hôte,
+      # là où la commande `nokker` lit le jeton local.
+      NOKKER_HOME: /opt/data
+      HERMES_HOME: /opt/data
+      NOKKER_LOCAL_SECRET_KEY: ${NOKKER_LOCAL_SECRET_KEY:?}   # coffre local (Fernet) ; sans elle, il refuse d'écrire
+      NOKKER_PG_DSN: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/nokker
+      CORTHEXIS_DATABASE_URL: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/corthexis
+      CORTHEXIS_EMBED_URLS: http://embed:8080
+      NOKKER_MEMORY_MODE: direct
+      # Bac à sable : le CLI docker de l'image `-lokkal` parle au proxy filtrant, jamais au socket.
+      DOCKER_HOST: tcp://dockerproxy:2375
+      NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
+      # local.allowed_hosts_env : Host acceptés (web relayé + API directe ; 127.0.0.1:8742 = sonde de santé dans le
+      # container, un littéral de bouclage qu'un navigateur ne peut pas forger) ; plus tard <nom>.nokker.app
+      NOKKER_ALLOWED_HOSTS: 127.0.0.1:8742,${NOKKER_ALLOWED_HOSTS:-127.0.0.1:${NOKKER_PORT:-7420},localhost:${NOKKER_PORT:-7420},127.0.0.1:${NOKKER_API_PORT:-8742},localhost:${NOKKER_API_PORT:-8742}}
+      NOKKER_SANDBOX_IMAGE: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
+      APPROVALS_ENC_KEY: ${NOKKER_APPROVALS_KEY:?}
+      ROUTER_KEY: ${NOKKER_ROUTER_KEY:-}
+    volumes:
+      - ./config/config.yaml:/etc/nokker/config.yaml:ro
+      - ${NOKKER_STATE_DIR:?}:/opt/data
+      # Dossier de travail AU MÊME CHEMIN que sur l'hôte : le chemin que le noyau voit est celui que le démon monte
+      # dans le bac à sable (local.code.roots), sans table de correspondance.
+      - ${NOKKER_HOST_WORKSPACE:?}:${NOKKER_HOST_WORKSPACE:?}
+    networks: [internal, dockerapi, outbound]
+    # API locale pour la commande `nokker` de l'hôte ; le noyau vérifie le Host (local.allowed_hosts) et le jeton.
+    ports: ["127.0.0.1:${NOKKER_API_PORT:-8742}:8742"]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8742/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  web:
+    <<: *hardening
+    image: ${NOKKER_WEB_IMAGE:-ghcr.io/nokker-ai/nokker-web}:${NOKKER_VERSION}
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]   # nginx officiel : bascule vers l'utilisateur nginx
+    depends_on: {core: {condition: service_healthy}}
+    volumes:
+      - ./web/lokkal.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [internal, front]   # un port n'est publié que depuis un réseau non interne : `front`, rien d'autre dessus
+    ports: ["127.0.0.1:${NOKKER_PORT:-7420}:8080"]
+    mem_limit: 128m
+
+  postgres:
+    <<: *hardening
+    image: pgvector/pgvector@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]   # entrypoint officiel : chown du dossier puis gosu
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${NOKKER_PG_ADMIN_PASSWORD:?}
+      POSTGRES_DB: nokker
+    command: ["-c", "shared_buffers=64MB", "-c", "max_connections=50"]
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    networks: [internal]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nokker"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  embed:
+    <<: *hardening
+    # Même image et même modèle que la mémoire de nokker.ai (index compatibles pour le miroir des abonnés, §6.3).
+    # Le modèle est téléchargé au premier démarrage dans le volume `models` (~330 Mo), puis servi hors ligne.
+    image: ghcr.io/ggml-org/llama.cpp@sha256:970168341efef973da5666ea5c362fa428ee66ba0dfa621b0f69bf3feb3320f7
+    environment:
+      LLAMA_CACHE: /models
+    command: >
+      --hf-repo ggml-org/embeddinggemma-300M-GGUF --hf-file embeddinggemma-300M-Q8_0.gguf
+      --embedding --pooling mean -t 2 -c 1024 -np 1 -b 512 -ub 512 --cache-ram 0 --host 0.0.0.0 --port 8080
+    volumes: [models:/models]
+    networks: [internal, outbound]
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # Init en trois temps, comme le job de la bêta : rôles (admin) → migrations (propriétaire) → rôles de nouveau.
+  roles:
+    image: pgvector/pgvector@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    user: postgres
+    depends_on: {postgres: {condition: service_healthy}}
+    entrypoint: ["sh", "/sql/roles.sh"]
+    environment: &pgadmin
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: ${NOKKER_PG_ADMIN_PASSWORD:?}
+      PGDATABASE: nokker
+      NOKKER_OWNER_PASSWORD: ${NOKKER_OWNER_PASSWORD:?}
+      NOKKER_APP_PASSWORD: ${NOKKER_APP_PASSWORD:?}
+    volumes: &sql
+      - ./sql:/sql:ro
+    networks: [internal]
+
+  migrate:
+    image: ${NOKKER_IMAGE:-ghcr.io/nokker-ai/nokker}:${NOKKER_VERSION}-lokkal
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    depends_on: {roles: {condition: service_completed_successfully}}
+    entrypoint: ["python3", "-m", "nokker", "--config", "/etc/nokker/config.yaml", "migrate"]
+    environment:
+      NOKKER_PG_DSN: postgresql://nokker_owner:${NOKKER_OWNER_PASSWORD:?}@postgres:5432/nokker
+    volumes: ["./config/config.yaml:/etc/nokker/config.yaml:ro"]
+    networks: [internal]
+
+  grants:
+    image: pgvector/pgvector@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    user: postgres
+    depends_on: {migrate: {condition: service_completed_successfully}}
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-q", "-f", "/sql/roles.sql"]
+    environment: *pgadmin
+    volumes: *sql
+    networks: [internal]
+
+  dockerproxy:
+    <<: *hardening
+    image: ${NOKKER_SANDBOXD_IMAGE:-ghcr.io/nokker-ai/sandboxd}:${NOKKER_VERSION}
+    command: ["python3", "dockerproxy.py"]
+    user: "0"            # propriétaire du socket ; aucune capacité (cap_drop ALL), système de fichiers en lecture seule
+    read_only: true
+    environment:
+      NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}
+      NOKKER_HOST_SKILLS: ${NOKKER_HOST_SKILLS:-}
+      NOKKER_SANDBOX_NETWORK: nokker-sandbox
+      NOKKER_SANDBOX_EGRESS: http://egress:3128
+      NOKKER_SANDBOX_IMAGES: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks: [dockerapi]
+    mem_limit: 64m
+
+  egress:
+    <<: *hardening
+    image: ${NOKKER_SANDBOXD_IMAGE:-ghcr.io/nokker-ai/sandboxd}:${NOKKER_VERSION}
+    command: ["python3", "egress.py"]
+    read_only: true
+    networks: [sandbox, outbound]
+    mem_limit: 64m
+
+volumes:
+  postgres:
+  models:
+
+networks:
+  internal: {internal: true}
+  dockerapi: {internal: true}
+  sandbox:
+    name: nokker-sandbox
+    internal: true
+  outbound: {}
+  front: {}

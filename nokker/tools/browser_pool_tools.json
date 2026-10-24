@@ -1,0 +1,815 @@
+[
+ {
+  "name": "browser_navigate",
+  "description": "Navigue vers une URL dans l’onglet courant (créé au besoin), au rythme d’un humain : écart minimal entre deux pages du même site, lecture après chargement. Renvoie l’état de la page et un snapshot avec références (ref=eN) à utiliser dans le",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "url": {
+     "type": "string",
+     "format": "uri"
+    },
+    "snapshot": {
+     "type": "boolean",
+     "description": "Joindre le snapshot (défaut true)"
+    },
+    "maxChars": {
+     "type": "integer",
+     "minimum": 500,
+     "maximum": 200000
+    }
+   },
+   "required": [
+    "url"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "read"
+ },
+ {
+  "name": "browser_navigate_back",
+  "description": "Retour arrière dans l’historique de l’onglet courant.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_snapshot",
+  "description": "Arbre d’accessibilité de la page courante avec références (ref=eN). À refaire après tout changement de page : les références ne survivent pas.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "maxChars": {
+     "type": "integer",
+     "minimum": 500,
+     "maximum": 200000
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_find",
+  "description": "Lignes du snapshot courant (nouveau snapshot si besoin) qui contiennent le texte ou l’expression régulière donnée — pour trouver une référence sans lire tout l’arbre.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "query": {
+     "type": "string",
+     "minLength": 1
+    },
+    "regex": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_click",
+  "description": "Clique un élément (souris déplacée en courbe, défilement naturel si hors écran). `ref` vient du snapshot ; `element` est une description humaine, pour le journal.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    },
+    "button": {
+     "type": "string",
+     "enum": [
+      "left",
+      "right",
+      "middle"
+     ]
+    },
+    "doubleClick": {
+     "type": "boolean"
+    },
+    "modifiers": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "Alt",
+       "Control",
+       "ControlOrMeta",
+       "Meta",
+       "Shift"
+      ]
+     }
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "ref"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_hover",
+  "description": "Amène la souris sur un élément (menus déroulants, infobulles).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "ref"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_type",
+  "description": "Tape du texte comme au clavier (rythme irrégulier, fautes corrigées) dans l’élément `ref` (cliqué d’abord) ou dans l’élément focalisé. Texte long (>160 car.) inséré d’un bloc comme un collage, sauf mode=type. `clear` vide le champ avant, `s",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "text": {
+     "type": "string"
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    },
+    "clear": {
+     "type": "boolean"
+    },
+    "submit": {
+     "type": "boolean"
+    },
+    "mode": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "type",
+      "paste"
+     ]
+    },
+    "slowly": {
+     "type": "boolean",
+     "description": "Compat playwright-mcp : équivaut à mode=type"
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "text"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_fill_form",
+  "description": "Remplit plusieurs champs à la suite, avec des pauses naturelles entre eux. type: textbox (frappe, champ vidé avant), checkbox/radio (clic si l’état diffère), combobox (sélection d’option par valeur ou libellé), slider (valeur).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "fields": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string"
+       },
+       "type": {
+        "type": "string",
+        "enum": [
+         "textbox",
+         "checkbox",
+         "radio",
+         "combobox",
+         "slider"
+        ]
+       },
+       "ref": {
+        "type": "string",
+        "pattern": "^e\\d+$"
+       },
+       "value": {
+        "type": [
+         "string",
+         "boolean",
+         "number"
+        ]
+       }
+      },
+      "required": [
+       "type",
+       "ref",
+       "value"
+      ],
+      "additionalProperties": false
+     },
+     "minItems": 1
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "fields"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_press_key",
+  "description": "Appuie sur une touche (Enter, Tab, Escape, ArrowDown, Control+a…).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "key": {
+     "type": "string",
+     "minLength": 1
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "key"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_select_option",
+  "description": "Sélectionne une ou plusieurs options d’un <select> (par valeur ou libellé).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    },
+    "values": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "minItems": 1
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "ref",
+    "values"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_scroll",
+  "description": "Défilement à la molette, par crans. Soit vers un élément (`ref`), soit d’une quantité : page, half, ou un nombre de pixels.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "direction": {
+     "type": "string",
+     "enum": [
+      "down",
+      "up"
+     ]
+    },
+    "amount": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "page",
+        "half"
+       ]
+      },
+      {
+       "type": "number"
+      }
+     ]
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_read_text",
+  "description": "Texte visible (innerText) de la page ou d’un élément — moins coûteux qu’un snapshot pour lire un article ou une fiche.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "maxChars": {
+     "type": "integer",
+     "minimum": 200,
+     "maximum": 300000
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_take_screenshot",
+  "description": "Capture JPEG de la fenêtre (ou d’un élément, ou de toute la page). Fichier écrit dans le dossier de sortie, image renvoyée.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    },
+    "fullPage": {
+     "type": "boolean"
+    },
+    "filename": {
+     "type": "string",
+     "pattern": "^[\\w.-]+\\.(jpg|jpeg)$"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_wait_for",
+  "description": "Attend un délai (time, secondes), l’apparition d’un texte, sa disparition (textGone) ou une URL contenant `url`. 30 s max sauf `time`.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "time": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 120
+    },
+    "text": {
+     "type": "string"
+    },
+    "textGone": {
+     "type": "string"
+    },
+    "url": {
+     "type": "string"
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_tabs",
+  "description": "list : onglets du profil (avec leur propriétaire). new : nouvel onglet (url optionnelle). select : rend courant l’onglet d’index donné — un onglet orphelin est adopté, un onglet d’une autre session vivante est refusé sauf force. close : fer",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "action": {
+     "type": "string",
+     "enum": [
+      "list",
+      "new",
+      "select",
+      "close"
+     ]
+    },
+    "index": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "url": {
+     "type": "string",
+     "format": "uri"
+    },
+    "force": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "action"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_handle_dialog",
+  "description": "Accepte ou rejette le dialogue (alert/confirm/prompt/beforeunload) en attente sur l’onglet courant.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "accept": {
+     "type": "boolean"
+    },
+    "promptText": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "accept"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_drag",
+  "description": "Glisse un élément sur un autre à la souris.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "startRef": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "endRef": {
+     "$ref": "#/properties/startRef"
+    },
+    "startElement": {
+     "type": "string"
+    },
+    "endElement": {
+     "type": "string"
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "startRef",
+    "endRef"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_evaluate",
+  "description": "Évalue une fonction JS dans la page : `function` est le texte d’une fonction, ex. \"() => document.title\" ou, avec `ref`, \"(el) => el.value\". Résultat sérialisé en JSON.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "function": {
+     "type": "string",
+     "minLength": 1
+    },
+    "ref": {
+     "type": "string",
+     "pattern": "^e\\d+$"
+    },
+    "element": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "function"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_console_messages",
+  "description": "Derniers messages console de l’onglet courant (option : uniquement un niveau).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "level": {
+     "type": "string",
+     "enum": [
+      "error",
+      "warning",
+      "info",
+      "log",
+      "debug"
+     ]
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_network_requests",
+  "description": "Dernières requêtes de l’onglet courant (méthode, statut, URL).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 300
+    },
+    "filter": {
+     "type": "string",
+     "description": "sous-chaîne d’URL"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_resize",
+  "description": "Change la taille de la fenêtre Chrome (la fenêtre entière, pas seulement le viewport).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "width": {
+     "type": "integer",
+     "minimum": 320,
+     "maximum": 3840
+    },
+    "height": {
+     "type": "integer",
+     "minimum": 240,
+     "maximum": 2160
+    }
+   },
+   "required": [
+    "width",
+    "height"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_handoff",
+  "description": "CAPTCHA, challenge anti-bot ou étape humaine (2FA, paiement…) : capture + alerte Telegram à l'utilisateur avec un bouton qui ouvre l’écran du navigateur sur son iPhone (noVNC via le réseau privé). L'utilisateur le fait lui-même ; le navigateur attend et reprend dès que ",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "reason": {
+     "type": "string"
+    },
+    "snapshot": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_pace",
+  "description": "Règle l’allure de cette session : calm, normal, brisk (normal = un humain au clavier). Sur un site qui bloque, préférer calm.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    },
+    "speed": {
+     "type": "string",
+     "enum": [
+      "calm",
+      "normal",
+      "brisk"
+     ]
+    }
+   },
+   "required": [
+    "speed"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_status",
+  "description": "Profils ouverts, onglets et propriétaires, sessions connectées, allure, écran, VNC, Telegram.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ },
+ {
+  "name": "browser_close",
+  "description": "Ferme les onglets de cette session (Chrome et les sessions authentifiées restent). À appeler quand la tâche navigateur est finie.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "lane": {
+     "type": "string",
+     "pattern": "^[a-zA-Z0-9._-]{1,40}$",
+     "description": "Lane de cette session (browser_lane open) : curseur et Chrome dédiés à un agent. Sans : onglet courant de la session."
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "effect": "write"
+ }
+]

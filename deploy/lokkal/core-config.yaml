@@ -1,0 +1,36 @@
+# Noyau Nokker — config de Nokker Lokkal (compose local, docs/LOKKAL.md §3 et §7). Modèle pour le compose de brosim.
+# Aucun secret ici : clés lues dans l'environnement (ROUTER_KEY ; plus tard le coffre local, §7.1).
+pg_dsn_env: NOKKER_PG_DSN            # Postgres pgvector du compose
+memory_mcp_url: ""                   # CortHeXis en mode direct (NOKKER_MEMORY_MODE=direct), pas sokkan-memory
+api_keys: []                         # seul le jeton local (local.token_path) et les sessions d'appareils passent
+telegram_ids: {}
+extra_go_senders: [local-owner]      # le propriétaire de la machine donne les GO
+tiers:
+  ship:
+    base_url: https://router.sokkan.ch/v1
+    model: qwen/qwen3.5-397b-a17b
+    api_key_env: ROUTER_KEY
+  deep:
+    base_url: https://router.sokkan.ch/v1
+    model: qwen/qwen3.5-397b-a17b
+    api_key_env: ROUTER_KEY
+judge_enabled: false
+web_search_enabled: true
+context_enabled: true
+context_corthexis:
+  root_dir: /opt/data/session-memory           # racine en lecture seule : tout l'état sous /opt/data
+previews_cache_dir: /opt/data/previews
+host: 0.0.0.0                        # dans le container ; le compose ne publie le port que sur 127.0.0.1 de l'hôte
+port: 8742
+local:
+  state_dir: /opt/data                         # NOKKER_HOME = HERMES_HOME, bind sur ~/.nokker/state de l'hôte
+  token_path: /opt/data/local-token
+  settings_path: /opt/data/settings.json
+  allowed_hosts_env: NOKKER_ALLOWED_HOSTS      # « 127.0.0.1:7420,localhost:7420 », calculé par l'installeur
+  allowed_hosts: ["127.0.0.1:8742", "localhost:8742"]   # repli si la variable est absente
+  max_calls: 60
+  code:
+    roots_env: NOKKER_HOST_WORKSPACE           # dossier(s) de l'utilisateur séparés par « : », montés au même chemin
+    host_roots: {}                             # racine vue par le noyau -> vue par le démon, si différente
+    backend: docker
+    network_name: nokker-sandbox

@@ -1,0 +1,6 @@
+{
+  "name": "nokker-miniapp-approve",
+  "private": true,
+  "type": "module",
+  "description": "Marqueur Node (type: module) pour que approve-core.js et les tests *.mjs se chargent en ES module. N'est pas un paquet publié, n'a pas de dépendances — aucun build, aucun bundler. Ce fichier n'a aucune utilité côté navigateur (le script officiel telegram-web-app.js et l'import ES natif suffisent) ; voir README.md pour la liste des fichiers à exposer publiquement sous /miniapp/."
+}

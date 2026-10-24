@@ -1,0 +1,13 @@
+.git
+.github
+docs
+site
+tests
+bench
+*.md
+!README.md
+!hermes-src/**
+.ruff_cache
+.pytest_cache
+__pycache__
+*.pyc

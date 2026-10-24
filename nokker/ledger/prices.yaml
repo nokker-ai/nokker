@@ -1,0 +1,77 @@
+# Grille de prix par modèle — repli versionné du ledger (nokker/ledger/prices.py).
+#
+# Source primaire en prod : `GET {router_url}/v1/models` (router.sokkan.ch), qui expose bien
+# `pricing.{prompt,cached,completion}` en USD/M sans authentification (vérifié 17.10.2026 en lisant
+# broker/app.py du Router : la route construit `pricing` depuis `m.price`, le même
+# dict que le catalogue). Ce fichier n'est qu'un REPLI (Router inatteignable, hors ligne, dev local)
+# et une trace versionnée de ce qu'on a vu une fois — il peut driver, c'est volontaire : la source de
+# vérité reste le Router. `nokker.ledger.prices.load()` tente le Router avant ce fichier.
+#
+# Chaque prix ci-dessous est copié tel que lu dans broker/catalog.json du Router le
+# 17.10.2026 (lecture de code, pas un appel HTTP) — fetched_at = date de cette lecture, pas une
+# garantie de fraîcheur. unit = USD par 1 000 000 de tokens (comme le Router).
+rate_chf_usd: 1.25 # 1 CHF = 1,25 USD (catalogue Router, confirmé dans catalog.json._doc)
+fetched_at: "2026-10-17"
+source: "lecture de code broker/catalog.json du Router (pas un appel réseau)"
+unit: "USD/1M tokens"
+
+models:
+  - id: "qwen/qwen3.8-27b"
+    prompt: "0.20"
+    cached: "0.05"
+    completion: "2.50"
+    note: "Ship on_demand, amont SOKKAN/OVH."
+
+  - id: "qwen/qwen3.6-35b-a3b"
+    prompt: "0.20"
+    cached: "0.05"
+    completion: "1.40"
+    note: "availability=committed, jamais appelable au token par une clé non titulaire (catalog.py 403) ; gardé pour mémoire de prix seulement."
+
+  - id: "qwen/qwen3.6-35b-a3b-eu"
+    prompt: "0.20"
+    cached: "0.05"
+    completion: "1.40"
+    note: "Ship route EU par défaut (Scaleway Paris via SOKKAN). Vendu à perte en interne (loss_leader) mais même PRIX PUBLIC que committed/swiss."
+
+  - id: "qwen/qwen3.6-35b-a3b-swiss"
+    prompt: "0.20"
+    cached: "0.05"
+    completion: "1.40"
+    note: "Ship zone CH (auto-hébergé, opportuniste, partagé)."
+
+  - id: "swiss-ai/apertus-v1.5-70b"
+    prompt: "0.875"
+    cached: "0.19"
+    completion: "3.125"
+    note: ""
+
+  - id: "openai/gpt-oss-20b"
+    prompt: "0.015"
+    cached: "0.008"
+    completion: "0.075"
+    note: ""
+
+  - id: "openai/gpt-oss-120b"
+    prompt: "0.10"
+    cached: "0.10"
+    completion: "0.50"
+    note: ""
+
+  - id: "qwen/qwen3.5-397b-a17b"
+    prompt: "1.00"
+    cached: "1.00"
+    completion: "6.00"
+    note: "Route Deep du Router (F5, D11, decision Nick 17.10) : debordement OVH transitoire, jamais presente comme notre Deep."
+
+  - id: "moonshotai/kimi-k2.6"
+    prompt: "0.85"
+    cached: "0.85"
+    completion: "4.15"
+    note: "Hors Router (Infomaniak), mesure pour le juge (nina-qa) seulement. 0 appel hors Router/Magnitude en P1 (C2)."
+
+  - id: "local/magnitude"
+    prompt: "0.00"
+    cached: "0.00"
+    completion: "0.00"
+    note: "Palier Local (Magnitude, CPU auto-hébergé) : self-hosted, jamais facture par le Router. Prix nul volontaire."

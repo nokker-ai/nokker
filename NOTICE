@@ -1,0 +1,16 @@
+Nokker
+Copyright 2026 Ninabot Sàrl
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Nokker is a fork of Hermes Agent by Nous Research, distributed under the MIT License:
+  Copyright (c) 2025 Nous Research
+  https://github.com/NousResearch/hermes-agent
+The full text of the original MIT license, which continues to apply to the portions
+of this software derived from Hermes Agent, is in LICENSES/MIT-hermes-agent.txt.
+
+Upstream base: Hermes Agent v0.22.2 (commit d923a5eb487a17c0a68801bba9ef0f56c81040a8,
+released 2026-10-15), tracked on the `vendor/hermes` branch of this repository.
+
+Third-party components bundled with or fetched by this software keep their own
+licenses; see docs/LICENSES-DEPENDENCIES.md.
