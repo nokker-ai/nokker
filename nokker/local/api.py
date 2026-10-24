@@ -127,6 +127,7 @@ class LocalApi:
     relay_host: str | None = None  # <nom>.nokker.app : accepté comme Host seulement tunnel ouvert (§7.5)
     tunnel: Any = None  # nokker.local.tunnel.Tunnel, posé par serve quand la machine est liée
     on_session_open: Any = None  # (thread_id, cwd) -> None : serve y lit le `.nokker/settings.json` du dépôt
+    mirror: Any = None  # nokker.local.mirror.MirrorWorker, posé par serve quand le miroir tourne (L5)
 
     def start_tunnel(self, relay_url: str, local_base: str, web_base: str | None = None) -> bool:
         """Ouvre le tunnel si la machine est liée (jeton de machine au coffre, nom connu). Rend True si lancé."""
@@ -255,6 +256,27 @@ class LocalApi:
                          "tunnel": "up" if up else "down", "url": f"https://{self.relay_host}" if up else None}
         if path == "/v1/local/link" or path.startswith("/v1/local/link/"):
             return self._link(method, path)
+        if path == "/v1/local/mirror" or path.startswith("/v1/local/mirror/"):
+            return self._mirror(method, path)
+        return None
+
+    def _mirror(self, method: str, path: str) -> tuple[int, dict[str, Any]] | None:
+        """Miroir web ⇄ machine (L5) : état, effacement des copies de la machine chez nokker.ai (envoi en pause),
+        reprise (tout est renvoyé)."""
+        if self.mirror is None:
+            if path == "/v1/local/mirror" and method == "GET":
+                return 200, {"enabled": False}
+            return 404, {"error": {"message": "miroir non actif sur cette machine"}}
+        if path == "/v1/local/mirror" and method == "GET":
+            return 200, self.mirror.status()
+        if path == "/v1/local/mirror/erase" and method == "POST":
+            try:
+                return 200, {"erased_turns": self.mirror.erase_remote(), "paused": True}
+            except httpx.HTTPError:
+                return 502, {"error": {"message": "nokker.ai n'a pas confirmé l'effacement : rien n'a changé ici"}}
+        if path == "/v1/local/mirror/resume" and method == "POST":
+            self.mirror.resume()
+            return 200, self.mirror.status()
         return None
 
     def _link(self, method: str, path: str) -> tuple[int, dict[str, Any]] | None:

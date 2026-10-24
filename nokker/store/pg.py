@@ -10,6 +10,7 @@ coût/CHF réel est `nokker.ledger.costs` (F6, `InMemoryLedger`/`PostgresLedger`
 différent ; `api/server.py` les branche, pas ceux d'ici)."""
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -205,6 +206,15 @@ class PgStore:
                         "ORDER BY created_at, thread_id, turn_index LIMIT %s", (*after, limit))
             return [(r[0].isoformat(), r[1], r[2], r[3]) for r in cur.fetchall()]
 
+    def erase_mirror_copies(self, prefix: str) -> int:
+        """Efface les COPIES du miroir dont le fil commence par `prefix` (`lokkal-<machine>-` chez nokker.ai,
+        `mirror-web-` sur une machine), chez le locataire courant seulement : fonction `nokker_mirror_erase`
+        (migration 015), qui refuse tout autre préfixe. Rend le nombre de tours effacés."""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT nokker_mirror_erase(%s)", (prefix,))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
     def close(self) -> None:
         self._db.close()
 
@@ -232,6 +242,16 @@ class MemoryStore:
     def append(self, turn: Turn) -> None:
         self._by_thread.setdefault(turn.thread_id, []).append(turn)
         self._order.append((turn.thread_id, turn.index))
+
+    def erase_mirror_copies(self, prefix: str) -> int:
+        """Comme `PgStore.erase_mirror_copies` (même refus : copies du miroir seulement)."""
+        bare = prefix.split(":", 1)[1] if ":" in prefix else prefix
+        if not re.fullmatch(r"(lokkal-[A-Za-z0-9_]+-|mirror-web-)", bare):
+            raise ValueError(f"préfixe refusé ({prefix}), seulement des copies du miroir")
+        gone = [t for t in self._by_thread if t.startswith(prefix)]
+        n = sum(len(self._by_thread.pop(t)) for t in gone)
+        self._order = [k for k in self._order if k[0] not in gone]
+        return n
 
     def turns_after(self, after: tuple[str, str, int], limit: int) -> list[tuple[str, str, int, dict[str, Any]]]:
         """Comme `PgStore.turns_after` ; l'ordre d'ajout tient lieu d'horodatage (rang à 12 chiffres)."""

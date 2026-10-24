@@ -388,3 +388,30 @@ def test_repo_settings_restrict_only_their_own_session(tmp_path):
     assert perms.decide(secret, Effect.READ, th)[0] is Decision.DENY
     cmd = ToolCall(id="3", name="terminal", arguments={"command": "rm -rf build"})
     assert perms.decide(cmd, Effect.DESTRUCTIVE, th)[0] is not Decision.ALLOW  # son allow est ignoré
+
+
+def test_mirror_routes_are_owner_only_and_report_a_failed_erase(tmp_path):
+    import httpx
+
+    api = _api(tmp_path)
+    assert api.handle("GET", "/v1/local/mirror", f"Bearer {api.token}", {}) == (200, {"enabled": False})
+    assert api.handle("POST", "/v1/local/mirror/erase", f"Bearer {api.token}", {})[0] == 404
+
+    class Mirror:
+        paused = False
+
+        def status(self):
+            return {"enabled": True, "paused": self.paused}
+
+        def erase_remote(self):
+            raise httpx.ConnectError("injoignable")
+
+        def resume(self):
+            self.paused = False
+
+    api.mirror = Mirror()
+    assert api.handle("POST", "/v1/local/mirror/erase", None, {})[0] == 401
+    status, body = api.handle("POST", "/v1/local/mirror/erase", f"Bearer {api.token}", {})
+    assert status == 502 and "rien n'a changé" in body["error"]["message"]
+    assert api.handle("POST", "/v1/local/mirror/resume", f"Bearer {api.token}", {}) == (200, {"enabled": True,
+                                                                                            "paused": False})

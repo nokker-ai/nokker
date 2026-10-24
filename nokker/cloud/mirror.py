@@ -7,8 +7,10 @@ Modèle : chaque fil a UNE maison (la machine, ou le web). L'autre côté en gar
     l'inférence relayée : pas de double comptage) ;
   - tirage (web → machine) : les tours des fils web du locataire depuis un curseur `(created_at, fil, indice)`, sauf
     les copies `lokkal-*` (une machine ne retire jamais ce qu'elle a poussé).
-Les fichiers du dossier de travail ne passent JAMAIS par ici (§6.3). L'effacement du compte efface les copies
-(même locataire). Les notes CortHeXis suivent dans une version suivante.
+Les fichiers du dossier de travail ne passent JAMAIS par ici (§6.3). Effacement propagé : l'effacement du compte efface
+les copies (même locataire) ; une machine efface les siennes (`erase`, route `POST /v1/mirror/erase`), par la fonction
+`nokker_mirror_erase` (migration 015) qui n'atteint que des copies. Les notes CortHeXis suivent dans une version
+suivante (aucun locataire de nokker.ai n'a encore de notes).
 """
 from __future__ import annotations
 
@@ -43,6 +45,12 @@ def push(store: Any, tenant: str, machine: str, items: list[dict[str, Any]]) -> 
     return {"accepted": accepted, "skipped": skipped}
 
 
+def erase(store: Any, tenant: str, machine: str) -> int:
+    """Efface toutes les copies poussées par `machine` chez `tenant` ; rend le nombre de tours effacés."""
+    with tenant_scope(tenant):
+        return store.erase_mirror_copies(scoped_thread_id(tenant, f"lokkal-{machine}-"))
+
+
 def pull(store: Any, tenant: str, since: str | None) -> dict[str, Any]:
     """Tours des fils web du locataire après le curseur (sous RLS en Postgres), sans les copies `lokkal-*`."""
     out, cursor = [], since
@@ -65,4 +73,4 @@ def _parse_cursor(since: str | None) -> tuple[str, str, int]:
     return (created, tid, int(idx))
 
 
-__all__ = ["mirror_thread", "pull", "push"]
+__all__ = ["erase", "mirror_thread", "pull", "push"]

@@ -159,8 +159,9 @@ def _turn(thread, index, text):
 
 
 def test_mirror_push_and_pull_between_machine_and_web():
-    from nokker.local.mirror import MirroringStore, MirrorWorker
-    from nokker.store.pg import MemoryStore, turn_to_dict
+    from nokker.local.mirror import MirrorWorker
+    from nokker.store.pg import MemoryStore
+    from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
 
     cloud_store = MemoryStore()
     router = ThreadingHTTPServer(("127.0.0.1", 0), FakeRouter)
@@ -176,23 +177,70 @@ def test_mirror_push_and_pull_between_machine_and_web():
         dev = _call(port, "/v1/link/device", {"machine": "atelier"})[1]
         _call(port, "/v1/link/approve", {"user_code": dev["user_code"]}, token="s")
         mt = _call(port, "/v1/link/token", {"device_code": dev["device_code"]})[1]["machine_token"]
-        local, state = MirroringStore(MemoryStore()), {}
+        local, state, saves = MemoryStore(), {}, []
         worker = MirrorWorker(store=local, base_url=f"http://127.0.0.1:{port}", token=lambda: mt, state=state,
-                              save=lambda: None)
-        local.append(_turn("th_local", 0, "corrige le test"))
-        assert worker.push_once() == 1 and not local.outbox
+                              save=lambda: saves.append(dict(state)))
+        with tenant_scope(INTERNAL_TENANT):
+            local.append(_turn("th_local", 0, "corrige le test"))
+        assert worker.push_once() == 1 and state["mirror_push_cursor"] and saves
         mid = links.machines_of("us_pierre")[0].id
         copies = [t for t, turns in cloud_store._by_thread.items() if f"lokkal-{mid}-th_local" in t]
         assert len(copies) == 1 and cloud_store._by_thread[copies[0]][0].calls == []
-        local.outbox.append({"thread_id": "th_local", "turn": turn_to_dict(local.inner._by_thread["th_local"][0])})
-        worker.push_once()
-        assert len(cloud_store._by_thread[copies[0]]) == 1  # renvoi : sauté, pas de doublon
+        assert worker.push_once() == 0  # rien de neuf après le curseur
+        state.pop("mirror_push_cursor")  # redémarrage sans curseur (état perdu) : tout repart, le web saute les doublons
+        assert worker.push_once() == 1 and len(cloud_store._by_thread[copies[0]]) == 1
         cloud_store.append(_turn("web1", 0, "planifie la semaine"))
         assert worker.pull_once() == 1  # la copie lokkal-* n'est jamais retirée
-        assert local.inner._by_thread["mirror-web-web1"][0].input.text == "planifie la semaine"
+        assert local._by_thread["mirror-web-web1"][0].input.text == "planifie la semaine"
         assert worker.pull_once() == 0 and state["mirror_cursor"]
-        assert not local.outbox  # une copie web n'est jamais renvoyée
+        assert worker.push_once() == 0  # une copie web n'est jamais renvoyée (le curseur la saute)
+        # Effacement propagé (§6.3) : le propriétaire efface les copies de SA machine chez nokker.ai ; l'envoi se met en
+        # pause, une reprise renvoie tout ; la session web, elle, reste.
+        assert worker.erase_remote() == 1 and state["mirror_paused"]
+        assert not [t for t in cloud_store._by_thread if f"lokkal-{mid}-" in t] and cloud_store._by_thread["web1"]
+        assert worker.push_once() == 0
+        worker.resume()
+        assert worker.push_once() == 1 and [t for t in cloud_store._by_thread if f"lokkal-{mid}-" in t]
     finally:
         cloud_http.configure(None)
         httpd.shutdown()
         router.server_close()
+
+
+def test_machine_refused_three_times_erases_its_web_copies():
+    """Compte effacé ou machine déliée chez nokker.ai : 401 au tirage. Un refus isolé n'efface rien ; au troisième
+    d'affilée, les copies des fils web gardées sur la machine partent (et seulement elles)."""
+    import httpx
+
+    from nokker.local.mirror import MirrorWorker
+    from nokker.store.pg import MemoryStore
+    from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
+
+    class Refuse:
+        def get(self, url, headers=None, params=None):
+            return httpx.Response(401, request=httpx.Request("GET", url), json={"error": {"message": "machine"}})
+
+    local = MemoryStore()
+    with tenant_scope(INTERNAL_TENANT):
+        local.append(_turn("mirror-web-web1", 0, "copie du web"))
+        local.append(_turn("th_local", 0, "fil de la machine"))
+    state = {"mirror_cursor": "c"}
+    w = MirrorWorker(store=local, base_url="http://cloud.invalid", token=lambda: "mt", state=state, save=lambda: None,
+                     client=Refuse())
+    assert w.pull_once() == 0 and w.pull_once() == 0 and "mirror-web-web1" in local._by_thread
+    w.pull_once()
+    assert "mirror-web-web1" not in local._by_thread and local._by_thread["th_local"]
+    assert "mirror_cursor" not in state
+
+
+def test_mirror_erase_refuses_anything_but_mirror_copies():
+    import pytest
+
+    from nokker.store.pg import MemoryStore
+
+    store = MemoryStore()
+    store.append(_turn("th_local", 0, "maison"))
+    for bad in ("th_", "", "lokkal-", "mirror-", "tn_x:th_"):
+        with pytest.raises(ValueError):
+            store.erase_mirror_copies(bad)
+    assert store.erase_mirror_copies("mirror-web-") == 0 and store._by_thread["th_local"]

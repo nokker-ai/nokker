@@ -15,6 +15,7 @@ Routes (rien d'autre n'est exposé ; `handle` rend False tant que `configure` n'
     GET  /v1/.well-known/jwks.json (aussi /.well-known/jwks.json en interne)
     POST /v1/inference/chat/completions (Bearer jeton de machine) → relayé au Router, compté au locataire
     POST /v1/mirror/turns {turns} | GET /v1/mirror/turns?since= (Bearer jeton de machine, abonnés) → miroir (L5)
+    POST /v1/mirror/erase (Bearer jeton de machine) → {erased_turns} : efface les copies de cette machine
 """
 from __future__ import annotations
 
@@ -139,6 +140,15 @@ def handle(h: Any, method: str, path: str) -> bool:
     if path == "/v1/gateway/machine" and method == "GET":
         h._json(200, {"machine_id": machine.id, "name": machine.name, "tenant": machine.tenant, "host": machine.host,
                       "inference": True})  # l'inférence passe par nous dès que la machine est liée (§7.2 révisé)
+        return True
+    if path == "/v1/mirror/erase" and method == "POST":
+        from nokker.cloud import mirror
+
+        # Effacement des copies de CETTE machine : un droit, pas une option de l'abonnement (abonnement échu compris).
+        if c.store is None:
+            h._json(404, {"error": {"message": "miroir non configuré"}})
+            return True
+        h._json(200, {"erased_turns": mirror.erase(c.store, machine.tenant, machine.id)})
         return True
     if path == "/v1/mirror/turns":
         from nokker.cloud import mirror

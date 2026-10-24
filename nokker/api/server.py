@@ -2000,13 +2000,14 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
     if local_api is not None and config.local.get("mirror") and local_api.setup is not None \
             and local_api.setup.vault.get("machine_token"):
         # Miroir web ⇄ Lokkal (L5, abonnés) : nokker.ai refuse (403) si le compte n'y a pas droit.
-        from nokker.local.mirror import MirroringStore, MirrorWorker
+        from nokker.local.mirror import MirrorWorker
 
-        kernel.store = MirroringStore(kernel.store)
         setup = local_api.setup
-        MirrorWorker(store=kernel.store, base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
-                     token=lambda: setup.vault.get("machine_token") or "", state=setup.state,
-                     save=setup._save).start()
+        local_api.mirror = MirrorWorker(
+            store=kernel.store, base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
+            token=lambda: setup.vault.get("machine_token") or "", state=setup.state,
+            save=setup._save)  # le propriétaire local est dans le locataire interne
+        local_api.mirror.start()
         logger.info("lokkal : miroir web ⇄ machine lancé")
     if local_api is not None and config.local.get("relay_url"):
         if local_api.start_tunnel(config.local["relay_url"], f"http://127.0.0.1:{config.port}",
