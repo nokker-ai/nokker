@@ -12,6 +12,9 @@ Les tables sous RLS ne sont visibles qu'avec `app.tenant_id` : il est posé sur 
 ce qui interdit aussi, par la politique elle-même, de toucher une ligne d'un autre locataire. `turns` est append-only :
 son trigger n'accepte un DELETE que si `nokker.erasing_tenant` désigne le locataire de la ligne (migration 013).
 
+Les images jointes (X7) vivent hors base, dans le magasin d'images (`images_root`) : le dossier du locataire y est
+supprimé après la validation de la transaction.
+
 Hors base, à faire par l'opérateur (le compte rendu le rappelle) : inscrire la ligne au journal des effacements
 (coffre de l'opérateur : identifiant de locataire et date, rien d'autre), et retirer la candidature et
 l'invitation chez front1 (Suisse), qui ne sont pas dans cette base. Les sauvegardes ne sont pas modifiées : les données
@@ -122,7 +125,22 @@ def _devices(conn: psycopg.Connection, account_id: str) -> list[dict[str, Any]]:
 
 
 def erase_account(dsn: str, *, email: str | None = None, account_id: str | None = None,
-                  apply: bool = False, confirm: str | None = None) -> Report:
+                  apply: bool = False, confirm: str | None = None, images_root: str | None = None) -> Report:
+    """`images_root` (X7, `NokkerConfig.images_root()`) : le magasin des images jointes ; le dossier du locataire y est
+    supprimé APRÈS la validation de la base (à blanc : seulement compté)."""
+    report = _erase_db(dsn, email=email, account_id=account_id, apply=apply, confirm=confirm)
+    if images_root:
+        from pathlib import Path
+
+        from nokker.images.store import ImageStore
+
+        store = ImageStore(Path(images_root))
+        report.deleted["images (fichiers)"] = (store.erase_tenant(report.tenant_id) if report.applied
+                                               else store.count_tenant(report.tenant_id))
+    return report
+
+
+def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: bool, confirm: str | None) -> Report:
     with psycopg.connect(dsn) as conn:
         acc, tenant, mail = _find_account(conn, email, account_id)
         if tenant == INTERNAL_TENANT:

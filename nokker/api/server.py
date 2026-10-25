@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -79,6 +80,7 @@ from nokker.core.turn import LLMCall, Tier, Turn, TurnInput, Usage
 from nokker.ledger.costs import InMemoryLedger, LedgerBackend, PostgresLedger
 from nokker.ledger.metrics import render as render_metrics
 from nokker.memory.corthexis import CorthexisMemory
+from nokker.images import ImageError, ImageStore, parse_attachments, sniff_media_type, split_content
 from nokker.providers.sokkan import SokkanProvider
 from nokker.qa.calibrate import DEFAULT_THRESHOLDS, load_thresholds_file
 from nokker.qa.escalate import EscalatorV0
@@ -155,13 +157,21 @@ _RE_MINIAPP = re.compile(r"^/miniapp/([^/]+)$")
 _RE_LOG_SECRET = re.compile(r"([?&](?:t|token|code|init_data|key)=)[^&\s\"]+")
 _RE_THREAD_ONE = re.compile(r"^/v1/threads/([^/]+)$")
 _RE_THREAD_CANCEL = re.compile(r"^/v1/threads/([^/]+)/cancel$")
+_RE_PAGE = re.compile(r"^/v1/pages/(pg_[0-9a-f]{16})(/link)?$")  # pages de session (docs/BUBBLES.md §10)
+# Aperçu du port d'une commande en arrière-plan (lot X6, docs/LOKKAL.md §7.7) : capacité signée DANS le chemin.
+_RE_PROC_LINK = re.compile(r"^/v1/local/processes/(bg_[0-9a-f]{8})/link$")
+_RE_PREVIEW = re.compile(r"^/v1/local/preview/(bg_[0-9a-f]{8})/(\d+\.[0-9a-f]{32})(/.*)?$")
 # Outils qu'un client peut appeler hors tour (docs/LOKKAL.md §7.4.4) : points de retour, skills, lecture du plan. Jamais
-# terminal, write_file, patch : ceux-là restent au modèle, sous ses portes.
+# terminal, write_file, patch : ceux-là restent au modèle, sous ses portes. `memory` (lister, lire, oublier) s'y ajoute
+# quand la mémoire de projet est allumée (`local.project_memory`, X1).
 DIRECT_TOOLS = frozenset({"checkpoint_list", "checkpoint_diff", "checkpoint_create", "checkpoint_restore", "skill_list",
                           "skill_view", "todo"})
 NOKKER_VERSION = "0.1.0"
 MIN_CLIENT_VERSION = "0.1.0"
 _RE_THREAD_SUB = re.compile(r"^/v1/threads/([^/]+)/(messages|bubbles)$")
+_RE_THREAD_IMAGE = re.compile(r"^/v1/threads/([^/]+)/images/([0-9a-f]{64})$")
+# Corps de /v1/chat/completions (X7) : 4 images de 5 Mo en base64 (~27 Mo) + texte et historique client.
+MAX_CHAT_BODY = 32 * 1024 * 1024
 _RE_BUBBLE_ONE = re.compile(r"^/v1/bubbles/([^/]+)$")
 _RE_BUBBLE_OP = re.compile(r"^/v1/bubbles/([^/]+)/(close|transfer|share)$")
 _RE_BUBBLE_ACTION = re.compile(r"^/v1/bubbles/([^/]+)/actions/([^/]+)$")
@@ -373,19 +383,25 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
         ledger.record(scoped_thread_id(tenant, f"lokkal-{machine}"), 0, call)
 
     dsn = config.pg_dsn()
-    if dsn:
-        from nokker.cloud.pg import PgLinkStore
+    from nokker.cloud.gateway_auth import GatewayAuth, MemoryGatewayAuthStore
 
-        store: Any = PgLinkStore(dsn)
+    # `link_store`, pas `store` : `store` est le magasin du NOYAU (miroir) — le même nom écrasait l'un par l'autre et
+    # /v1/mirror/erase appelait erase_mirror_copies sur le magasin des liens (trouvé le 24.10).
+    if dsn:
+        from nokker.cloud.pg import PgGatewayAuthStore, PgLinkStore
+
+        link_store: Any = PgLinkStore(dsn)
+        auth_store: Any = PgGatewayAuthStore(dsn)
     else:
         from nokker.cloud.link import MemoryLinkStore
 
-        store = MemoryLinkStore()
+        link_store, auth_store = MemoryLinkStore(), MemoryGatewayAuthStore()
+    links = LinkService(base_url=cl.get("base_url") or "https://app.nokker.ai",
+                        gateway_domain=cl.get("gateway_domain") or "nokker.app", store=link_store)
+    signer = Signer(private_pem=pem.encode(), issuer=(cl.get("base_url") or "https://app.nokker.ai").rstrip("/"))
     cloud_http.configure(CloudLink(
-        links=LinkService(base_url=cl.get("base_url") or "https://app.nokker.ai",
-                          gateway_domain=cl.get("gateway_domain") or "nokker.app", store=store),
-        signer=Signer(private_pem=pem.encode(), issuer=(cl.get("base_url") or "https://app.nokker.ai").rstrip("/")),
-        identity=identity, tenant_of=tenant_of,
+        links=links, signer=signer, identity=identity, tenant_of=tenant_of,
+        gateway_auth=GatewayAuth(links=links, signer=signer, store=auth_store),
         router_base=deep.base_url, router_key=deep.api_key, record_usage=record_usage, store=store,
         # Miroir (L5, abonnés) : drapeau `mirror` + liste de comptes (« * » = tous) tant que l'abonnement n'est pas lu.
         mirror_allowed=(lambda acc: "*" in cl.get("mirror_accounts", []) or acc in cl.get("mirror_accounts", []))
@@ -505,10 +521,29 @@ def start_admin(config: NokkerConfig) -> Any:
         return None
 
 
+def _mcp_header_source(srv: dict[str, Any], static: dict[str, str], secrets: Any | None) -> Any:
+    """En-têtes d'un serveur MCP avec `token` et/ou `headers` (valeurs littérales ou `secret:NOM`), relus au coffre à
+    chaque ouverture de session. None si le serveur n'en déclare pas (en-têtes fixes, comme avant X4)."""
+    if not srv.get("token") and not srv.get("headers"):
+        return None
+    from nokker.secrets.refs import SecretResolver
+
+    resolver = secrets.resolver() if secrets is not None else SecretResolver(None)
+
+    def build() -> dict[str, str]:
+        h = {**static, **{str(k): str(v) for k, v in resolver.resolve(dict(srv.get("headers") or {})).items()}}
+        if srv.get("token"):
+            h["Authorization"] = f"Bearer {resolver.resolve(srv['token'])}"
+        return h
+
+    return build
+
+
 def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
                  ledger: LedgerBackend | None = None, memory: object | None = None,
                  approvals: BaseApprovals | None = None, hub: BubbleHub | None = None,
-                 connectors: ConnectorProvider | None = None, extra_sources: list[Any] | None = None) -> Kernel:
+                 connectors: ConnectorProvider | None = None, extra_sources: list[Any] | None = None,
+                 secrets: Any | None = None) -> Kernel:
     """Ressources par locataire (docs/TENANCY.md §5) : outils (`TenantRegistry`), mémoire longue (`TenantMemory`),
     préfixe (`product_prefix_path` de l'engine) et plafonds (`TenantLimits`, `LimitedPolicy`) suivent le locataire
     courant, lu à chaque appel. Interne : tout ce qui suit, inchangé. Testeur : cœurs + `recall_context` + web + bulles +
@@ -522,7 +557,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     Le remplacement vit côté appelant (config du banc), pas ici.
 
     `extra_sources` : sources d'outils de plus pour le locataire interne seulement (jamais pour un testeur) — les outils
-    de code d'une session Nokker Lokkal (`nokker code`, `nokker/tools/code.py`)."""
+    de code d'une session Nokker Lokkal (`nokker code`, `nokker/tools/code.py`).
+
+    `secrets` : le coffre de Lokkal (`nokker.secrets.Vault`, lot X4) — ses valeurs entrent au caviardage des
+    invariants, et les références `secret:NOM` des serveurs MCP (`token`, `headers`) sont résolues à chaque
+    connexion. None : ni l'un ni l'autre (une référence échoue à l'usage)."""
     dsn = config.pg_dsn()
     store = PgStore(dsn) if dsn else MemoryStore()
     if dsn:
@@ -539,8 +578,9 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     for srv in config.mcp_tool_servers:
         token = os.environ.get(srv.get("token_env", ""), "") if srv.get("token_env") else ""
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        source_kw = {"header_source": hs} if (hs := _mcp_header_source(srv, headers, secrets)) is not None else {}
         raw_source = McpToolSource(name=srv["name"], url=srv["url"], headers=headers,
-                                   close_on_turn_end=srv.get("close_on_turn_end"))
+                                   close_on_turn_end=srv.get("close_on_turn_end"), **source_kw)
         # Un serveur MCP ne déclare pas d'effet lui-même : la table (F3) l'annote, et sert aussi de
         # 2e ligne de défense (SECRET -> poignée) indépendante de redact_result du noyau.
         mcp_sources.append(SecretScrubbingToolSource(inner=raw_source, effects=effects))
@@ -576,6 +616,10 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
                            connectors=connectors)
 
     inv = invariants or build_invariants(config)
+    if secrets is not None and hasattr(inv, "known"):
+        # Toute valeur du coffre (les deux portées) est caviardée dans chaque résultat d'outil et chaque réponse ; les
+        # valeurs connues d'avant (env NOKKER_SECRET_*, fichier) sont gardées.
+        inv.known = secrets.known.merge(inv.known)
     gates = build_gates(config, inv)
     escalator = TenantEscalator(EscalatorV0(addressee=config.escalation_addressee))  # jamais chez un testeur
     limits = TenantLimits.from_config(config.tenant_limits, dsn)
@@ -598,10 +642,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
             continue
         extra = {"reasoning_off_body": tier_cfg.reasoning_off_body} if tier_cfg.reasoning_off_body is not None else {}
         main_provider = SokkanProvider(base_url=tier_cfg.base_url, api_key=tier_cfg.api_key(),
-                                       model=tier_cfg.model, **extra)
+                                       model=tier_cfg.model, vision=tier_cfg.vision, **extra)
         if tier_cfg.fallback_model:
             from nokker.providers.hedged import HedgedProvider
 
+            # Le modèle de repli n'a pas de capacité déclarée à lui : pas de vision (le palier n'enverra pas d'image).
             spare = SokkanProvider(base_url=tier_cfg.base_url, api_key=tier_cfg.api_key(),
                                    model=tier_cfg.fallback_model, **extra)
             providers[tier] = HedgedProvider(main_provider, spare, hedge_after_s=tier_cfg.hedge_after_s)
@@ -613,9 +658,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     # effet exécutée sans preuve). `approvals=` explicite (banc, test) prime toujours sur la config.
     appr = approvals if approvals is not None else (build_approvals(config) if config.approvals_enabled else None)
     tenant_memory = TenantMemory(memory if memory is not None else NullMemory())
+    images_root = config.images_root()
     kernel = Kernel(store=store, context=context, memory=tenant_memory, invariants=inv, gates=gates,
                     escalator=escalator, policy=policy, providers=providers, tools=tools, ledger=ledger,
-                    approvals=appr, tool_loading=tool_loading(config), observer=hub, limits=limits)
+                    approvals=appr, tool_loading=tool_loading(config), observer=hub, limits=limits,
+                    images=ImageStore(Path(images_root)) if images_root else None)
     if hub is not None:
         hub.kernel = kernel
         if hub.scrub is None:
@@ -824,6 +871,9 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
 
         def _local_route(self, method: str, path: str) -> bool:
             """Routes `/v1/local/*` (Nokker Lokkal) ; True si la requête a reçu sa réponse."""
+            if local_api is not None and path.startswith("/v1/pages/"):
+                self._page_route(method, path)
+                return True
             m = _RE_THREAD_CANCEL.match(path) if local_api is not None and method == "POST" else None
             if m:
                 if not self._local_owner():
@@ -833,17 +883,155 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return True
             if local_api is None or not path.startswith("/v1/local/"):
                 return False
+            if path.startswith("/v1/local/preview/") or path.startswith("/v1/local/processes"):
+                self._process_route(method, path)
+                return True
             if path.startswith("/v1/local/approvals") and self._local_owner():
                 self._local_approvals(method, path)
                 return True
             if path == "/v1/local/tools/call" and method == "POST":
                 self._local_tool_call()
                 return True
+            if path == "/v1/local/cost" and method == "GET":
+                self._local_cost()
+                return True
             body = self._read_json_body() if method in ("POST", "PUT") else {}
             out = local_api.handle(method, path, self.headers.get("Authorization"), body,
                                    relayed=bool(self.headers.get("X-Nokker-Relay")))
             self._json(*(out or (404, {"error": {"message": "not found"}})))
             return True
+
+        def _page_route(self, method: str, path: str) -> None:
+            """`GET /v1/pages/{id}` (auth locale, OU lien signé, OU page publique ; sinon 404) et
+            `POST /v1/pages/{id}/link` (propriétaire) — docs/BUBBLES.md §10.3."""
+            from nokker.pages.store import PAGE_HEADERS
+
+            m = _RE_PAGE.match(path)
+            store = local_api.pages
+            meta = store.get(m.group(1)) if m else None
+            if meta is None:
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            if m.group(2):
+                if method != "POST":
+                    self._json(404, {"error": {"message": "not found"}})
+                elif not self._local_owner():
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                else:
+                    body = self._read_json_body()
+                    download = bool(body.get("download"))
+                    if self.headers.get("X-Nokker-Relay"):
+                        # Interface servie par la passerelle : lien d'entrée sur <nom>--pages.nokker.app, signé par
+                        # nokker.ai à la demande de cette machine (même route pour le client, en local comme à distance).
+                        got = local_api.link.pages_token(meta.page_id, bool(body.get("embed")), download) \
+                            if local_api.link is not None else None
+                    else:
+                        url, exp = store.link(meta.page_id, download=download)
+                        got = {"url": url, "expires_at": exp}
+                    relay_host = (local_api.setup.state.get("relay_host") if local_api.setup is not None else None)
+                    if got and meta.public and relay_host:  # « Copier le lien » : seulement pour une page publique
+                        got = {**got, "public_url": f"https://{relay_host.replace('.', '--pages.', 1)}/{meta.page_id}"}
+                    self._json(200, got) if got else self._json(502, {"error": {"message": "nokker.ai injoignable"}})
+                return
+            if method != "GET":
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            q = parse_qs(urlparse(self.path).query)
+            exp, sig = (q.get("exp") or [""])[0], (q.get("sig") or [""])[0]
+            tunnel = getattr(local_api, "tunnel", None)
+            # Par la passerelle : le relais a vérifié le cookie de pages de CE compte et le dit dans X-Nokker-Account,
+            # cru seulement si la requête arrive par notre tunnel (X-Nokker-Tunnel = son secret de processus).
+            relayed = (tunnel is not None and self.headers.get("X-Nokker-Pages") == "1"
+                       and bool(self.headers.get("X-Nokker-Account"))
+                       and hmac.compare_digest(self.headers.get("X-Nokker-Tunnel") or "", getattr(tunnel, "secret", "")))
+            download = (q.get("dl") or [""])[0] == "1"
+            if not (meta.public or relayed or (exp and sig and store.verify(meta.page_id, exp, sig, download))
+                    or self._local_owner()):
+                self._json(404, {"error": {"message": "not found"}})  # une page privée n'existe pas pour un inconnu
+                return
+            try:
+                version = int((q.get("v") or ["0"])[0]) or None
+            except ValueError:
+                version = None
+            found = store.read(meta.page_id, version)
+            if found is None:
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            body = found[1]
+            self.send_response(200)
+            for k, v in PAGE_HEADERS.items():
+                self.send_header(k, v)
+            if download:  # « Télécharger » : la page est autonome (§10.1), elle marche hors ligne telle quelle
+                from urllib.parse import quote as _q
+
+                from nokker.pages.store import download_name
+
+                name = download_name(found[0])
+                ascii_name = name.encode("ascii", "replace").decode().replace("?", "_").replace('"', "")
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{_q(name)}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _process_route(self, method: str, path: str) -> None:
+            """Commandes en arrière-plan (lot X6, docs/LOKKAL.md §7.7) : `GET /v1/local/processes` (propriétaire),
+            `POST /v1/local/processes/{id}/link` (propriétaire) → lien signé de l'aperçu du port, et
+            `GET /v1/local/preview/{id}/{exp}.{sig}/…` : la requête est rejouée DANS le bac à sable du processus
+            (aucun port publié sur l'hôte), servie avec la CSP `sandbox` des pages. En local seulement : par la
+            passerelle, l'aperçu n'existe pas (404), comme une page privée pour un inconnu."""
+            from nokker.pages.store import PAGE_HEADERS
+            from nokker.tools.processes import ProcessError
+
+            relayed = bool(self.headers.get("X-Nokker-Relay"))
+            if path == "/v1/local/processes" and method == "GET":
+                if not self._local_owner():
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                else:
+                    self._json(200, {"processes": local_api.code.processes()})
+                return
+            m = _RE_PROC_LINK.match(path)
+            if m and method == "POST":
+                found = local_api.code.find_process(m.group(1)) if not relayed else None
+                if not self._local_owner():
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                elif found is None or not found[1].port or found[1].state != "running":
+                    self._json(404, {"error": {"message": "pas d'aperçu pour ce processus"}})
+                else:
+                    url, exp = local_api.preview_signer.link(m.group(1))
+                    self._json(200, {"url": url, "expires_at": exp, "port": found[1].port})
+                return
+            m = _RE_PREVIEW.match(path)
+            if not m or method not in ("GET", "HEAD") or relayed \
+                    or not local_api.preview_signer.verify(m.group(1), m.group(2)):
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            found = local_api.code.find_process(m.group(1))
+            if found is None:
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            tid, proc, src = found
+            query = urlparse(self.path).query
+            upstream = (m.group(3) or "/") + (f"?{query}" if query else "")
+            try:
+                status, ctype, body, location = src.process_table(tid).fetch(proc.id, upstream, method)
+            except ProcessError as e:
+                self._json(502, {"error": {"message": str(e)}})
+                return
+            base = f"/v1/local/preview/{m.group(1)}/{m.group(2)}"
+            self.send_response(status)
+            for k, v in PAGE_HEADERS.items():
+                if k != "Content-Type":
+                    self.send_header(k, v)
+            self.send_header("Content-Type", re.sub(r"[\r\n]", "", ctype)[:200])
+            if location:  # redirection de l'appli : gardée sous le préfixe signé, jamais vers une autre origine
+                loc = re.sub(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?", "", location.strip())
+                if loc.startswith("/") and not loc.startswith("//") and not re.search(r"[\r\n]", loc):
+                    self.send_header("Location", base + loc)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if method == "GET":
+                self.wfile.write(body)
 
         def _local_tool_call(self) -> None:
             """Appel d'outil du propriétaire, sans tour modèle (docs/LOKKAL.md §7.4.4) : `/diff`, `/rollback`, `/skills`,
@@ -857,7 +1045,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if thread_id not in local_api.code.sessions():
                 self._json(404, {"error": {"message": "pas de session locale sur ce fil"}})
                 return
-            if name not in DIRECT_TOOLS:
+            direct = DIRECT_TOOLS | ({"memory"} if local_api.project_memory is not None else set())
+            if name not in direct:
                 self._json(403, {"error": {"message": f"outil non appelable directement : {name}"}})
                 return
             if not isinstance(arguments, dict) or (name == "todo" and arguments):
@@ -877,6 +1066,35 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._json(202, {"approval_id": out})
             else:
                 self._json(200, {"content": out.content, "is_error": out.is_error})
+
+        def _local_cost(self) -> None:
+            """Totaux de coût de la session et du jour (X2, docs/LOKKAL.md §7.8) : lecture seule du ledger, aucun outil,
+            aucun tour modèle. `?thread_id=` (facultatif : sans lui, le jour seul) et `?day=AAAA-MM-JJ` (UTC, défaut
+            aujourd'hui)."""
+            from datetime import date as _date
+
+            from nokker.ledger.turn_cost import ledger_totals
+
+            if not self._local_owner():
+                self._json(401, {"error": {"message": "jeton local requis"}})
+                return
+            if ledger is None:
+                self._json(404, {"error": {"message": "ledger non configuré"}})
+                return
+            q = parse_qs(urlparse(self.path).query)
+            thread_id = (q.get("thread_id") or [""])[0]
+            raw_day = (q.get("day") or [""])[0]
+            try:
+                day = _date.fromisoformat(raw_day) if raw_day else datetime.now(timezone.utc).date()
+            except ValueError:
+                self._json(400, {"error": {"message": "day : AAAA-MM-JJ attendu"}})
+                return
+            prices = getattr(ledger, "prices", None)
+            with tenant_scope(tenant_of_thread(thread_id) if thread_id else INTERNAL_TENANT):
+                session = ({"thread_id": thread_id, **ledger_totals(ledger, prices, thread_id=thread_id)}
+                           if thread_id else None)
+                today = {"date": day.isoformat(), **ledger_totals(ledger, prices, day=day)}
+            self._json(200, {"session": session, "day": today})
 
         def _local_owner(self) -> bool:
             """Le propriétaire de la machine : jeton local (sur la machine), ou jeton signé par nokker.ai arrivé par la
@@ -1246,6 +1464,26 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                                          members=[str(x) for x in members] if members is not None else None)
                     self._json(200, hub.thread_json(t))
                     return
+            m = _RE_THREAD_IMAGE.match(path)
+            if m and method == "GET":
+                # Octets d'une image jointe (X7) : membres du fil seulement, et seulement si CE fil la référence.
+                tid = sid(m.group(1))
+                hub.require_member(tid, sender)
+                images = getattr(kernel, "images", None)
+                data = images.get(tid, m.group(2)) if images is not None else None
+                media = sniff_media_type(data) if data is not None else None
+                if data is None or media is None:
+                    self._json(404, {"error": {"message": "image inconnue"}})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", media)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, max-age=86400, immutable")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             m = _RE_THREAD_SUB.match(path)
             if m:
                 tid, sub = sid(m.group(1)), m.group(2)
@@ -1448,6 +1686,9 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
 
         def _chat_completions(self, sender: str | None, tenant: str) -> None:
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > MAX_CHAT_BODY:  # 4 images de 5 Mo en base64 + le texte (X7)
+                self._json(413, {"error": {"message": f"requête au-delà de {MAX_CHAT_BODY // (1024 * 1024)} Mo"}})
+                return
             raw = self.rfile.read(length) if length else b"{}"
             try:
                 body = json.loads(raw)
@@ -1474,10 +1715,25 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 thread_id = fixed
             messages = body.get("messages") or []
             user_text = ""
-            for m in reversed(messages):
-                if m.get("role") == "user":
-                    user_text = m.get("content") or ""
-                    break
+            raw_images: list[Any] = []
+            try:
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        # X7 (docs/LOKKAL.md §7.6) : `content` chaîne ou parties OpenAI (text, image_url en data URL),
+                        # et/ou `attachments` [{data|url|path, media_type?, name?}] ; type contrôlé par les octets.
+                        user_text, parts = split_content(m.get("content"))
+                        extra = m.get("attachments") or []
+                        if not isinstance(extra, list):
+                            raise ImageError("attachments doit être une liste")
+                        if parts or extra:
+                            if getattr(kernel, "images", None) is None:
+                                raise ImageError("images non prises en charge sur cette instance")
+                            cwd = local_api.code.sessions().get(thread_id) if local_api is not None else None
+                            raw_images = parse_attachments([*extra, *parts], cwd=cwd)
+                        break
+            except ImageError as e:
+                self._json(400, {"error": {"message": str(e)}})
+                return
             stream = bool(body.get("stream", False))
 
             if hub is not None:
@@ -1489,7 +1745,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 except ThreadNotFound:
                     self._json(404, {"error": {"message": "fil inconnu"}})
                     return
-            inp = TurnInput(thread_id=thread_id, user_text=user_text, channel="api", sender=sender)
+            refs = [kernel.images.put(thread_id, img) for img in raw_images] if raw_images else []  # type: ignore[attr-defined]
+            inp = TurnInput(thread_id=thread_id, user_text=user_text, channel="api", sender=sender, images=refs)
             if stream:
                 tokens = (self.headers.get("X-Nokker-Stream-Tokens") or "").strip() == "1"
                 self._stream_turn(inp, tokens)
@@ -1890,11 +2147,17 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
     ledger = ledger if ledger is not None else build_ledger(config)
     # Nokker Lokkal (docs/LOKKAL.md §7) : jeton local, Host autorisés, sessions de code. Absent = bêta, rien de tout ça.
     local_api = LocalApi.from_config(config.local, config.port) if config.local else None
+    if local_api is not None and local_api.vault is not None:
+        local_api.vault.startup_report()  # fournisseur choisi ; adresse OpenBao sans choix, coffre scellé : un avis
     if local_api is not None:  # sessions de code : leur préfixe (le dossier, le bac à sable, les tests)
         import dataclasses
 
         code_prefix = config.local.get("prefix_path") or str(Path(__file__).parent.parent / "prompts"
                                                              / "prefix-lokkal-code.md")
+        if local_api.project_memory is not None:  # mémoire de projet (X1) : la règle « noter ce qu'on apprend »
+            from nokker.context.project_memory import code_prefix as _code_prefix
+
+            code_prefix = _code_prefix(code_prefix, project_memory=True)
         config = dataclasses.replace(config, prefix_path=code_prefix, profile_path=None)
     events = EventBus() if (config.approvals_enabled or config.bubbles_enabled or config.agents_enabled) else None
     hub = build_hub(config, events) if config.bubbles_enabled else None
@@ -1912,7 +2175,9 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         approvals = build_approvals(config, on_event=events.publish if events is not None else None) \
             if config.approvals_enabled else None
         connector_store = build_connector_store(config)
-        provider = ConnectorsForTenant(connector_store, tenancy.account_for_tenant) if connector_store else None
+        resolve = local_api.vault.resolver().resolve if local_api is not None and local_api.vault is not None else None
+        provider = ConnectorsForTenant(connector_store, tenancy.account_for_tenant, resolve=resolve) \
+            if connector_store else None
         delegate = None
         extra = None
         if local_api is not None:
@@ -1923,16 +2188,20 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             from nokker.tools.delegate import DelegateToolSource
 
             parent: dict[str, Kernel] = {}
+            # Hooks (X3) : le registre filtré de l'enfant en est entouré aussi ; le coureur ne lance chez un sous-agent
+            # que les hooks d'un bloc `"subagents": true` (héritage explicite, nokker/tools/hooks.py).
             delegate = DelegateToolSource(
-                lambda registry, thread_id, observer: _dc.replace(parent["k"], tools=registry, observer=observer),
+                lambda registry, thread_id, observer: _dc.replace(
+                    parent["k"], observer=observer,
+                    tools=local_api.hooks.wrap(registry) if local_api.hooks is not None else registry),
                 local_api.code, emit=events.publish if events is not None else None, parent_observer=hub)
             extra = [*local_api.tool_sources(), delegate]
         kernel = build_kernel(config, ledger=ledger, approvals=approvals, hub=hub, connectors=provider,
-                              extra_sources=extra)
+                              extra_sources=extra, secrets=local_api.vault if local_api is not None else None)
         if delegate is not None:
             parent["k"] = kernel
             delegate.bind(getattr(kernel.tools, "internal", kernel.tools))
-        connectors_http.configure(Connectors(connector_store) if connector_store else None)
+        connectors_http.configure(Connectors(connector_store, resolve=resolve) if connector_store else None)
         configure_onboarding(config, tenancy, approvals)
         configure_cloud_link(config, tenancy, approvals, ledger, store=kernel.store)
         if cloud_http._cloud is not None:  # skill « sessions Lokkal » (§6.4) pour les comptes : outil DESTRUCTIVE
@@ -1945,6 +2214,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         configure_telegram(config, tenancy, kernel, hub, approvals)
     if hub is not None:
         hub.agents_hub = agents_hub
+        if local_api is not None:
+            hub.pages = local_api.pages  # une page déplacée vers un autre fil le suit (docs/BUBBLES.md §10.5)
     if local_api is not None:
         from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates
 
@@ -1952,15 +2223,21 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
 
         if local_api.code.backend == "docker" and (n := reap_sandboxes(local_api.code.instance or "")):
             logger.info("lokkal : %d bac(s) à sable orphelin(s) supprimé(s) au démarrage", n)
+        if local_api.code.backend == "local" and local_api.code.state_dir \
+                and (n := reap_sandboxes("", processes_dir=os.path.join(local_api.code.state_dir, "processes"))):
+            logger.info("lokkal : %d processus en arrière-plan orphelin(s) arrêté(s) au démarrage", n)
         kernel.max_calls = int(config.local.get("max_calls", 60))  # une tâche de code fait des dizaines d'appels
         kernel.max_tokens = int(config.local.get("max_tokens", 16384))
+        kernel.budget_notice_at = config.local.get("budget_notice_at", 0.8)  # « termine maintenant » à 80 % du budget
+        kernel.stall_limit = config.local.get("stall_limit", 6)  # 6 appels répétés à l'identique : conclure
         from nokker.qa.escalate import LocalEscalator
 
         kernel.escalator = LocalEscalator()  # en local, personne d'autre que le propriétaire
 
         def use_default_model(base_url: str, api_key: str, model: str) -> None:
             # Le modèle choisi à l'onboarding sert les deux paliers, en direct (pas de redémarrage).
-            provider = SokkanProvider(base_url=base_url, api_key=api_key, model=model)
+            provider = SokkanProvider(base_url=base_url, api_key=api_key, model=model,
+                                      vision=config.vision_for_model(model))
             kernel.providers[Tier.SHIP] = provider
             kernel.providers[Tier.DEEP] = provider
 
@@ -1980,8 +2257,27 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             mode=config.local.get("mode"), fallback=Mode.ACCEPT_EDITS,
             user_settings=Path(config.local.get("settings_path") or "~/.config/nokker/settings.json").expanduser()))
         perms = kernel.gates.permissions
-        local_api.on_session_open = lambda thread_id, cwd: perms.restrict_for_thread(
-            thread_id, Path(cwd) / ".nokker" / "settings.json")  # le dépôt restreint son fil, comme `nokker code`
+        if local_api.hooks_enabled:
+            # Hooks des sessions (lot X3, drapeau `local.hooks`) : autour du registre du noyau, donc de tout appel
+            # (tour, appel direct du propriétaire, carte approuvée) ; commandes dans le bac à sable du fil.
+            from nokker.tools.hooks import HookRunner
+
+            local_api.hooks = HookRunner(sandbox=local_api.code.run_hook, user_settings=local_api.settings_path,
+                                         scrub=kernel.invariants.scrub_output, redact=kernel.invariants.redact_result,
+                                         mode_of=perms.mode_for, emit=events.publish if events is not None else None)
+            kernel.tools = local_api.hooks.wrap(kernel.tools)
+
+        def on_session_open(thread_id: str, cwd: str) -> dict[str, Any] | None:
+            # Le dépôt restreint son fil (comme `nokker code`), AVANT les hooks : en mode plan, aucun ne tourne.
+            perms.restrict_for_thread(thread_id, Path(cwd) / ".nokker" / "settings.json")
+            return {"hooks": local_api.hooks.open_session(thread_id, cwd)} if local_api.hooks is not None else None
+
+        local_api.on_session_open = on_session_open
+        if local_api.project_memory is not None:  # X1 : noyau dans la fenêtre, rappel du projet, événements
+            from nokker.context.project_memory import install as install_project_memory
+
+            local_api.project_memory.emit = events.publish if events is not None else None
+            install_project_memory(kernel, local_api.project_memory)
     if config.admin_enabled:
         start_admin(config)
     # Sans clé d'API configurée, le serveur n'est PLUS ouvert par défaut (bêta OVH : `api_keys: []`, seuls les jetons de
@@ -2009,6 +2305,26 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             save=setup._save)  # le propriétaire local est dans le locataire interne
         local_api.mirror.start()
         logger.info("lokkal : miroir web ⇄ machine lancé")
+    if local_api is not None:
+        # Charge de la machine (X5) : envoyée à nokker.ai toutes les 60 s et à l'ouverture du tunnel, seulement si la
+        # machine est liée (jeton de machine au coffre, relu à chaque envoi : un lien fait après le démarrage compte).
+        from nokker.local.load import ActiveTurns, LoadReporter, measure, nvidia_gpus
+
+        active = ActiveTurns()
+        kernel.run_turn = active.wrap(kernel.run_turn)  # fils dont un tour est en cours (API, Telegram)
+        setup = local_api.setup
+
+        def machine_token() -> str | None:
+            try:
+                return setup.vault.get("machine_token") if setup is not None else None
+            except Exception:  # noqa: BLE001 — coffre sans clé : machine considérée non liée
+                return None
+
+        local_api.load = LoadReporter(
+            base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai", token=machine_token,
+            measure=lambda: measure(version=NOKKER_VERSION, sessions=len(local_api.code.sessions()),
+                                    active_turns=active.count(), gpus=nvidia_gpus))
+        local_api.load.start()
     if local_api is not None and config.local.get("relay_url"):
         if local_api.start_tunnel(config.local["relay_url"], f"http://127.0.0.1:{config.port}",
                                   config.local.get("web_base")):

@@ -178,7 +178,9 @@ class LedgerBackend(Protocol):
     def record_verdict(self, thread_id: str, turn_index: int, verdict: Verdict) -> None: ...
 
     def fetch_calls(self, *, thread_id: str | None = None, turn_index: int | None = None,
-                     day: date | None = None, tier: str | None = None) -> list[CallRecord]: ...
+                     day: date | None = None, tier: str | None = None,
+                     include_subagents: bool = False) -> list[CallRecord]: ...
+    # `include_subagents` (X2) : avec `thread_id`, ajoute les fils de sous-agents `<thread_id>/sa-…` (coût de session).
 
     def fetch_verdicts(self, *, thread_id: str | None = None, turn_index: int | None = None,
                         day: date | None = None) -> list[VerdictRecord]: ...
@@ -229,9 +231,13 @@ class InMemoryLedger(_AggregatorMixin):
         ))
 
     def fetch_calls(self, *, thread_id: str | None = None, turn_index: int | None = None,
-                     day: date | None = None, tier: str | None = None) -> list[CallRecord]:
+                     day: date | None = None, tier: str | None = None,
+                     include_subagents: bool = False) -> list[CallRecord]:
+        def same_thread(t: str) -> bool:
+            return t == thread_id or (include_subagents and t.startswith(f"{thread_id}/sa-"))
+
         return [c for c in self._calls
-                if (thread_id is None or c.thread_id == thread_id)
+                if (thread_id is None or same_thread(c.thread_id))
                 and (turn_index is None or c.turn_index == turn_index)
                 and (day is None or c.created_at.astimezone(timezone.utc).date() == day)
                 and (tier is None or c.tier == tier)]
@@ -289,9 +295,15 @@ class PostgresLedger(_AggregatorMixin):
             )
 
     def fetch_calls(self, *, thread_id: str | None = None, turn_index: int | None = None,
-                     day: date | None = None, tier: str | None = None) -> list[CallRecord]:
+                     day: date | None = None, tier: str | None = None,
+                     include_subagents: bool = False) -> list[CallRecord]:
         where, params = ["1=1"], []
-        if thread_id is not None:
+        if thread_id is not None and include_subagents:
+            # Préfixe comparé par `left()`, pas `LIKE` : un `_` d'identifiant (`th_…`) est un joker pour LIKE.
+            child = f"{thread_id}/sa-"
+            where.append("(thread_id = %s OR left(thread_id, %s) = %s)")
+            params.extend([thread_id, len(child), child])
+        elif thread_id is not None:
             where.append("thread_id = %s")
             params.append(thread_id)
         if turn_index is not None:

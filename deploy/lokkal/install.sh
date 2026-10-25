@@ -18,11 +18,13 @@
 #   --update            garde .env et l'état, change de version, relance
 #   --uninstall         arrête et retire les containers ; --purge efface aussi l'état et la base
 #   --no-open           n'ouvre pas le navigateur
+#   --vault             coffre OpenBao pour les secrets du noyau (profil compose vault), descellé automatiquement
+#   --vault-manual      idem, mais la part de descellement est affichée une fois et redemandée à chaque redémarrage
 # Variables (tests) : NOKKER_RELEASE_BASE (URL des pièces de release), NOKKER_SKIP_PULL=1, NOKKER_NO_CLI=1.
 set -eu
 
 REPO=nokker-ai/nokker
-VERSION=""; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1
+VERSION=""; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nokker"
 
 say()  { printf '\033[1m›\033[0m %s\n' "$*"; }
@@ -45,6 +47,8 @@ while [ $# -gt 0 ]; do
     --uninstall) MODE=uninstall; shift;;
     --purge) PURGE=1; shift;;
     --no-open) OPEN=0; shift;;
+    --vault) VAULT=auto; shift;;
+    --vault-manual) VAULT=manual; shift;;
     -h|--help) sed -n '2,25p' "$0" 2>/dev/null || true; exit 0;;
     *) die "option inconnue : $1";;
   esac
@@ -152,6 +156,12 @@ tar -xzf "$TMP/$PKG" -C "$TMP"
 for f in docker-compose.yml config initdb sql web VERSION install.sh; do rm -rf "${DIR:?}/$f"; cp -R "$TMP/nokker/$f" "$DIR/$f"; done
 chmod -R go-w "$DIR"; chmod 755 "$DIR/initdb" "$DIR/sql" "$DIR/web" "$DIR/config"
 chmod 644 "$DIR"/initdb/* "$DIR"/sql/* "$DIR"/web/* "$DIR"/config/*; chmod 700 "$DIR/install.sh"
+# Coffre (profil vault) : scripts remplacés, part et AppRole (vault/unseal, vault/approle) jamais touchés. Les deux
+# dossiers existent toujours : core monte vault/approle (vide sans le profil), docker le créerait sinon en root.
+mkdir -p "$DIR/vault/unseal" "$DIR/vault/approle"; chmod 700 "$DIR/vault" "$DIR/vault/unseal" "$DIR/vault/approle"
+if [ -d "$TMP/nokker/vault" ]; then
+  for f in init.sh unseal.sh; do cp "$TMP/nokker/vault/$f" "$DIR/vault/$f"; chmod 600 "$DIR/vault/$f"; done
+fi
 
 port_free() { curl -s -m 1 -o /dev/null "http://127.0.0.1:$1/" 2>/dev/null; [ $? -eq 7 ]; }   # 7 = connexion refusée
 pick_port() { p=$1; while ! port_free "$p"; do p=$((p + 1)); done; echo "$p"; }
@@ -195,6 +205,12 @@ else
   setv NOKKER_VERSION "$VERSION"
   [ -n "$WORKSPACE" ] && warn "--workspace ignoré : installation existante (modifier NOKKER_HOST_WORKSPACE dans $DIR/.env)"
 fi
+if [ -n "$VAULT" ]; then
+  [ -f "$DIR/vault/init.sh" ] || die "--vault : cette version de Lokkal n'a pas le coffre OpenBao"
+  [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ] || [ "$MODE" != update ] \
+    || warn "coffre activé sur une installation existante : secrets du coffre fichier à migrer (nokker vault migrate --from file --to openbao)"
+  setv COMPOSE_PROFILES vault; setv NOKKER_SECRETS_PROVIDER openbao; setv NOKKER_VAULT_UNSEAL "$VAULT"
+fi
 chmod 600 "$DIR/.env"; chmod 700 "$DIR/state"
 WEB_PORT=$(getv NOKKER_PORT); API_PORT=$(getv NOKKER_API_PORT)
 
@@ -209,6 +225,19 @@ chmod 600 "$CONF_DIR/lokkal.json"
 if [ "${NOKKER_SKIP_PULL:-0}" != 1 ]; then
   say "téléchargement des images (première fois : quelques minutes)"
   compose pull -q
+fi
+if [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ]; then
+  # Coffre d'abord, initialisé HORS du noyau (vault-init), pour que core démarre avec son AppRole.
+  say "coffre OpenBao"
+  compose up -d openbao vault-unseal >/dev/null 2>"$TMP/up.log" || { cat "$TMP/up.log" >&2; die "le coffre ne démarre pas"; }
+  rc=0; compose --profile vault-init run --rm vault-init || rc=$?
+  case $rc in
+    0) ;;
+    3) warn "coffre initialisé sans AppRole dans $DIR/vault/approle : le noyau n'y aura pas accès (LOKKAL §7, generate-root)";;
+    *) die "initialisation du coffre échouée (docker compose -p nokker logs openbao)";;
+  esac
+  [ "$(getv NOKKER_VAULT_UNSEAL)" = manual ] && ! compose exec -T openbao bao status >/dev/null 2>&1 \
+    && warn "coffre scellé (mode manuel) : docker compose -p nokker exec openbao bao operator unseal"
 fi
 say "démarrage"
 compose up -d --remove-orphans >/dev/null 2>"$TMP/up.log" || { cat "$TMP/up.log" >&2; die "le démarrage a échoué (journal : docker compose -p nokker logs)"; }

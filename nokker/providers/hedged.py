@@ -33,6 +33,12 @@ class HedgedProvider:
     def model(self) -> str:
         return self.primary.model
 
+    @property
+    def vision(self) -> bool:
+        """Vision des DEUX modèles (X7) : le repli peut répondre à la place du primaire, une image ne part que si
+        l'un comme l'autre sait la lire."""
+        return bool(getattr(self.primary, "vision", False)) and bool(getattr(self.fallback, "vision", False))
+
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
                  session_key: str, max_tokens: int = 2048,
                  on_delta: Callable[[str], None] | None = None) -> Completion:

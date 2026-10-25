@@ -44,6 +44,33 @@ The model chosen in onboarding serves both of Lokkal's tiers (the conversational
 across several different models, and a reviewer model checking the work, are **planned** for Lokkal: today the install
 runs one model for everything, and the reviewer step is off.
 
+## Images in a request
+
+A message can carry up to **4 images** (png, jpeg, webp or gif, **5 MB each**). The type is checked from the file's
+bytes, not from its name. Images are stored on your machine, under `~/.nokker/state/images`, once per content hash;
+the conversation keeps only a reference. Deleting a session deletes its images.
+
+Whether the model reads them depends on the model:
+
+- the default Router model reads images;
+- a model that cannot read images never receives them: it gets a short note saying an image was attached but not
+  read, and the client tells you so (event `attachment.skipped`, reason `no_vision`);
+- your own endpoint and local models are treated as text-only for now.
+
+Only the most recent images of a conversation are sent in full (the current message's, then the latest ones, up to 4);
+older ones are replaced by a one-line mention, like long tool results.
+
+For API clients: send OpenAI-style content parts (`{"type": "image_url", "image_url": {"url":
+"data:image/png;base64,..."}}`) on `/v1/chat/completions`, or an `attachments` list next to `content`: `{"data":
+"<base64>"}`, or `{"path": "<file>"}` for a file inside the session folder. Remote `http(s)` image addresses are refused.
+A refused image answers `400` with `{"error": {"message": ...}}`.
+
+## What a turn costs
+
+Every turn reports its tokens per model, and its cost when the model is in the core's price table (see
+[cli.md](cli.md#cost-per-turn)). With your own endpoint or a local model, a model the table does not know shows tokens
+only: Lokkal does not guess what your provider charges. Qwen3.5-397B-A17B on OVH AI Endpoints is in the table, in euros.
+
 ## Memory and embeddings
 
 Memory runs on your machine, in the install's database, with a small embedding service that downloads its model on first

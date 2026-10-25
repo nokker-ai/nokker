@@ -21,6 +21,10 @@ WRITE ; `terminal` = classé PAR APPEL (`ToolSpec.effect_of`) : commande dangere
 d'approbation forte), commande de lecture pure → READ, le reste → WRITE ; déclaré DESTRUCTIVE si le classement
 échoue. Une commande « hardline » (rm -rf /, mkfs, fork bomb…) est refusée par la source même après approbation.
 
+Commandes en arrière-plan (lot X6, `nokker/tools/processes.py`, drapeau `background`) : `process_start` a l'effet de
+SA commande, classée comme `terminal` (mêmes cartes, mêmes règles, « hardline » jamais) ; `process_list` et
+`process_logs` = READ ; `process_stop` = READ aussi : il n'arrête que ce que le fil a lui-même lancé (sans carte).
+
 Hermes n'est importé qu'à la création d'un dossier de travail : sans lui (CI unitaire), le module se charge, les
 schémas existent, et `classify_command` retombe sur un classement prudent (jamais READ, DESTRUCTIVE au moindre
 doute).
@@ -37,6 +41,7 @@ from typing import Any
 
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
+from nokker.tools.processes import SANDBOX_LOG_DIR, ProcessError, ProcessTable, reap_processes
 
 WORKSPACE_MOUNT = "/workspace"
 # Python 3.14 + Node 22 : de quoi lancer les tests des dépôts Python et TypeScript du banc de code. Remplacée en L2
@@ -110,23 +115,27 @@ def classify_command(command: str) -> Effect:
     return Effect.READ if _read_only(command) else Effect.WRITE
 
 
-def reap_sandboxes(instance: str, docker: str = "docker") -> int:
+def reap_sandboxes(instance: str, docker: str = "docker", processes_dir: str | None = None) -> int:
     """Supprime les bacs à sable de CETTE instance de noyau (`nokker.instance=<instance>`) restés d'un arrêt sans
     `close()` (container tué, machine éteinte). À appeler au démarrage du noyau local. Seulement les siens : un autre
     noyau ou un banc peut tourner sur la même machine (vu le 23.10 : un redémarrage a tué les bacs à sable d'un banc
-    en cours). Rend le nombre supprimé ; 0 si docker est absent."""
+    en cours). Rend le nombre supprimé ; 0 si docker est absent. Leurs processus en arrière-plan partent avec eux.
+
+    `processes_dir` (backend local, `<état>/processes`) : arrête aussi les processus en arrière-plan laissés par un
+    noyau tué (`reap_processes` : seulement ceux qui portent encore leur marque)."""
     import subprocess
 
+    reaped = reap_processes(processes_dir) if processes_dir else 0
     if not instance:
-        return 0
+        return reaped
     try:
         ids = subprocess.run([docker, "ps", "-aq", "--filter", f"label=nokker.instance={instance}"],
                              capture_output=True, text=True, timeout=30).stdout.split()
         if ids:
             subprocess.run([docker, "rm", "-f", *ids], capture_output=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
-        return 0
-    return len(ids)
+        return reaped
+    return reaped + len(ids)
 
 
 # ─────────────────────────────── schémas ───────────────────────────────
@@ -170,6 +179,28 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
 )
 CODE_TOOLS = tuple(name for name, *_ in _SPECS)
 
+# Commandes en arrière-plan (lot X6) : présentes seulement avec `background=True` (drapeau `local.background_processes`).
+_PROCESS_SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
+    ("process_start", "Lance une commande qui ne rend pas la main (serveur de dev, watch) en arrière-plan, dans le "
+                      "dossier de travail ; rend son id. Pour une commande qui se termine (tests, build), terminal.",
+     Effect.DESTRUCTIVE, {
+        "type": "object", "required": ["command"], "properties": {
+            "command": {"type": "string"},
+            "name": {"type": "string", "description": "nom court (ex. « vite »)"},
+            "port": {"type": "integer", "description": "port HTTP que la commande ouvre : l'utilisateur en reçoit un "
+                                                       "aperçu privé"}}}),
+    ("process_list", "Liste les processus en arrière-plan de ce fil (état, code de sortie).", Effect.READ, {
+        "type": "object", "properties": {}}),
+    ("process_logs", "Lit la fin du journal (stdout et stderr) d'un processus en arrière-plan.", Effect.READ, {
+        "type": "object", "required": ["id"], "properties": {
+            "id": {"type": "string", "description": "bg_…"},
+            "tail": {"type": "integer", "description": "dernières lignes (défaut 200, max 2000)", "default": 200}}}),
+    ("process_stop", "Arrête un processus en arrière-plan de ce fil (SIGTERM, puis SIGKILL après 5 s).", Effect.READ, {
+        "type": "object", "required": ["id"], "properties": {"id": {"type": "string", "description": "bg_…"}}}),
+)
+PROCESS_TOOLS = tuple(name for name, *_ in _PROCESS_SPECS)
+_CLASSIFIED = ("terminal", "process_start")  # effet = celui de la commande (`classify_command`)
+
 
 # ─────────────────────────────── dossier de travail ───────────────────────────────
 
@@ -183,8 +214,11 @@ class Workspace:
     todos: Any
     cwd: str  # le dossier tel que les outils le voient (/workspace en docker, le chemin hôte en local)
     reader: Any = None  # docker : lectures et recherches faites directement dans le dossier monté (voir local_reads)
+    procs: Any = None  # nokker.tools.processes.ProcessTable, créée au premier process_start
 
     def close(self) -> None:
+        if self.procs is not None:  # fin du fil : rien ne lui survit (docker : le container part aussi, ci-dessous)
+            self.procs.stop_all()
         try:
             self.env.cleanup()
         except Exception:  # noqa: BLE001 — fermeture au mieux
@@ -219,6 +253,9 @@ class CodeToolSource:
     # un `-v` part de l'hôte, pas du container du noyau. None = `root` (noyau sur l'hôte, ou dossier monté au même
     # chemin des deux côtés).
     host_root: str | None = None
+    # Chemin du dossier DANS le bac à sable. /workspace par défaut ; un banc peut monter le dépôt là où l'image de
+    # l'environnement l'attend (SWE-bench : /testbed, où l'installation éditable du projet pointe).
+    mount: str = WORKSPACE_MOUNT
     # Identifiant du noyau qui possède ce bac à sable (étiquette `nokker.instance`) : son ménage au démarrage ne
     # touche que les siens. None = pas d'étiquette (banc, `nokker code`), donc jamais ramassé par un noyau.
     instance: str | None = None
@@ -230,6 +267,11 @@ class CodeToolSource:
     # pas en local. En docker, `root` reste monté EN ENTIER sur /workspace (le `.git` d'un worktree pointe vers le
     # dépôt par un chemin relatif : il doit voir les deux) ; seul le dossier de départ change. Voir `scoped()`.
     subdir: str = ""
+    # Commandes en arrière-plan (lot X6, `local.background_processes`) : outils process_* présents seulement si vrai.
+    background: bool = False
+    # Backend local : journaux des processus en arrière-plan sous `<state_dir>/processes/<fil>/` (et fiches de ménage,
+    # `reap_processes`). None = dossier temporaire de l'utilisateur.
+    state_dir: str | None = None
     _spaces: dict[str, Workspace] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -256,10 +298,11 @@ class CodeToolSource:
         return dataclasses.replace(self, subdir=subdir)
 
     def specs(self) -> list[ToolSpec]:
+        specs = (*_SPECS, *_PROCESS_SPECS) if self.background else _SPECS
         return [ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core, source="builtin:code",
-                         effect_of=(lambda a: classify_command(str(a.get("command", "")))) if n == "terminal"
-                         else None)
-                for n, d, e, p in _SPECS]
+                         effect_of=(lambda a: classify_command(str(a.get("command", "")))) if n in _CLASSIFIED
+                         else None, fresh=n in ("process_list", "process_logs"))
+                for n, d, e, p in specs]
 
     # ── cycle de vie ──
     def workspace(self, thread_id: str) -> Workspace:
@@ -277,7 +320,7 @@ class CodeToolSource:
         if not current:
             return
         roots = current.split(os.pathsep)
-        wanted = self.root if self.backend == "local" else WORKSPACE_MOUNT
+        wanted = self.root if self.backend == "local" else self.mount
         if wanted not in roots:
             os.environ["HERMES_WRITE_SAFE_ROOT"] = os.pathsep.join([*roots, wanted])
 
@@ -307,9 +350,9 @@ class CodeToolSource:
 
             safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", thread_id)[:48] or "default"
             # Étiquette `nokker.sandbox` : le proxy du socket docker du compose n'accepte que ces containers-là.
-            cwd = WORKSPACE_MOUNT + ("/" + self.subdir if self.subdir else "")
+            cwd = self.mount + ("/" + self.subdir if self.subdir else "")
             env = DockerEnvironment(image=self.image, cwd=cwd, timeout=120, task_id=f"nokker-{safe}",
-                                    volumes=[f"{self.host_root or self.root}:{WORKSPACE_MOUNT}"], network=self.network,
+                                    volumes=[f"{self.host_root or self.root}:{self.mount}"], network=self.network,
                                     persistent_filesystem=False, persist_across_processes=False,
                                     # --user <uid:gid> du processus : les fichiers créés dans le dépôt appartiennent à
                                     # l'utilisateur, pas à root (compose : le noyau tourne sous l'uid de l'hôte).
@@ -332,10 +375,10 @@ class CodeToolSource:
         import posixpath
 
         p = posixpath.normpath(posixpath.join(ws.cwd, (path or ".").strip()))
-        if p != WORKSPACE_MOUNT and not p.startswith(WORKSPACE_MOUNT + "/"):
+        if p != self.mount and not p.startswith(self.mount + "/"):
             return None
         root = os.path.realpath(self.root)
-        full = os.path.realpath(os.path.join(root, p[len(WORKSPACE_MOUNT):].lstrip("/")))
+        full = os.path.realpath(os.path.join(root, p[len(self.mount):].lstrip("/")))
         if full != root and not full.startswith(root + os.sep):
             raise PermissionError(f"{path!r} sort du dossier de travail")
         return full
@@ -343,7 +386,7 @@ class CodeToolSource:
     def _to_container(self, text: str) -> str:
         """Le modèle ne voit jamais les chemins de l'hôte : ils redeviennent /workspace/…."""
         for root in {os.path.realpath(self.root), self.root}:
-            text = text.replace(root + "/", WORKSPACE_MOUNT + "/").replace(f'"{root}"', f'"{WORKSPACE_MOUNT}"')
+            text = text.replace(root + "/", self.mount + "/").replace(f'"{root}"', f'"{self.mount}"')
         return text
 
     def close(self, thread_id: str | None = None) -> None:
@@ -374,7 +417,7 @@ class CodeToolSource:
             text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
-        if name not in CODE_TOOLS:
+        if name not in CODE_TOOLS and not (self.background and name in PROCESS_TOOLS):
             return out(f"outil inconnu : {name}", True)
         try:
             ws = self.workspace(ctx.thread_id)
@@ -404,12 +447,16 @@ class CodeToolSource:
                 return self._patch(ws, a, out)
             if name == "terminal":
                 return self._terminal(ws, a, out)
+            if name in PROCESS_TOOLS:
+                return self._process(ws, ctx.thread_id, name, a, out)
             from tools.todo_tool import todo_tool
 
             text = todo_tool(a.get("todos"), bool(a.get("merge")), store=ws.todos)
             return out(text, "error" in json.loads(text))
         except PermissionError as e:
             return out(f"REFUSÉ : {e}", True)
+        except ProcessError as e:
+            return out(str(e), True)
         except KeyError as e:
             return out(f"argument manquant : {e.args[0]}", True)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
@@ -441,6 +488,14 @@ class CodeToolSource:
             r["_hint"] = "passage introuvable : relis le fichier (read_file) ou cherche-le (search_files)"
         return out(r, bool(r.get("error")))
 
+    def run_hook(self, thread_id: str, command: str, stdin: str, timeout: int) -> tuple[int | None, str]:
+        """Une commande de hook (nokker/tools/hooks.py) dans l'environnement du fil : le bac à sable en docker (jamais
+        l'hôte), l'hôte en backend local comme `terminal`. Charge utile sur stdin, sortie bornée. Un sous-agent
+        (`<fil>/sa-<id>`) passe par le bac à sable de son fil parent : pas un container de plus pour un hook."""
+        ws = self.workspace(thread_id.split("/sa-", 1)[0])
+        r = ws.env.execute(command, timeout=max(1, int(timeout)), stdin_data=stdin, bounded_capture=True)
+        return r.get("returncode"), _clip(str(r.get("output") or ""))
+
     def _terminal(self, ws: Workspace, a: dict[str, Any], out: Any) -> ToolResult:
         command = str(a.get("command") or "").strip()
         if not command:
@@ -453,6 +508,74 @@ class CodeToolSource:
         code = r.get("returncode")
         return out({"returncode": code, "output": _clip(str(r.get("output") or ""))}, False)
 
+    # ── commandes en arrière-plan (lot X6) ──
+    def _process_dir(self, thread_id: str) -> str:
+        """Backend local : dossier des journaux du fil, sous l'état du noyau (un nom sûr + une empreinte du fil)."""
+        import hashlib
+        import tempfile
 
-__all__ = ["CODE_TOOLS", "CodeToolSource", "DEFAULT_SANDBOX_IMAGE", "Workspace", "classify_command",
+        base = self.state_dir or os.path.join(tempfile.gettempdir(), f"nokker-bg-{os.getuid()}")
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", thread_id)[:40] or "default"
+        return os.path.join(base, "processes", f"{safe}-{hashlib.sha256(thread_id.encode()).hexdigest()[:8]}")
+
+    def processes(self, ws: Workspace, thread_id: str) -> ProcessTable:
+        with self._lock:
+            if ws.procs is None:
+                if self.backend == "local":
+                    d = self._process_dir(thread_id)
+                    os.makedirs(d, mode=0o700, exist_ok=True)
+                    ws.procs = ProcessTable(ws.env, d, host_logs=True, cwd=ws.cwd)
+                else:
+                    ws.procs = ProcessTable(ws.env, SANDBOX_LOG_DIR, cwd=ws.cwd)
+            return ws.procs
+
+    def find_process(self, proc_id: str) -> tuple[str, Any] | None:
+        """(fil, processus) d'un id `bg_…` de cette source, ou None (aperçu d'un port, docs/LOKKAL.md §7.7)."""
+        with self._lock:
+            spaces = list(self._spaces.items())
+        for tid, ws in spaces:
+            if ws.procs is not None:
+                try:
+                    return tid, ws.procs.get(proc_id)
+                except ProcessError:
+                    continue
+        return None
+
+    def process_table(self, thread_id: str) -> ProcessTable | None:
+        with self._lock:
+            ws = self._spaces.get(thread_id)
+        return ws.procs if ws is not None else None
+
+    def _process(self, ws: Workspace, thread_id: str, name: str, a: dict[str, Any], out: Any) -> ToolResult:
+        if name == "process_start":
+            command = str(a.get("command") or "").strip()
+            if not command:
+                return out("commande vide", True)
+            why = hardline_reason(command)
+            if why:
+                return out(f"REFUSÉ, jamais exécuté même approuvé : {why}", True)
+            port = a.get("port")
+            if port is not None:
+                port = int(port)
+                if not 1 <= port <= 65535:
+                    return out(f"port invalide : {port}", True)
+            table = self.processes(ws, thread_id)
+            proc = table.start(command, str(a.get("name") or ""), port)
+            first = table.logs(proc.id, tail=40)  # ce que la commande a déjà dit (un échec immédiat se voit ici)
+            hint = "la suite : process_logs ; l'arrêter : process_stop ; il s'arrête aussi à la fin du fil"
+            if port:
+                hint += f" ; le port {port} est proposé à l'utilisateur en aperçu privé (ne donne pas d'URL)"
+            return out({**first, "hint": hint})
+        table = self.processes(ws, thread_id)
+        if name == "process_list":
+            return out({"processes": [p.view() for p in table.list()]})
+        proc_id = str(a.get("id") or "").strip()
+        if not proc_id:
+            raise KeyError("id")
+        if name == "process_logs":
+            return out(table.logs(proc_id, int(a.get("tail") or 200)))
+        return out(table.stop(proc_id).view())
+
+
+__all__ = ["CODE_TOOLS", "PROCESS_TOOLS", "CodeToolSource", "DEFAULT_SANDBOX_IMAGE", "Workspace", "classify_command",
            "hardline_reason", "reap_sandboxes"]

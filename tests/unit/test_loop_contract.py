@@ -248,6 +248,20 @@ def test_duplicate_read_call_same_turn_is_not_re_executed():
     assert len(read_verdicts) == 1  # pas de 2e verdict pour un appel qui n'a pas été réévalué
 
 
+def test_fresh_read_is_re_executed_each_call():
+    """Lot X6 : le journal d'un processus en arrière-plan change sans qu'aucun outil n'écrive ; une lecture `fresh`
+    n'est jamais resservie par le cache du tour, et ne vide pas ce cache pour les autres lectures."""
+    k, tools, *_ = kernel([
+        Message("assistant", tool_calls=[tc("calendar_list"), tc("process_logs", id="bg_1"),
+                                         tc("process_logs", id="bg_1"), tc("calendar_list")]),
+        Message("assistant", "vu"),
+    ])
+    tools.specs = {**Tools.specs, "process_logs": ToolSpec("process_logs", "journal", {}, Effect.READ, fresh=True)}
+    turn = k.run_turn(TurnInput("t1", "le serveur a démarré ?"))
+    assert tools.called == ["calendar_list", "process_logs", "process_logs"]
+    assert not any("déjà appelé" in m.content for m in turn.messages if m.role == "tool" and m.name == "process_logs")
+
+
 def test_recall_hit_logs_a_memory_verdict_layer0():
     """Signal de mesure (P1-S1, 17.10.2026) : un juge de banc doit pouvoir reconnaître qu'un rappel
     automatique a eu lieu, sans que le modèle ait appelé memory_search lui-même."""
@@ -529,3 +543,45 @@ def test_recall_text_is_scrubbed_before_entering_the_turn_head():
 
     _recall_kernel(LeakyMem(), SpyCtx()).run_turn(TurnInput("t1", "comment j'accède à hote2 ?"))
     assert seen and seen[0][0].text == "mot de passe [secret:pw] pour hote2"
+
+
+def test_stalled_turn_concludes_without_burning_the_budget():
+    """Banc SWE-bench du 24.10 : des tâches relançaient les mêmes commandes jusqu'au plafond d'appels. Un même appel
+    qui rend le même résultat est une répétition : note au premier, conclusion sans outils à `stall_limit`."""
+    loop_call = Message("assistant", tool_calls=[tc("calendar_list", day="lundi")])
+    # 5 appels : le 2e rend le résultat déjà obtenu (mémo des lectures, texte différent du 1er), 3e à 5e = 3 répétitions
+    k, tools, ship, _ = kernel([loop_call] * 5 + [Message("assistant", "Je n'avance plus : voici où j'en suis.")])
+    k.max_calls, k.stall_limit = 20, 3
+    turn = k.run_turn(TurnInput("t1", "cherche"))
+    assert turn.reply == "Je n'avance plus : voici où j'en suis." and turn.error is None
+    assert [v for v in turn.verdicts if v.rule == "loop:stalled"]
+    assert len(turn.calls) == 6  # 5 appels d'outils puis la conclusion, pas 20
+    notes = [m.content for m in turn.messages if m.role == "user"]
+    assert notes and all("calendar_list" in n for n in notes)
+
+
+def test_changing_arguments_is_not_a_stall():
+    script = [Message("assistant", tool_calls=[tc("calendar_list", day=d)]) for d in ("lundi", "mardi", "mercredi")]
+    k, *_ = kernel(script + [Message("assistant", "fini")])
+    k.max_calls, k.stall_limit = 20, 2
+    turn = k.run_turn(TurnInput("t1", "cherche"))
+    assert turn.reply == "fini" and not [v for v in turn.verdicts if v.rule == "loop:stalled"]
+
+
+def test_stall_signature_ignores_durations():
+    from nokker.core.loop import stall_signature
+
+    call = tc("terminal", command="pytest -q")
+    a = ToolResult(call_id="", name="terminal", content="1 failed in 0.53s at 12:01:02")
+    b = ToolResult(call_id="", name="terminal", content="1 failed in 0.61s at 12:03:09")
+    c = ToolResult(call_id="", name="terminal", content="1 passed in 0.61s")
+    assert stall_signature(call, a) == stall_signature(call, b) != stall_signature(call, c)
+
+
+def test_budget_notice_asks_to_finish_before_the_limit():
+    script = [Message("assistant", tool_calls=[tc("calendar_list", day=str(i))]) for i in range(9)]
+    k, *_ = kernel(script + [Message("assistant", "terminé")])
+    k.max_calls, k.budget_notice_at = 10, 0.8
+    turn = k.run_turn(TurnInput("t1", "cherche"))
+    notes = [m.content for m in turn.messages if m.role == "user"]
+    assert turn.reply == "terminé" and len(notes) == 1 and "Il te reste 2 appels sur 10" in notes[0]

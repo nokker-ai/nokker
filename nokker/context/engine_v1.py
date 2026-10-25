@@ -51,17 +51,22 @@ class ContextEngineV1(ContextEngineV0):
 
         memory_text = mgr.memory_block(turn.thread_id)
         index_block = self.tools_index_block()
-        # Du plus stable au moins stable (cache de préfixe) : préfixe, index d'outils, profil, puis la mémoire de
-        # session, qui change à la clôture d'un épisode.
+        project_text = self.project_block(turn)
+        # Du plus stable au moins stable (cache de préfixe) : préfixe, index d'outils, profil, mémoire de projet (change
+        # quand une consigne du dépôt change ou qu'une règle est notée, au tour suivant), puis la mémoire de session,
+        # qui change à la clôture d'un épisode.
         system_parts = self.system_parts(index_block)
+        if project_text:
+            system_parts.append(project_text)
         if memory_text:
             system_parts.append(memory_text)
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
         # Couche 4 — l'épisode courant, append-only, chaque tour avec son en-tête d'origine ; les résultats délestés
         # par un stub (état de vue persisté).
+        kept = self.images_kept(history, turn)
         for past in history:
-            messages.append({"role": "user", "content": self.past_user(past, mgr.replay_head(past, st))})
+            messages.append(self.user_message(past, self.past_user(past, mgr.replay_head(past, st)), kept))
             for m in past.messages:
                 d = m.to_openai()
                 if m.role == "tool":
@@ -85,7 +90,7 @@ class ContextEngineV1(ContextEngineV0):
             return parts
 
         head = self.turn_head(turn, head_parts)
-        messages.append({"role": "user", "content": self.past_user(turn)})
+        messages.append(self.user_message(turn, self.past_user(turn), kept))
         messages.extend(m.to_openai() for m in turn.messages)
 
         tools_payload = [s.to_openai() for s in core_tools] + [s.to_openai() for s in loaded_tools]
@@ -97,6 +102,8 @@ class ContextEngineV1(ContextEngineV0):
             "current": sum(mgr._turn_tokens(p, st) for p in history),
             "turn_block": estimate_tokens("\n\n".join([head, turn.input.text])),
         }
+        if self.project_memory is not None:
+            layer_tokens["project"] = estimate_tokens(project_text)
         return Assembled(messages=messages, tools=tools_payload, prefix_sha256=self._prefix_sha256,
                          layer_tokens=layer_tokens)
 

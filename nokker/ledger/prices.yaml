@@ -14,6 +14,7 @@ rate_chf_usd: 1.25 # 1 CHF = 1,25 USD (catalogue Router, confirmé dans catalog.
 fetched_at: "2026-10-17"
 source: "lecture de code broker/catalog.json du Router (pas un appel réseau)"
 unit: "USD/1M tokens"
+currency: "USD" # devise par défaut d'une entrée ; une entrée peut porter la sienne (`currency`), jamais convertie sans taux
 
 models:
   - id: "qwen/qwen3.8-27b"
@@ -63,6 +64,14 @@ models:
     cached: "1.00"
     completion: "6.00"
     note: "Route Deep du Router (F5, D11, decision Nick 17.10) : debordement OVH transitoire, jamais presente comme notre Deep."
+
+  - id: "Qwen3.5-397B-A17B"
+    prompt: "0.60"
+    cached: "0.60"
+    completion: "3.60"
+    currency: "EUR"
+    fetched_at: "2026-10-06"
+    note: "OVH AI Endpoints EN DIRECT (identifiant du modèle chez OVH, casse comprise), le Deep de Lokkal avec une clé OVH. Pas de cache côté OVH : un jeton « en cache » coûte le prix d'entrée. Prix en EUR tels que publiés (grille OVH relevée le 06.10.2026), jamais convertis."
 
   - id: "moonshotai/kimi-k2.6"
     prompt: "0.85"

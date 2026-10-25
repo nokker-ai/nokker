@@ -10,16 +10,18 @@ Outils natifs du noyau (jamais délégués à une source) :
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nokker.tools.select import relevant_tools
 from nokker.core.ports import (
@@ -28,8 +30,9 @@ from nokker.core.ports import (
     TurnStream, call_effect,
 )
 from nokker.core.stream import ScrubbedDeltas, holdback_for
+from nokker.images.render import materialize
 from nokker.core.turn import (
-    Decision, Effect, Gate, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
+    Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
 )
 from nokker.tenancy.context import submit_in_context
 
@@ -47,6 +50,11 @@ CLARIFY_TOOL = "clarify"
 # Ajoutée au dernier appel quand la limite d'appels est atteinte (jamais gardée dans l'historique).
 WRAP_UP_NOTE = ("[Limite d'appels d'outils atteinte pour ce tour] Réponds maintenant, sans outil, avec ce que tu as "
                 "déjà trouvé ; si une partie manque, dis-le simplement et propose de continuer.")
+BUDGET_NOTE = ("[noyau] Il te reste {left} appels sur {total} pour ce tour. Termine maintenant : supprime les fichiers "
+               "temporaires que tu as créés (scripts d'essai, reproductions), lance les tests concernés une dernière "
+               "fois, puis conclus.")
+STALL_NOTE = ("[noyau] Tu viens de relancer `{name}` avec les mêmes arguments et le même résultat : ça ne fait pas "
+              "avancer. Change d'approche (relis le code concerné, teste une autre hypothèse) ou conclus.")
 
 logger = logging.getLogger("nokker.core.loop")
 
@@ -61,6 +69,18 @@ def worst(verdicts: list[Verdict]) -> Decision:
 
 def error_signature(result: ToolResult) -> str:
     return f"{result.name}:{result.content[:120]}"
+
+
+_VOLATILE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:s|ms|sec|seconds)\b|0x[0-9a-f]{6,}|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b",
+                       re.IGNORECASE)
+
+
+def stall_signature(call: ToolCall, result: ToolResult) -> str:
+    """Signature d'un appel d'outil et de son résultat, sans ce qui change d'une exécution à l'autre (durées
+    « in 0.53s », adresses 0x…, heures) : deux pytest identiques sur un code inchangé ont la même signature."""
+    args = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, default=str)
+    body = hashlib.sha1(_VOLATILE.sub("", result.content or "").encode("utf-8", "replace")).hexdigest()
+    return f"{call.name}|{args}|{body}"
 
 
 def _short_error(e: BaseException | None) -> str:
@@ -130,6 +150,14 @@ class Kernel:
     # Réponse coupée par la limite (finish_reason « length ») SANS appel d'outil : ce n'est pas une réponse, le
     # noyau demande de continuer, au plus ce nombre de fois par tour.
     truncation_retries: int = 2
+    # Longue tâche (session de code) : à cette fraction de `max_calls`, le noyau rappelle au modèle qu'il doit conclure
+    # (ranger, tester, répondre) ; None = jamais. Banc SWE-bench du 24.10 : 12 tâches sur 31 allaient jusqu'au plafond
+    # sans conclure, avec 59 % des jetons du banc.
+    budget_notice_at: float | None = None
+    # Stagnation : un même appel d'outil (nom + arguments) qui rend le même résultat (durées et adresses ignorées)
+    # compte comme une répétition. À la première, une note demande de changer d'approche ; à `stall_limit`
+    # répétitions dans le tour, le noyau conclut sans outils (règle `loop:stalled`). None = pas de détection.
+    stall_limit: int | None = None
     # Fils dont le tour en cours doit s'arrêter (POST /v1/threads/{id}/cancel, client terminal) : vérifié avant chaque
     # appel modèle et chaque outil ; le tour finit sur « annulé », sans erreur d'amont.
     _cancelled: set[str] = field(default_factory=set, init=False, repr=False)
@@ -196,6 +224,9 @@ class Kernel:
     # P1 bulles (docs/BUBBLES.md §3/§6) : observateur optionnel (`nokker/bubbles/hub.py::BubbleHub`) —
     # contexte reçu d'autres fils, événements turn.*/tool.*, producteurs de bulles. `None` = inchangé.
     observer: TurnObserver | None = None
+    # Magasin des images jointes (X7, `nokker/images/store.py::ImageStore`) : le noyau y lit les octets juste avant
+    # l'appel modèle, pour un palier avec vision. `None` = aucune image ne peut être lue (note texte au modèle).
+    images: Any = None
     # Plafonds des testeurs (docs/TENANCY.md §5, `nokker/tenancy/limits.py::TenantLimits`) : vérifiés AVANT le tour,
     # jamais pour le locataire interne. `None` = aucun plafond (tests, bancs).
     limits: TenantLimits | None = None
@@ -259,6 +290,24 @@ class Kernel:
         self.ledger.record(turn.thread_id, turn.index, call)
         return call
 
+    def _conclude(self, turn: Turn, history: list, recall: list, state: RouteState, thread_id: str,
+                  stream: TurnStream | None, rule: str, reason: str, reply: str = "") -> str:
+        """Fin de boucle sans réponse du modèle (limite d'appels, stagnation) : un dernier appel SANS outils rédige la
+        réponse avec ce qui a été trouvé (vu en réel le 20.10.2026 : la bonne page trouvée au 8e appel, puis « boucle
+        d'outils non terminée » escaladée ; et le tour suivant répondait à cette question restée orpheline). Le palier
+        est redemandé à la politique : un doute (REDO_DEEP) posé au dernier appel envoie la conclusion en Deep. Toujours
+        une réponse dans l'historique : jamais de question laissée ouverte pour le tour suivant."""
+        route = self.policy.choose(state)
+        self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0, rule=rule,
+                                          reason=reason)])
+        reply = self._wrap_up(turn, history, recall, route, thread_id, stream) if not turn.escalated else reply
+        if not reply:
+            turn.error = "max_calls"  # échec : ni conclusion ni escalade motivée
+            reply = self.escalator.escalate(turn, "boucle d'outils non terminée")
+            turn.escalated = True
+        turn.messages.append(Message(role="assistant", content=reply))
+        return reply
+
     def _wrap_up(self, turn: Turn, history: list, recall: list, route: RouteDecision, thread_id: str,
                  stream: TurnStream | None = None, redo_allowed: bool = True) -> str:
         """Dernier appel sans outils quand la limite d'appels est atteinte : la réponse avec ce qui a été trouvé, ce qui
@@ -269,7 +318,7 @@ class Kernel:
         assembled.messages.append({"role": "user", "content": WRAP_UP_NOTE})
         assembled.tools = []
         try:
-            comp, live = self._complete(self.providers[route.tier], assembled, route, thread_id, stream)
+            comp, live = self._complete(self.providers[route.tier], assembled, route, thread_id, stream, turn)
         except Exception:  # noqa: BLE001 — l'appelant escalade
             logger.warning("appel de conclusion en échec", exc_info=True)
             return ""
@@ -307,9 +356,17 @@ class Kernel:
         recall_started = time.monotonic()
         recall_future = None
         if checked.text.strip() and checked.text.strip().lower() != "/new":
-            recall_future = submit_in_context(_RECALL_POOL, self.memory.recall, checked.text, self.recall_k)
+            # `recall_for` (optionnel) : un port qui sait quel fil appelle (mémoire de projet des sessions locales, X1).
+            recall_for = getattr(self.memory, "recall_for", None)
+            recall_future = submit_in_context(_RECALL_POOL, recall_for, inp.thread_id, checked.text, self.recall_k) \
+                if recall_for is not None else submit_in_context(_RECALL_POOL, self.memory.recall, checked.text,
+                                                                 self.recall_k)
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender)
+        # Images jointes (X7) : références seules, déjà validées et rangées au magasin par la frontière (API) ; le nom
+        # de fichier, seul texte venu du client, passe par le caviardage comme le reste.
+        turn.images = [ImageRef(sha256=i.sha256, media_type=i.media_type, size=i.size,
+                                name=self.invariants.scrub_output(i.name) if i.name else "") for i in inp.images]
         # Contexte reçu (bulle transférée, message d'une autre session), passé par le scrubber de sortie :
         # il vient d'un autre fil, jamais un secret n'entre par là.
         injected = self._observe("context_for", inp.thread_id) or []
@@ -351,11 +408,18 @@ class Kernel:
         # DESTRUCTIVE, SEND_*, SPEND, SECRET) : un doublon là est une DÉCISION du modèle, pas du bruit.
         tool_result_cache: dict[tuple[str, str], ToolResult] = {}
         truncations = 0
+        seen_calls: set[str] = set()  # signatures d'appels (stall_signature) déjà vues ce tour
+        stalls = 0
+        notice_at = (max(1, int(self.max_calls * self.budget_notice_at))
+                     if self.budget_notice_at and self.max_calls > 4 else None)
 
         try:
             self._cancelled.discard(inp.thread_id)  # une annulation d'avant ce tour ne le vise pas
             for call_index in range(self.max_calls):
                 state.call_index = call_index
+                if call_index == notice_at:
+                    turn.messages.append(Message(role="user", content=BUDGET_NOTE.format(
+                        left=self.max_calls - call_index, total=self.max_calls)))
                 if self._take_cancel(inp.thread_id):
                     reply = "Annulé à ta demande."
                     turn.error = "cancelled"
@@ -390,7 +454,7 @@ class Kernel:
                         assembled = self.context.assemble(turn, history, recall, loaded, route.tier)
                     try:
                         comp, live = self._complete(self.providers[route.tier], assembled, route, inp.thread_id,
-                                                    stream)
+                                                    stream, turn)
                         break
                     except Exception as e:  # noqa: BLE001 — un amont indisponible n'est pas un bug du noyau
                         failure = e
@@ -418,6 +482,7 @@ class Kernel:
                         live.discard()  # texte d'un appel qui finit en outils : pas la réponse
                     turn.messages.append(Message(role="assistant", content=msg.content, tool_calls=msg.tool_calls))
                     terminal_text = None
+                    stall_note: str | None = None
                     for tc in msg.tool_calls:
                         if inp.thread_id in self._cancelled:  # annulé : les appels restants ne partent pas
                             turn.messages.append(Message(role="tool", content="annulé par l'utilisateur",
@@ -442,10 +507,24 @@ class Kernel:
                             sig = error_signature(result)
                             state.repeated_error = state.repeated_error or sig in last_errors
                             last_errors.append(sig)
+                        if self.stall_limit:
+                            ssig = stall_signature(tc, result)
+                            if ssig in seen_calls:
+                                stalls += 1
+                                if stalls == 1 or stalls == max(2, self.stall_limit // 2):
+                                    stall_note = STALL_NOTE.format(name=tc.name)
+                            seen_calls.add(ssig)
                     if terminal_text is not None:
                         reply = terminal_text
                         turn.messages.append(Message(role="assistant", content=reply))
                         break
+                    if self.stall_limit and stalls >= self.stall_limit and not turn.escalated:
+                        # Le tour ne progresse plus : conclure maintenant plutôt que de brûler le reste du budget.
+                        reply = self._conclude(turn, history, recall, state, inp.thread_id, stream, "loop:stalled",
+                                               f"{stalls} appels d'outils répétés à l'identique, conclusion sans outils")
+                        break
+                    if stall_note is not None:
+                        turn.messages.append(Message(role="user", content=stall_note))
                     continue
 
                 if getattr(comp, "finish_reason", None) == "length" and truncations < self.truncation_retries:
@@ -477,23 +556,10 @@ class Kernel:
                 turn.messages.append(Message(role="assistant", content=reply))
                 break
             else:
-                # Limite d'appels atteinte : un dernier appel SANS outils rédige la réponse avec ce qui a été trouvé
-                # (vu en réel le 20.10.2026 : la bonne page trouvée au 8e appel, puis « boucle d'outils non terminée »
-                # escaladée ; et le tour suivant répondait à cette question restée orpheline au lieu de la nouvelle).
-                # Le palier est redemandé à la politique : un doute (REDO_DEEP) posé au dernier appel envoie la
-                # conclusion en Deep au lieu de rejouer le palier douté.
+                # Limite d'appels atteinte : conclusion sans outils (`_conclude`).
                 state.call_index = self.max_calls
-                route = self.policy.choose(state)
-                self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
-                                                  rule="loop:max_calls",
-                                                  reason=f"{self.max_calls} appels, conclusion sans outils")])
-                reply = self._wrap_up(turn, history, recall, route, inp.thread_id, stream) if not turn.escalated else reply
-                if not reply:
-                    turn.error = "max_calls"  # échec : ni conclusion ni escalade motivée
-                    reply = self.escalator.escalate(turn, "boucle d'outils non terminée")
-                    turn.escalated = True
-                # Toujours une réponse dans l'historique : jamais de question laissée ouverte pour le tour suivant.
-                turn.messages.append(Message(role="assistant", content=reply))
+                reply = self._conclude(turn, history, recall, state, inp.thread_id, stream, "loop:max_calls",
+                                       f"{self.max_calls} appels, conclusion sans outils", reply)
         except Exception as e:  # noqa: BLE001 — le tour est enregistré même en échec
             turn.error = f"{type(e).__name__}: {e}"
 
@@ -519,6 +585,14 @@ class Kernel:
                 tools_done(turn.thread_id)
             except Exception:  # noqa: BLE001
                 logger.warning("turn_done des outils en échec", exc_info=True)
+        # 11. Hooks `turn_end` (Nokker Lokkal, lot X3, nokker/tools/hooks.py) : seulement si le registre est entouré des
+        # hooks ; le tour fini (réponse caviardée) leur est passé, rien ne revient dans le tour.
+        ended = getattr(self.tools, "turn_ended", None)
+        if callable(ended):
+            try:
+                ended(turn)
+            except Exception:  # noqa: BLE001 — un hook en panne ne casse jamais un tour
+                logger.warning("hooks turn_end en échec", exc_info=True)
         return turn
 
     def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict) -> Turn:
@@ -585,6 +659,8 @@ class Kernel:
         # le résultat déjà connu.
         cache_key = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)) if seen is not None \
             else None
+        if getattr(spec, "fresh", False):
+            cache_key = None  # journal d'un processus, liste des processus : relus à chaque appel
         if effect is Effect.READ and cache_key is not None and cache_key in seen:
             cached = seen[cache_key]
             return ToolResult(call_id=tc.id, name=tc.name,
@@ -611,7 +687,7 @@ class Kernel:
                 admitted.content = admitted.content + str(suffix)
             if effect is Effect.READ and cache_key is not None:
                 seen[cache_key] = admitted
-            elif seen is not None:
+            elif seen is not None and effect is not Effect.READ:
                 # Un appel à effet a pu changer ce que les lectures renvoient (fichier patché puis relu, événement
                 # créé puis listé) : les lectures déjà faites ce tour ne valent plus.
                 seen.clear()
@@ -647,11 +723,27 @@ class Kernel:
         return [route, RouteDecision(tier=Tier.SHIP, reasoning=route.reasoning,
                                      reason=f"repli : {route.tier.value} indisponible")]
 
+    def _wire_messages(self, provider: Provider, assembled, thread_id: str, turn: Turn | None) -> list[dict]:
+        """Messages tels qu'ils partent (X7) : parties `nokker_image` du Context Engine changées en `image_url` (palier
+        avec vision) ou en note texte (sans vision). Des images non lues : verdict `images:not_read` au ledger et
+        événement `attachment.skipped` à l'utilisateur, une fois par tour."""
+        vision = bool(getattr(provider, "vision", False))
+        messages, skipped = materialize(assembled.messages, vision=vision, blobs=self.images, thread_id=thread_id)
+        if skipped and turn is not None and not any(v.rule == "images:not_read" for v in turn.verdicts):
+            self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
+                                              rule="images:not_read",
+                                              reason=f"{skipped} image(s) non envoyée(s) : modèle sans vision "
+                                                     f"({getattr(provider, 'model', '?')})")])
+            if self.observer is not None and hasattr(self.observer, "attachment_skipped"):
+                self._observe("attachment_skipped", turn, skipped, "no_vision")
+        return messages
+
     def _complete(self, provider: Provider, assembled, route: RouteDecision, thread_id: str,
-                  stream: TurnStream | None):
+                  stream: TurnStream | None, turn: Turn | None = None):
         """Un appel modèle (en streaming si le client l'a demandé et que le provider sait le faire). Un flux
         coupé APRÈS le premier morceau (`StreamInterrupted`, vu en réel 19.10) : reset du client puis UN rejeu
         sans streaming. Toute autre erreur remonte (repli de palier ou escalade chez l'appelant)."""
+        messages = self._wire_messages(provider, assembled, thread_id, turn)
         live = None
         kwargs = {}
         if stream is not None and accepts_on_delta(provider):
@@ -659,13 +751,13 @@ class Kernel:
             kwargs["on_delta"] = live.feed
         budget = {"max_tokens": self.max_tokens} if self.max_tokens else {}
         try:
-            return provider.complete(assembled.messages, assembled.tools, reasoning=route.reasoning,
+            return provider.complete(messages, assembled.tools, reasoning=route.reasoning,
                                      session_key=thread_id, **budget, **kwargs), live
         except StreamInterrupted as e:
             logger.warning("flux amont interrompu (%s) : rejeu sans streaming", e)
             if live is not None:
                 live.discard()
-            return provider.complete(assembled.messages, assembled.tools, reasoning=route.reasoning,
+            return provider.complete(messages, assembled.tools, reasoning=route.reasoning,
                                      session_key=thread_id, **budget), None
         except Exception:
             if live is not None:

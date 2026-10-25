@@ -32,6 +32,9 @@ class TierConfig:
     # selon le message) ou « prefix » (nos GPU, vLLM/llama.cpp : tout le catalogue, stable donc payé une fois). Celui du
     # palier Ship décide de `Kernel.tool_loading` (tools/select.py).
     cache: str = "none"
+    # Le modèle lit-il les images jointes (X7, docs/LOKKAL.md §7.6) ? Sans vision, l'image n'est pas envoyée : le modèle
+    # reçoit une note texte et l'utilisateur l'événement `attachment.skipped`. Mesuré avant de passer à `true`.
+    vision: bool = False
 
     def api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")
@@ -104,6 +107,9 @@ class NokkerConfig:
     # d'environnement ici la rend stable entre redémarrages, SANS jamais passer par le YAML du dépôt.
     previews_sign_secret_env: str = "NOKKER_PREVIEWS_SIGN_SECRET"
     ledger_dsn_env: str | None = None  # None -> réutilise pg_dsn_env (même Postgres que le Store)
+    # Magasin des images jointes (X7, nokker/images/store.py). Vide : `<local.state_dir>/images` sur Lokkal, aucune image
+    # acceptée ailleurs (400 sur la route de chat).
+    images_dir: str = ""
     host: str = "0.0.0.0"
     port: int = 8642
     tiers: dict[str, TierConfig] = field(default_factory=lambda: {
@@ -170,7 +176,10 @@ class NokkerConfig:
     # `telegram_ids`, appareils de Nick), et aucun appareil ne s'enrôle sans invitation. docs/TENANCY.md §2.
     internal_tenant: bool = True
     # Nokker Lokkal (docs/LOKKAL.md §7, nokker/local/api.py) : None (bêta) = pas d'API locale ni d'outils de code.
-    # {token_path, allowed_hosts, code: {roots, host_roots, backend, image, network_name}}
+    # {token_path, allowed_hosts, code: {roots, host_roots, backend, image, network_name},
+    #  secrets: {provider: file|openbao (défaut file ; NOKKER_SECRETS_PROVIDER prime), file: {path, key_env, key_file},
+    #            openbao: {address, mount, prefix, auth, role_id_file, secret_id_file, token_file, ca_file}}}
+    # (coffre local, lot X4 : nokker/secrets/, docs/en/secrets.md)
     local: dict[str, Any] | None = None
     # nokker.ai, côté cloud du lien Lokkal (docs/LOKKAL.md §7.2 révisé, §7.5, nokker/cloud/) : None (défaut) = aucune
     # route /v1/link/*, /v1/gateway/*, /v1/inference/*. {signing_key_env, base_url, gateway_domain}
@@ -216,6 +225,22 @@ class NokkerConfig:
     # approbations). sendMessage SEULEMENT : ce bot est lu en continu par OpenClaw, un getUpdates/setWebhook d'ici lui
     # volerait ses messages. Vide = pas de notification Telegram.
     admin_notify_token_env: str = "NOKKER_ADMIN_NOTIFY_TOKEN"
+
+    def images_root(self) -> str:
+        """Dossier du magasin d'images : `images_dir`, sinon `<local.state_dir>/images` (Lokkal), sinon vide (aucune)."""
+        if self.images_dir:
+            return self.images_dir
+        if self.local is not None:
+            return str(Path(self.local.get("state_dir") or "~/.config/nokker").expanduser() / "images")
+        return ""
+
+    def vision_for_model(self, model: str) -> bool:
+        """Vision d'un modèle choisi à l'onboarding (Router, clé de l'utilisateur, modèle local) : celle d'un palier de
+        la config qui sert le même modèle (nom comparé sans préfixe ni casse), sinon non."""
+        def bare(m: str) -> str:
+            return (m or "").rsplit("/", 1)[-1].strip().lower()
+
+        return any(t.vision and bare(t.model) == bare(model) for t in self.tiers.values()) if model else False
 
     def known_users(self) -> frozenset[str]:
         """Utilisateurs connus (partage de bulle, membres de fil) : identités des clés d'API + Telegram."""
@@ -272,7 +297,7 @@ def load_config(path: str | None = None) -> NokkerConfig:
         name: TierConfig(base_url=t["base_url"], model=t["model"], api_key_env=t.get("api_key_env", "ROUTER_KEY"),
                          reasoning_off_body=t.get("reasoning_off_body"),
                          fallback_model=t.get("fallback_model", ""), hedge_after_s=float(t.get("hedge_after_s", 8.0)),
-                         cache=str(t.get("cache", "none")))
+                         cache=str(t.get("cache", "none")), vision=bool(t.get("vision", False)))
         for name, t in (raw.get("tiers") or {}).items()
     } or None
     # `api_keys: []` explicite = AUCUNE clé (bêta OVH), pas la clé par défaut `API_SERVER_KEY → nick` ; absente = défaut.

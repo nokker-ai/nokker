@@ -11,13 +11,18 @@ from nokker.connectors import build_connector
 from nokker.connectors.errors import ConnectorError
 from nokker.connectors.store import KINDS, ConnectorStore
 from nokker.core.ports import ToolSource
+from nokker.secrets.base import SecretsError
 
 logger = logging.getLogger("nokker.connectors")
 
 
 class ConnectorProvider:
-    def __init__(self, store: ConnectorStore, account_for_tenant: Callable[[str], Any]) -> None:
-        self.store, self._account_for_tenant = store, account_for_tenant
+    """`resolve` (Lokkal, lot X4) : l'identifiant rangé peut être une référence `secret:NOM`, lue au coffre ici, au
+    moment de construire la source ; nom absent ou coffre scellé → connecteur sauté et journalisé (sans valeur)."""
+
+    def __init__(self, store: ConnectorStore, account_for_tenant: Callable[[str], Any],
+                 resolve: Callable[[str], str] | None = None) -> None:
+        self.store, self._account_for_tenant, self._resolve = store, account_for_tenant, resolve
 
     def sources_for(self, tenant_id: str) -> list[ToolSource]:
         found = self._account_for_tenant(tenant_id)
@@ -29,7 +34,10 @@ class ConnectorProvider:
             try:
                 cred = self.store.get(account_id, kind)
                 if cred is not None:
-                    out.append(build_connector(kind, cred.settings, cred.secret))
+                    secret = self._resolve(cred.secret) if self._resolve else cred.secret
+                    out.append(build_connector(kind, cred.settings, secret))
             except ConnectorError as exc:
                 logger.warning("connecteur %s ignoré pour %s : %s", kind, tenant_id, exc.code)
+            except SecretsError as exc:
+                logger.warning("connecteur %s ignoré pour %s : %s", kind, tenant_id, exc)
         return out

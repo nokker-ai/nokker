@@ -26,6 +26,9 @@ class ToolSpec:
     # Effet qui dépend des arguments (ex. `terminal` : `ls` ne détruit rien, `rm -rf` si). None = `effect` pour
     # tout appel ; sinon `effect` est le repli quand le classement échoue (donc le plus prudent des deux).
     effect_of: Callable[[dict[str, Any]], Effect] | None = field(default=None, compare=False, repr=False)
+    # Lecture dont le résultat change d'un appel à l'autre sans qu'aucun outil n'écrive (journal d'un processus en
+    # arrière-plan) : jamais resservie par le cache des lectures du tour (`core/loop.py::_tool_step`).
+    fresh: bool = False
 
     def effect_for(self, arguments: dict[str, Any]) -> Effect:
         """Effet de CET appel : `effect_of(arguments)` si l'outil classe ses appels, sinon `effect`."""

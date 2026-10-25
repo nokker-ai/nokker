@@ -217,6 +217,7 @@ def _shannon_entropy(s: str) -> float:
 
 
 _WORDS_SPLIT_RE = re.compile(r"[/_+]")
+_VERSIONED_WORD_RE = re.compile(r"^[a-z]{1,15}\d{1,2}$")
 
 
 def _looks_like_safe_token(token: str) -> bool:
@@ -232,8 +233,15 @@ def _looks_like_safe_token(token: str) -> bool:
     # joint seulement par « _ » ou « + », c'est la forme d'un mot de passe « mots + année » (Acme_Backup_2026_NAS),
     # caviardé avant b573b0d et qui doit le rester (revue du 20.10).
     digits_ok = "/" in token
-    if (len(parts) >= 2 and any(x.isalpha() for x in parts)
-            and all((x.isalpha() and len(x) <= 15) or (digits_ok and x.isdigit() and len(x) <= 8) for x in parts)):
+    # Dans un CHEMIN, un mot en minuscules suivi d'un petit numéro de version (« miniconda3 », « python3 », « lib64 »,
+    # « x86 ») est aussi un morceau lisible : `/opt/miniconda3/bin/activate` était caviardé dans la CONSIGNE même
+    # (banc SWE-bench du 24.10 : 24 tâches sur 50 lançaient `source /[secret:entropy-…] testbed`).
+    def readable(x: str) -> bool:
+        if x.isalpha() and len(x) <= 15:
+            return True
+        return digits_ok and ((x.isdigit() and len(x) <= 8) or bool(_VERSIONED_WORD_RE.match(x)))
+
+    if len(parts) >= 2 and any(x.isalpha() for x in parts) and all(readable(x) for x in parts):
         return True
     if _HEX_RE.match(token) and len(token) in _SAFE_HEX_LENGTHS:
         return True

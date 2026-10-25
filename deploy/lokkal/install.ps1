@@ -25,7 +25,9 @@ param(
   [switch]$Update,
   [switch]$Uninstall,
   [switch]$Purge,
-  [switch]$NoOpen
+  [switch]$NoOpen,
+  [switch]$Vault,                   # coffre OpenBao (profil vault), descellé automatiquement
+  [switch]$VaultManual              # idem, part de descellement affichée une fois, redemandée à chaque redémarrage
 )
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -100,6 +102,7 @@ if ($Yes)       { $shArgs += "--yes" }
 if ($Update)    { $shArgs += "--update" }
 if ($Uninstall) { $shArgs += "--uninstall" }
 if ($Purge)     { $shArgs += "--purge" }
+if ($VaultManual) { $shArgs += "--vault-manual" } elseif ($Vault) { $shArgs += "--vault" }
 $shArgs += "--no-open"
 $quoted = ($shArgs | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join " "
 $envs = ""

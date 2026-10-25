@@ -6,9 +6,15 @@ JSON (`req` / `res` / `body` / `cancel` / `ping`).
 
 Le relais filtre AVANT la machine : sur `/v1/*`, seul un jeton d'accès ou de délégation de nokker.ai, signé, du MÊME
 compte que la machine, passe ; hors `/v1`, GET/HEAD seulement (fichiers de l'interface) ; jamais de jeton local ;
-cookies retirés dans les deux sens. Pages : origine séparée, CSP `sandbox`, cookie `__Host-nk_pg` propre aux pages.
+cookies retirés dans les deux sens. Pages : origine séparée, CSP `sandbox` + `frame-ancestors`, entrée par un jeton de
+pages à usage unique (`/_auth`), puis cookie `__Host-nk_pg` (onglet) ou capacité d'URL `/_s/<cap>/` (iframe, `embed=1` :
+pas de cookie tiers, qui ne passe plus une fois nokker.app sur la PSL ni depuis nokker.ai).
 
-État en mémoire (une réplique en v1) : la table nom → tunnel. Rien sur disque.
+Connexion du navigateur (LOKKAL §7.3) : `/_gw/token|refresh|logout` sur `<nom>.nokker.app`, traités par le relais
+SANS tunnel ; le renouvellement vit dans `__Host-nk_rt` (posé par le relais seul) et ne passe jamais au Lokkal.
+
+État en mémoire (une réplique en v1) : la table nom → tunnel, les jti de pages consommés, le compteur de débit de
+`/_gw`. Rien sur disque.
 """
 from __future__ import annotations
 
@@ -48,6 +54,15 @@ STRIP_REQ = HOP | {"cookie", "x-forwarded-for", "x-forwarded-host", "x-forwarded
                    "cf-ray", "cf-visitor", "cf-ipcountry", "cdn-loop", "cf-access-jwt-assertion"}
 STRIP_RES = HOP | {"set-cookie"}
 PAGES_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+PAGES_TOKEN_MAX_TTL = 60          # jeton de pages : exp − iat (BUBBLES §10.3)
+CAP_TTL = 3600                    # capacité d'URL des iframes
+EXPIRED_HTML = ('<!doctype html><meta charset="utf-8"><title>Lien expiré</title>'
+                '<p style="font:14px system-ui;color:#666;padding:1em">Lien expiré : rouvrez la page.</p>'
+                '<script>try{parent.postMessage({type:"nokker:pages-expired"},"*")}catch(e){}</script>')
+RT_COOKIE = "__Host-nk_rt"        # renouvellement de la connexion par la passerelle (§7.3)
+RT_MAX_AGE = 30 * 86400
+GW_BODY_MAX = 8 << 10
+GW_RATE = (20, 60.0)              # /_gw : 20 requêtes par minute et par IP
 
 
 @dataclass
@@ -67,6 +82,8 @@ class Settings:
     issuer: str = "https://app.nokker.ai"
     audiences: tuple[str, ...] = ("nokker.app",)       # jetons d'accès et de délégation (LOKKAL §7.5)
     cookie_secret: bytes = b""                          # cookies des pages (HMAC), propre au relais
+    frame_ancestors: str = "https://nokker.ai https://app.nokker.ai"  # + https://<nom>.nokker.app
+    pages_accept_access_token: bool = True              # /_auth avec un jeton d'accès : toléré jusqu'au train du 2.11
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Settings":
@@ -79,12 +96,15 @@ class Settings:
                    jwks_url=env.get("NOKKER_JWKS_URL", cls.jwks_url),
                    issuer=env.get("NOKKER_TOKEN_ISSUER", cls.issuer),
                    audiences=tuple(a for a in env.get("NOKKER_TOKEN_AUDIENCES", "nokker.app").split(",") if a),
-                   cookie_secret=secret.encode())
+                   cookie_secret=secret.encode(),
+                   frame_ancestors=env.get("NOKKER_PAGES_FRAME_ANCESTORS", cls.frame_ancestors),
+                   pages_accept_access_token=env.get("NOKKER_PAGES_ACCEPT_ACCESS_TOKEN", "1") == "1")
 
 
 # --------------------------------------------------------------------------------------------- identités
 MachineCheck = Callable[[str], Awaitable[Machine | None]]
 TokenCheck = Callable[[str], Awaitable[dict | None]]
+CorePost = Callable[[str, dict], Awaitable[tuple[int, Any]]]   # (statut, JSON) ; statut 0 = noyau injoignable
 
 
 class CoreClient:
@@ -106,6 +126,20 @@ class CoreClient:
         except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError) as e:
             log.warning("vérification de machine impossible : %s", e)
             return None
+
+    async def post(self, path: str, body: dict) -> tuple[int, Any]:
+        """Appel du relais lui-même à nokker.ai (connexion par la passerelle, §7.3)."""
+        try:
+            async with self.http.post(f"{self.s.core_url}{path}", json=body,
+                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
+                try:
+                    data = await r.json(content_type=None)
+                except ValueError:
+                    data = None
+                return r.status, data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("noyau injoignable (%s) : %s", path, type(e).__name__)
+            return 0, None
 
     async def token(self, tok: str) -> dict | None:
         if not self._jwks:
@@ -212,11 +246,36 @@ def check_cookie(secret: bytes, value: str, name: str) -> str | None:
     return tenant
 
 
+def cap_key(secret: bytes) -> bytes:
+    """Clé des capacités d'URL, séparée de celle des cookies : une capacité n'est pas un cookie, et l'inverse."""
+    return hmac.new(secret, b"nokker-pages-cap", hashlib.sha256).digest()
+
+
+class RateLimit:
+    def __init__(self, n: int, per: float):
+        self.n, self.per, self.hits = n, per, {}
+
+    def ok(self, key: str) -> bool:
+        now = time.monotonic()
+        if len(self.hits) > 10000:
+            self.hits = {k: v for k, v in self.hits.items() if v and v[-1] > now - self.per}
+        h = [t for t in self.hits.get(key, []) if t > now - self.per]
+        if len(h) >= self.n:
+            self.hits[key] = h
+            return False
+        h.append(now)
+        self.hits[key] = h
+        return True
+
+
 class Relay:
-    def __init__(self, s: Settings, check_machine: MachineCheck, check_token: TokenCheck):
+    def __init__(self, s: Settings, check_machine: MachineCheck, check_token: TokenCheck,
+                 core_post: CorePost | None = None):
         self.s = s
-        self.check_machine, self.check_token = check_machine, check_token
+        self.check_machine, self.check_token, self.core_post = check_machine, check_token, core_post
         self.reg = Registry()
+        self.used_jti: dict[str, float] = {}       # jti des jetons de pages consommés → expiration
+        self.gw_rate = RateLimit(*GW_RATE)
 
     # ---- routage par Host
     def parse_host(self, host: str) -> tuple[str, str] | None:
@@ -239,6 +298,8 @@ class Relay:
         if where is None:
             return web.Response(status=404, text="inconnu\n")
         kind, name = where
+        if kind == "app" and (req.path == "/_gw" or req.path.startswith("/_gw/")):
+            return await self.gw(req, name)      # avant la table des tunnels : marche machine hors ligne
         if kind == "relay":
             if req.path == "/healthz":
                 return web.Response(text="ok\n")
@@ -324,38 +385,146 @@ class Relay:
             return web.Response(status=405, text="méthode refusée\n")
         return await self.forward(req, t, req.path_qs, tenant, extra={})
 
+    def pages_headers(self, name: str) -> dict:
+        fa = f"https://{name}.{self.s.domain} {self.s.frame_ancestors}".strip()
+        return {"Content-Security-Policy": f"{PAGES_CSP}; frame-ancestors {fa}", "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
+                "Cross-Origin-Resource-Policy": "same-origin"}
+
+    def pages_entry(self, claims: dict | None, m: Machine) -> bool:
+        """Jeton présenté à `/_auth`. Jeton de pages (scope `pages`) : cette machine, ≤ 60 s, usage unique par jti.
+        Jeton d'accès (sans scope) : toléré tant que `pages_accept_access_token` (jusqu'au 2.11)."""
+        if not claims or claims_tenant(claims) != m.tenant:
+            return False
+        scope = claims.get("scope")
+        if scope is None:
+            return self.s.pages_accept_access_token and claims.get("machine") in (None, m.machine_id)
+        if scope != "pages" or claims.get("machine") != m.machine_id:
+            return False
+        try:
+            iat, exp, jti = int(claims["iat"]), int(claims["exp"]), str(claims["jti"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not jti or exp - iat > PAGES_TOKEN_MAX_TTL:
+            return False
+        now = time.time()
+        if len(self.used_jti) > 1000:
+            self.used_jti = {j: e for j, e in self.used_jti.items() if e > now}
+        if jti in self.used_jti:
+            log.info("jeton de pages rejoué (machine %s)", m.name)
+            return False
+        self.used_jti[jti] = exp + 60
+        return True
+
     async def pages(self, req: web.Request, t: Tunnel) -> web.StreamResponse:
         if req.method not in ("GET", "HEAD"):
             return web.Response(status=405, text="méthode refusée\n")
         host = f"{t.machine.name}--pages.{self.s.domain}"
         if req.path == "/_auth":
-            # Lien signé par l'interface : ?token=<jeton d'accès>&to=/<page>. Échangé contre un cookie de pages.
-            claims = await self.check_token(req.query.get("token", ""))
-            if not claims or claims_tenant(claims) != t.machine.tenant:
-                return web.Response(status=401, text="lien expiré ou invalide\n")
+            # Lien signé par nokker.ai : ?token=<jeton de pages>&to=/<page>[&embed=1].
+            if not self.pages_entry(await self.check_token(req.query.get("token", "")), t.machine):
+                return web.Response(status=401, text="lien expiré ou invalide\n", headers={"Cache-Control": "no-store"})
             to = req.query.get("to", "/")
-            if not to.startswith("/") or to.startswith("//"):
+            if not to.startswith("/") or to.startswith("//") or "\\" in to:
                 to = "/"
-            exp = int(time.time()) + 12 * 3600
-            r = web.HTTPFound(location=to)
-            r.set_cookie("__Host-nk_pg", sign_cookie(self.s.cookie_secret, t.machine.tenant, t.machine.name, exp),
-                         secure=True, httponly=True, samesite="Lax", path="/", max_age=12 * 3600)
+            if req.query.get("embed") == "1":
+                # iframe : capacité dans le chemin, sans cookie (tiers une fois sur la PSL, et depuis nokker.ai).
+                cap = sign_cookie(cap_key(self.s.cookie_secret), t.machine.tenant, t.machine.name,
+                                  int(time.time()) + CAP_TTL)
+                r = web.HTTPFound(location=f"/_s/{cap}{to}")
+            else:
+                exp = int(time.time()) + 12 * 3600
+                r = web.HTTPFound(location=to)
+                r.set_cookie("__Host-nk_pg", sign_cookie(self.s.cookie_secret, t.machine.tenant, t.machine.name, exp),
+                             secure=True, httponly=True, samesite="Lax", path="/", max_age=12 * 3600)
             r.headers["Cache-Control"] = "no-store"
             r.headers["Referrer-Policy"] = "no-referrer"
             return r
-        tenant = check_cookie(self.s.cookie_secret, req.cookies.get("__Host-nk_pg", ""), t.machine.name)
-        page = req.path.lstrip("/")
+        prefix = None
+        if req.path.startswith("/_s/"):
+            cap, _, rest = req.path[len("/_s/"):].partition("/")
+            tenant = check_cookie(cap_key(self.s.cookie_secret), cap, t.machine.name)
+            if tenant is None:
+                # L'iframe est d'une autre origine : le client ne voit pas ce 401. La page le lui dit (postMessage,
+                # sans secret), il redemande un lien et remonte l'iframe.
+                return web.Response(status=401, body=EXPIRED_HTML, content_type="text/html", charset="utf-8",
+                                    headers=self.pages_headers(t.machine.name))
+            page, prefix = rest, f"/_s/{cap}"
+        else:
+            tenant = check_cookie(self.s.cookie_secret, req.cookies.get("__Host-nk_pg", ""), t.machine.name)
+            page = req.path.lstrip("/")
         if not PAGE_RE.match(page) or any(seg in ("", ".", "..") for seg in page.split("/")):
             return web.Response(status=404, text="page inconnue\n")
-        extra = {"Content-Security-Policy": PAGES_CSP, "X-Content-Type-Options": "nosniff",
-                 "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
-                 "Cross-Origin-Resource-Policy": "same-origin"}
-        # Sans cookie, on demande quand même au noyau : il sert les pages PUBLIQUES et refuse les autres (401).
+        # Sans preuve, on demande quand même au noyau : il sert les pages PUBLIQUES et refuse les autres.
         path = "/v1/pages/" + page + (("?" + req.query_string) if req.query_string else "")
-        return await self.forward(req, t, path, tenant, extra=extra, pages_host=host)
+        return await self.forward(req, t, path, tenant, extra=self.pages_headers(t.machine.name), pages_host=host,
+                                  location_prefix=prefix)
+
+    # ---- connexion du navigateur par la passerelle (LOKKAL §7.3), sans tunnel
+    async def gw(self, req: web.Request, name: str) -> web.StreamResponse:
+        host = f"{name}.{self.s.domain}"
+        ns = {"Cache-Control": "no-store"}
+        action = req.path[len("/_gw/"):] if req.path.startswith("/_gw/") else ""
+        if action not in ("token", "refresh", "logout"):
+            return web.Response(status=404, text="inconnu\n", headers=ns)
+        if req.method != "POST":
+            return web.Response(status=405, text="méthode refusée\n", headers=ns)
+        # CSRF : origine exacte ET JSON (requête préalable CORS forcée hors même origine) ; SameSite=Strict en plus.
+        if req.headers.get("Origin") != f"https://{host}" or req.content_type != "application/json":
+            return web.json_response({"error": "forbidden"}, status=403, headers=ns)
+        if req.content_length is not None and req.content_length > GW_BODY_MAX:
+            return web.json_response({"error": "too_large"}, status=413, headers=ns)
+        if self.core_post is None:
+            return web.json_response({"error": "unavailable"}, status=503, headers=ns)
+        ip = req.headers.get("CF-Connecting-IP", req.remote or "")
+        if action != "logout" and not self.gw_rate.ok(ip):
+            return web.json_response({"error": "rate_limited"}, status=429, headers={**ns, "Retry-After": "60"})
+        rt = req.cookies.get(RT_COOKIE, "")
+        if action == "logout":
+            if rt:
+                await self.core_post("/v1/gateway/revoke", {"refresh_token": rt})
+            r = web.Response(status=204, headers=ns)
+            self._clear_rt(r)
+            return r
+        if action == "token":
+            try:
+                body = await req.json()
+                code, verifier = body["code"], body["code_verifier"]
+                if not (isinstance(code, str) and isinstance(verifier, str) and code and verifier):
+                    raise ValueError
+            except (ValueError, KeyError, TypeError):
+                return web.json_response({"error": "invalid_request"}, status=400, headers=ns)
+            st, data = await self.core_post("/v1/gateway/token",
+                                            {"code": code, "code_verifier": verifier, "host": host})
+            return self._grant(st, data, clear_on_refusal=False)
+        if not rt:
+            return web.json_response({"error": "invalid_grant"}, status=401, headers=ns)
+        st, data = await self.core_post("/v1/gateway/refresh", {"refresh_token": rt, "host": host})
+        return self._grant(st, data, clear_on_refusal=True)
+
+    def _grant(self, st: int, data: Any, clear_on_refusal: bool) -> web.Response:
+        ns = {"Cache-Control": "no-store"}
+        if st == 200 and isinstance(data, dict) and data.get("access_token") and data.get("refresh_token"):
+            r = web.json_response({"access_token": data["access_token"], "expires_in": data.get("expires_in", 900)},
+                                  headers=ns)
+            r.set_cookie(RT_COOKIE, str(data["refresh_token"]), secure=True, httponly=True, samesite="Strict",
+                         path="/", max_age=RT_MAX_AGE)
+            return r
+        if st in (400, 401):
+            # Refus net de nokker.ai (invalid_grant) : seul cas où le renouvellement est jeté.
+            r = web.json_response({"error": "invalid_grant"}, status=401, headers=ns)
+            if clear_on_refusal:
+                self._clear_rt(r)
+            return r
+        log.warning("connexion par la passerelle : nokker.ai a répondu %s", st or "rien")
+        return web.json_response({"error": "upstream"}, status=502, headers=ns)   # cookie gardé
+
+    @staticmethod
+    def _clear_rt(r: web.StreamResponse) -> None:
+        r.del_cookie(RT_COOKIE, path="/", secure=True, httponly=True, samesite="Strict")
 
     async def forward(self, req: web.Request, t: Tunnel, path: str, tenant: str | None, extra: dict,
-                      pages_host: str | None = None) -> web.StreamResponse:
+                      pages_host: str | None = None, location_prefix: str | None = None) -> web.StreamResponse:
         if t.closed.is_set():
             return web.Response(status=502, text="machine hors ligne\n")
         if req.content_length and req.content_length > MAX_BODY:
@@ -377,19 +546,36 @@ class Relay:
         st = t.streams[sid] = Stream()
         resp: web.StreamResponse | None = None
         try:
-            try:
-                body = await req.read()            # borné par client_max_size (50 Mio) → 413
-            except web.HTTPRequestEntityTooLarge:
-                return web.Response(status=413, text="corps trop gros\n")
-            parts = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)] or [b""]
-            await t.send({"t": "req", "id": sid, "method": req.method, "path": path, "headers": headers,
-                          "body": b64(parts[0]), "more": len(parts) > 1})
-            for i, chunk in enumerate(parts[1:], start=2):
-                await t.send({"t": "body", "id": sid, "data": b64(chunk), "more": i < len(parts)})
+            # Corps en flux, trame par trame : jamais tout le corps en mémoire (4 images de 5 Mo ≈ 27 Mo par message, pod
+            # à 512 Mi). Une trame d'avance pour savoir si c'est la dernière (`more`).
+            started, size, prev = False, 0, None
+
+            async def emit(chunk: bytes, more: bool) -> None:
+                nonlocal started
+                if not started:
+                    started = True
+                    await t.send({"t": "req", "id": sid, "method": req.method, "path": path, "headers": headers,
+                                  "body": b64(chunk), "more": more})
+                else:
+                    await t.send({"t": "body", "id": sid, "data": b64(chunk), "more": more})
+            async for data in req.content.iter_chunked(CHUNK):
+                size += len(data)
+                if size > MAX_BODY:                 # sans Content-Length (chunked) : coupé en route
+                    if started:
+                        await self._cancel(t, sid)
+                    return web.Response(status=413, text="corps trop gros\n")
+                if prev is not None:
+                    await emit(prev, True)
+                prev = data
+            await emit(prev or b"", False)
             f = await asyncio.wait_for(st.queue.get(), RESPONSE_TIMEOUT)
             if f.get("t") != "res":
                 return web.Response(status=502, text="machine injoignable\n")
             out = {k: v for k, v in f.get("headers", []) if k.lower() not in STRIP_RES}
+            if location_prefix:
+                for k, v in list(out.items()):      # redirection relative du noyau : reste sous la capacité
+                    if k.lower() == "location" and v.startswith("/") and not v.startswith("//"):
+                        out[k] = location_prefix + v
             out.update(extra)
             status = int(f.get("status", 502))
             if not f.get("more"):
@@ -441,7 +627,7 @@ async def main() -> None:
     s = Settings.from_env()
     http = aiohttp.ClientSession()
     core = CoreClient(s, http)
-    relay = Relay(s, core.machine, core.token)
+    relay = Relay(s, core.machine, core.token, core.post)
     runner = web.AppRunner(make_app(relay), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()

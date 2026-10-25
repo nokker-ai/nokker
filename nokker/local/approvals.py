@@ -23,14 +23,14 @@ FILE_TOOLS = ("write_file", "patch", "read_file", "search_files")
 def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None) -> list[str]:
     if strength == "strong":
         return []
-    if tool == "terminal":
+    if tool in ("terminal", "process_start"):  # process_start : commande en arrière-plan (lot X6)
         cmd = " ".join(str(arguments.get("command", "")).split())
         if not cmd:
             return []
         words = cmd.split(" ")
-        out = [f"terminal({cmd})"]
+        out = [f"{tool}({cmd})"]
         if len(words) > 2:
-            out.append(f"terminal({' '.join(words[:2])}*)")
+            out.append(f"{tool}({' '.join(words[:2])}*)")
         return out
     if tool in FILE_TOOLS and arguments.get("path"):
         path = posixpath.normpath(str(arguments["path"]))

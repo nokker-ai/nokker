@@ -32,7 +32,7 @@ def _approbation_block(approval: Approval, *, outcome: str) -> str:
     lines = [
         "[Approbation]",
         f"Outil : {approval.tool_name}",
-        *([f"Commande : {approval.arguments['command']}"] if approval.tool_name == "terminal"
+        *([f"Commande : {approval.arguments['command']}"] if approval.tool_name in ("terminal", "process_start")
           and approval.arguments.get("command") else []),
         f"Décision : {approval.status}",
         f"Décideur : {approval.decided_by}",

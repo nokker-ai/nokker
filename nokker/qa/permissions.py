@@ -35,6 +35,9 @@ from nokker.core.turn import Decision, Effect, Gate, ToolCall, Turn, Verdict
 
 # accept_edits : écritures permises sans carte. checkpoint_create n'écrit que dans le dépôt fantôme des points de retour.
 FILE_EDIT_TOOLS = frozenset({"write_file", "patch", "checkpoint_create"})
+# accept_edits : la mémoire de projet (X1) n'écrit que dans le dossier d'état de Nokker, chaque note est visible
+# (événement `memory.noted`) et un oubli se range à part (rien n'est détruit) — même régime qu'un point de retour.
+MEMORY_EDIT_TOOLS = frozenset({"memory_note", "memory"})
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
 
@@ -59,7 +62,8 @@ class Rule:
         return cls(tool=m.group(1), pattern=(m.group(2) or None))
 
     def matches(self, call: ToolCall) -> bool:
-        if call.name != self.tool:
+        # Une règle `terminal(…)` couvre aussi la même commande lancée en arrière-plan (lot X6) : mêmes règles.
+        if call.name != self.tool and not (self.tool == "terminal" and call.name == "process_start"):
             return False
         if self.pattern is None:
             return True
@@ -69,7 +73,7 @@ class Rule:
 def _subjects(call: ToolCall) -> list[str]:
     """Ce que le motif d'une règle compare : la commande, ou le(s) chemin(s) touchés."""
     a = call.arguments
-    if call.name == "terminal":
+    if call.name in ("terminal", "process_start"):
         return [str(a.get("command", "")).strip()]
     if call.name == "patch" and str(a.get("mode")) == "patch":
         return [p.strip() for p in re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", str(a.get("patch", "")),
@@ -105,10 +109,15 @@ class LocalPermissions:
         if rule not in rules:
             rules.append(rule)
 
+    def mode_for(self, thread_id: str | None = None) -> Mode:
+        """Le mode en vigueur sur ce fil : celui de l'utilisateur, ou celui du dépôt s'il est plus strict."""
+        proj_mode = self.thread_project.get(thread_id or "", (None, [], []))[0]
+        return proj_mode if proj_mode and _STRICTNESS[proj_mode.value] > _STRICTNESS[self.mode.value] else self.mode
+
     def decide(self, call: ToolCall, effect: Effect, thread_id: str | None = None) -> tuple[Decision | None, str]:
         """(décision, motif). None = rien à dire : les portes du noyau décident seules (ex. destructif en mode auto)."""
-        proj_mode, proj_ask, proj_deny = self.thread_project.get(thread_id or "", (None, [], []))
-        mode = proj_mode if proj_mode and _STRICTNESS[proj_mode.value] > _STRICTNESS[self.mode.value] else self.mode
+        _, proj_ask, proj_deny = self.thread_project.get(thread_id or "", (None, [], []))
+        mode = self.mode_for(thread_id)
         for r in [*self.deny, *proj_deny]:
             if r.matches(call):
                 return Decision.DENY, f"règle deny {r.tool}({r.pattern or ''})"
@@ -123,7 +132,7 @@ class LocalPermissions:
         if effect is Effect.READ:
             return Decision.ALLOW, f"mode {mode.value} : lecture"
         if effect is Effect.WRITE:
-            if mode is Mode.AUTO or (mode is Mode.ACCEPT_EDITS and call.name in FILE_EDIT_TOOLS):
+            if mode is Mode.AUTO or (mode is Mode.ACCEPT_EDITS and call.name in FILE_EDIT_TOOLS | MEMORY_EDIT_TOOLS):
                 return Decision.ALLOW, f"mode {mode.value} : écriture dans le dossier"
             return Decision.HITL, f"mode {mode.value} : écriture demandée"
         return None, ""  # DESTRUCTIVE, SEND_*, SPEND, SECRET : les invariants décident (carte forte, refus…)
@@ -164,7 +173,7 @@ class PermissionGates:
     permissions: LocalPermissions
 
     def action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> list[Verdict]:
-        if call.name == "terminal":
+        if call.name in ("terminal", "process_start"):
             from nokker.tools.code import hardline_reason
 
             why = hardline_reason(str(call.arguments.get("command", "")))
@@ -190,4 +199,4 @@ class PermissionGates:
         return getattr(self.inner, name)
 
 
-__all__ = ["FILE_EDIT_TOOLS", "LocalPermissions", "Mode", "PermissionGates", "Rule"]
+__all__ = ["FILE_EDIT_TOOLS", "MEMORY_EDIT_TOOLS", "LocalPermissions", "Mode", "PermissionGates", "Rule"]

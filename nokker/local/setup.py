@@ -1,8 +1,9 @@
 """Premier lancement de Nokker Lokkal (docs/LOKKAL.md §7.1) : modèles, coffre local, état de l'onboarding.
 
-- **Coffre local** (`LocalVault`) : clés BYOK et clé du Router, chiffrées au repos (Fernet) dans un fichier 0600, avec une
-  clé que l'installeur génère dans le `.env` du compose (`NOKKER_LOCAL_SECRET_KEY`). Sans cette clé, le coffre refuse
-  d'écrire : jamais une clé d'API en clair sur le disque. Les clés sont désignées par leur nom (`router`,
+- **Coffre local** (`LocalVault`) : clés BYOK et clé du Router, portée `system` du coffre (nokker/secrets/, lot X4) ;
+  fournisseur `file` par défaut : chiffrées au repos (Fernet) dans `vault.bin` (0600), avec une clé que l'installeur
+  génère dans le `.env` du compose (`NOKKER_LOCAL_SECRET_KEY`) ; `openbao` sur choix explicite. Sans clé, le coffre
+  refuse d'écrire : jamais une clé d'API en clair sur le disque. Les clés sont désignées par leur nom (`router`,
   `byok:<nom>`) et ne sortent jamais par l'API.
 - **Modèles** : Router (compte lié), BYOK (tout point d'accès compatible OpenAI) ou modèle local (Ollama détecté sur
   l'hôte). Choisir le modèle par défaut rebranche les paliers du noyau en direct (`apply`), sans redémarrage.
@@ -19,65 +20,48 @@ from typing import Any
 
 import httpx
 
+from nokker.secrets.base import SecretsError, SecretsProvider
+from nokker.secrets.file import FileSecrets
+
 SECRET_KEY_ENV = "NOKKER_LOCAL_SECRET_KEY"
 ROUTER_URL = "https://router.sokkan.ch/v1"
 OLLAMA_CANDIDATES = ("http://host.docker.internal:11434", "http://127.0.0.1:11434")
 
 
-class VaultError(RuntimeError):
-    """Coffre inutilisable : pas de clé de chiffrement, ou fichier illisible avec cette clé."""
+# Coffre inutilisable (clé absente, fichier illisible, OpenBao scellé ou injoignable) : l'erreur du coffre (X4).
+VaultError = SecretsError
 
 
-@dataclass
 class LocalVault:
-    path: Path
-    key_env: str = SECRET_KEY_ENV
+    """Les clés du noyau (`router`, `byok:<nom>`, `machine_token`) : la portée `system` du coffre (nokker/secrets/),
+    donc le fournisseur choisi (`file` : `<state_dir>/vault.bin`, `openbao`). `LocalVault(path)` = fournisseur `file`
+    sur ce fichier, clé dans `key_env` seulement (forme d'avant X4, gardée pour les appelants et les tests)."""
 
-    def _fernet(self) -> Any:
-        from cryptography.fernet import Fernet
+    def __init__(self, path: Path | None = None, key_env: str = SECRET_KEY_ENV, *,
+                 provider: SecretsProvider | None = None) -> None:
+        if provider is None:
+            if path is None:
+                raise ValueError("LocalVault : path ou provider requis")
+            provider = FileSecrets(path=Path(path), scope="system", key_env=key_env, key_file=None, create_key=False)
+        self.provider = provider
 
-        key = os.environ.get(self.key_env, "")
-        if not key:
-            raise VaultError(f"{self.key_env} absente : le coffre local ne range rien en clair")
-        return Fernet(key.encode())
-
-    def _load(self) -> dict[str, str]:
-        if not self.path.is_file():
-            return {}
-        from cryptography.fernet import InvalidToken
-
-        try:
-            return json.loads(self._fernet().decrypt(self.path.read_bytes()))
-        except InvalidToken as e:
-            raise VaultError("coffre local illisible avec la clé actuelle") from e
+    def __repr__(self) -> str:
+        return f"LocalVault({self.provider!r})"
 
     def get(self, name: str) -> str | None:
-        return self._load().get(name)
+        return self.provider.get(name)
 
     def put(self, name: str, secret: str) -> None:
-        data = self._load()
-        data[name] = secret
-        self._write(data)
+        self.provider.set(name, secret)
 
     def delete(self, name: str) -> None:
-        data = self._load()
-        if data.pop(name, None) is not None:
-            self._write(data)
+        self.provider.delete(name)
 
     def names(self) -> list[str]:
         try:
-            return sorted(self._load())
-        except VaultError:
+            return [i.name for i in self.provider.list()]
+        except SecretsError:
             return []
-
-    def _write(self, data: dict[str, str]) -> None:
-        blob = self._fernet().encrypt(json.dumps(data).encode())
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(blob)
-        os.replace(tmp, self.path)
 
 
 def test_endpoint(base_url: str, api_key: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
@@ -223,6 +207,20 @@ class LocalLink:
         d = r.json()
         self._pending = {"device_code": d["device_code"], "expires_at": time.time() + int(d.get("expires_in", 600))}
         return {k: d[k] for k in ("user_code", "verification_uri", "expires_in", "interval") if k in d}
+
+    def pages_token(self, page_id: str, embed: bool = False, download: bool = False) -> dict[str, Any] | None:
+        """Lien d'entrée sur `<nom>--pages.nokker.app` pour une page de cette machine (docs/BUBBLES.md §10.3), demandé
+        à nokker.ai avec le jeton de machine : `{url, expires_at}`, ou None sans lien / nokker.ai injoignable."""
+        token = self.setup.vault.get("machine_token")
+        if not token:
+            return None
+        try:
+            r = self._http().post(self.base_url.rstrip("/") + "/v1/gateway/pages-token",
+                                  json={"page_id": page_id, "embed": bool(embed), "download": bool(download)},
+                                  headers={"Authorization": f"Bearer {token}"})
+            return r.json() if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
 
     def status(self) -> dict[str, Any]:
         if "router" in self.setup.vault.names():

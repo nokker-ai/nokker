@@ -124,6 +124,13 @@ class TenantMemory:
     def recall(self) -> Callable[..., list[Recall]]:
         return self.for_tenant().recall
 
+    @property
+    def recall_for(self) -> Callable[..., list[Recall]]:
+        """Rappel qui connaît le fil (mémoire de projet, X1) ; une mémoire qui ne le porte pas : `recall` tel quel."""
+        mem = self.for_tenant()
+        fn = getattr(mem, "recall_for", None)
+        return fn if fn is not None else (lambda thread_id, query, k=5: mem.recall(query, k))
+
     def propose(self, thread_id: str, facts: list[str]) -> None:
         self.for_tenant().propose(thread_id, facts)
 

@@ -8,6 +8,11 @@ versionné, chaque prix daté et sourcé (lecture de code du 17.10.2026, pas un 
 
 Taux de change : le catalogue Router utilise 1 CHF = 1,25 USD (confirmé dans le `_doc` de
 `catalog.json`). Configurable ici via `chf_usd_rate`.
+
+Devise par entrée (X2, coût par tour, 25.10.2026) : le catalogue est en USD (celui du Router), mais un prix lu
+ailleurs garde SA devise (`currency`, ex. EUR pour OVH AI Endpoints en direct) plutôt qu'un taux de change inventé.
+`cost()` rend `(montant, devise)` dans la devise de l'entrée ; `cost_usd`/`cost_chf` ne convertissent que ce qu'ils
+savent convertir (USD → CHF au taux du catalogue) et rendent None sinon.
 """
 from __future__ import annotations
 
@@ -37,6 +42,9 @@ class PriceEntry:
     cached_usd_per_m: float  # entrée cachée (lecture de cache)
     completion_usd_per_m: float  # sortie
     source: str
+    # Devise des trois prix ci-dessus (les noms de champs disent USD pour l'historique : c'est la devise du catalogue
+    # Router). Une entrée EUR est servie telle quelle par `PriceCatalog.cost`, jamais convertie sans taux connu.
+    currency: str = "USD"
 
 
 class PriceCatalog:
@@ -54,16 +62,28 @@ class PriceCatalog:
     def models(self) -> list[str]:
         return sorted(self._entries)
 
-    def cost_usd(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int) -> float | None:
+    def cost(self, model: str, new_tokens: int, cached_tokens: int,
+             completion_tokens: int) -> tuple[float, str] | None:
+        """(montant, devise) dans la devise de l'entrée ; None si le modèle est inconnu (jamais un prix inventé)."""
         entry = self.get(model)
         if entry is None:
             return None
-        return (new_tokens * entry.prompt_usd_per_m + cached_tokens * entry.cached_usd_per_m +
-                completion_tokens * entry.completion_usd_per_m) / 1_000_000
+        amount = (new_tokens * entry.prompt_usd_per_m + cached_tokens * entry.cached_usd_per_m +
+                  completion_tokens * entry.completion_usd_per_m) / 1_000_000
+        return amount, entry.currency
+
+    def cost_usd(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int) -> float | None:
+        got = self.cost(model, new_tokens, cached_tokens, completion_tokens)
+        return got[0] if got is not None and got[1] == "USD" else None
 
     def cost_chf(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int) -> float | None:
-        usd = self.cost_usd(model, new_tokens, cached_tokens, completion_tokens)
-        return None if usd is None else self.usd_to_chf(usd)
+        got = self.cost(model, new_tokens, cached_tokens, completion_tokens)
+        if got is None:
+            return None
+        amount, currency = got
+        if currency == "CHF":
+            return amount
+        return self.usd_to_chf(amount) if currency == "USD" else None  # EUR → CHF : pas de taux dans le catalogue
 
     def usd_to_chf(self, usd: float) -> float:
         return usd / self.chf_usd_rate
@@ -93,6 +113,7 @@ def load_from_yaml(path: Path | str = DEFAULT_YAML_PATH) -> PriceCatalog:
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     rate = float(data.get("rate_chf_usd", DEFAULT_CHF_USD_RATE))
     fetched_at = data.get("fetched_at", "?")
+    default_currency = str(data.get("currency") or "USD").upper()
     # Le format YAML porte prompt/cached/completion directement sur l'item (pas sous une sous-clé
     # « pricing » comme la réponse du Router) : construit à la main plutôt que de forcer
     # `_entries_from_models` (réservée au format Router) sur un format différent.
@@ -104,7 +125,8 @@ def load_from_yaml(path: Path | str = DEFAULT_YAML_PATH) -> PriceCatalog:
                 prompt_usd_per_m=float(m["prompt"]),
                 cached_usd_per_m=float(m["cached"]),
                 completion_usd_per_m=float(m["completion"]),
-                source=f"yaml:{path.name}@{fetched_at}",
+                source=f"yaml:{path.name}@{m.get('fetched_at') or fetched_at}",
+                currency=str(m.get("currency") or default_currency).upper(),
             )
         except (KeyError, ValueError, TypeError) as e:
             raise ValueError(f"prices.yaml: entrée invalide pour {m!r}: {e}") from e

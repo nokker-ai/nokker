@@ -25,8 +25,20 @@ def card(st: Status | None, kind: str) -> dict[str, Any]:
 
 
 class Connectors:
-    def __init__(self, store: ConnectorStore, tester=test_connection) -> None:
-        self.store, self._test = store, tester
+    def __init__(self, store: ConnectorStore, tester=test_connection, resolve=None) -> None:
+        # `resolve` (Lokkal, X4) : un identifiant `secret:NOM` est rangé tel quel (la référence) et lu au coffre pour
+        # chaque test ; sans `resolve`, il est pris littéralement (la bêta n'a pas de coffre).
+        self.store, self._test, self._resolve = store, tester, resolve
+
+    def _secret(self, secret: str) -> str:
+        if self._resolve is None:
+            return secret
+        from nokker.secrets.base import SecretsError
+
+        try:
+            return self._resolve(secret)
+        except SecretsError as e:
+            raise ConnectorError("bad_settings", str(e)) from None
 
     def presets(self) -> dict[str, Any]:
         return {"mail": sorted(PRESETS), "calendar": ["ical", "caldav"]}
@@ -42,7 +54,7 @@ class Connectors:
         if kind == "mail":
             settings = normalize_settings(settings)
         secret = str(secret or "").strip()
-        r: TestResult = self._test(kind, settings, secret)
+        r: TestResult = self._test(kind, settings, self._secret(secret))
         if not r.ok:
             raise ConnectorError(r.code or "protocol_error", r.message)
         self.store.put(account_id, kind, settings, secret)
@@ -53,7 +65,7 @@ class Connectors:
         cred = self.store.get(account_id, kind)
         if cred is None:
             raise ConnectorError("not_configured", "connecteur non relié")
-        r = self._test(kind, cred.settings, cred.secret)
+        r = self._test(kind, cred.settings, self._secret(cred.secret))
         if r.ok:
             self.store.mark_ok(account_id, kind)
         return {"ok": r.ok, "message": r.message, "code": r.code}

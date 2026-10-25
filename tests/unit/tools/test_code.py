@@ -202,3 +202,20 @@ def test_docker_sandbox_end_to_end(monkeypatch):
     finally:
         src.close()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_mount_path_is_configurable_for_bench_images(tmp_path):
+    """Banc SWE-bench : le dépôt est monté où l'image de l'environnement l'attend (/testbed) ; le modèle ne voit que
+    ce chemin, jamais celui de l'hôte, et les points de retour retrouvent le fichier hôte."""
+    from types import SimpleNamespace
+
+    from nokker.tools.checkpoints import host_path
+
+    src = CodeToolSource(root=str(tmp_path), backend="docker", mount="/testbed")
+    assert src._to_container(f"modifié : {tmp_path}/pkg/mod.py") == "modifié : /testbed/pkg/mod.py"
+    ws = SimpleNamespace(cwd="/testbed")
+    (tmp_path / "pkg").mkdir()
+    assert src._host_path(ws, "pkg") == str(tmp_path / "pkg")
+    assert src._host_path(ws, "/workspace/pkg") is None  # l'ancien montage n'existe pas dans ce bac
+    assert host_path(tmp_path, "/testbed/pkg/mod.py", "/testbed") == str(tmp_path / "pkg" / "mod.py")
+    assert CodeToolSource(root=str(tmp_path), backend="docker").mount == "/workspace"

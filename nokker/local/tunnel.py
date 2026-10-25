@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import logging
 import random
 import threading
@@ -30,8 +31,57 @@ SUBPROTOCOL = "nokker-tunnel.v1"
 MAX_FRAME = 1024 * 1024
 CHUNK = 256 * 1024  # corps découpé en trames de 256 Kio (base64 < 1 Mio)
 MAX_IN_FLIGHT = 64
+MAX_BODY = 50 * 1024 * 1024  # même plafond que le relais (413 au-delà) : un relais fautif ne remplit pas la RAM
 PING_S = 25.0
 _HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "set-cookie"}
+
+
+class _Inbound:
+    """Corps des requêtes en cours d'arrivée, trame par trame. `feed` rend `(req, corps)` quand la requête est
+    complète, `"too_big"` la première fois qu'elle dépasse `limit` (le reste de ses trames est ensuite jeté), `None`
+    sinon. `cancel` oublie tout ce qui concerne la requête : rien ne reste en mémoire si le relais abandonne."""
+
+    def __init__(self, limit: int = MAX_BODY) -> None:
+        self.limit = limit
+        self.pending: dict[int, dict[str, Any]] = {}
+        self.chunks: dict[int, list[bytes]] = {}
+        self.sizes: dict[int, int] = {}
+        self.refused: set[int] = set()
+
+    def feed(self, msg: dict[str, Any]) -> Any:
+        rid = int(msg["id"])
+        more = bool(msg.get("more"))
+        if msg.get("t") == "req":
+            self.cancel(rid)
+            self.pending[rid] = msg
+            self.chunks[rid], self.sizes[rid] = [], 0
+            data = base64.b64decode(msg.get("body") or "")
+        elif rid in self.refused:
+            if not more:
+                self.refused.discard(rid)
+            return None
+        elif rid not in self.pending:
+            return None  # trame d'une requête inconnue ou déjà annulée
+        else:
+            data = base64.b64decode(msg.get("data") or "")
+        self.sizes[rid] += len(data)
+        if self.sizes[rid] > self.limit:
+            self.cancel(rid)
+            if more:
+                self.refused.add(rid)
+            return "too_big"
+        self.chunks[rid].append(data)
+        if more:
+            return None
+        req, body = self.pending.pop(rid), b"".join(self.chunks.pop(rid))
+        self.sizes.pop(rid, None)
+        return req, body
+
+    def cancel(self, rid: int) -> None:
+        self.pending.pop(rid, None)
+        self.chunks.pop(rid, None)
+        self.sizes.pop(rid, None)
+        self.refused.discard(rid)
 
 
 @dataclass
@@ -43,6 +93,9 @@ class Tunnel:
     on_up: Callable[[], None] | None = None
     on_down: Callable[[], None] | None = None
     state: str = "down"
+    # Preuve qu'une requête arrive par CE tunnel (et non d'un processus local qui imiterait les en-têtes du relais) :
+    # ajoutée à chaque requête rejouée, vérifiée par le serveur avant de croire `X-Nokker-Account` (pages, §10.3).
+    secret: str = field(default_factory=lambda: secrets.token_hex(16), repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _tasks: dict[int, asyncio.Task] = field(default_factory=dict, init=False, repr=False)
@@ -91,8 +144,7 @@ class Tunnel:
             delay = min(delay * 2, 60.0)
 
     async def _serve(self, ws: Any) -> None:
-        bodies: dict[int, list[bytes]] = {}
-        pending: dict[int, dict[str, Any]] = {}
+        inbound = _Inbound()
 
         async def pinger() -> None:
             while True:
@@ -110,24 +162,22 @@ class Tunnel:
                     if kind == "ping":
                         await ws.send(json.dumps({"t": "pong"}))
                     elif kind == "cancel":
-                        task = self._tasks.pop(int(msg["id"]), None)
+                        rid = int(msg["id"])
+                        task = self._tasks.pop(rid, None)
                         if task is not None:
                             task.cancel()
+                        inbound.cancel(rid)  # annulée pendant l'arrivée de son corps
                     elif kind in ("req", "body"):
                         rid = int(msg["id"])
-                        if kind == "req":
-                            pending[rid] = msg
-                            bodies[rid] = [base64.b64decode(msg.get("body") or "")]
-                        else:
-                            bodies.setdefault(rid, []).append(base64.b64decode(msg.get("data") or ""))
-                        if not msg.get("more"):
-                            req = pending.pop(rid, None)
-                            if req is None:
-                                continue
+                        got = inbound.feed(msg)
+                        if got == "too_big":
+                            await ws.send(json.dumps(_res(rid, 413, [["content-type", "application/json"]], json.dumps(
+                                {"error": {"message": "corps de requête trop gros (50 Mio au plus)"}}).encode())))
+                        elif got is not None:
+                            req, body = got
                             if len(self._tasks) >= MAX_IN_FLIGHT:
                                 await ws.send(json.dumps(_res(rid, 503, [], "tunnel saturé".encode())))
                                 continue
-                            body = b"".join(bodies.pop(rid, []))
                             self._tasks[rid] = asyncio.create_task(self._forward(ws, client, rid, req, body))
         finally:
             ping.cancel()
@@ -138,7 +188,8 @@ class Tunnel:
     async def _forward(self, ws: Any, client: httpx.AsyncClient, rid: int, req: dict[str, Any], body: bytes) -> None:
         path = str(req.get("path") or "/")
         base = self.local_base if path.startswith("/v1/") or path == "/healthz" or not self.web_base else self.web_base
-        headers = [(k, v) for k, v in req.get("headers") or [] if k.lower() not in _HOP]
+        headers = [(k, v) for k, v in req.get("headers") or [] if k.lower() not in _HOP and k.lower() != "x-nokker-tunnel"]
+        headers.append(("X-Nokker-Tunnel", self.secret))
         try:
             async with client.stream(str(req.get("method") or "GET"), base.rstrip("/") + path, headers=headers,
                                      content=body or None) as r:

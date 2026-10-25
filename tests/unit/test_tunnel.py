@@ -103,3 +103,31 @@ def test_tunnel_relays_json_bodies_and_sse():
     assert echo == (b"a" * 300_000 + b"Z")[::-1]  # corps reçu en deux trames, réponse découpée en trames
     sse = b"".join(base64.b64decode(x.get("data") or "") for x in f if x.get("id") == 3 and x["t"] == "body")
     assert b"data: 0" in sse and b"data: 2" in sse
+
+
+def _frame(t: str, rid: int, data: bytes, more: bool) -> dict:
+    key = "body" if t == "req" else "data"
+    return {"t": t, "id": rid, key: base64.b64encode(data).decode(), "more": more, "path": "/v1/x"}
+
+
+def test_inbound_body_capped_and_rest_dropped():
+    from nokker.local.tunnel import _Inbound
+    box = _Inbound(limit=10)
+    assert box.feed(_frame("req", 1, b"123456", True)) is None
+    assert box.feed(_frame("body", 1, b"78901", True)) == "too_big"  # 11 > 10 : refusée une seule fois
+    assert box.feed(_frame("body", 1, b"x", True)) is None
+    assert box.feed(_frame("body", 1, b"y", False)) is None
+    assert not box.pending and not box.chunks and not box.sizes and not box.refused
+    req, body = box.feed(_frame("req", 2, b"ok", False))
+    assert req["id"] == 2 and body == b"ok"
+
+
+def test_inbound_cancel_mid_body_leaves_nothing():
+    from nokker.local.tunnel import _Inbound
+    box = _Inbound()
+    box.feed(_frame("req", 7, b"a" * 1000, True))
+    box.feed(_frame("body", 7, b"b" * 1000, True))
+    box.cancel(7)
+    assert not box.pending and not box.chunks and not box.sizes
+    assert box.feed(_frame("body", 7, b"c", False)) is None  # trame tardive d'une requête annulée : jetée
+    assert not box.chunks

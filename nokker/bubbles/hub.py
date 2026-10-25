@@ -34,6 +34,8 @@ from nokker.bubbles.types import (
 )
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import ToolCall, ToolResult, Turn, TurnInput
+from nokker.ledger.prices import load as load_prices
+from nokker.ledger.turn_cost import is_subagent_thread, root_thread, row_from_call, turn_cost
 from nokker.tenancy.context import (
     INTERNAL_TENANT, current_tenant_or_none, scoped_thread_id, tenant_of_thread, tenant_scope,
 )
@@ -123,6 +125,14 @@ class BubbleHub:
     # Une seule bulle `search` par tour (canari 18.10 : 3 web_search d'un même tour = 3 bulles violettes) :
     # les recherches suivantes du tour fusionnent leurs résultats dans la première.
     _turn_search: dict[str, str] = field(default_factory=dict)
+    # Bulles `artifact` touchées pendant le tour : `working` pendant le tour, `done` à `turn_done` (§10.2).
+    _turn_artifacts: dict[str, set[str]] = field(default_factory=dict)
+    pages: Any = None  # nokker.pages.store.PageStore du noyau local (None ailleurs)
+    # Coût par tour (X2, docs/LOKKAL.md §7.8) : grille de prix de `turn.cost` ; None = celle du ledger du noyau, sinon
+    # la grille versionnée. Les appels des sous-agents d'un fil s'accumulent ici jusqu'à la fin du tour qui les a lancés.
+    prices: Any = None
+    _subagent_calls: dict[str, list] = field(default_factory=dict)  # fil de session -> [UsageRow]
+    _cost_guard: threading.Lock = field(default_factory=threading.Lock)
 
     # ─────────────────────────────── utilitaires ───────────────────────────────
 
@@ -254,6 +264,13 @@ class BubbleHub:
         for b in self.bubbles.list_thread(thread_id):
             self._close(b.id)
         self.threads.delete(thread_id)
+        # Images jointes (X7) : les octets partent avec le fil (ceux qu'un autre fil du locataire référence restent).
+        images = getattr(self.kernel, "images", None) if self.kernel is not None else None
+        if images is not None:
+            try:
+                images.erase_thread(thread_id)
+            except Exception:  # noqa: BLE001 — le fil est supprimé ; le reste est journalisé pour l'opérateur
+                logger.exception("images du fil %s non effacées", thread_id)
         self._emit("thread.deleted", {"thread_id": thread_id}, audience)
         return t
 
@@ -279,8 +296,11 @@ class BubbleHub:
         turns = turns[-max(1, min(200, limit)):]
         out: list[dict[str, Any]] = []
         for t in turns:
-            out.append({"index": t.index, "role": "user", "content": t.input.text, "sender": t.sender,
-                        "channel": t.channel})
+            user = {"index": t.index, "role": "user", "content": t.input.text, "sender": t.sender,
+                    "channel": t.channel}
+            if t.images:  # X7 : références ; octets par GET /v1/threads/{id}/images/{sha256}
+                user["images"] = [i.to_dict() for i in t.images]
+            out.append(user)
             out.append({"index": t.index, "role": "assistant", "content": t.reply})
         return out
 
@@ -313,7 +333,7 @@ class BubbleHub:
                       state: dict[str, Any] | None = None, status: str = "idle",
                       actions: list[dict[str, Any]] | None = None) -> Bubble:
         self.require_member(thread_id, user)
-        if kind not in KINDS or kind in ("notify", "episode"):
+        if kind not in KINDS or kind in ("notify", "episode", "artifact"):
             raise BubbleError(f"kind non créable par un client : {kind}")
         if state is not None and not isinstance(state, dict):
             raise BubbleError("state doit être un objet")
@@ -378,6 +398,8 @@ class BubbleHub:
         old_audience = self.bubble_audience(src)
         if mode == "move":
             out = self.bubbles.update(src.id, thread_id=dest.id, origin=origin)
+            if src.kind == "artifact" and self.pages is not None:  # la page suit le fil d'arrivée (§10.5)
+                self.pages.update(str((src.state or {}).get("page_id") or ""), thread_id=dest.id)
         else:
             out = self.bubbles.clone(src, thread_id=dest.id, origin=origin)
         # Contexte : au PROCHAIN tour du fil d'arrivée (et du fil de départ en move).
@@ -570,6 +592,11 @@ class BubbleHub:
         self._emit("turn.started", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn)}, audience)
         self._emit_thread(self.threads.update(turn.thread_id, working=True))
 
+    def attachment_skipped(self, turn: Turn, count: int, reason: str) -> None:
+        """Images jointes non lues par le modèle (X7, docs/LOKKAL.md §7.6) : `reason` = "no_vision"."""
+        self._emit("attachment.skipped", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), "count": count,
+                                          "reason": reason}, self.thread_audience(turn.thread_id))
+
     def tool_call(self, turn: Turn, call: ToolCall) -> None:
         self._tool_t0[(turn.thread_id, call.id)] = time.monotonic()
         preview = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True)[:ARGS_PREVIEW_CHARS]
@@ -613,6 +640,16 @@ class BubbleHub:
             return None
         if self.threads.get(turn.thread_id) is None:
             self.threads.ensure(turn.thread_id, turn.sender, turn.input.text)
+        if produced.kind == "artifact":  # une bulle par page et par fil (docs/BUBBLES.md §10.2)
+            page_id = produced.state.get("page_id")
+            same = next((b for b in self.bubbles.list_thread(turn.thread_id)
+                         if b.kind == "artifact" and b.closed_at is None and (b.origin or {}).get("mode") != "copy"
+                         and (b.state or {}).get("page_id") == page_id), None)
+            self._turn_artifacts.setdefault(_turn_id(turn), set())
+            if same is not None:
+                b = self.update_from_kernel(same.id, state=produced.state, status="working")
+                self._turn_artifacts[_turn_id(turn)].add(b.id)
+                return f"\n[bulle {b.id} (artifact) mise à jour : version {produced.state.get('version')}]"
         prev_id = self._turn_search.get(_turn_id(turn)) if produced.kind == "search" else None
         prev = self.bubbles.get(prev_id) if prev_id else None
         if prev is not None and prev.closed_at is None:
@@ -628,6 +665,8 @@ class BubbleHub:
         self._emit_bubble("bubble.created", b)
         if b.kind == "search":
             self._turn_search[_turn_id(turn)] = b.id
+        if b.kind == "artifact":
+            self._turn_artifacts.setdefault(_turn_id(turn), set()).add(b.id)
         try:
             self.producers.after_create(b)
         except Exception:  # noqa: BLE001 — un aperçu en panne ne casse pas le tour
@@ -638,6 +677,11 @@ class BubbleHub:
         audience = self.thread_audience(turn.thread_id)
         tid = _turn_id(turn)
         self._turn_search.pop(tid, None)
+        for bid in self._turn_artifacts.pop(tid, set()):  # la page a fini de bouger pour ce tour
+            try:
+                self.update_from_kernel(bid, status="done")
+            except Exception:  # noqa: BLE001 — bulle fermée ou retirée entre-temps
+                logger.debug("bulle artifact %s non close", bid, exc_info=True)
         if turn.reply:
             self._emit("turn.delta", {"thread_id": turn.thread_id, "turn_id": tid, "text": turn.reply}, audience)
         prompt = sum(c.usage.prompt for c in turn.calls)
@@ -650,9 +694,33 @@ class BubbleHub:
             data["tier"] = turn.calls[-1].tier.value
         if chf:
             data["cost_chf"] = round(sum(chf), 6)
+        # Le coût part AVANT `turn.done` : un client qui cesse d'écouter à `turn.done` (mode non interactif) l'a déjà.
+        self._emit_turn_cost(turn, tid, audience)
         self._emit("turn.done", data, audience)
         if self.threads.get(turn.thread_id) is not None:
             self._emit_thread(self.threads.update(turn.thread_id, working=False, last_snippet=turn.reply or ""))
+
+    def _price_catalog(self) -> Any:
+        if self.prices is None:
+            self.prices = getattr(getattr(self.kernel, "ledger", None), "prices", None) or load_prices()
+        return self.prices
+
+    def _emit_turn_cost(self, turn: Turn, tid: str, audience: set[str]) -> None:
+        """`turn.cost` (X2), juste avant `turn.done`. Un tour de sous-agent ne publie rien : ses appels comptent dans le tour
+        du fil de session qui l'a lancé (un tour humain = un `turn.cost`, sous-agents compris)."""
+        try:
+            if is_subagent_thread(turn.thread_id):
+                with self._cost_guard:
+                    self._subagent_calls.setdefault(root_thread(turn.thread_id), []).extend(
+                        row_from_call(c) for c in turn.calls)
+                return
+            with self._cost_guard:
+                children = self._subagent_calls.pop(turn.thread_id, [])
+            body = turn_cost(turn.calls, self._price_catalog(), subagents=children)
+        except Exception:  # noqa: BLE001 — un coût manqué ne casse jamais la fin du tour
+            logger.exception("turn.cost non calculé")
+            return
+        self._emit("turn.cost", {"thread_id": turn.thread_id, "turn_id": tid, **body}, audience)
 
 
 __all__ = ["NOTIFY_TTL_S", "SESSION_CHANNEL", "BubbleHub"]

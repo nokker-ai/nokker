@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,8 +35,11 @@ class _SyncMcp:
     permet à un port synchrone (`ToolSource`, `MemoryPort`) de parler à un serveur MCP async.
     """
 
-    def __init__(self, url: str, headers: dict[str, str] | None = None, timeout_s: float = 30.0) -> None:
+    def __init__(self, url: str, headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
+                 timeout_s: float = 30.0) -> None:
         self.url = url
+        # Un appelable est lu à chaque ouverture de session : en-têtes tirés du coffre au moment de l'usage (X4,
+        # références `secret:NOM`), jamais figés au démarrage.
         self.headers = headers or {}
         self.timeout_s = timeout_s
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -89,7 +93,8 @@ class _SyncMcp:
         async with self._alock:
             if self._session is not None:  # relu après acquisition — une autre coroutine a pu la créer
                 return self._session
-            http_client = httpx2.AsyncClient(headers=self.headers, timeout=self.timeout_s)
+            headers = self.headers() if callable(self.headers) else self.headers
+            http_client = httpx2.AsyncClient(headers=headers, timeout=self.timeout_s)
             self._transport_cm = streamable_http_client(self.url, http_client=http_client)
             read, write = await self._transport_cm.__aenter__()
             self._session_cm = ClientSession(read, write)
@@ -147,9 +152,12 @@ class McpToolSource:
     # Outil appelé en fin de tour si le tour a utilisé ce serveur (ex. `browser_close` pour brosim : un onglet
     # gardé ouvert bloque le suivant sur un site hostile — 2 onglets max par compte ; Nick 20.10). None = rien.
     close_on_turn_end: str | None = None
+    # En-têtes résolus à l'ouverture de chaque session (références `secret:NOM`, nokker/secrets/refs.py) ; prime sur
+    # `headers` quand il est posé.
+    header_source: Callable[[], dict[str, str]] | None = None
 
     def __post_init__(self) -> None:
-        self._io = _SyncMcp(self.url, self.headers, self.timeout_s)
+        self._io = _SyncMcp(self.url, self.header_source or self.headers, self.timeout_s)
         self._cache: list[ToolSpec] | None = None
         self._used_by: set[str] = set()
         self._used_lock = threading.Lock()

@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 from nokker.core.turn import (
     Decision,
     Gate,
+    ImageRef,
     InputCheck,
     LLMCall,
     Message,
@@ -54,12 +55,13 @@ def apply_migrations(dsn: str, *, strict: bool = False) -> bool:
 
 def _enc_usage(u: Usage) -> dict[str, Any]:
     return {"prompt": u.prompt, "completion": u.completion, "cached": u.cached, "reasoning": u.reasoning,
-            "cached_reported": u.cached_reported}
+            "cached_reported": u.cached_reported, "reasoning_reported": u.reasoning_reported}
 
 
 def _dec_usage(d: dict[str, Any]) -> Usage:
     return Usage(prompt=d.get("prompt", 0), completion=d.get("completion", 0), cached=d.get("cached", 0),
-                 reasoning=d.get("reasoning", 0), cached_reported=d.get("cached_reported", False))
+                 reasoning=d.get("reasoning", 0), cached_reported=d.get("cached_reported", False),
+                 reasoning_reported=d.get("reasoning_reported", False))
 
 
 def _enc_tool_call(tc: ToolCall) -> dict[str, Any]:
@@ -126,6 +128,7 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
         "calls": [_enc_call(c) for c in turn.calls], "verdicts": [_enc_verdict(v) for v in turn.verdicts],
         "escalated": turn.escalated, "pending_approvals": [_enc_tool_call(t) for t in turn.pending_approvals],
         "error": turn.error, "injected": list(turn.injected), "head": turn.head,
+        "images": [i.to_dict() for i in turn.images],  # références seules (X7), jamais les octets
     }
 
 
@@ -139,6 +142,7 @@ def turn_from_dict(d: dict[str, Any]) -> Turn:
         escalated=d.get("escalated", False),
         pending_approvals=[_dec_tool_call(t) for t in d.get("pending_approvals", [])],
         error=d.get("error"), injected=list(d.get("injected", [])), head=d.get("head", ""),
+        images=[ImageRef.from_dict(i) for i in d.get("images", [])],
     )
 
 

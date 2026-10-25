@@ -16,6 +16,17 @@ MACHINES = {"tok-jean": R.Machine("m1", "jean", "t_jean", True),
             "tok-pauvre": R.Machine("m2", "pauvre", "t_pauvre", False)}
 TOKENS = {"a.jean.sig": {"tenant": "t_jean"}, "a.autre.sig": {"tenant": "t_autre"},
           "a.jeanm2.sig": {"tenant": "t_jean", "machine": "m9"}}
+_T = 2_000_000_000
+TOKENS.update({
+    "p.ok1.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 60, "jti": "j1"},
+    "p.ok2.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 60, "jti": "j2"},
+    "p.ok3.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 60, "jti": "j3"},
+    "p.long.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 900, "jti": "j4"},
+    "p.m9.sig": {"tenant": "t_jean", "machine": "m9", "scope": "pages", "iat": _T, "exp": _T + 60, "jti": "j5"},
+    "p.nojti.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 60},
+    "d.deleg.sig": {"tenant": "t_jean", "machine": "m1", "scope": "lokkal:session", "iat": _T, "exp": _T + 60,
+                    "jti": "j6"},
+})
 
 
 async def check_machine(tok):
@@ -275,3 +286,176 @@ async def test_jetons_du_noyau_nokker_ai():
         assert (await client.get("/v1/local/sessions", headers=H(Authorization=f"Bearer {other}"))).status == 401
         task.cancel(); await ws.close(); await client.close()
     await srv.close()
+
+
+async def test_pages_jeton_dedie_et_iframe(env):
+    relay, c = env
+    seen = []
+
+    async def redirige(req, body, ws):
+        hs = [["Content-Type", "text/html"]]
+        if req["path"].startswith("/v1/pages/vieux"):
+            hs.append(["Location", "/neuf"])
+        await ws.send_str(json.dumps({"t": "res", "id": req["id"], "status": 302 if len(hs) > 1 else 200,
+                                      "headers": hs, "body": "", "more": False}))
+    ws, task = await open_tunnel(c, seen=seen, handler=redirige)
+    P = "jean--pages.nokker.app"
+    # jeton de pages : une seule fois ; ≤ 60 s ; cette machine ; jti exigé ; délégation refusée
+    r = await c.get("/_auth?token=p.ok1.sig&to=/rapport.html", headers=H(P), allow_redirects=False)
+    assert r.status == 302 and "__Host-nk_pg" in r.cookies
+    assert (await c.get("/_auth?token=p.ok1.sig&to=/rapport.html", headers=H(P), allow_redirects=False)).status == 401
+    for bad in ("p.long.sig", "p.m9.sig", "p.nojti.sig", "d.deleg.sig"):
+        assert (await c.get(f"/_auth?token={bad}&to=/x", headers=H(P), allow_redirects=False)).status == 401, bad
+    # jeton d'accès : toléré jusqu'au 2.11, refusé une fois l'interrupteur coupé
+    relay.s = R.Settings(cookie_secret=b"x" * 32, pages_accept_access_token=False)
+    assert (await c.get("/_auth?token=a.jean.sig&to=/x", headers=H(P), allow_redirects=False)).status == 401
+    relay.s = S
+    # iframe : capacité d'URL, pas de cookie ; le téléchargement garde sa requête
+    r = await c.get("/_auth?token=p.ok2.sig&to=/rapport.html%3Fdl%3D1&embed=1", headers=H(P), allow_redirects=False)
+    assert r.status == 302 and "__Host-nk_pg" not in r.cookies
+    loc = r.headers["Location"]
+    assert loc.startswith("/_s/") and loc.endswith("/rapport.html?dl=1")
+    r = await c.get(loc, headers=H(P))
+    assert r.status == 200
+    assert seen[-1][0]["path"] == "/v1/pages/rapport.html?dl=1"
+    assert ("X-Nokker-Account", "t_jean") in [tuple(h) for h in seen[-1][0]["headers"]]
+    csp = r.headers["Content-Security-Policy"]
+    assert "sandbox" in csp and "frame-ancestors https://jean.nokker.app https://nokker.ai https://app.nokker.ai" in csp
+    # redirection relative du noyau : reste sous la capacité
+    cap = loc.split("/")[2]
+    r = await c.get(f"/_s/{cap}/vieux", headers=H(P), allow_redirects=False)
+    assert r.headers["Location"] == f"/_s/{cap}/neuf"
+    # capacité expirée, d'une autre machine, ou un cookie de pages présenté comme capacité : 401
+    key = R.cap_key(S.cookie_secret)
+    for bad in (R.sign_cookie(key, "t_jean", "jean", 1), R.sign_cookie(key, "t_jean", "autre", 2**31),
+                R.sign_cookie(S.cookie_secret, "t_jean", "jean", 2**31), "n-importe-quoi"):
+        r = await c.get(f"/_s/{bad}/rapport.html", headers=H(P))
+        assert r.status == 401 and "nokker:pages-expired" in await r.text()
+        assert "frame-ancestors" in r.headers["Content-Security-Policy"]
+    # chemin de page invalide sous la capacité
+    assert (await c.get(f"/_s/{cap}/a//b", headers=H(P))).status == 404
+    # le cookie d'onglet ne vaut pas capacité : sans preuve, le noyau décide (pages publiques)
+    r = await c.get("/rapport.html", headers=H(P))
+    assert "frame-ancestors" in r.headers["Content-Security-Policy"]
+    assert "x-nokker-account" not in {k.lower() for k, _ in seen[-1][0]["headers"]}
+    task.cancel(); await ws.close()
+
+
+class FakeCore:
+    def __init__(self):
+        self.calls, self.mode = [], "ok"
+        self.n = 0
+
+    async def __call__(self, path, body):
+        self.calls.append((path, body))
+        if self.mode == "down":
+            return 0, None
+        if self.mode == "5xx":
+            return 503, {"error": "x"}
+        if path == "/v1/gateway/revoke":
+            return 200, {}
+        if self.mode == "refuse" or body.get("code") == "mauvais" or body.get("refresh_token") == "rt-mort":
+            return 400, {"error": "invalid_grant"}
+        self.n += 1
+        return 200, {"access_token": f"at{self.n}", "expires_in": 900, "refresh_token": f"rt{self.n}"}
+
+
+@pytest.fixture
+async def gwenv():
+    core = FakeCore()
+    relay = R.Relay(S, check_machine, check_token, core)
+    client = TestClient(TestServer(R.make_app(relay)))
+    await client.start_server()
+    yield core, client
+    await client.close()
+
+
+def G(**kw):
+    return H("jean.nokker.app", Origin="https://jean.nokker.app", **kw)
+
+
+async def test_gw_connexion(gwenv):
+    core, c = gwenv
+    # machine hors ligne : la connexion marche quand même (pas de tunnel)
+    r = await c.post("/_gw/token", json={"code": "c1", "code_verifier": "v1"}, headers=G())
+    assert r.status == 200 and r.headers["Cache-Control"] == "no-store"
+    assert await r.json() == {"access_token": "at1", "expires_in": 900}
+    assert core.calls[-1] == ("/v1/gateway/token", {"code": "c1", "code_verifier": "v1", "host": "jean.nokker.app"})
+    ck = r.cookies["__Host-nk_rt"]
+    assert ck.value == "rt1" and ck["secure"] and ck["httponly"] and ck["path"] == "/" and not ck["domain"]
+    assert ck["samesite"] == "Strict"
+    # refresh : rotation
+    r = await c.post("/_gw/refresh", json={}, headers=G(Cookie="__Host-nk_rt=rt1"))
+    assert r.status == 200 and (await r.json())["access_token"] == "at2" and r.cookies["__Host-nk_rt"].value == "rt2"
+    assert core.calls[-1] == ("/v1/gateway/refresh", {"refresh_token": "rt1", "host": "jean.nokker.app"})
+    # noyau en panne : 502, cookie GARDÉ
+    for mode in ("down", "5xx"):
+        core.mode = mode
+        r = await c.post("/_gw/refresh", json={}, headers=G(Cookie="__Host-nk_rt=rt2"))
+        assert r.status == 502 and "__Host-nk_rt" not in r.cookies, mode
+    core.mode = "ok"
+    # refus net : 401 et cookie effacé
+    r = await c.post("/_gw/refresh", json={}, headers=G(Cookie="__Host-nk_rt=rt-mort"))
+    assert r.status == 401 and r.cookies["__Host-nk_rt"].value == "" and r.cookies["__Host-nk_rt"]["secure"]
+    assert (await c.post("/_gw/refresh", json={}, headers=G())).status == 401
+    # code refusé : 401
+    assert (await c.post("/_gw/token", json={"code": "mauvais", "code_verifier": "v"}, headers=G())).status == 401
+    assert (await c.post("/_gw/token", json={"code": 1}, headers=G())).status == 400
+    # logout : 204, révocation, cookie effacé ; sans cookie aussi
+    r = await c.post("/_gw/logout", json={}, headers=G(Cookie="__Host-nk_rt=rt2"))
+    assert r.status == 204 and r.cookies["__Host-nk_rt"].value == ""
+    assert core.calls[-1] == ("/v1/gateway/revoke", {"refresh_token": "rt2"})
+    n = len(core.calls)
+    assert (await c.post("/_gw/logout", json={}, headers=G())).status == 204 and len(core.calls) == n
+
+
+async def test_gw_garde_fous(gwenv):
+    core, c = gwenv
+    body = {"code": "c", "code_verifier": "v"}
+    # CSRF : origine exacte et JSON exigés
+    assert (await c.post("/_gw/token", json=body, headers=H())).status == 403
+    assert (await c.post("/_gw/token", json=body, headers=H(Origin="https://evil.nokker.app"))).status == 403
+    assert (await c.post("/_gw/token", json=body, headers=H(Origin="https://jean--pages.nokker.app"))).status == 403
+    assert (await c.post("/_gw/token", data="code=c&code_verifier=v",
+                         headers=G(**{"Content-Type": "application/x-www-form-urlencoded"}))).status == 403
+    assert (await c.post("/_gw/token", data="x", headers=G(**{"Content-Type": "text/plain"}))).status == 403
+    # méthode, route inconnue, hôte des pages : jamais au tunnel
+    assert (await c.get("/_gw/token", headers=G())).status == 405
+    assert (await c.post("/_gw/autre", json={}, headers=G())).status == 404
+    assert (await c.post("/_gw/token", json=body, headers=H("jean--pages.nokker.app",
+                                                             Origin="https://jean--pages.nokker.app"))).status in (405, 502)
+    assert (await c.post("/_gw/token", data=b"{" + b" " * (9 << 10) + b"}",
+                         headers=G(**{"Content-Type": "application/json"}))).status == 413
+    assert core.calls == []
+    # débit par IP
+    codes = [(await c.post("/_gw/token", json=body, headers=G(**{"CF-Connecting-IP": "9.9.9.9"}))).status
+             for _ in range(22)]
+    assert codes.count(429) == 2 and codes[:20] == [200] * 20
+    assert (await c.post("/_gw/token", json=body, headers=G(**{"CF-Connecting-IP": "8.8.8.8"}))).status == 200
+
+
+async def test_gw_le_cookie_ne_passe_pas_au_lokkal(gwenv):
+    _, c = gwenv
+    seen = []
+    ws, task = await open_tunnel(c, seen=seen)
+    r = await c.get("/v1/threads", headers=H(Authorization="Bearer a.jean.sig", Cookie="__Host-nk_rt=rt1"))
+    assert r.status == 200
+    assert "cookie" not in {k.lower() for k, _ in seen[-1][0]["headers"]}
+    task.cancel(); await ws.close()
+
+
+async def test_corps_en_flux_et_plafond_sans_longueur(env, monkeypatch):
+    _, c = env
+    seen = []
+    ws, task = await open_tunnel(c, seen=seen)
+    big = bytes(range(256)) * (27 * 4096)        # ~27 Mo : 4 images de 5 Mo + l'enveloppe
+    r = await c.post("/v1/threads/x/messages", data=big, headers=H(Authorization="Bearer a.jean.sig"))
+    assert r.status == 200 and seen[-1][1] == big
+
+    async def chunked():
+        for _ in range(8):
+            yield b"x" * 100_000
+    monkeypatch.setattr(R, "MAX_BODY", 300_000)
+    r = await c.post("/v1/threads/x/messages", data=chunked(), headers=H(Authorization="Bearer a.jean.sig"))
+    assert r.status == 413
+    task.cancel(); await ws.close()

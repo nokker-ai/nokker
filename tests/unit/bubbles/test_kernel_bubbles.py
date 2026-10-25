@@ -92,7 +92,7 @@ def test_turn_events_and_thread_working_flag(tmp_path):
     k.run_turn(TurnInput(t.id, "cherche lvm", sender="alice"))
     types = [x for x in rec.types() if x != "bubble.created"]
     assert types[:2] == ["turn.started", "thread.updated"]
-    assert types[-3:] == ["turn.delta", "turn.done", "thread.updated"]
+    assert types[-4:] == ["turn.delta", "turn.cost", "turn.done", "thread.updated"]  # coût avant la fin (X2)
     assert types.count("tool.call") == 2 and types.count("tool.result") == 2
     updates = [d["thread"]["working"] for d in rec.of("thread.updated")]
     assert updates[-2:] == [True, False]

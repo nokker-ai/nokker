@@ -244,3 +244,176 @@ def test_mirror_erase_refuses_anything_but_mirror_copies():
         with pytest.raises(ValueError):
             store.erase_mirror_copies(bad)
     assert store.erase_mirror_copies("mirror-web-") == 0 and store._by_thread["th_local"]
+
+
+def _linked(port, name="atelier"):
+    dev = _call(port, "/v1/link/device", {"machine": name})[1]
+    _call(port, "/v1/link/approve", {"user_code": dev["user_code"]}, token="sess-pierre")
+    return _call(port, "/v1/link/token", {"device_code": dev["device_code"]})[1]
+
+
+def test_my_machines_list_seen_revoke_and_pages_token(cloud):
+    """Écran « mes machines » (onboarding) et jeton de pages (docs/BUBBLES.md §10.3)."""
+    port, signer, _ = cloud
+    tok = _linked(port)
+    mid = tok["machine_id"]
+    assert _call(port, "/v1/link/machines")[0] == 401
+    status, body = _call(port, "/v1/link/machines", token="sess-pierre")
+    assert status == 200 and [m["machine_id"] for m in body["machines"]] == [mid]
+    assert body["machines"][0]["last_seen_at"] is None
+    _call(port, "/v1/gateway/machine", token=tok["machine_token"])  # contrôle du relais
+    assert _call(port, "/v1/link/machines", token="sess-pierre")[1]["machines"][0]["last_seen_at"] > 0
+
+    page = "pg_0123456789abcdef"
+    status, link = _call(port, f"/v1/link/machines/{mid}/pages-token", {"page_id": page, "embed": True},
+                         token="sess-pierre")
+    assert status == 200 and link["url"].startswith("https://atelier--pages.nokker.app/_auth?token=")
+    assert link["url"].endswith(f"&to=/{page}&embed=1")
+    from urllib.parse import parse_qs, urlsplit
+
+    claims = verify_token(parse_qs(urlsplit(link["url"]).query)["token"][0], _call(port, "/v1/.well-known/jwks.json")[1])
+    assert claims["scope"] == "pages" and claims["machine"] == mid and claims["exp"] - claims["iat"] <= 60
+    assert not _call(port, f"/v1/link/machines/{mid}/pages-token", {"page_id": page}, token="sess-pierre")[1][
+        "url"].endswith("embed=1")
+    assert _call(port, f"/v1/link/machines/{mid}/pages-token", {"page_id": "../x"}, token="sess-pierre")[0] == 404
+    other = "mc_" + "0" * 16
+    assert _call(port, f"/v1/link/machines/{other}/revoke", {}, token="sess-pierre")[0] == 404  # pas la sienne
+    assert _call(port, f"/v1/link/machines/{mid}/revoke", {}, token="sess-pierre") == (200, {"revoked": True})
+    assert _call(port, "/v1/link/machines", token="sess-pierre")[1]["machines"] == []
+    assert _call(port, "/v1/gateway/machine", token=tok["machine_token"])[0] == 401
+
+
+def test_machine_load_sent_by_the_machine_read_in_my_machines(cloud):
+    """Lot X5 (docs/LOKKAL.md §7.2) : la machine pousse sa charge avec son jeton ; « mes machines » rend la dernière
+    et son âge ; rien sans jeton, rien d'illisible, rien de trop gros, plus rien après révocation."""
+    port, _, _ = cloud
+    tok = _linked(port, "calcul")
+    mt, mid = tok["machine_token"], tok["machine_id"]
+    machines = _call(port, "/v1/link/machines", token="sess-pierre")[1]["machines"]
+    assert [(m["load"], m["load_at"], m["load_age_s"]) for m in machines] == [(None, None, None)]
+    load = {"v": 1, "version": "0.1.0", "ram": {"total_mb": 32768, "free_mb": 20000, "source": "host"},
+            "cpu": {"count": 16, "load1": 2.5, "source": "host"}, "sessions": 2, "active_turns": 1,
+            "gpus": [{"name": "NVIDIA GeForce RTX 3090", "memory_total_mb": 24576, "memory_free_mb": 24000,
+                      "util_pct": 0}], "pirate": "<script>"}
+    assert _call(port, "/v1/gateway/machine/load", load)[0] == 401
+    assert _call(port, "/v1/gateway/machine/load", load, token="faux")[0] == 401
+    status, ack = _call(port, "/v1/gateway/machine/load", load, token=mt)
+    assert status == 200 and ack["stored"] is True and ack["at"] > 0
+    assert _call(port, "/v1/gateway/machine/load", {"rien": 1}, token=mt)[0] == 400
+    assert _call(port, "/v1/gateway/machine/load", {"ram": {}, "x": "y" * 20000}, token=mt)[0] == 413
+    [m] = _call(port, "/v1/link/machines", token="sess-pierre")[1]["machines"]
+    assert m["machine_id"] == mid and m["load_age_s"] >= 0 and m["load_at"] > 0
+    assert "pirate" not in m["load"] and m["load"]["ram"] == load["ram"] and m["load"]["gpus"] == load["gpus"]
+    assert m["load"]["sessions"] == 2 and m["load"]["active_turns"] == 1 and m["last_seen_at"] is None  # pas le relais
+    _call(port, f"/v1/link/machines/{mid}/revoke", {}, token="sess-pierre")
+    assert _call(port, "/v1/gateway/machine/load", load, token=mt)[0] == 401
+
+
+def test_local_reporter_reaches_the_cloud_route(cloud, tmp_path):
+    """Le vrai `LoadReporter` contre la vraie route : la mesure de la machine passe le nettoyage telle quelle."""
+    import httpx
+
+    from nokker.local.load import LoadReporter, measure
+
+    port, _, _ = cloud
+    tok = _linked(port, "poste")
+    rep = LoadReporter(base_url=f"http://127.0.0.1:{port}", token=lambda: tok["machine_token"],
+                       measure=lambda: measure(version="0.1.0", sessions=1), client=httpx.Client(timeout=10))
+    assert rep.send_once() is True
+    [m] = [x for x in _call(port, "/v1/link/machines", token="sess-pierre")[1]["machines"]
+           if x["machine_id"] == tok["machine_id"]]
+    assert m["load"]["version"] == "0.1.0" and m["load"]["sessions"] == 1 and m["load"]["ram"]["total_mb"] > 0
+
+
+def test_machine_asks_for_its_own_page_link(cloud):
+    """Interface servie par la passerelle : le Lokkal demande le lien avec son jeton de machine (pas d'id à connaître,
+    pas de session app.nokker.ai dans le navigateur)."""
+    port, _, _ = cloud
+    tok = _linked(port, "bureau")
+    page = "pg_fedcba9876543210"
+    assert _call(port, "/v1/gateway/pages-token", {"page_id": page})[0] == 401
+    status, link = _call(port, "/v1/gateway/pages-token", {"page_id": page, "embed": True}, token=tok["machine_token"])
+    assert status == 200 and link["url"].startswith("https://bureau--pages.nokker.app/_auth?token=")
+    assert link["url"].endswith(f"to=/{page}&embed=1")
+    assert _call(port, "/v1/gateway/pages-token", {"page_id": "x"}, token=tok["machine_token"])[0] == 404
+    dl = _call(port, "/v1/gateway/pages-token", {"page_id": page, "download": True}, token=tok["machine_token"])[1]
+    assert dl["url"].endswith(f"to=/{page}%3Fdl%3D1")  # le relais redirige vers /<page>?dl=1
+
+
+def test_local_link_client_posts_with_the_machine_token(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from nokker.local.setup import LocalLink, LocalSetup, LocalVault
+
+    monkeypatch.setenv("NOKKER_LOCAL_SECRET_KEY", Fernet.generate_key().decode())
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"url": "https://x--pages.nokker.app/_auth?token=t&to=/pg_0", "expires_at": 1}
+
+    class Client:
+        def __init__(self):
+            self.seen = []
+
+        def post(self, url, json=None, headers=None):
+            self.seen.append((url, json, headers))
+            return Resp()
+
+    setup = LocalSetup(state_path=tmp_path / "setup.json", vault=LocalVault(tmp_path / "vault.bin"))
+    client = Client()
+    link = LocalLink(setup=setup, base_url="https://app.nokker.ai", client=client)
+    assert link.pages_token("pg_0") is None  # pas lié : rien demandé
+    setup.vault.put("machine_token", "mt-secret")
+    assert link.pages_token("pg_0", embed=True)["url"].startswith("https://x--pages")
+    url, body, headers = client.seen[-1]
+    assert url == "https://app.nokker.ai/v1/gateway/pages-token" and body == {"page_id": "pg_0", "embed": True, "download": False}
+    assert headers == {"Authorization": "Bearer mt-secret"}
+
+
+def test_gateway_login_code_pkce_refresh_rotation_and_reuse(cloud):
+    """Connexion par la passerelle (§7.3) : code 60 s à usage unique lié au challenge, jeton d'accès lié à la machine,
+    rotation du renouvellement, réutilisation = famille révoquée, machine déliée = plus de renouvellement."""
+    import base64
+    import hashlib
+
+    from nokker.cloud.gateway_auth import GatewayAuth
+
+    port, signer, _ = cloud
+    cloud_http._cloud.gateway_auth = GatewayAuth(links=cloud_http._cloud.links, signer=signer)
+    tok = _linked(port, "salon")
+    host = "salon.nokker.app"
+    verifier = "v" * 50
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    auth = "/v1/gateway/authorize"
+    assert _call(port, auth, {"host": host, "code_challenge": challenge})[0] == 401
+    assert _call(port, auth, {"host": "autre.nokker.app", "code_challenge": challenge}, token="sess-pierre")[0] == 403
+    assert _call(port, auth, {"host": host, "code_challenge": challenge, "code_challenge_method": "plain"},
+                 token="sess-pierre")[0] == 400
+    status, a = _call(port, auth, {"host": host, "code_challenge": challenge}, token="sess-pierre")
+    assert status == 200 and a["redirect"] == f"https://{host}/auth/callback"
+    assert _call(port, "/v1/gateway/token", {"code": a["code"], "code_verifier": "faux" * 12, "host": host})[0] == 400
+    assert _call(port, "/v1/gateway/token", {"code": a["code"], "code_verifier": verifier, "host": host})[0] == 400  # consommé
+    a = _call(port, auth, {"host": host, "code_challenge": challenge}, token="sess-pierre")[1]
+    status, t1 = _call(port, "/v1/gateway/token", {"code": a["code"], "code_verifier": verifier, "host": host})
+    assert status == 200 and t1["expires_in"] == 900 and t1["refresh_token"]
+    claims = verify_token(t1["access_token"], _call(port, "/v1/.well-known/jwks.json")[1])
+    assert claims["machine"] == tok["machine_id"] and claims["tenant"] == "tn_pierre"
+    status, t2 = _call(port, "/v1/gateway/refresh", {"refresh_token": t1["refresh_token"], "host": host})
+    assert status == 200 and t2["refresh_token"] != t1["refresh_token"]
+    # l'ancien resservi (vol) : refusé, et toute la famille tombe — le nouveau aussi
+    assert _call(port, "/v1/gateway/refresh", {"refresh_token": t1["refresh_token"], "host": host})[0] == 400
+    assert _call(port, "/v1/gateway/refresh", {"refresh_token": t2["refresh_token"], "host": host})[0] == 400
+    # nouvelle connexion, puis déconnexion
+    a = _call(port, auth, {"host": host, "code_challenge": challenge}, token="sess-pierre")[1]
+    t3 = _call(port, "/v1/gateway/token", {"code": a["code"], "code_verifier": verifier, "host": host})[1]
+    assert _call(port, "/v1/gateway/revoke", {"refresh_token": t3["refresh_token"]}) == (200, {"revoked": True})
+    assert _call(port, "/v1/gateway/refresh", {"refresh_token": t3["refresh_token"], "host": host})[0] == 400
+    # machine déliée : plus de renouvellement
+    a = _call(port, auth, {"host": host, "code_challenge": challenge}, token="sess-pierre")[1]
+    t4 = _call(port, "/v1/gateway/token", {"code": a["code"], "code_verifier": verifier, "host": host})[1]
+    _call(port, f"/v1/link/machines/{tok['machine_id']}/revoke", {}, token="sess-pierre")
+    assert _call(port, "/v1/gateway/refresh", {"refresh_token": t4["refresh_token"], "host": host})[0] == 400
+    # l'ancien chemin (session du compte → jeton d'accès) reste, sans code
+    assert _call(port, "/v1/gateway/token", {}, token="sess-pierre")[0] == 200

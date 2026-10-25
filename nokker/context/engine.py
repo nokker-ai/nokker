@@ -20,8 +20,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.images.render import IMAGE_PART
 from nokker.tools.select import compact_index
 from nokker.core.ports import Assembled, Recall, ToolRegistry, ToolSpec
 from nokker.core.turn import Tier, ToolResult, Turn
@@ -70,6 +72,12 @@ class ContextEngineV0:
     # interne → `prefix_path` + `profile_path`, testeur → ce fichier, sans profil ; hors d'un `tenant_scope`, NoTenant.
     # None : un seul préfixe pour tous (tests, bancs qui construisent l'engine eux-mêmes).
     product_prefix_path: str | None = None
+    # Images jointes (X7) envoyées en entier dans la fenêtre : celles du tour courant puis les plus récentes, jusqu'à ce
+    # nombre ; les plus anciennes sont délestées en une ligne de texte (une image pèse des milliers de jetons).
+    keep_images: int = 4
+    # Mémoire de projet des sessions locales (lot X1, `context/project_memory.py`) : son noyau court entre dans le
+    # message système après le profil. None (défaut, et drapeau `local.project_memory` éteint) : rien ne change.
+    project_memory: Any = None
 
     def __post_init__(self) -> None:
         self._layers = {"internal": (self._load(self.prefix_path),
@@ -133,6 +141,16 @@ class ContextEngineV0:
             parts.append(self._profile_text)
         return parts
 
+    def project_block(self, turn: Turn) -> str:
+        """Noyau de la mémoire de projet pour le fil du tour (figé par tour), ou "" sans mémoire de projet."""
+        if self.project_memory is None:
+            return ""
+        try:
+            return self.project_memory.core_block(turn.thread_id, turn.index, turn.input.text)
+        except Exception:  # la mémoire ne casse jamais un assemblage
+            logger.exception("mémoire de projet : noyau indisponible")
+            return ""
+
     @staticmethod
     def turn_head(turn: Turn, compute: Callable[[], list[str]]) -> str:
         """En-tête du tour, calculé au premier assemblage puis figé sur le tour (`Turn.head`) : les appels suivants
@@ -140,6 +158,37 @@ class ContextEngineV0:
         if not turn.head:
             turn.head = "\n\n".join(compute())
         return turn.head
+
+    def images_kept(self, history: list[Turn], turn: Turn) -> set[tuple[int, str]]:
+        """(index du tour, sha256) des images envoyées en entier : celles du tour courant, puis les plus récentes de la
+        fenêtre jusqu'à `keep_images`. Les autres sont délestées en une ligne de texte (comme un gros résultat)."""
+        kept: set[tuple[int, str]] = {(turn.index, i.sha256) for i in turn.images}
+        budget = max(0, self.keep_images - len(kept))
+        for past in reversed(history):
+            for img in reversed(past.images):
+                if budget <= 0:
+                    return kept
+                kept.add((past.index, img.sha256))
+                budget -= 1
+        return kept
+
+    @staticmethod
+    def user_message(t: Turn, text: str, kept: set[tuple[int, str]]) -> dict:
+        """Message `user` d'un tour : chaîne seule sans image ; avec images, parties `text` + une partie `nokker_image`
+        par image gardée (le noyau la change en `image_url` ou en note selon le palier, nokker/images/render.py) ; une
+        image délestée devient une ligne de texte, sans octets."""
+        if not t.images:
+            return {"role": "user", "content": text}
+        parts: list[dict] = [{"type": "text", "text": text}] if text else []
+        for img in t.images:
+            if (t.index, img.sha256) in kept:
+                parts.append({"type": IMAGE_PART, "sha256": img.sha256, "media_type": img.media_type,
+                              "name": img.name})
+            else:
+                label = f"{img.name} " if img.name else ""
+                parts.append({"type": "text", "text": f"[image délestée : {label}({img.media_type}, "
+                                                      f"{max(1, img.size // 1024)} Ko), jointe au tour {t.index}]"})
+        return {"role": "user", "content": parts}
 
     @staticmethod
     def past_user(past: Turn, with_head: bool = True) -> str:
@@ -169,14 +218,19 @@ class ContextEngineV0:
         # que le modèle reçoit comme INFORMATION. Le hash du préfixe (A4, `_compute_prefix_sha256`) ne
         # change pas : il porte sur `self._prefix_text` seul, pas sur ce message combiné.
         index_block = self.tools_index_block()
-        messages.append({"role": "system", "content": "\n\n".join(self.system_parts(index_block))})
+        project_text = self.project_block(turn)
+        system_parts = self.system_parts(index_block)
+        if project_text:
+            system_parts.append(project_text)
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
         # Couche 3 — épisodes clos : vide en v0 (aucune frontière d'épisode, cf. docstring). Budget 0.
         episodes_text = ""
 
         # Couche 4 — tours bruts de l'épisode courant, append-only, chacun avec SON en-tête d'origine (`past_user`).
+        kept = self.images_kept(history, turn)
         for past in history:
-            messages.append({"role": "user", "content": self.past_user(past)})
+            messages.append(self.user_message(past, self.past_user(past), kept))
             messages.extend(m.to_openai() for m in past.messages)
 
         # Couche 5 — en-tête du tour (date, rappel CortHeXis, contexte reçu) + message courant, REGROUPÉS DANS LE MÊME
@@ -201,7 +255,7 @@ class ContextEngineV0:
             return parts
 
         head = self.turn_head(turn, head_parts)
-        messages.append({"role": "user", "content": self.past_user(turn)})
+        messages.append(self.user_message(turn, self.past_user(turn), kept))
 
         # Rejoue l'ÉPISODE COURANT de CE tour : les tool_calls/résultats déjà produits PAR CE TOUR,
         # avant ce call_index (`core/loop.py` rappelle `assemble()` à chaque appel du MÊME tour, pas
@@ -227,6 +281,8 @@ class ContextEngineV0:
             "current": estimate_tokens("".join(self.past_user(p) for p in history)),
             "turn_block": estimate_tokens("\n\n".join([head, turn.input.text])),
         }
+        if self.project_memory is not None:
+            layer_tokens["project"] = estimate_tokens(project_text)
         return Assembled(messages=messages, tools=tools_payload, prefix_sha256=self._prefix_sha256,
                           layer_tokens=layer_tokens)
 

@@ -5,15 +5,19 @@ memory_mcp_url: ""                   # CortHeXis en mode direct (NOKKER_MEMORY_M
 api_keys: []                         # seul le jeton local (local.token_path) et les sessions d'appareils passent
 telegram_ids: {}
 extra_go_senders: [local-owner]      # le propriétaire de la machine donne les GO
+# vision (X7) : le 397B lit les images — mesuré le 25.10.2026 chez l'amont (Qwen3.5-397B-A17B, PNG 8×8 rouge en data
+# URL : « solid red square », 86 jetons d'entrée). Images jointes : <local.state_dir>/images.
 tiers:
   ship:
     base_url: https://router.sokkan.ch/v1
     model: qwen/qwen3.5-397b-a17b
     api_key_env: ROUTER_KEY
+    vision: true
   deep:
     base_url: https://router.sokkan.ch/v1
     model: qwen/qwen3.5-397b-a17b
     api_key_env: ROUTER_KEY
+    vision: true
 judge_enabled: false
 web_search_enabled: true
 context_enabled: true
@@ -29,6 +33,14 @@ local:
   allowed_hosts_env: NOKKER_ALLOWED_HOSTS      # « 127.0.0.1:7420,localhost:7420 », calculé par l'installeur
   allowed_hosts: ["127.0.0.1:8742", "localhost:8742"]   # repli si la variable est absente
   max_calls: 60
+  pages: true                                  # pages de session + bulle artifact (docs/BUBBLES.md §10) : les clients de
+                                               # nokker-apps ≥ 8e01708 (APPS_REF ef9440d) savent afficher un kind inconnu
+  background_processes: true                   # process_start/list/logs/stop dans le bac à sable (lot X6, docs/LOKKAL.md §7.7)
+  hooks: true                                  # hooks des réglages (lot X3) : session_start, pre_tool, post_tool,
+                                               # turn_end, dans le bac à sable ; ceux du dépôt après confiance
+  project_memory: true                         # mémoire de projet (X1, docs/LOKKAL.md §7.11) : AGENTS.md / NOKKER.md /
+                                               # CLAUDE.md importés dans CortHeXis, notes apprises ; défaut du code : off
+  project_memory_core_tokens: 800              # noyau toujours injecté ; le reste est rappelé par pertinence
   code:
     roots_env: NOKKER_HOST_WORKSPACE           # dossier(s) de l'utilisateur séparés par « : », montés au même chemin
     host_roots: {}                             # racine vue par le noyau -> vue par le démon, si différente

@@ -49,7 +49,7 @@ EXISTANT, une identité qui n'en est pas membre reçoit 403 (serveur ouvert sans
 ```
 
 - `kind` ∈ `monitor` (cyan #5FD4C8) · `search` (violet #B49CFF) · `notify` (laiton #E3B06A) · `timer` (vert #5BD39A) ·
-  `script` (bleu #6FA8FF) · `media` (rose #FF8BB5) · `agent_draft` (cyan) · `approval` (laiton) · `episode` (mémoire de session délestée, couleur côté client). Couleurs côté client
+  `script` (bleu #6FA8FF) · `media` (rose #FF8BB5) · `agent_draft` (cyan) · `approval` (laiton) · `episode` (mémoire de session délestée, couleur côté client) · `artifact` (page créée en session, §10, couleur côté client). Couleurs côté client
   (`packages/brand`), jamais dans l'API.
 - `status` ∈ `idle` · `working` (le client glow) · `done` · `failed`.
 - `version` : entier croissant, chaque modification l'incrémente ; un `PATCH` peut porter `if_version` (409 sinon).
@@ -68,6 +68,7 @@ EXISTANT, une identité qui n'en est pas membre reçoit 403 (serveur ouvert sans
 | `notify` | `{from_thread, from_title, text, approval_id?, actions}` — action implicite `goto` (« Aller à la session ») |
 | `agent_draft` | `{name, role, model, tools: [..], fill: 0..1}` — à l'activation : `bubble.closed` + `agent.created` (Crew) |
 | `approval` | `{approval_id}` — la carte elle-même se lit par `/v1/approvals/{id}` |
+| `artifact` | `{page_id, path, title, mime, version, size, public, updated_at}` — page créée en session (§10) ; jamais le contenu de la page ; jamais créable par un client (400) |
 | `episode` | `{episode_id, title, summary, turns, from_turn, to_turn, tokens_raw, closed_reason, day, keywords}` — créée par le noyau à la **clôture d'un épisode** (docs/NEVER-CLEAR.md §3) ; jamais créable par un client (400). Actions : `reload` (épingle l'épisode dans la mémoire de session du fil), `archive` (désépingle et ferme). `move`/`copy` vers un autre fil copie la transcription (caviardée) dans le **réservoir du fil d'arrivée** et injecte `[Contexte reçu]` + `recall_context("rs_…")` : la mémoire voyage sans lecture inter-fils |
 
 | Méthode | Chemin | Rôle |
@@ -165,8 +166,10 @@ l'implémentation, non couverts ci-dessus —
 ## 6. Événements ajoutés à `/v1/events`
 
 `turn.started` {thread_id, turn_id} · `turn.delta` {thread_id, turn_id, text} · `tool.call` {thread_id, turn_id,
-call_id, name, args_preview} · `tool.result` {thread_id, turn_id, call_id, name, ok, ms} · `turn.done` {thread_id,
-turn_id, usage, tier?, cost_chf?} · `thread.updated` {thread} · `bubble.created` {bubble} · `bubble.updated` {bubble}
+call_id, name, args_preview} · `tool.result` {thread_id, turn_id, call_id, name, ok, ms} · `turn.cost` {thread_id,
+turn_id, calls, subagent_calls, input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens, cost
+{devise: montant}, unpriced_models, models} (juste avant `turn.done` ; forme et règles : docs/en/cli.md « Cost per
+turn ») · `turn.done` {thread_id, turn_id, usage, tier?, cost_chf?} · `thread.updated` {thread} · `bubble.created` {bubble} · `bubble.updated` {bubble}
 · `bubble.closed` {bubble_id, thread_id} · `bubble.transferred` {…§3} · `session.message` {from_thread, to_thread,
 text} · `agent.created` {agent}.
 
@@ -309,3 +312,157 @@ bulle** (`bubble.closed`) et publie `agent.created` — réponse `200 {"activate
 `armed` n'a pas d'effet à soumettre aux portes). Sans Crew configuré (`agents_enabled=False`), l'activation lève
 une erreur 400 (« crew (agents) non configuré ») plutôt que de fermer la bulle sans rien créer.
 
+
+### 9.5 Crew avec moteur (lot X14, contrat PROVISOIRE du 25.10.2026, dev ↔ onboarding)
+
+> Provisoire : le moteur n'est pas encore codé (vague 2, après le coffre X4 et l'approbation au téléphone X10). Le
+> web code en face de ce contrat ; un changement passe par ce paragraphe, daté, pas par un message.
+
+**Agent** (forme de `GET /v1/agents` et de toute réponse qui porte un agent ; champs §9.4 conservés) :
+
+```
+{ …§9.4…,
+  "status": "paused" | "armed" | "running" | "failed",   // paused = au repos/désarmé (bleu), armed = prêt (vert),
+                                                          // running = un passage en cours (orange), failed = dernier
+                                                          // passage en échec (rouge) ; jamais la couleur seule à l'écran
+  "instructions": "…",                                    // la mission (le prompt de chaque passage)
+  "trigger": {"kind": "manual"}
+           | {"kind": "schedule", "cron": "0 7 * * 1-5", "tz": "Europe/Zurich"}
+           | {"kind": "once", "at": "2026-11-02T07:00:00Z"}
+           | {"kind": "event", "event": "alert:<nom>" | "webhook:<id>" | "mail:<filtre>"},
+  "next_run_at": "…" | null,                              // calculé par le noyau (schedule, once) ; null sinon
+  "last_run": {"run_id", "status", "ended_at"} | null,
+  "secrets": ["NOM", …],                                  // NOMS du coffre (X4), jamais de valeur
+  "budget": {"max_calls": 100, "max_cost": 2.0, "currency": "EUR"} | null,
+  "auto_approve": ["outil(motif)", …],                    // règles levées sans carte pendant un passage ; une règle
+                                                          // d'écriture sur un agent déclenché par événement : refusée
+  "placement": {"machine": "auto" | "mc_…"} | null        // X15 ; null = la machine qui porte le noyau
+}
+```
+
+**Actions** (identité vérifiée du locataire ; erreurs `{"error": {"message"}}`) :
+
+```
+POST   /v1/agents                      {…}  → 201 agent ; trigger manual → "armed", sinon → "paused" (à armer)
+PATCH  /v1/agents/{id}                 {…}  → 200 agent ; changer trigger, tools, auto_approve ou secrets d'un agent
+                                              armé le remet en "paused"
+POST   /v1/agents/{id}/arm                  → 200 agent ; 202 {"approval_id"} si auto_approve contient une écriture
+                                              (carte FORTE, clé d'appareil, docs/APPROVALS.md) ; l'agent passe
+                                              "armed" à l'approbation
+POST   /v1/agents/{id}/disarm               → 200 agent ("paused") ; un passage en cours continue (l'annuler à part)
+POST   /v1/agents/{id}/run                  → 202 {"run_id"} : lancer maintenant (tout statut sauf running)
+DELETE /v1/agents/{id}                      → 204 ; un passage en cours est annulé d'abord ; les fils des passages
+                                              restent (turns append-only)
+GET    /v1/agents/{id}/runs?limit=20&before=<run_id>
+       → {"runs": [{"run_id", "agent_id", "trigger": "manual|schedule|once|event", "scheduled_for", "started_at",
+                    "ended_at", "status": "queued|running|waiting_approval|succeeded|failed|cancelled|skipped",
+                    "thread_id", "cost": {"tokens_in", "tokens_out", "amount", "currency"} | null,
+                    "summary": "…" | null}], "next_before": "…" | null}
+POST   /v1/agents/{id}/runs/{run_id}/cancel → 200 run
+```
+
+Un passage est un tour ordinaire dans son propre fil (`thread_id`) : ses effets passent par les portes et les cartes
+comme partout (les cartes vont au téléphone, X10) ; `waiting_approval` = le passage attend une carte. Lancer,
+armer et désarmer depuis le deck ne demandent pas d'autre carte que ci-dessus : le clic de l'humain EST la
+décision (« une session propose, l'humain approuve »).
+
+**Événements** (diffusés comme `agent.created`, à toute identité vérifiée du locataire) :
+`agent.updated {agent}` (tout changement, dont `status`, `next_run_at`, `last_run`), `agent.deleted {id}`,
+`agent.run {agent_id, run}` (chaque changement d'état d'un passage). La carte respire tant que `status` vaut
+`running`.
+
+**Fils des passages** (onboarding, 25.10) : chaque passage a son propre fil ; ce fil porte `origin: {"kind": "agent",
+"agent_id", "run_id"}` dans la liste des fils et dans `GET /v1/threads/{id}`, pour que les clients les rangent sous
+l'agent plutôt que dans la liste des sessions (les autres fils : `origin` absent).
+
+**Proposition par une session** : toujours l'outil `agent_draft` (§9.4) ; `state` porte en plus `instructions`,
+`trigger`, `secrets`, `budget`, `auto_approve`. L'activation crée l'agent avec les mêmes règles que `POST
+/v1/agents` (manual → armed, sinon paused ; armer reste un geste à part, avec la carte forte si une écriture est
+levée).
+
+## 10. Bulle `artifact` et pages créées en session (contrat du 24.10.2026, implémentation noyau : dev, avant le 27.10)
+
+**État (24.10, p2/lokkal)** : 10.1, 10.2, 10.3, 10.5, 10.6 codés (`nokker/pages/`, `/v1/pages/{id}` et `/link` dans le
+serveur local). Éteint par défaut dans le noyau (`local.pages`), **allumé par la config Lokkal** (`deploy/lokkal/core-config.yaml`)
+depuis l'APPS_REF nokker-apps 8e01708 (25.10 ; ef9440d depuis, CSS de la bulle réparé), qui porte le correctif « kind inconnu » de la CLI : une machine qui
+garderait une CLI rc.5 plantait sur `artifact`.
+10.4 (publish/unpublish) : à faire avec le jeton de machine (`pages_public`).
+
+Le pourquoi (autre origine, privée par défaut, publique sur choix) : docs/LOKKAL.md §6.6 et docs/GATEWAY.md §5. Ici,
+le contrat entre le noyau et les clients.
+
+### 10.1 Créer une page
+
+- **Explicite** : outil `page_create {path, title}` (effet WRITE, dans le dossier de travail de la session). Une page,
+  c'est **un fichier HTML autonome du dossier de travail** (CSS, JS et images en ligne ou en `data:`) ; pas de
+  fichiers annexes en v1 (servir un dossier exposerait le dépôt). Pas de détection implicite « tout HTML écrit est
+  une page » : le modèle décide de montrer, l'utilisateur voit pourquoi une bulle apparaît.
+- `page_id` = `pg_` + 16 hex aléatoires (jamais dérivé du chemin : un id devinable ou qui révèle l'arborescence ne
+  sert à rien) ; une page par (fil, chemin) : `page_create` sur un chemin déjà page rend la même `page_id`.
+- Le noyau garde une **copie** de chaque version (`$NOKKER_DATA/pages/<page_id>/v<N>.html`, 5 Mo max par version,
+  `text/html` seulement en v1 ; pas de SVG, qui exécute du script) : la page reste servable si le fichier bouge ou si
+  le dépôt change de branche, et le miroir (L5) n'a qu'à copier ce dossier.
+- Le producteur (`nokker/bubbles/producers.py`) crée la bulle sur le résultat de `page_create` (une bulle par
+  `page_id` et par fil), `created_by: "nina"`, `status: done`.
+
+### 10.2 Suivre le fichier
+
+- Chaque `write_file`/`patch` réussi sur le chemin d'une page du fil prend une nouvelle copie, `version + 1`, et pousse
+  `bubble.updated` (pas de polling client). Pendant le tour qui modifie la page, `status: working` ; `done` à la fin du
+  tour. Un fichier supprimé ne supprime pas la page (la dernière copie reste) ; `close` sur la bulle la retire.
+- Le `state` ne porte jamais le HTML : l'aperçu vivant est un `<iframe>` vers l'URL de la page (§10.3), rechargé à
+  chaque `bubble.updated`.
+
+### 10.3 Servir une page
+
+| Méthode | Chemin | Rôle |
+|---|---|---|
+| GET | `/v1/pages/{page_id}` | la dernière version ; `?v=N` une version précise |
+| POST | `/v1/pages/{page_id}/link` | `{embed?, download?}` → `{url, expires_at, public_url?}` : lien signé pour l'`<iframe>`, « ouvrir » et « télécharger » (un iframe ne pose pas d'`Authorization`) ; `public_url` (`https://<nom>--pages.nokker.app/<page_id>`, « copier le lien ») seulement si la page est publique et la machine liée |
+
+- Preuves acceptées par `GET` : l'auth normale, OU une signature `?exp=&sig=` (même schéma que §9.3, TTL 1 h,
+  `hmac.compare_digest`), OU `public: true`. Sinon 404 (pas 401 : une page privée n'existe pas pour un inconnu).
+- `download: true` : lien dont le `GET` porte `Content-Disposition: attachment; filename="<titre>.html"` (la page est
+  autonome, elle marche hors ligne telle quelle) ; en local la signature couvre le téléchargement (`dl=1`), par la
+  passerelle le relais redirige vers `/<page_id>?dl=1` et laisse passer l'en-tête.
+- En-têtes posés par le noyau lui-même (défense en profondeur, le relais les pose aussi) : `Content-Security-Policy:
+  sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads` (la même que le relais ; origine opaque : ni cookie, ni stockage, ni appel authentifié à
+  l'API, même servie depuis `127.0.0.1` à côté de l'interface locale), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. Côté client : `<iframe sandbox="allow-scripts allow-forms
+  allow-popups allow-modals allow-downloads">`, jamais `allow-same-origin`.
+- **Par la passerelle** : l'interface (servie par `<nom>.nokker.app`) appelle la MÊME route `POST /v1/pages/{id}/link
+  {embed?}` ; le Lokkal, qui a vérifié le jeton d'accès du compte, demande le lien à nokker.ai avec son jeton de machine
+  (`POST /v1/gateway/pages-token {page_id, embed?}`) et le rend tel quel. Depuis app.nokker.ai (« mes machines ») :
+  `POST /v1/link/machines/{machine_id}/pages-token {page_id, embed?}` (session du compte). Les deux rendent `{url,
+  expires_at}` ; `url` = `https://<nom>--pages.nokker.app/_auth?token=<jeton
+  pages>&to=/<page_id>` (+ `&embed=1` pour l'iframe : le relais redirige alors vers une capacité d'URL, sans cookie
+  tiers). Jeton pages : ES256, `iss https://app.nokker.ai`, `aud nokker.app`, `scope: pages`, `machine`, `tenant`,
+  `jti`, 60 s au plus, usage unique tenu par le relais. Le relais vérifie, puis passe `X-Nokker-Pages: 1` et
+  `X-Nokker-Account` ; le noyau local ne croit ce compte que si la requête porte `X-Nokker-Tunnel` = le secret de
+  SON tunnel (posé par le client de tunnel à chaque requête rejouée : un processus local qui imiterait les en-têtes
+  du relais n'a pas ce secret). Localement, sans passerelle : `POST /v1/pages/{id}/link`.
+- Les pages ne doivent utiliser que des URL **relatives** ou `data:` : elles sont servies depuis
+  `<nom>--pages.nokker.app` (ou `127.0.0.1` en local), jamais depuis l'origine où elles ont été écrites.
+- URL publique : `https://<nom>--pages.nokker.app/<page_id>` (le relais traduit vers `/v1/pages/<page_id>` du
+  Lokkal) ; **la même URL** pour un abonné, servie depuis le miroir (L5) : un lien partagé ne casse pas quand on
+  s'abonne ni quand la machine s'éteint. Localement, sans passerelle : le lien signé de `/link`.
+
+### 10.4 Publier
+
+- Actions de la bulle : `open` (client seul : `/link` puis nouvel onglet), `publish`, `unpublish`.
+- `publish` passe par une **carte d'approbation forte** (APPROVALS.md) et n'est proposée que si le compte y a droit :
+  abonné ou compte vérifié, dit par le jeton de machine de nokker.ai (`pages_public: true`) ; sinon l'action est
+  absente (pas grisée). `unpublish` : sans carte, immédiat. `public` dans le `state` suit.
+- Une page publique porte un lien de signalement ajouté par le relais (pas par le noyau).
+
+### 10.5 Glisser vers une autre session
+
+- `transfer` existant (§3). `move` : la bulle part, la page suit le fil d'arrivée (ses modifications futures viennent
+  de ce fil). `copy` : **même `page_id`**, aucun fichier dupliqué ; la bulle copiée est figée à la version copiée
+  (`origin` posé) et « ouvrir » montre la dernière version. Le résumé injecté (§3) donne titre, chemin et version,
+  jamais le contenu.
+
+### 10.6 Ce que voient les journaux et les événements
+
+- `tool.call` d'un `write_file` qui écrit une page : `args_preview` comme pour tout fichier (coupé, caviardé des
+  secrets par les invariants) ; le contenu de la page n'entre ni dans le `state`, ni dans `bubble.*`, ni au ledger.

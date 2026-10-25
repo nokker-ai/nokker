@@ -87,6 +87,9 @@ class SokkanProvider:
     # autre appel finit — on ATTEND (1, 2, 4, 8, 8… s, dans `total_budget_s`) sans consommer les réessais réseau,
     # au lieu d'abandonner en 3 s et d'escalader (vu en réel le 20.10.2026 : « palier ship indisponible : 429 »).
     busy_backoff_cap_s: float = 8.0
+    # Le modèle de ce palier lit-il les images (X7) ? Lu par le noyau (`core/loop.py::_wire_messages`) : avec vision,
+    # les images jointes partent en parties `image_url` (data URL) ; sans, une note texte les remplace. Défaut : non.
+    vision: bool = False
 
     def __post_init__(self) -> None:
         self._client = httpx.Client(timeout=self.timeout_s)
@@ -357,9 +360,11 @@ def _parse_usage(raw: dict[str, Any]) -> Usage:
         cached = details.get("cached_tokens") or 0
         cached_reported = True
     completion_details = raw.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
     reasoning_tokens = completion_details.get("reasoning_tokens") or 0
     return Usage(prompt=prompt, completion=completion, cached=cached, reasoning=reasoning_tokens,
-                 cached_reported=cached_reported)
+                 cached_reported=cached_reported, reasoning_reported="reasoning_tokens" in completion_details)
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:

@@ -4,6 +4,8 @@ Table outil → kind :
   - `web_search`                                → `search` (state §2 : query, took_ms, engines, results)
   - `infra_gpu_info`, `infra_disk_*`, `infra_*_info`/`*_usage`/`*_status` en lecture → `monitor`
   - `session_send` → `notify` côté destinataire : produit par `hub.BubbleHub.send_message`, pas ici.
+  - `page_create`, et `write_file`/`patch` sur une page du fil → `artifact` (§10 ; bloc `nokker:page` du résultat,
+    posé par `nokker/pages/tools.py`) ; le hub garde UNE bulle par page et par fil.
 
 Aperçus (§5, chantier `nokker/previews/`, en parallèle) : le producteur `search` appelle
 `Producers.request_previews(bubble)` après création — no-op par défaut, injectable (le service d'aperçus
@@ -109,6 +111,15 @@ class Producers:
             if st is None:
                 return None
             return ProducedBubble(kind="search", title=st["query"][:200], state=st)
+        if call.name in ("page_create", "write_file", "patch"):
+            from nokker.pages.tools import page_states
+
+            pages = page_states(result.content)
+            if pages:
+                st = pages[0]
+                return ProducedBubble(kind="artifact", title=str(st.get("title") or st.get("path"))[:200], state=st,
+                                      status="working")
+            return None
         if is_monitor_tool(call.name, spec):
             st = monitor_state(call.name, call.arguments, result.content)
             title = f"{st['metric']} {st['target']}".strip()

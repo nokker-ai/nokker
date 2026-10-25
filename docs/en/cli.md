@@ -43,12 +43,21 @@ your settings.
 
 ```json
 {"reply": "...", "thread_id": "th_...", "cwd": "/home/you/nokker/my-project",
- "pending_approvals": [], "refused": [{"tool": "terminal", "effect": "write", "target": "..."}], "cancelled": false}
+ "pending_approvals": [], "refused": [{"tool": "terminal", "effect": "write", "target": "..."}], "cancelled": false,
+ "cost": {"thread_id": "th_...", "turn_id": "th_...:3", "calls": 4, "subagent_calls": 0,
+          "input_tokens": 48210, "cached_tokens": null, "output_tokens": 1905, "reasoning_tokens": null,
+          "total_tokens": 50115, "cost": {"EUR": 0.035784}, "unpriced_models": [], "models": [...]}}
 ```
+
+`cost` is the turn's cost as the core reported it (see [Cost per turn](#cost-per-turn)). It is missing when the server
+does not report costs.
 
 On failure: `{"error": "...", "refused": []}` and exit code 1.
 
 ## In a session
+
+Under each turn, a dim line gives its cost: `12.4 k tokens · €0.03` (the terminal shows it in French:
+`12,4 k jetons · 0,03 €`). See [Cost per turn](#cost-per-turn).
 
 Each tool call shows its effect in plain words (read, write, destructive, send, spend, secret), then its duration.
 Results are folded to three lines: press `o` (with an empty input) or type `/out` to unfold, `/tools` to unfold all.
@@ -56,6 +65,13 @@ Sub-agents appear as indented lines under the call that started them.
 
 A new session on a local folder starts in **`accept_edits`** mode: edits inside the folder go through without a card,
 commands ask, destructive actions ask with a stronger card. See [permissions.md](permissions.md).
+
+### Images
+
+Type `@capture.png` (a file inside the session folder) or paste an image from the clipboard to attach it to your
+message: up to 4 images, png, jpeg, webp or gif, 5 MB each. If the model cannot read images, a line says so and the
+model is told an image was attached. Status: the core accepts images; `@file` and paste in the terminal client are
+**rolling out**. See [models.md](models.md#images-in-a-request).
 
 ### Approval card
 
@@ -98,6 +114,9 @@ displayed card and cancels the turn, otherwise quits.
 | `/skills [name]` | Skills by family; with a name, its content |
 | `/plan` | The session's work plan, with each step's state |
 | `/agents` | Sub-agents of the thread: goal, state, last tool, duration |
+| `/cost` | Cost of the session (thread and its sub-agents) and of the day (UTC): tokens, and the amount when the model has a price |
+
+| `/memory [note\|forget <note>]` | Project memory: learned notes and instruction sections; one note; forget it (**planned**, see [memory.md](memory.md)) |
 | `/cancel` | Cancel the running turn (Esc too) |
 | `/out` | Unfold or fold the preview of the last tool call (`o` too) |
 | `/tools` | Unfold or fold all previews |
@@ -115,6 +134,25 @@ displayed card and cancels the turn, otherwise quits.
 tool route of the core (`POST /v1/local/tools/call`) that is **planned**: the client side is ready, and the core side
 is being merged. Until then, ask the agent in plain words ("list the restore points", "roll back to the previous
 one"): the same tools are available to it.
+
+## Cost per turn
+
+At the end of every turn the core publishes a `turn.cost` event, just before `turn.done`. It counts the turn's model
+calls, its sub-agents' calls included:
+
+- tokens per model: input (`input_tokens`, cache included), of which cached (`cached_tokens`), output
+  (`output_tokens`, reasoning included), of which reasoning (`reasoning_tokens`). Cached and reasoning tokens are
+  `null` when the endpoint did not report them: unknown is not zero;
+- the cost, in the currency of the core's price table (`nokker/ledger/prices.yaml`). A model in the table gets an
+  amount; a model that is not in it gets **tokens only**: the core never guesses a price. Amounts are never converted
+  between currencies, so `cost` is a map such as `{"EUR": 0.0312}` (empty when nothing has a price).
+
+For example, Qwen3.5-397B-A17B on OVH AI Endpoints is priced €0.60 per million input tokens and €3.60 per million
+output tokens (no cache discount).
+
+Session and day totals come from a read-only local route, `GET /v1/local/cost?thread_id=<thread>&day=YYYY-MM-DD`
+(local token; `day` defaults to today, UTC). It returns `{session, day}`, each with the same fields plus `turns`.
+Without a database, the totals start again from zero when the core restarts.
 
 ## Choosing the server
 

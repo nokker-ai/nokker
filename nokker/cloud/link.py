@@ -87,10 +87,22 @@ class Signer:
         r, s = decode_dss_signature(self._key.sign(f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256())))
         return f"{head}.{body}.{_b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
 
-    def access_token(self, account: str, tenant: str, ttl_s: int = 900, now: float | None = None) -> str:
+    def access_token(self, account: str, tenant: str, ttl_s: int = 900, now: float | None = None,
+                     machine: str | None = None) -> str:
+        """Jeton d'accès §7.5 ; `machine` le lie à UNE machine (connexion par la passerelle, §7.3)."""
         t = int(now or time.time())
-        return self.sign({"iss": self.issuer, "aud": AUDIENCE, "sub": account, "tenant": tenant, "iat": t,
-                          "exp": t + ttl_s, "jti": uuid.uuid4().hex})
+        claims = {"iss": self.issuer, "aud": AUDIENCE, "sub": account, "tenant": tenant, "iat": t, "exp": t + ttl_s,
+                  "jti": uuid.uuid4().hex}
+        if machine:
+            claims["machine"] = machine
+        return self.sign(claims)
+
+    def pages_token(self, account: str, tenant: str, machine: str, ttl_s: int = 60, now: float | None = None) -> str:
+        """Jeton d'entrée sur `<nom>--pages.nokker.app/_auth` (docs/BUBBLES.md §10.3) : portée `pages`, 60 s, la machine
+        nommée ; usage unique tenu par le relais (jti)."""
+        t = int(now or time.time())
+        return self.sign({"iss": self.issuer, "aud": AUDIENCE, "sub": account, "tenant": tenant, "machine": machine,
+                          "scope": "pages", "iat": t, "exp": t + min(ttl_s, 60), "jti": uuid.uuid4().hex})
 
     def delegation_token(self, account: str, tenant: str, machine: str, web_session: str, ttl_s: int = 300,
                          now: float | None = None) -> str:
@@ -153,6 +165,11 @@ class Machine:
     token_sha256: str
     created_at: float
     revoked: bool = False
+    last_seen_at: float | None = None  # dernier GET /v1/gateway/machine du relais (écran « mes machines »)
+    # Charge courante (lot X5) : gardée à part, une ligne par machine sous la RLS du locataire (migration 020) ;
+    # posée ici seulement par `LinkService.machines_with_load`.
+    load: dict[str, Any] | None = None
+    load_at: float | None = None  # heure de nokker.ai à la réception (pas l'horloge de la machine)
 
 
 @dataclass
@@ -171,6 +188,7 @@ class MemoryLinkStore:
     def __init__(self) -> None:
         self.requests: dict[str, _Request] = {}
         self.machines: dict[str, Machine] = {}
+        self.loads: dict[str, tuple[str, dict[str, Any], float]] = {}  # machine → (locataire, charge, reçue à)
         self.lock = threading.Lock()
 
     def add_request(self, r: _Request) -> None:
@@ -219,6 +237,20 @@ class MemoryLinkStore:
     def of_account(self, account: str) -> list[Machine]:
         with self.lock:
             return [m for m in self.machines.values() if m.account == account and not m.revoked]
+
+    def seen(self, machine_id: str, at: float) -> None:
+        with self.lock:
+            if machine_id in self.machines:
+                self.machines[machine_id].last_seen_at = at
+
+    def set_load(self, machine_id: str, tenant: str, load: dict[str, Any], at: float) -> None:
+        with self.lock:
+            self.loads[machine_id] = (tenant, load, at)
+
+    def loads_of(self, tenant: str, machine_ids: list[str]) -> dict[str, tuple[dict[str, Any], float]]:
+        """Charges des machines demandées, de CE locataire seulement (comme la RLS de la migration 020)."""
+        with self.lock:
+            return {mid: (v[1], v[2]) for mid in machine_ids if (v := self.loads.get(mid)) and v[0] == tenant}
 
 
 @dataclass
@@ -301,6 +333,36 @@ class LinkService:
 
     def machines_of(self, account: str) -> list[Machine]:
         return self.store.of_account(account)
+
+    def machine_of(self, account: str, machine_id: str) -> Machine | None:
+        """La machine non révoquée de CE compte, sinon None (sans dire si elle existe ailleurs)."""
+        return next((m for m in self.store.of_account(account) if m.id == machine_id), None)
+
+    def report_load(self, machine: Machine, raw: Any) -> dict[str, Any] | None:
+        """Charge envoyée par la machine (`POST /v1/gateway/machine/load`), nettoyée puis gardée (une ligne courante
+        par machine, l'heure est celle de nokker.ai). None si le corps n'est pas une charge."""
+        from nokker.local.load import clean_load
+
+        load = clean_load(raw)
+        if load is None:
+            return None
+        self.store.set_load(machine.id, machine.tenant, load, self.clock())
+        return load
+
+    def machines_with_load(self, account: str, tenant: str) -> list[Machine]:
+        """Les machines du compte (« mes machines »), chacune avec sa dernière charge connue."""
+        machines = self.store.of_account(account)
+        loads = self.store.loads_of(tenant, [m.id for m in machines]) if machines else {}
+        from dataclasses import replace
+
+        return [replace(m, load=loads[m.id][0], load_at=loads[m.id][1]) if m.id in loads else m for m in machines]
+
+    def revoke_machine(self, account: str, machine_id: str) -> bool:
+        m = self.machine_of(account, machine_id)
+        if m is None:
+            return False
+        self.store.revoke(m.id)
+        return True
 
 
 __all__ = ["AUDIENCE", "ISSUER", "LinkService", "Machine", "MemoryLinkStore", "Signer", "TokenError", "slug",

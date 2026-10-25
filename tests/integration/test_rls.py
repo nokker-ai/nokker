@@ -32,10 +32,12 @@ CONTENT_TABLES = [
     "nokker_episodes", "nokker_day_summaries", "nokker_view_state", "nokker_reservoir",
     "approvals", "approval_events",
     "ledger_entries", "ledger_verdicts", "llm_calls", "verdicts", "nokker_agents",
+    "lokkal_machine_load",  # charge des machines Lokkal (020) : lue et écrite en connaissant le locataire
 ]
 OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
-              "lokkal_machines", "lokkal_link_requests"}  # lien Lokkal (014) : cherchées par empreinte de jeton ou par code
+              "lokkal_machines", "lokkal_link_requests",  # lien Lokkal (014) : cherchées par empreinte de jeton ou par code
+              "lokkal_gateway_codes", "lokkal_gateway_refresh"}  # connexion passerelle (019), idem, par empreinte
 
 
 @pytest.fixture(scope="module")

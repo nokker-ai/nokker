@@ -10,9 +10,12 @@
 #   dockerproxy seule voie du noyau vers docker : n'accepte que les bacs à sable étiquetés nokker.sandbox (sandboxd/)
 #   egress      seule sortie des bacs à sable ; plages privées refusées (box, LAN, Postgres, métadonnées cloud)
 #   roles, migrate, grants   à chaque démarrage : rôles SQL (admin), migrations (propriétaire), droits de nouveau
+#   openbao, vault-unseal    profil `vault` (install.sh --vault, COMPOSE_PROFILES=vault dans .env) : coffre OpenBao
+#               des secrets du noyau, et son compagnon qui le descelle (mode auto) ; vault-init (profil vault-init,
+#               lancé une fois par l'installeur) l'initialise. La part et le root token n'entrent jamais dans `core`.
 #
 # Réseaux (aucun port publié hors 127.0.0.1) :
-#   internal    core, web, postgres, embed, init — interne : pas d'Internet
+#   internal    core, web, postgres, embed, init, openbao — interne : pas d'Internet
 #   dockerapi   core ↔ dockerproxy seulement — interne
 #   sandbox     `nokker-sandbox` : bacs à sable ↔ egress seulement — interne ; nom fixe, le noyau le passe à docker
 #   front       web seul : publie 127.0.0.1:${NOKKER_PORT} (docker ne publie pas depuis un réseau interne)
@@ -57,8 +60,15 @@ services:
       NOKKER_SANDBOX_IMAGE: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
       APPROVALS_ENC_KEY: ${NOKKER_APPROVALS_KEY:?}
       ROUTER_KEY: ${NOKKER_ROUTER_KEY:-}
+      # Coffre (LOKKAL §7 X4) : `file` (vault.bin, NOKKER_LOCAL_SECRET_KEY) sans le profil vault ; `openbao` avec. Le
+      # noyau ne reçoit que role_id et secret_id de l'AppRole nokker-core, en fichiers (rien dans l'environnement).
+      NOKKER_SECRETS_PROVIDER: ${NOKKER_SECRETS_PROVIDER:-file}
+      NOKKER_OPENBAO_ADDR: http://openbao:8200
+      NOKKER_OPENBAO_ROLE_ID_FILE: /run/nokker-vault/role_id
+      NOKKER_OPENBAO_SECRET_ID_FILE: /run/nokker-vault/secret_id
     volumes:
       - ./config/config.yaml:/etc/nokker/config.yaml:ro
+      - ./vault/approle:/run/nokker-vault:ro
       - ${NOKKER_STATE_DIR:?}:/opt/data
       # Dossier de travail AU MÊME CHEMIN que sur l'hôte : le chemin que le noyau voit est celui que le démon monte
       # dans le bac à sable (local.code.roots), sans table de correspondance.
@@ -197,9 +207,84 @@ services:
     networks: [sandbox, outbound]
     mem_limit: 64m
 
+  # ---- profil vault (LOKKAL §7 X4) ---------------------------------------------------------------------------
+  openbao:
+    <<: *hardening
+    profiles: [vault]
+    image: ${NOKKER_OPENBAO_IMAGE:-openbao/openbao:2.4.1}
+    user: "100:1000"     # openbao de l'image ; pas l'entrypoint de l'image (il veut root pour changer d'utilisateur)
+    entrypoint: ["/bin/sh", "-c"]
+    # Serveur (pas -dev), stockage file, HTTP sur le réseau interne seulement (aucun port publié). OpenBao 2.4 ne
+    # fait pas de mlock (mesuré) : disable_mlock explicite plutôt qu'une protection qui n'existe pas.
+    command:
+      - |
+        cat > /tmp/nokker.hcl <<'HCL'
+        storage "file" { path = "/openbao/file" }
+        listener "tcp" {
+          address     = "0.0.0.0:8200"
+          tls_disable = true
+        }
+        api_addr      = "http://openbao:8200"
+        disable_mlock = true
+        ui            = false
+        HCL
+        exec bao server -config=/tmp/nokker.hcl
+    environment:
+      BAO_ADDR: http://127.0.0.1:8200   # pour la CLI dans le conteneur (descellement manuel : exec openbao bao …)
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - vault:/openbao/file
+    networks: [internal]
+    mem_limit: 256m
+    healthcheck:   # vivant (scellé ou non) ; l'état du descellement est le contrôle « coffre » de doctor
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health?sealedcode=200&uninitcode=200"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  vault-unseal:
+    <<: *hardening
+    profiles: [vault]
+    image: ${NOKKER_OPENBAO_IMAGE:-openbao/openbao:2.4.1}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    entrypoint: ["/bin/sh", "/vault/unseal.sh"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      HOME: /tmp
+    depends_on:
+      openbao: {condition: service_started}
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./vault/unseal.sh:/vault/unseal.sh:ro
+      - ./vault/unseal:/vault/unseal:ro     # vide en mode manual : le compagnon ne fait rien
+    networks: [internal]
+    mem_limit: 32m
+
+  vault-init:
+    <<: *hardening
+    profiles: [vault-init]
+    restart: "no"
+    image: ${NOKKER_OPENBAO_IMAGE:-openbao/openbao:2.4.1}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    entrypoint: ["/bin/sh", "/vault/init.sh"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      HOME: /tmp
+      VAULT_UNSEAL: ${NOKKER_VAULT_UNSEAL:-auto}
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./vault/init.sh:/vault/init.sh:ro
+      - ./vault/unseal:/vault/unseal
+      - ./vault/approle:/vault/approle
+    networks: [internal]
+
 volumes:
   postgres:
   models:
+  vault:
 
 networks:
   internal: {internal: true}

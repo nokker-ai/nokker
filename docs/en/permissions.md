@@ -36,6 +36,8 @@ Local sessions installed by Lokkal start in `accept_edits`: every write to the f
 A rule is `tool` or `tool(pattern)`. The pattern is a case-sensitive glob (`fnmatch`).
 
 - `terminal(pattern)` is matched against the whole command, trimmed.
+- `terminal(pattern)` also covers the same command started in the background (`process_start`, see
+  [background.md](background.md)); `process_start(pattern)` covers background starts only.
 - `write_file(pattern)`, `read_file(pattern)`, `patch(pattern)` are matched against the normalised path
   (`./src/a.py` becomes `src/a.py`; `../x` stays `../x`, so `src/**` never covers it). For a multi-file patch, every
   path in the patch must match.
@@ -76,8 +78,11 @@ Where the user file is:
 - Lokkal installed by `install.sh`: `~/.nokker/state/settings.json` (the state folder is mounted into the core).
 - `nokker code` run directly (headless, from a checkout): `~/.config/nokker/settings.json`.
 
-Note: today, the repository file `.nokker/settings.json` is read by `nokker code`; sessions served by the installed
-core read the user file only. Reading the repository file in installed sessions is **planned**.
+The repository file is read when the session opens, by `nokker code` and by sessions served by the installed core.
+
+The same files can also declare **hooks** (commands run before or after a tool call, at the start of a session, at
+the end of a turn): see [hooks.md](hooks.md). A hook never approves a call; repository hooks run only once you trust
+them.
 
 ## Hard limits
 

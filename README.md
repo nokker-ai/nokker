@@ -1,5 +1,3 @@
-<!-- Draft of the root README of the public repository nokker-ai/nokker. Not published yet. -->
-
 # Nokker
 
 A multi-model coding agent that works in your folder, never clears its session, and asks before it does anything
@@ -38,7 +36,7 @@ irm https://nokker.ai/install.ps1 | iex
 ```
 
 You need Docker. Downloads are checked with sha256, and with cosign signatures when `cosign` is installed. Details,
-options and uninstall: [docs/en/install.md](install.md).
+options and uninstall: [docs/en/install.md](docs/en/install.md).
 
 ## A session
 
@@ -72,21 +70,18 @@ Terminal labels are currently in French; English labels are planned.
 
 ## Documentation
 
-- [Install](install.md)
-- [The `nokker` command](cli.md)
-- [Permissions](permissions.md)
-- [Skills](skills.md), [sub-agents](subagents.md), [checkpoints](checkpoints.md)
-- [Models](models.md)
-- [Gateway](gateway.md) (rolling out)
+- [Install](docs/en/install.md)
+- [The `nokker` command](docs/en/cli.md)
+- [Permissions](docs/en/permissions.md), [hooks](docs/en/hooks.md)
+- [Skills](docs/en/skills.md), [sub-agents](docs/en/subagents.md), [checkpoints](docs/en/checkpoints.md)
+- [Models](docs/en/models.md)
+- [Gateway](docs/en/gateway.md) (rolling out)
 
 ## How it compares
 
-On a set of 22 coding tasks (bug fixes, features, hard tasks, multi-file changes, refactors; Python and TypeScript;
-checked by hidden tests), run 3 times with the same model on both sides, Nokker Lokkal solved 59 of 66 runs and a
-widely used reference coding agent solved 60 of 66. After one fix found by this benchmark, both solved the same 20
-tasks of 22 on every run. Lokkal was slower: on a 6-task subset after optimisation, 46 s on average against 30 s.
-Small benchmark, our own tasks, one model: read it as "the harness is not what limits results", not as a ranking.
-A public, reproducible set (SWE-bench Verified subset) is planned; its method and results will be published here.
+On a 50-task sample of SWE-bench Verified, judged by the official harness, Nokker Lokkal resolves 35 tasks, on par
+with a reference coding agent driven by the same model (37), with 40 % fewer input tokens. Method, every run and how
+to reproduce them: [docs/en/benchmarks.md](docs/en/benchmarks.md).
 
 ## Licence
 

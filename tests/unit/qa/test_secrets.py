@@ -276,3 +276,14 @@ def test_aws_secret_key_after_its_keyword_even_in_strict_mode():
     assert r.text.endswith(". Renvoie-la.")
     sha = "le commit secret 3f9a1c2b4d5e6f708192a3b4c5d6e7f8091a2b3c est poussé"
     assert redact(sha, weak=False).text == sha
+
+def test_paths_with_versioned_words_are_not_secrets():
+    """Banc SWE-bench du 24.10 : `/opt/miniconda3/bin/activate` caviardé dans la consigne (24 tâches sur 50)."""
+    from nokker.qa.secrets import redact
+
+    for text in ("source /opt/miniconda3/bin/activate testbed", "/usr/lib/python3/dist-packages/apport",
+                 "/usr/lib64/x86_64-linux-gnu/libssl.so", "cd /home/user/projects/app2/src/components"):
+        assert redact(text).text == text, text
+    # un vrai secret à barres obliques reste caviardé
+    aws = "wJalrXUtnFEMI" + "/K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
+    assert aws not in redact(f"key {aws}").text

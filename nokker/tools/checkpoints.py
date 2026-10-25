@@ -147,10 +147,11 @@ def code_root_of(code_source: Any) -> Callable[[str], Path | None]:
     return lambda _thread_id: Path(code_source.root)
 
 
-def host_path(root: Path, path: str) -> str:
-    """Chemin vu par l'outil → chemin hôte : `/workspace/x` → `root/x` ; relatif → sous `root`."""
-    if path == WORKSPACE_MOUNT or path.startswith(WORKSPACE_MOUNT + "/"):
-        return str(root / path[len(WORKSPACE_MOUNT):].lstrip("/"))
+def host_path(root: Path, path: str, mount: str = WORKSPACE_MOUNT) -> str:
+    """Chemin vu par l'outil → chemin hôte : `/workspace/x` (ou le montage du bac) → `root/x` ; relatif → sous
+    `root`."""
+    if path == mount or path.startswith(mount + "/"):
+        return str(root / path[len(mount):].lstrip("/"))
     p = Path(path)
     return str(p if p.is_absolute() else root / p)
 
@@ -224,7 +225,7 @@ class CheckpointingToolSource:
         if root is not None and name in WRITE_TOOLS and not result.is_error:
             try:
                 for p in _written_paths(name, arguments):
-                    self.manager.record_agent_write(host_path(root, p))
+                    self.manager.record_agent_write(host_path(root, p, getattr(self.inner, "mount", WORKSPACE_MOUNT)))
             except Exception:  # noqa: BLE001
                 logger.warning("ledger après %s en échec", name, exc_info=True)
         return result

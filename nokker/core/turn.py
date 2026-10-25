@@ -105,6 +105,7 @@ class Usage:
     cached: int = 0
     reasoning: int = 0
     cached_reported: bool = False  # False = l'amont n'a rien déclaré : ne pas en déduire 0 % de cache (A5)
+    reasoning_reported: bool = False  # même règle pour le raisonnement (X2) : absent ≠ zéro
 
 
 @dataclass
@@ -157,12 +158,34 @@ class InputCheck:
 
 
 @dataclass
+class ImageRef:
+    """Image jointe à un message (lot X7, docs/LOKKAL.md §7.6) : la RÉFÉRENCE seule, les octets vivent dans le magasin
+    d'images (`nokker/images/store.py`, par sha256, dédupliqués par locataire). `media_type` est celui lu dans les
+    octets, jamais celui déclaré par le client."""
+
+    sha256: str
+    media_type: str  # image/png | image/jpeg | image/webp | image/gif
+    size: int  # octets
+    name: str = ""  # nom de fichier d'origine (affichage seulement), caviardé
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"sha256": self.sha256, "media_type": self.media_type, "size": self.size, "name": self.name}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ImageRef:
+        return cls(sha256=str(d["sha256"]), media_type=str(d.get("media_type", "")), size=int(d.get("size", 0)),
+                   name=str(d.get("name", "")))
+
+
+@dataclass
 class TurnInput:
     thread_id: str
     user_text: str
     channel: str = "api"  # telegram | slack | webchat | api
     sender: str | None = None
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Images déjà validées et rangées au magasin (X7) : le noyau ne reçoit jamais d'octets dans le tour.
+    images: list[ImageRef] = field(default_factory=list)
 
 
 @dataclass
@@ -189,3 +212,6 @@ class Turn:
     # précédent octet pour octet (cache de préfixe entre tours, option A de Nick, 20.10.2026). Vide = tour d'avant
     # ce changement, rejoué comme avant (injected + texte).
     head: str = ""
+    # Images jointes au message humain (X7) : références seulement, persistées avec le tour (append-only) ; les octets
+    # restent au magasin d'images et partent avec l'effacement du fil ou du compte.
+    images: list[ImageRef] = field(default_factory=list)

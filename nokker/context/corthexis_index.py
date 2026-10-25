@@ -86,6 +86,10 @@ class CorthexisSemanticIndex:
         tmp.replace(path)  # atomique : l'indexeur ne lit jamais un fichier à moitié écrit
         self._enqueue(project)
 
+    def enqueue_project(self, project: str) -> None:
+        """Réindexe en fond le dossier `root/<projet>` (notes écrites par l'appelant : mémoire de projet, X1)."""
+        self._enqueue(project)
+
     def _enqueue(self, project: str) -> None:
         with self._lock:
             if project not in self._pending:
@@ -177,6 +181,27 @@ class CorthexisSemanticIndex:
             if h.rerank is not None and h.rerank >= self.min_rerank:
                 h.score = max(h.score, h.rerank)
         return kept[:k]
+
+    def search_rows(self, projects: tuple[str, ...], query: str, k: int = 8) -> list[dict]:
+        """Lignes brutes de CortHeXis dans ces projets (mémoire de projet, X1 : le seuil est chez l'appelant) ; même
+        disjoncteur que `search`. Jamais d'exception."""
+        if not query.strip() or time.monotonic() < self._disabled_until:
+            return []
+        projects = tuple(p for p in projects if (self.root / p).is_dir())
+        if not projects:
+            return []
+        try:
+            from corthexis import service as cx_service
+
+            rows = cx_service.search(query, top_k=k, deep=self.deep, projects=projects)
+            self._failures = 0
+        except Exception:
+            self._failures += 1
+            if self._failures >= 3:
+                self._disabled_until = time.monotonic() + 60.0
+                logger.warning("corthexis(projet): recherche indisponible, coupée 60 s", exc_info=True)
+            return []
+        return [r for r in rows if isinstance(r, dict) and "error" not in r and "info" not in r]
 
     def close(self) -> None:
         try:
