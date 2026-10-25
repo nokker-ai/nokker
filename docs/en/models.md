@@ -82,8 +82,10 @@ Lokkal install.
 Status:
 
 - routing, the reviewer and the card advice are in the install, on by default;
-- which models serve the small tier and the reviewer is being measured: until that choice ships, the install runs the
-  default model for every tier and for the reviewer. Dedicated small and reviewer models on the Router: **rolling out**;
+- on the Router, the install uses Qwen3.6-35B-A3B (EU) for the small tier, Qwen3.5-397B-A17B for the conversational
+  and deep tiers, and Qwen3.5-397B-A17B with reasoning off as the reviewer: it caught the most planted bugs and gave
+  the best risk levels on strong cards in our measurement. The reviewer is the same model as the writer; a reviewer
+  from another model family is an option you can set with `judge`;
 - with your own endpoint or a local model, everything runs on that one model (the small tier folds into the
   conversational one);
 - the advice shown on approvals from your phone ships with phone approvals: **rolling out**.

@@ -18,6 +18,7 @@ atomique et borné (`take`) : deux tours simultanés ne dépassent jamais un pla
 """
 from __future__ import annotations
 
+import dataclasses
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -174,6 +175,22 @@ class TenantLimits:
     hard_turns_per_day: int | None = DEFAULT_LIMITS["hard_turns_per_day"]
     deep_per_day: int = DEFAULT_LIMITS["deep_per_day"]
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    # Plafonds du palier payé (Billing.caps_for, nokker/billing) : None = pas d'abonnement actif → plafonds de la
+    # config. Les clés présentes (turns_per_day, turns_per_week, hard_turns_per_day, deep_per_day) remplacent celles-ci.
+    caps_for: Callable[[str], dict[str, int] | None] | None = None
+
+    def _for(self, tid: str) -> TenantLimits:
+        """Les plafonds qui s'appliquent à CE locataire (ceux de son abonnement s'il en a un)."""
+        caps = None
+        if self.caps_for is not None and tid and tid != INTERNAL_TENANT:
+            try:
+                caps = self.caps_for(tid)
+            except Exception:  # noqa: BLE001 — paiement injoignable : plafonds de la bêta, jamais de blocage
+                caps = None
+        if not caps:
+            return self
+        keys = ("turns_per_day", "turns_per_week", "hard_turns_per_day", "deep_per_day")
+        return dataclasses.replace(self, caps_for=None, **{k: int(v) for k, v in caps.items() if k in keys})
 
     @classmethod
     def from_config(cls, limits: dict[str, Any] | None, dsn: str = "") -> TenantLimits:
@@ -206,6 +223,9 @@ class TenantLimits:
 
     # ── tour ──────────────────────────────────────────────────────────────────────────────────────────────────────
     def check_turn(self, sender: str | None) -> Verdict | None:
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.check_turn(sender)
         """None : le tour passe (et il est compté). Sinon le verdict à journaliser ; le tour répond `reply(verdict)`."""
         tid = current_tenant()  # hors scope : NoTenant, jamais un tour sans quota par défaut
         if tid == INTERNAL_TENANT:
@@ -227,12 +247,18 @@ class TenantLimits:
         return None
 
     def reply(self, verdict: Verdict | None = None) -> str:
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.reply(verdict)
         (_, day_end), (_, week_end) = self._keys()
         if verdict is not None and verdict.rule == "limits:turns_per_week":
             return LIMIT_REPLY_WEEK.format(n=self.turns_per_week, at=_swiss_hour(week_end))
         return LIMIT_REPLY_DAY.format(n=self._day_cap(), at=_swiss_hour(day_end))
 
     def notice(self, sender: str | None) -> str | None:
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.notice(sender)
         """Mode soft : avertissement à ajouter à la réponse du tour qui vient de DÉPASSER le quota du jour ou de la
         semaine (une seule fois par fenêtre : le tour n° cap + 1). None sinon, et toujours None en mode hard."""
         tid = current_tenant()
@@ -249,6 +275,9 @@ class TenantLimits:
         return None
 
     def allow_deep(self, sender: str | None) -> bool:
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.allow_deep(sender)
         tid = current_tenant()
         if tid == INTERNAL_TENANT:
             return True
@@ -258,6 +287,9 @@ class TenantLimits:
     # ── lecture (GET /v1/account/usage, docs/CLIENT-API.md) ───────────────────────────────────────────────────────
     def usage(self, sender: str) -> dict[str, Any]:
         tid = current_tenant()
+        eff = self._for(tid)
+        if eff is not self:
+            return eff.usage(sender)
         internal = tid == INTERNAL_TENANT
         (day, day_end), (week, week_end) = self._keys()
         used_day = 0 if internal else self.counter.read(tid, sender, day.date(), "turns")

@@ -204,3 +204,18 @@ def test_turns_stay_append_only_outside_erasure(pg, seeded):  # noqa: F811
         conn.execute("SELECT set_config('nokker.erasing_tenant', %s, true)", (A,))
         with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
             conn.execute("DELETE FROM turns")
+
+
+@requires_pg
+def test_active_subscription_blocks_erasure(pg, seeded):  # noqa: F811
+    import psycopg
+
+    from nokker.admin.erase import EraseError, erase_account
+
+    with psycopg.connect(pg["su"], autocommit=True) as conn:
+        conn.execute("UPDATE subscriptions SET status = 'active' WHERE tenant_id = %s", (B,))
+    with pytest.raises(EraseError, match="abonnement actif"):
+        erase_account(pg["app"], account_id=ACC[B])
+    with psycopg.connect(pg["su"], autocommit=True) as conn:
+        conn.execute("UPDATE subscriptions SET status = 'canceled' WHERE tenant_id = %s", (B,))
+    assert erase_account(pg["app"], account_id=ACC[B]).deleted.get("subscriptions") == 1  # à blanc : compté

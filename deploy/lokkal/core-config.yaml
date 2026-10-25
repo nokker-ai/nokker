@@ -26,12 +26,12 @@ tiers:
     model: qwen/qwen3.5-397b-a17b
     api_key_env: ROUTER_KEY
     vision: true
-  # small: EN ATTENTE DE D1 (décision produit, banc interne). Sans ce palier, le trivial part en Ship (repli X8).
-  #   base_url: https://router.sokkan.ch/v1
-  #   model: <petit modèle retenu par D1>
-  #   api_key_env: ROUTER_KEY
+  small:                                       # D1 (25.10) : 35B-eu, classé par les règles (aucun appel de plus)
+    base_url: https://router.sokkan.ch/v1
+    model: qwen/qwen3.6-35b-a3b-eu
+    api_key_env: ROUTER_KEY
 # Multi-modèle et juge allumés (X8, docs/LOKKAL.md §7.12). Routage par tour : trivial → small, conversation → Ship,
-# code → Deep. Choix NEUTRE en attendant D1 : un seul modèle (le 397B déjà servi) sur tous les paliers et pour le juge.
+# code → Deep. D1 tranchée le 25.10 : petit palier 35B-eu, Ship et Deep 397B, juge 397B raisonnement coupé.
 route:
   policy: v1                                   # v0 : Ship partout, Deep sur signaux (défaut du code)
   classifier: rules                            # rules : aucun appel ; model : petit palier, 1 jeton, tour ambigu
@@ -40,10 +40,10 @@ judge_enabled: false                 # portes action/bascule du juge (couche 2) 
 judge_review: true                   # le juge relit le diff du tour avant « terminé » (renvoi à l'auteur, 1 fois)
 judge_review_rounds: 1
 judge_advice: true                   # avis court + niveau de risque sur les cartes fortes (format de X10)
-# judge: EN ATTENTE DE D1 — sans ce bloc, le juge est le palier Ship (ici le 397B, raisonnement coupé).
-#   base_url: https://router.sokkan.ch/v1
-#   model: <juge retenu par D1>
-#   api_key_env: ROUTER_KEY
+judge:                               # D1 (25.10) : 397B, raisonnement coupé (reasoning_effort: none, défaut)
+  base_url: https://router.sokkan.ch/v1
+  model: qwen/qwen3.5-397b-a17b
+  api_key_env: ROUTER_KEY
 web_search_enabled: true
 context_enabled: true
 context_corthexis:                             # never clear sur le moteur CortHeXis (docs/NEVER-CLEAR.md §11)

@@ -29,12 +29,14 @@ from typing import Any
 
 import psycopg
 
+from nokker.billing.plans import ACTIVE_STATUSES
 from nokker.tenancy.context import INTERNAL_TENANT
 
 # Tables sans colonne de rattachement, connues et volontairement hors effacement : comptes d'opérateurs, journal
 # d'administration, candidatures historiques (elles vivent chez front1), nonces (traités à part, par scope_id).
 UNSCOPED_OK = {"operators", "admin_audit", "beta_applications", "used_nonces", "schema_migrations",
-               "lokkal_link_requests"}  # flux d'appareil Lokkal : 10 min, aucune donnée de compte
+               "lokkal_link_requests",  # flux d'appareil Lokkal : 10 min, aucune donnée de compte
+               "billing_events"}  # idempotence des webhooks Stripe : identifiant et type d'événement, aucune donnée de compte
 _LAST = ("accounts", "tenants")  # supprimées après tout le reste, dans cet ordre
 # Équipe (X17, migration 023) : un compte membre d'un projet d'un AUTRE locataire y a des lignes au locataire du projet.
 # Elles partent avec lui : la transaction pose aussi `app.account_id` / `app.account_email`, que les politiques d'équipe
@@ -159,6 +161,12 @@ def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: boo
             raise EraseError(f"le locataire {tenant} porte {others} autre(s) compte(s) : effacement du locataire refusé")
         if apply and confirm != acc:
             raise EraseError(f"--apply exige --confirm {acc}")
+        if conn.execute("SELECT to_regclass('subscriptions')").fetchone()[0]:
+            conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant,))
+            live = conn.execute("SELECT count(*) FROM subscriptions WHERE tenant_id = %s AND status = ANY(%s)",
+                                (tenant, sorted(ACTIVE_STATUSES))).fetchone()[0]
+            if live:  # sinon Stripe continue de facturer un compte effacé ici
+                raise EraseError(f"{acc} a un abonnement actif : le résilier d'abord (Billing.cancel_for)")
         report = Report(account_id=acc, tenant_id=tenant, email=mail, devices=_devices(conn, acc))
 
         conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant,))  # RLS : ce locataire, cette transaction

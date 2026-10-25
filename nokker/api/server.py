@@ -101,6 +101,7 @@ from nokker.store.pg import MemoryStore, PgStore, apply_migrations
 from nokker import feedback as feedback_mod
 from nokker.connectors import http as connectors_http
 from nokker.cloud import http as cloud_http
+from nokker.billing import http as billing_http
 from nokker.onboarding import http as onboarding_http
 from nokker.incidents import http as incidents_http
 from nokker.plan import http as plan_http
@@ -668,6 +669,25 @@ def configure_onboarding(config: NokkerConfig, tenancy: Tenancy, approvals: Any)
                                          approvals=approvals,
                                          acceptances=PgAcceptances(dsn) if dsn else MemoryAcceptances(),
                                          consents=PgConsents(dsn) if dsn else MemoryConsents()), codes)
+
+
+def configure_billing(config: NokkerConfig) -> None:
+    """Abonnements Stripe, seulement si `billing_enabled` ET les deux secrets posés. Jamais de clé live par défaut."""
+    from nokker.billing.plans import plans_from_config
+    from nokker.billing.service import Billing
+    from nokker.billing.store import MemoryBilling, PgBilling
+    from nokker.billing.stripe import StripeClient
+
+    key, webhook = os.environ.get(config.billing_secret_key_env, ""), os.environ.get(config.billing_webhook_secret_env, "")
+    if not (config.billing_enabled and key and webhook):
+        billing_http.configure(None)
+        return
+    if key.startswith(("sk_live_", "rk_live_")) and not config.billing_live:
+        raise RuntimeError("billing: clé Stripe live refusée (billing_live est faux)")
+    dsn = config.pg_dsn()
+    billing_http.configure(Billing(store=PgBilling(dsn) if dsn else MemoryBilling(), stripe=StripeClient(key),
+                                   plans=plans_from_config(config.billing_plans), prices=dict(config.billing_prices),
+                                   webhook_secret=webhook, app_url=config.app_url))
 
 
 def configure_feedback(config: NokkerConfig, kernel: Kernel) -> None:
@@ -1666,7 +1686,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if onboarding_http.handle(self, "GET", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                 return
             if path.startswith("/v1/connectors") or path in ("/v1/account", "/v1/account/usage") \
-                    or (team_http.enabled() and team_http.is_team_path(path)):
+                    or (team_http.enabled() and team_http.is_team_path(path)) \
+                    or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                 self._account_route("GET", path)
                 return
 
@@ -1958,6 +1979,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 elif onboarding_http.account_route(self, method, path, account) \
                         or team_http.handle(self, method, path, account):  # équipe (X17), drapeau `team`
                     pass
+                elif billing_http.handle(self, method, path, account):
+                    pass
                 elif not connectors_http.handle(self, method, path, account):
                     self._json(404, {"error": {"message": "not found"}})
 
@@ -2037,13 +2060,16 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if cloud_http.handle(self, "POST", path):  # nokker.ai : lien Lokkal, passerelle, inférence relayée
                 return
             if path != "/v1/chat/completions":
+                if billing_http.handle_webhook(self, "POST", path):  # public : authentifié par la signature Stripe
+                    return
                 if onboarding_http.handle(self, "POST", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                     return
                 if path == "/v1/telegram/webhook":
                     telegram_http.webhook(self)
                     return
                 if path == "/v1/telegram/pairing" or path == "/v1/feedback" or path.startswith("/v1/connectors") \
-                        or (team_http.enabled() and team_http.is_team_path(path)):
+                        or (team_http.enabled() and team_http.is_team_path(path)) \
+                        or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                     self._account_route("POST", path)
                     return
                 if hub is not None and path.startswith(("/v1/threads", "/v1/bubbles")):
@@ -2786,6 +2812,10 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         connectors_http.configure(Connectors(connector_store, resolve=resolve, locality=locality)
                                   if connector_store else None)
         configure_onboarding(config, tenancy, approvals)
+        configure_billing(config)
+        if billing_http.service() is not None and kernel.limits is not None:
+            # Plafonds du palier payé (docs/TENANCY.md) : un abonné actif a ceux de son plan, les autres ceux de la bêta.
+            kernel.limits.caps_for = billing_http.service().caps_for
         configure_cloud_link(config, tenancy, approvals, ledger, store=kernel.store,
                              connector_store=connector_store if local_api is None else None,
                              invariants=kernel.invariants, limits=kernel.limits)

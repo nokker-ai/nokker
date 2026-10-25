@@ -44,11 +44,13 @@ CONTENT_TABLES = [
     "nokker_alert_sources", "nokker_alert_seen", "nokker_incidents", "nokker_plan_cards", "nokker_plan_proposals",
     "nokker_plan_briefs",
     "lokkal_machine_deck",  # deck de chaque machine (028, X15) : machine authentifiée ou compte du deck
+    "subscriptions",  # abonnements Stripe (010) : sous RLS
 ]
 OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
               "lokkal_machines", "lokkal_link_requests",  # lien Lokkal (014) : cherchées par empreinte de jeton ou par code
-              "lokkal_gateway_codes", "lokkal_gateway_refresh"}  # connexion passerelle (019), idem, par empreinte
+              "lokkal_gateway_codes", "lokkal_gateway_refresh",  # connexion passerelle (019), idem, par empreinte
+              "billing_customers", "billing_events"}  # webhook Stripe (010) : lus avant de connaître le locataire
 
 
 @pytest.fixture(scope="module")
@@ -104,11 +106,14 @@ def _dummy_row(conn, table: str) -> tuple[list[str], list]:
         "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() "
         "AND table_name = %s AND is_nullable = 'NO' AND column_default IS NULL ORDER BY ordinal_position",
         (table,)).fetchall()
+    from datetime import datetime, timezone
+
     from psycopg.types.json import Jsonb
 
     vals = {"text": lambda: uuid.uuid4().hex, "integer": lambda: secrets.randbelow(10**6),
             "bigint": lambda: secrets.randbelow(10**9), "double precision": lambda: 1.0,
-            "boolean": lambda: False, "jsonb": lambda: Jsonb({})}
+            "boolean": lambda: False, "jsonb": lambda: Jsonb({}),
+            "timestamp with time zone": lambda: datetime.now(timezone.utc)}
     return [c for c, _ in rows], [vals[t]() for _, t in rows]
 
 
@@ -496,3 +501,45 @@ def test_crew_engine_ticks_each_tenant_in_its_own_scope(pg, pod_env, tmp_path):
                 assert w.agents.store.get(made[other]) is None and w.agents.store.runs(made[other])[0] == []
     finally:
         w.agents.store.close()
+
+
+def test_billing_pg_store_isolation_idempotence_and_stale_events(pg, pod_env):
+    """nokker/billing sur le vrai rôle nokker_app : webhook sans locataire (tables hors RLS), abonnement sous RLS."""
+    from datetime import datetime, timedelta, timezone
+
+    from nokker.billing.store import PgBilling
+    from nokker.tenancy.context import tenant_scope
+
+    store = PgBilling(pg["app"])
+    t0 = datetime(2100, 1, 1, 12, 0, tzinfo=timezone.utc)  # plus récent que les lignes factices des autres tests du module
+    row = {"stripe_subscription": "sub_1", "stripe_customer": "cus_a", "plan": "solo", "status": "active",
+           "current_period_end": t0 + timedelta(days=30), "cancel_at_period_end": False, "last_event_at": t0}
+
+    assert store.put_customer("cus_a", A, "us_a") == "cus_a"
+    assert store.put_customer("cus_a2", A, "us_a") == "cus_a"  # un seul client Stripe par locataire
+    assert store.put_customer("cus_b", B, "us_b") == "cus_b"
+    assert store.tenant_for_customer("cus_a") == (A, "us_a") and store.tenant_for_customer("cus_inconnu") is None
+    assert not store.event_seen("evt_1")
+    store.mark_event("evt_1", "customer.subscription.created")
+    store.mark_event("evt_1", "customer.subscription.created")
+    assert store.event_seen("evt_1")
+
+    with tenant_scope(A):
+        assert store.upsert_subscription(row) is True
+        assert store.upsert_subscription({**row, "status": "canceled", "last_event_at": t0 - timedelta(seconds=1)}) is False
+        assert store.upsert_subscription({**row, "status": "past_due", "last_event_at": t0 + timedelta(seconds=1)}) is True
+    with tenant_scope(B):
+        assert store.upsert_subscription({**row, "stripe_customer": "cus_b", "plan": "essentiel"}) is True
+    assert store.subscription(A)["status"] == "past_due" and store.subscription(A)["plan"] == "solo"
+    assert store.subscription(B)["plan"] == "essentiel"
+
+    with tenant_scope(A):  # résilié puis égalité de seconde : jamais ressuscité ; un abonnement actif passe devant
+        gone = {**row, "stripe_subscription": "sub_old", "status": "canceled", "last_event_at": t0 + timedelta(days=1)}
+        assert store.upsert_subscription(gone) is True
+        assert store.upsert_subscription({**gone, "status": "active"}) is False
+        assert store.subscription(A)["stripe_subscription"] == "sub_1"  # sub_old est plus récent mais résilié
+
+    import psycopg
+
+    with psycopg.connect(pg["app"]) as conn:  # hors scope : la RLS ne rend rien
+        assert conn.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 0

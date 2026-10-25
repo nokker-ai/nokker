@@ -257,6 +257,16 @@ class NokkerConfig:
     # volerait ses messages. Vide = pas de notification Telegram.
     admin_notify_token_env: str = "NOKKER_ADMIN_NOTIFY_TOKEN"
 
+    # ─────────────────────── Abonnements Stripe (nokker/billing) ───────────────────────
+    # Éteint par défaut : aucune route /v1/billing/*, aucun plafond de palier. Une clé `sk_live_…` est REFUSÉE tant que
+    # `billing_live` n'est pas posé (décision produit, pas de la configuration par défaut).
+    billing_enabled: bool = False
+    billing_live: bool = False
+    billing_secret_key_env: str = "NOKKER_STRIPE_SECRET_KEY"
+    billing_webhook_secret_env: str = "NOKKER_STRIPE_WEBHOOK_SECRET"
+    billing_prices: dict[str, str] = field(default_factory=dict)  # {palier: price_id Stripe}
+    billing_plans: dict[str, dict[str, int]] = field(default_factory=dict)  # plafonds qui remplacent DEFAULT_PLANS
+
     def images_root(self) -> str:
         """Dossier du magasin d'images : `images_dir`, sinon `<local.state_dir>/images` (Lokkal), sinon vide (aucune)."""
         if self.images_dir:
