@@ -15,21 +15,27 @@ choose the model.
 
 - **Code.** It reads, searches, edits and patches files, runs your tests and commands in a disposable sandbox, keeps a
   work plan, delegates to sub-agents in separate git worktrees, runs dev servers in the background, and takes a
-  restore point before every write so you can roll back. Use it from a terminal (`nokker`), from Zed (Agent Client
-  Protocol) or VS Code, or in CI with `nokker review`.
+  restore point before every write so you can roll back. Hooks run your own checks before and after a tool. A
+  request can carry screenshots (in the terminal: rolling out). In the web app you watch the file being written as
+  the model types it (rolling out). Use it from a terminal (`nokker`), from Zed (Agent Client Protocol) or VS Code,
+  or in CI with `nokker review`.
 - **Ops.** It runs commands on your servers by name, with approvals that follow the role of the host: any change on
-  `prod` needs a strong card. ssh keys come from a local vault and never reach the model. Every action with an effect
-  goes into a chained audit journal you can verify.
+  `prod` needs a strong card. ssh keys come from a local vault (a file, or OpenBao) and never reach the model. Every
+  action with an effect goes into a chained audit journal you can verify.
 - **Agents.** Scheduled or event-driven jobs (every morning, on a webhook, on an alert in beta) with their own tools,
   budget and secrets by name. A session proposes an agent as a card; you create it and you arm it. Ready-made packs:
   mail, social, jobs, brand, video, MCP builder, ops.
 - **Memory that never starts from zero.** A session is an endless journal: heavy results are moved aside and recalled
   when needed, finished episodes become summaries, and nothing is erased. `AGENTS.md`, `NOKKER.md` and `CLAUDE.md`
   are only the entry point: the agent writes down the rules and corrections you give it, per project, and recalls them
-  by relevance. Memory runs on your machine.
+  by relevance. Memory runs on your machine, in [CortHeXis](https://github.com/ninabot-ch/corthexis).
 - **Approval from your phone** (rolling out). Strong cards (a `prod` change, an e-mail sent in your name, a deletion)
   are signed with a passkey on your phone. Your machine checks the signature itself, and the page shows what you are
   signing, and who described it.
+- **Web and machine, each with its own reach** (rolling out). A connector you set up on nokker.ai (mail, calendar)
+  works from your machine too, and its credentials stay on nokker.ai. What lives on your machine (your repositories,
+  ssh keys, your local network) never goes to the web: a web session that needs it hands the task over to a session
+  on your machine, under that machine's approvals.
 - **Several machines** (rolling out). Link several machines to one account: agent runs go to the least loaded
   machine that has what they need (RAM first, GPU when asked), and one deck shows all your sessions and agents.
 - **Any model.** The Nokker Router (rolling out), any OpenAI-compatible endpoint with your own key, or a model running
@@ -105,9 +111,10 @@ to reproduce them: [docs/en/benchmarks.md](docs/en/benchmarks.md).
 
 ## Tests
 
-Tests run on every push to `main` and on every pull request: 2,354 tests (2,208 unit tests, and 146 integration tests
-against a real Postgres with pgvector), plus `ruff`. Tests that need a hosted model or a local llama.cpp server skip
-themselves there. Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Tests run on every push to `main` and on every pull request: more than 2,300 tests (2,173 unit tests and 139
+integration tests against a real Postgres with pgvector and a disposable OpenBao on the last run), plus `ruff`. Tests
+that need a hosted model or a local llama.cpp server skip themselves there.
+Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Licence
 
@@ -121,7 +128,8 @@ copyright notice are kept in `NOTICE` and `LICENSES/`. Third-party components ke
 Private beta / early access.
 
 - Rolling out: account link and Nokker Router, the gateway (`<name>.nokker.app`), approval from your phone, relayed
-  mail and calendar connectors, placement on several machines and the shared deck, the subscriber mirror, the VS Code
+  mail and calendar connectors, hand-over from a web session to your machine, live file writing in the web app,
+  images from the terminal, placement on several machines and the shared deck, the subscriber mirror, the VS Code
   extension on the Marketplace, the `nokker review` GitHub Action.
 - Beta (off by default): incidents and the plan, team projects.
 - Planned: project skills, `/memory` in the terminal, background sub-agents, `mail:` agent triggers, English
