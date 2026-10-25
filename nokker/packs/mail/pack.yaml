@@ -1,0 +1,9 @@
+name: mail
+version: 1
+title: Mail and calendar
+description: >-
+  Triage the inbox, write replies as drafts, a morning brief of mail and agenda, and scheduling help, on the mail and
+  calendar connectors you set up yourself.
+connectors: [mail, calendar]
+tools: [skill_view, skill_list, mail_search, mail_read, mail_draft, mail_move, mail_send, calendar_events,
+        calendar_create, calendar_update]

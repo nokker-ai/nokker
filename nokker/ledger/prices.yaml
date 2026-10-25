@@ -63,7 +63,7 @@ models:
     prompt: "1.00"
     cached: "1.00"
     completion: "6.00"
-    note: "Route Deep du Router (F5, D11, decision Nick 17.10) : debordement OVH transitoire, jamais presente comme notre Deep."
+    note: "Route Deep du Router (F5, D11, decision produit du 17.10) : debordement OVH transitoire, jamais presente comme notre Deep."
 
   - id: "Qwen3.5-397B-A17B"
     prompt: "0.60"

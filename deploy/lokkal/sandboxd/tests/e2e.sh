@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Recette du proxy docker + proxy de sortie contre un VRAI démon, avec le VRAI CLI docker (image docker:cli), en
-# rejouant les appels du DockerEnvironment de Hermes. À lancer sur une machine de test, jamais en prod.
+# rejouant les appels du DockerEnvironment de la bibliothèque amont. À lancer sur une machine de test, jamais en prod.
 #   e2e.sh   (depuis ce dossier)
 set -uo pipefail
 P=nokker-e2e-$$
@@ -35,7 +35,7 @@ D run --rm --cpus 0.5 --memory 64m --pids-limit 32 alpine:3.20 true >/dev/null 2
 id=$(D create --storage-opt size=1m hello-world 2>&1); case "$id" in *Forbidden*|*nokker*) fail "sonde disque : $id";; *)
   pass "sonde disque create (ou refus du pilote de stockage, hors proxy)"; D rm "$id" >/dev/null 2>&1;; esac
 
-echo "— bac à sable façon Hermes"
+echo "— bac à sable façon bibliothèque amont"
 cid=$(D run -d --init --name $P-sb --label nokker.sandbox=fil-1 -w /workspace --cap-drop ALL \
   --cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add FOWNER --security-opt no-new-privileges --pids-limit 256 \
   --cpus 1 --memory 512m --tmpfs /tmp --tmpfs /run -v "$WS:/workspace" --network $SB alpine:3.20 sleep infinity 2>&1)

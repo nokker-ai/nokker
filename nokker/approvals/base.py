@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -30,7 +31,7 @@ from nokker.approvals.notify import ApprovalNotifier, NullNotifier
 from nokker.approvals.types import Device, Session
 from nokker.core.ports import Approval, Challenge, Proof
 from nokker.core.turn import ToolCall, Turn, Verdict
-from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_of_thread
+from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_of_thread, tenant_scope
 
 logger = logging.getLogger("nokker.approvals")
 
@@ -40,7 +41,7 @@ SESSION_TTL_S = 12 * 3600.0
 
 
 # Appareils nés d'une simple connexion (code e-mail, et Google plus tard) : ils ouvrent une session, ils ne décident
-# jamais d'une approbation (décision de Nick, 21.10.2026 — scope §16).
+# jamais d'une approbation (décision produit du 21.10.2026 — scope §16).
 LOGIN_ONLY_VIA = ("email-code", "google")
 
 
@@ -79,6 +80,10 @@ class BaseApprovals:
     # Carte d'un testeur : notifiée à SON compte (son Telegram relié, `telegram/notify.py`), jamais à `notifier` qui écrit
     # aux opérateurs internes. `None` = pas de notification pour les testeurs (la carte reste visible dans l'app web).
     tester_notifier: Callable[[Approval], None] | None = None
+    # Une décision (locale, signée, ou venue par nokker.ai) passe la carte de `pending` à `approved|rejected` sous ce
+    # verrou : deux décisions concurrentes de la même carte (le propriétaire en local ET son téléphone, lot X10) n'en
+    # appliquent qu'une, jamais les deux.
+    _decision_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     # ─────────────────────── primitives de stockage (sous-classe) ───────────────────────
 
@@ -166,7 +171,7 @@ class BaseApprovals:
 
     def decider_allowed(self, decided_by: str | None, card_tenant: str) -> bool:
         """Un décideur n'est accepté que dans le locataire de la carte : les opérateurs internes sur les cartes internes,
-        le compte du testeur sur les SIENNES ; jamais Nick chez un testeur, jamais un testeur chez un autre."""
+        le compte du testeur sur les SIENNES ; jamais l'opérateur chez un testeur, jamais un testeur chez un autre."""
         return bool(decided_by) and self.user_tenant(decided_by) == card_tenant
 
     def device_visible(self, device: Device) -> bool:
@@ -181,7 +186,7 @@ class BaseApprovals:
             id=str(uuid.uuid4()), thread_id=turn.thread_id, turn_index=turn.index, channel=turn.channel,
             tool_name=call.name, arguments=dict(call.arguments), args_sha256=args_sha256(call.arguments),
             strength=verdict.strength or "standard", rule=verdict.rule, reason=verdict.reason, advice=advice,
-            status="pending", created_at=now, expires_at=now + self.default_ttl_s,
+            status="pending", created_at=now, expires_at=now + self.default_ttl_s, call_id=call.id or None,
         )
         self._store_approval(approval)
         self._append_event(approval.id, "requested", {"rule": approval.rule, "strength": approval.strength})
@@ -243,7 +248,10 @@ class BaseApprovals:
         self._append_event(approval.id, "failed", {"error": error})
         return approval
 
-    def challenge(self, approval_id: str) -> Challenge:
+    def challenge(self, approval_id: str, ttl_s: float | None = None, *, bind_tool: bool = False) -> Challenge:
+        """`ttl_s` : durée du défi (défaut `challenge_ttl_s`, 120 s) ; une carte relayée vers nokker.ai (lot X10) en
+        demande une plus longue, bornée par l'expiration de la carte elle-même. `bind_tool` : le nom de l'outil entre
+        dans le défi (cartes relayées : nokker.ai vérifie lui-même qu'une preuve d'envoi porte sur CET outil, X20b)."""
         approval = self._load_visible(approval_id)
         if approval is None:
             raise ApprovalNotFound(approval_id)
@@ -254,11 +262,13 @@ class BaseApprovals:
             raise ApprovalNotPending(approval.status)
         now = self.clock()
         nonce = new_nonce()
-        exp = now + self.challenge_ttl_s
+        exp = min(now + (self.challenge_ttl_s if ttl_s is None else ttl_s), approval.expires_at)
         self._reserve_nonce(nonce, approval_id, exp)
-        return Challenge(approval_id=approval_id, args_sha256=approval.args_sha256, nonce=nonce, exp=exp)
+        return Challenge(approval_id=approval_id, args_sha256=approval.args_sha256, nonce=nonce, exp=exp,
+                         tool=approval.tool_name if bind_tool else None)
 
-    def decide(self, approval_id: str, decision: str, proof: Proof) -> Approval:
+    def _pending_card(self, approval_id: str, decision: str) -> Approval:
+        """La carte à décider, encore en attente ; lève sinon. Appelée SOUS `_decision_lock`."""
         if decision not in ("approve", "reject"):
             raise ProofInvalid(f"décision inconnue : {decision!r}")
         approval = self._load_visible(approval_id)
@@ -269,14 +279,21 @@ class BaseApprovals:
             raise ApprovalExpired(approval_id)
         if approval.status != "pending":
             raise ApprovalNotPending(approval.status)
+        return approval
 
+    @staticmethod
+    def _check_challenge(approval: Approval, proof: Proof) -> str:
+        """Le défi de la preuve porte sur CETTE carte, l'audience des décisions et des arguments inchangés ; rend son
+        nonce (pas encore consommé)."""
         if not proof.challenge:
             raise ProofInvalid("preuve sans défi (`challenge` manquant)")
         try:
             challenge_obj = json.loads(proof.challenge)
         except json.JSONDecodeError as e:
             raise ProofInvalid(f"défi illisible : {e}") from e
-        if challenge_obj.get("approval_id") != approval_id:
+        if not isinstance(challenge_obj, dict):
+            raise ProofInvalid("défi illisible : objet JSON attendu")
+        if challenge_obj.get("approval_id") != approval.id:
             raise ProofInvalid("le défi porte sur une autre approbation")
         if challenge_obj.get("aud") != "nokker-approval":
             raise ProofInvalid("audience du défi invalide")
@@ -286,48 +303,99 @@ class BaseApprovals:
         fresh_hash = args_sha256(approval.arguments)
         if fresh_hash != approval.args_sha256 or challenge_obj.get("args_sha256") != approval.args_sha256:
             raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+        if "tool" in challenge_obj and challenge_obj["tool"] != approval.tool_name:
+            raise ProofInvalid("le défi porte sur un autre outil")
         nonce = challenge_obj.get("nonce")
-        if not nonce or not isinstance(nonce, str) or not self._consume_nonce(nonce, approval_id):
+        if not nonce or not isinstance(nonce, str):
             raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
+        return nonce
 
-        decided_by, decided_via = self._verify_proof(approval, decision, proof)
-        if not self.decider_allowed(decided_by, self.tenant_of(approval)):
-            raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
-
-        now = self.clock()
+    def _commit(self, approval: Approval, decision: str, decided_by: str, decided_via: str,
+                extra: dict | None = None) -> Approval:
         approval.status = "approved" if decision == "approve" else "rejected"
-        approval.decided_by = decided_by
-        approval.decided_via = decided_via
-        approval.decided_at = now
+        approval.decided_by, approval.decided_via, approval.decided_at = decided_by, decided_via, self.clock()
         self._store_approval(approval)
-        self._append_event(approval.id, approval.status, {"decided_by": decided_by, "decided_via": decided_via})
-        self._emit("approval.decided",
-                   {"approval_id": approval.id, "decision": approval.status, "by": decided_by, "via": decided_via})
+        self._append_event(approval.id, approval.status,
+                           {"decided_by": decided_by, "decided_via": decided_via, **(extra or {})})
+        return approval
+
+    def note_forwarded(self, approval: Approval) -> None:
+        """Carte forte déposée chez nokker.ai (lot X10, `nokker/local/remote_approvals.py`) : le lien de décision est
+        parti au téléphone. `approval.forwarded {approval_id, thread_id}` dit aux clients locaux (éditeurs) où la
+        carte attend ; rien ne change dans la carte (le terminal peut toujours la décider)."""
+        with tenant_scope(self.tenant_of(approval)):
+            self._emit("approval.forwarded", {"approval_id": approval.id, "thread_id": approval.thread_id})
+
+    def _emit_decided(self, approval: Approval) -> None:
+        self._emit("approval.decided", {"approval_id": approval.id, "decision": approval.status,
+                                        "by": approval.decided_by, "via": approval.decided_via})
+
+    def decide(self, approval_id: str, decision: str, proof: Proof) -> Approval:
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, decision)
+            nonce = self._check_challenge(approval, proof)
+            if not self._consume_nonce(nonce, approval_id):
+                raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
+            decided_by, decided_via = self._verify_proof(approval, decision, proof)
+            if not self.decider_allowed(decided_by, self.tenant_of(approval)):
+                raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
+            approval = self._commit(approval, decision, decided_by, decided_via)
+        self._emit_decided(approval)
         return approval
 
     def decide_local(self, approval_id: str, decision: str, decided_by: str) -> Approval:
         """Décision par le propriétaire de la machine (Nokker Lokkal, jeton local, docs/LOKKAL.md §7.4.3) : mêmes
         contrôles d'état et d'empreinte des arguments que `decide`, sans signature d'appareil. Appelée seulement par
         la route locale, jamais par une route qu'on peut joindre depuis la passerelle."""
-        if decision not in ("approve", "reject"):
-            raise ProofInvalid(f"décision inconnue : {decision!r}")
-        approval = self._load_visible(approval_id)
-        if approval is None:
-            raise ApprovalNotFound(approval_id)
-        self._expire_if_needed(approval)
-        if approval.status == "expired":
-            raise ApprovalExpired(approval_id)
-        if approval.status != "pending":
-            raise ApprovalNotPending(approval.status)
-        if args_sha256(approval.arguments) != approval.args_sha256:
-            raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
-        approval.status = "approved" if decision == "approve" else "rejected"
-        approval.decided_by, approval.decided_via, approval.decided_at = decided_by, "local-token", self.clock()
-        self._store_approval(approval)
-        self._append_event(approval.id, approval.status, {"decided_by": decided_by, "decided_via": "local-token"})
-        self._emit("approval.decided",
-                   {"approval_id": approval.id, "decision": approval.status, "by": decided_by, "via": "local-token"})
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, decision)
+            if args_sha256(approval.arguments) != approval.args_sha256:
+                raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+            if decision == "approve" and (approval.rule == "ops:prod" or approval.rule.startswith("ops:prod:")):
+                # Plancher prod (lot X11) : approuver se fait à la clé d'appareil seulement, jamais au jeton local
+                # (défense en profondeur : la route locale refuse déjà) ; refuser reste possible ici.
+                raise ProofInvalid("carte prod : clé d'appareil exigée (docs/APPROVALS.md), pas le jeton local")
+            approval = self._commit(approval, decision, decided_by, "local-token")
+        self._emit_decided(approval)
         return approval
+
+    def decide_remote(self, approval_id: str, decision: str, proof: Proof, device: Device, *, origin: str,
+                      decided_by: str, rp_id: str | None = None) -> Approval:
+        """Décision venue par nokker.ai (lot X10, docs/LOKKAL.md §7.3) : la preuve est vérifiée ICI, sur la machine,
+        exactement comme une décision signée locale (`_verify_device_proof` : mêmes règles d'appareil, UV exigé pour
+        une carte forte), mais contre la clé publique d'un appareil du compte lié (`device`, donnée par nokker.ai) et
+        l'origine WebAuthn de nokker.ai (`origin`, `rp_id`). nokker.ai n'a aucune clé privée d'appareil : il ne peut
+        rien décider seul.
+
+        Le nonce n'est consommé qu'APRÈS une preuve valide : une preuve fausse (relais fautif, compte volé) ne brûle pas
+        le défi de la carte, l'appareil légitime peut encore signer. Le rejeu reste impossible : une preuve valide
+        consomme le nonce, et une seconde preuve sur le même défi est refusée. `decided_by` : l'identité locale sous
+        laquelle l'outil s'exécute (le propriétaire de la machine) ; l'appareil et le compte vont au journal."""
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, decision)
+            nonce, via = self.verify_signed_decision(approval, decision, proof, device, origin=origin, rp_id=rp_id)
+            if not self._consume_nonce(nonce, approval_id):
+                raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
+            approval = self._commit(approval, decision, decided_by, via,
+                                    {"remote": True, "device_id": device.id, "account": device.user})
+        self._emit_decided(approval)
+        return approval
+
+    def verify_signed_decision(self, approval: Approval, decision: str, proof: Proof, device: Device, *,
+                               origin: str, rp_id: str | None = None) -> tuple[str, str]:
+        """Vérification PURE d'une décision signée par un appareil donné (sans état : rien n'est consommé ni écrit) :
+        le défi porte sur CETTE carte (id, audience, empreinte des arguments, outil s'il est lié), la preuve nomme
+        CET appareil, pas de TOTP, puis `_verify_device_proof` (appareil approuvé et qui décide, UV exigé pour une carte
+        forte, origine et rpId WebAuthn). Rend `(nonce du défi, decided_via)` ; lève `ProofInvalid`.
+
+        Une seule routine pour la machine (`decide_remote`, lot X10) et pour nokker.ai quand il vérifie lui-même la
+        preuve d'un envoi relayé (lot X20b, `nokker/cloud/relay.py`) : chacun tient ensuite son propre usage unique."""
+        nonce = self._check_challenge(approval, proof)
+        if proof.totp:
+            raise ProofInvalid("TOTP non accepté pour une décision à distance — clé d'appareil requise")
+        if proof.device_id != device.id:
+            raise ProofInvalid("la preuve nomme un autre appareil")
+        return nonce, self._verify_device_proof(approval, decision, proof, device, origin=origin, rp_id=rp_id)
 
     def _verify_proof(self, approval: Approval, decision: str, proof: Proof) -> tuple[str, str]:
         """Renvoie `(decided_by, decided_via)` ou lève `ProofInvalid`. `proof.challenge` a déjà été
@@ -350,59 +418,64 @@ class BaseApprovals:
             self._set_totp_last_step(user, step)
             return user, "totp"
 
-        if proof.webauthn_signature and proof.device_id:
+        if proof.device_id and (proof.webauthn_signature or proof.signature):
             device = self._load_device(proof.device_id)
             if device is None:
                 raise ProofInvalid("appareil inconnu")
-            if device.status != "approved":
-                raise ProofInvalid(f"appareil non approuvé (statut={device.status!r})")
-            _require_deciding_device(device)
-            if not self.webauthn_origin:
+            return device.user, self._verify_device_proof(approval, decision, proof, device,
+                                                          origin=self.webauthn_origin)
+
+        raise ProofInvalid("aucune preuve exploitable (signature d'appareil, WebAuthn, ou TOTP)")
+
+    def _verify_device_proof(self, approval: Approval, decision: str, proof: Proof, device: Device, *,
+                             origin: str | None, rp_id: str | None = None) -> str:
+        """Preuve d'un appareil (WebAuthn ou signature P1363) sur `"<challenge>.<decision>"` ; rend `decided_via` ou
+        lève `ProofInvalid`. Une seule routine pour la décision locale (`decide`) et celle venue par nokker.ai
+        (`decide_remote`) : mêmes règles d'appareil (approuvé, pas de simple connexion), UV exigé pour une carte
+        forte, clé logicielle refusée pour une carte forte."""
+        if device.status != "approved":
+            raise ProofInvalid(f"appareil non approuvé (statut={device.status!r})")
+        _require_deciding_device(device)
+        if proof.webauthn_signature:
+            if not origin:
                 raise ProofInvalid("vérification WebAuthn non configurée côté serveur (origine attendue absente)")
             expected_challenge = hashlib.sha256(f"{proof.challenge}.{decision}".encode("utf-8")).digest()
             try:
                 verify_webauthn_assertion(
-                    device.public_key_spki, proof.webauthn_client_data_json, proof.webauthn_authenticator_data,
-                    proof.webauthn_signature, expected_challenge=expected_challenge,
-                    expected_origin=self.webauthn_origin, require_uv=approval.strength == "strong")
-            except WebAuthnError as e:
+                    device.public_key_spki, proof.webauthn_client_data_json or "",
+                    proof.webauthn_authenticator_data or "", proof.webauthn_signature,
+                    expected_challenge=expected_challenge, expected_origin=origin,
+                    require_uv=approval.strength == "strong", expected_rp_id=rp_id)
+            except (WebAuthnError, SignatureError) as e:
                 raise ProofInvalid(str(e)) from e
-            return device.user, "webauthn"
-
-        if proof.signature and proof.device_id:
-            device = self._load_device(proof.device_id)
-            if device is None:
-                raise ProofInvalid("appareil inconnu")
-            if device.status != "approved":
-                raise ProofInvalid(f"appareil non approuvé (statut={device.status!r})")
-            _require_deciding_device(device)
-            message = f"{proof.challenge}.{decision}".encode("utf-8")
+            return "webauthn"
+        if not proof.signature:
+            raise ProofInvalid("aucune preuve exploitable (signature d'appareil, WebAuthn, ou TOTP)")
+        message = f"{proof.challenge}.{decision}".encode("utf-8")
+        try:
+            verify_p1363_signature(device.public_key_spki, message, proof.signature)
+        except SignatureError as e:
+            raise ProofInvalid(str(e)) from e
+        via = "signature"
+        if proof.telegram_init_data:
+            if not self.telegram_bot_token:
+                raise ProofInvalid("validation Telegram non configurée côté serveur")
             try:
-                verify_p1363_signature(device.public_key_spki, message, proof.signature)
-            except SignatureError as e:
+                info = verify_telegram_init_data(proof.telegram_init_data, self.telegram_bot_token,
+                                                 self.telegram_max_age_s)
+            except TelegramInitDataError as e:
                 raise ProofInvalid(str(e)) from e
-            via = "signature"
-            if proof.telegram_init_data:
-                if not self.telegram_bot_token:
-                    raise ProofInvalid("validation Telegram non configurée côté serveur")
-                try:
-                    info = verify_telegram_init_data(proof.telegram_init_data, self.telegram_bot_token,
-                                                     self.telegram_max_age_s)
-                except TelegramInitDataError as e:
-                    raise ProofInvalid(str(e)) from e
-                tg_user_id = str((info.get("user") or {}).get("id", ""))
-                if not device.telegram_user_id or tg_user_id != device.telegram_user_id:
-                    raise ProofInvalid("initData Telegram ne correspond pas à l'appareil")
-                via = "signature+telegram"
-            if approval.strength == "strong" and via != "signature+telegram":
-                # Une clé logicielle (CLI : trousseau ou fichier 0600) n'est PAS libérée par biométrie : elle ne
-                # suffit qu'au niveau standard. strong = Mini App (clé libérée par BiometricManager, initData
-                # vérifié), passkey avec UV, ou plus tard app native attestée (docs/APPROVALS.md §1).
-                raise ProofInvalid("niveau « strong » : signature d'une clé logicielle refusée — approuver depuis "
-                                   "la Mini App Telegram, une passkey ou l'app native")
-            return device.user, via
-
-        raise ProofInvalid("aucune preuve exploitable (signature d'appareil, WebAuthn, ou TOTP)")
+            tg_user_id = str((info.get("user") or {}).get("id", ""))
+            if not device.telegram_user_id or tg_user_id != device.telegram_user_id:
+                raise ProofInvalid("initData Telegram ne correspond pas à l'appareil")
+            via = "signature+telegram"
+        if approval.strength == "strong" and via != "signature+telegram":
+            # Une clé logicielle (CLI : trousseau ou fichier 0600) n'est PAS libérée par biométrie : elle ne
+            # suffit qu'au niveau standard. strong = Mini App (clé libérée par BiometricManager, initData
+            # vérifié), passkey avec UV, ou plus tard app native attestée (docs/APPROVALS.md §1).
+            raise ProofInvalid("niveau « strong » : signature d'une clé logicielle refusée — approuver depuis "
+                               "la Mini App Telegram, une passkey ou l'app native")
+        return via
 
     # ─────────────────────── appareils (docs/CLIENT-API.md) ───────────────────────
 
@@ -488,8 +561,8 @@ class BaseApprovals:
 
     def enroll_totp_secret(self, user: str, secret_b32: str) -> None:
         """Pose le secret TOTP d'un utilisateur. Hors API (docs/CLIENT-API.md n'expose aucune route pour
-        ça) — provisionné par un outil d'exploitation direct sur le backend (Vaultwarden distribue le
-        secret au vrai utilisateur séparément). Jamais relu par `decide()`/l'API : seul le CODE est
+        ça) — provisionné par un outil d'exploitation direct sur le backend (le gestionnaire de mots de
+        passe distribue le secret au vrai utilisateur séparément). Jamais relu par `decide()`/l'API : seul le CODE est
         vérifié, jamais le secret lui-même renvoyé."""
         self._store_totp_secret(user.strip().lower(), secret_b32)
 

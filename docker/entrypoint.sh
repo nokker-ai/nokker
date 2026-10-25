@@ -1,7 +1,7 @@
 #!/bin/sh
 # Nokker (nokker) — entrypoint minimal.
 #
-# Ce dépôt n'embarque pas le runtime s6-overlay de Hermes (celui-ci vit dans
+# Ce dépôt n'embarque pas le runtime s6-overlay de la bibliothèque amont (il vit dans
 # hermes-nokker, construit depuis la source). Cette image installe
 # hermes-agent comme DÉPENDANCE ÉPINGLÉE (pip, voir pyproject.toml et
 # Dockerfile) : le binaire `nokker` qu'elle fournit (alias de couche de

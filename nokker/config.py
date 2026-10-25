@@ -44,7 +44,7 @@ class TierConfig:
 class ApiKeyIdentity:
     """Une clé Bearer acceptée par `/v1/chat/completions`, et l'identité qui lui est liée.
 
-    Sécurité (consigne Nick/F2, 17.10.2026) : `Turn.sender` ne doit JAMAIS venir d'un champ que le
+    Sécurité (consigne produit F2, 17.10.2026) : `Turn.sender` ne doit JAMAIS venir d'un champ que le
     CLIENT contrôle (`user` du corps, un en-tête arbitraire) — ça reviendrait à laisser l'appelant
     s'auto-attribuer un GO. La seule identité qu'`api/server.py` fait confiance est celle liée, ICI EN
     CONFIG SERVEUR, à la clé Bearer effectivement présentée (secret que seul le vrai appelant détient)."""
@@ -61,6 +61,14 @@ class NokkerConfig:
     pg_dsn_env: str = "NOKKER_PG_DSN"
     memory_mcp_url: str = ""  # vide = pas de mémoire longue (l'instance interne pose son URL dans sa config)
     memory_mcp_token_env: str = "SOKKAN_MEMORY_MCP_TOKEN"
+    # Mémoire longue (`nokker/memory/corthexis.py::from_config`) : `mcp` (défaut : `memory_mcp_url`, vide = aucune),
+    # `direct` (bibliothèque CortHeXis dans le processus, sur le Postgres et l'embed du compose — Nokker Lokkal) ou
+    # `off`. Vide : `NOKKER_MEMORY_MODE` de l'environnement, sinon `mcp`.
+    memory_mode: str = ""
+    # Mode `direct` : `projects` (scope du rappel ; défaut `[u-local]`, les notes de portée user de la mémoire de projet),
+    # `database_url_env` (CORTHEXIS_DATABASE_URL), `embed_urls`, `profile` (leger|standard|gpu), `rerank_url`, `deep`,
+    # `min_score` (0,15), `relative_floor` (0,6), `min_rerank` (0,35) — seuils de l'index local au profil leger.
+    memory_direct: dict[str, Any] = field(default_factory=dict)
     prefix_path: str = str(PRODUCT_PREFIX_PATH)  # l'instance interne pose son propre préfixe dans sa config
     escalation_addressee: str = "l'équipe"  # « Je transmets à … » de l'instance interne (jamais chez un testeur)
     profile_path: str | None = None
@@ -75,7 +83,7 @@ class NokkerConfig:
     # serveur ouvert (dev seulement) : alors sender=None TOUJOURS (aucune identité de confiance).
     api_keys: list[ApiKeyIdentity] = field(default_factory=list)
     # Identifiants Telegram numériques connus de l'instance interne — PAS utilisés pour résoudre Turn.sender
-    # aujourd'hui : vérifié dans gateway/run_turn.py (hermes-nokker), le mode proxy de la gateway Hermes
+    # aujourd'hui : vérifié dans gateway/run_turn.py (hermes-nokker), le mode proxy de la passerelle amont
     # NE TRANSMET AUCUNE identité (ni en-tête, ni champ `user` ; corps strictement {model, messages,
     # stream}). Posés ici pour que F7 (pont gateway) puisse les relier à un futur en-tête VÉRIFIÉ côté
     # gateway (elle connaît déjà TELEGRAM_ALLOWED_USERS avant d'appeler le proxy) ; `qa/invariants.py`
@@ -90,7 +98,7 @@ class NokkerConfig:
     allowlist_addresses: list[str] = field(default_factory=list)
     effect_overrides: dict[str, str] = field(default_factory=dict)  # EffectsTable.load(...)
     # Recherche web sans clé (tools/web.py, P1 18.10.2026) : 4 moteurs gratuits/publics (Exa,
-    # Parallel, Firecrawl, Keenable — décision Nick, pas de moteur payant, pas d'index maison).
+    # Parallel, Firecrawl, Keenable — décision produit, pas de moteur payant, pas d'index maison).
     web_search_enabled: bool = True
     web_search_engines: list[str] = field(default_factory=lambda: ["exa", "parallel", "firecrawl", "keenable"])
     web_search_budget_s: float = 2.5
@@ -126,16 +134,29 @@ class NokkerConfig:
     # `qa.calibrate.DEFAULT_THRESHOLDS`, 0,3/0,7).
     judge: TierConfig = field(default_factory=lambda: TierConfig(base_url="https://router.sokkan.ch/v1",
                                                                   model="qwen/qwen3.8-27b"))
+    judge_explicit: bool = False  # posé par `load_config` quand le YAML porte `judge:` (sinon `judge_config()` = Ship)
     judge_thresholds_path: str | None = None
+    # ─────────────────────── X8 : juge allumé, multi-modèle (docs/LOKKAL.md §7.17) ───────────────────────
+    # Rôles du juge indépendants des portes ci-dessus (`judge_enabled` = couche 2 des portes action/bascule, < 90 % au
+    # banc B-1, éteinte) : relecture du diff avant « terminé » et avis sur les cartes fortes. Éteints par défaut.
+    judge_review: bool = False
+    judge_review_rounds: int = 1  # renvois de relecture à l'auteur par tour, au plus
+    judge_advice: bool = False
+    judge_max_tokens: int = 400  # relecture et avis ; plus pour un juge qui raisonne d'abord (gpt-oss)
+    judge_verdict_max_tokens: int = 1  # questions des portes : 1 jeton (logprobs) ; plus pour un juge qui raisonne
+    # Routage par tour : `policy` v0 (défaut : Ship, Deep sur signaux) | v1 (trivial → `small`, conversation → Ship,
+    # code → Deep) ; `classifier` rules (défaut, aucun appel) | model (petit palier, 1 jeton, tour ambigu seulement) ;
+    # `code_to_deep` (v1, défaut true) ; `classifier_max_tokens` (1 ; plus pour un petit modèle qui raisonne).
+    route: dict[str, Any] = field(default_factory=dict)
 
     # ─────────────────────── P1 : approbations fortes (docs/APPROVALS.md) ───────────────────────
-    # Doctrine Nick (17.10) : jamais d'action à effet HITL exécutée sans preuve — donc câblé par défaut
+    # Doctrine produit (17.10) : jamais d'action à effet HITL exécutée sans preuve — donc câblé par défaut
     # (`True`), pas une option qu'il faut se souvenir d'activer. `False` reproduit le comportement
     # d'avant ce chantier (carte seulement dans `turn.pending_approvals`, aucune preuve exigée).
     approvals_enabled: bool = True
     approvals_dsn_env: str | None = None  # None -> réutilise pg_dsn_env (même Postgres que le Store)
     # Notificateur Telegram (sendMessage + bouton `web_app`) : désactivé par défaut (aucun appel réseau
-    # tant que Nick ne l'active pas explicitement ET ne fournit pas de jeton de bot).
+    # tant que l'opérateur ne l'active pas explicitement ET ne fournit pas de jeton de bot).
     approvals_telegram_enabled: bool = False
     telegram_bot_token_env: str = "TELEGRAM_BOT_TOKEN"
     telegram_mini_app_url: str = ""
@@ -157,7 +178,7 @@ class NokkerConfig:
     # `root_dir` (notes par fil), `database_url_env` (défaut CORTHEXIS_DATABASE_URL), `embed_urls`, `profile`
     # (leger|standard|gpu), `rerank_url`, `min_score`, `min_rerank`, `chunk_target`.
     context_corthexis: dict[str, Any] = field(default_factory=dict)
-    # {sender: thread_id}. Une passerelle qui fait tourner l'identifiant de session à chaque `/new` (gateway Hermes du
+    # {sender: thread_id}. Une passerelle qui fait tourner l'identifiant de session à chaque `/new` (passerelle amont du
     # canari, vu le 19.10.2026 : « Session reset ») casserait le « never clear » : chaque session serait un fil neuf.
     # Pour ces identités, toutes les sessions tombent dans UN fil fixe ; un changement d'identifiant de session y
     # clôt l'épisode (raison `marker`) sans rien perdre.
@@ -170,10 +191,10 @@ class NokkerConfig:
     # Access est vérifié par la console (organisation `admin_access_team`, audience lue dans `admin_access_aud_env`) ; le
     # rôle vient de `admin_operators` ({e-mail: owner|ops|lecteur}), recopié dans la table `operators` au démarrage.
     # Dev seulement : sans clé d'API, accepter toute requête comme interne (sans identité). JAMAIS en bêta/prod : une
-    # requête anonyme tomberait dans le locataire de Nick (trouvé à l'intégration multi-locataire, 21.10.2026).
+    # requête anonyme tomberait dans le locataire interne (trouvé à l'intégration multi-locataire, 21.10.2026).
     dev_open_api: bool = False
     # Locataire interne (opérateurs internes, canari). `false` sur la bêta OVH : aucun expéditeur n'y est interne (clés d'API,
-    # `telegram_ids`, appareils de Nick), et aucun appareil ne s'enrôle sans invitation. docs/TENANCY.md §2.
+    # `telegram_ids`, appareils de l'opérateur), et aucun appareil ne s'enrôle sans invitation. docs/TENANCY.md §2.
     internal_tenant: bool = True
     # Nokker Lokkal (docs/LOKKAL.md §7, nokker/local/api.py) : None (bêta) = pas d'API locale ni d'outils de code.
     # {token_path, allowed_hosts, code: {roots, host_roots, backend, image, network_name},
@@ -184,6 +205,16 @@ class NokkerConfig:
     # nokker.ai, côté cloud du lien Lokkal (docs/LOKKAL.md §7.2 révisé, §7.5, nokker/cloud/) : None (défaut) = aucune
     # route /v1/link/*, /v1/gateway/*, /v1/inference/*. {signing_key_env, base_url, gateway_domain}
     cloud_link: dict[str, Any] | None = None
+    # Équipe (lot X17, docs/LOKKAL.md §7.15, nokker/team/) : projets partagés entre comptes nokker.ai, membres et rôles,
+    # catalogue de skills, règles qui restreignent, noms de secrets, notes de projet en miroir. Éteint par défaut :
+    # aucune route /v1/projects*, aucun champ `project` sur les agents, comportement inchangé.
+    team: bool = False
+    # Plan et incidents (lot X18, docs/LOKKAL.md §7.18). `plan` : cartes hiérarchiques, consignes héritées injectées,
+    # avancement calculé, propositions de découpe, brief du matin (routes /v1/plan*, outils plan_*). `operate` : alertes
+    # signées → incidents → agents `alert:<nom>` (routes /v1/alerts*, /v1/incidents*). Éteints par défaut : 404 comme
+    # avant, aucun outil, aucun bloc de contexte. Le brief et les passages d'agents demandent le moteur Crew (X14).
+    plan: bool = False
+    operate: bool = False
     # Pool de navigateurs de la bêta (docs/BROWSER-POOL.md, nokker/tools/browser_pool.py) : noms des variables
     # d'environnement de l'adresse du gestionnaire et de son jeton. Variable absente ou vide = pas de navigateur.
     browser_pool_url_env: str | None = "NOKKER_BROWSER_POOL_URL"
@@ -212,7 +243,7 @@ class NokkerConfig:
     admin_access_aud_env: str = "NOKKER_ADMIN_ACCESS_AUD"
     admin_operators: dict[str, str] = field(default_factory=dict)
     admin_console_url: str = "https://admin.nokker.ai"
-    # Tirage des candidatures depuis nokker-beta-api (front1, routes /internal/* liées à son IP Tailscale). Vide = pas de
+    # Tirage des candidatures depuis nokker-beta-api (front1, routes /internal/* liées à une adresse privée). Vide = pas de
     # tirage. Notification Telegram de chaque nouvelle candidature aux `admin_notify_chat_ids` (bot : ci-dessous).
     beta_pull_url: str = ""
     beta_pull_token_env: str = "NOKKER_BETA_PULL_TOKEN"
@@ -221,7 +252,7 @@ class NokkerConfig:
     # Même liste lue dans l'environnement (identifiants séparés par des virgules), ajoutée à la précédente : un
     # identifiant de personne n'a pas à vivre dans la config versionnée.
     admin_notify_chat_ids_env: str | None = None
-    # Jeton du bot qui envoie ces notifications (21.10, Nick : le bot de prod de l'instance interne, pas celui du canari qui garde les
+    # Jeton du bot qui envoie ces notifications (décision produit du 21.10 : le bot de prod de l'instance interne, pas celui du canari qui garde les
     # approbations). sendMessage SEULEMENT : ce bot est lu en continu par OpenClaw, un getUpdates/setWebhook d'ici lui
     # volerait ses messages. Vide = pas de notification Telegram.
     admin_notify_token_env: str = "NOKKER_ADMIN_NOTIFY_TOKEN"
@@ -280,6 +311,14 @@ class NokkerConfig:
         extra = [x.strip() for x in from_env.split(",") if x.strip()]
         return tuple(dict.fromkeys([*map(str, self.admin_notify_chat_ids), *extra]))
 
+    def judge_config(self) -> TierConfig:
+        """Modèle du juge : `judge:` du YAML s'il est posé ; sinon le palier Ship (un seul modèle : clé de l'utilisateur,
+        modèle local — X8), sinon le premier palier, sinon le défaut du code."""
+        default = TierConfig(base_url="https://router.sokkan.ch/v1", model="qwen/qwen3.8-27b")
+        if self.judge_explicit or self.judge != default:
+            return self.judge
+        return self.tiers.get("ship") or next(iter(self.tiers.values()), None) or self.judge
+
     def go_senders(self) -> frozenset[str]:
         from nokker.qa.invariants import GoAuthorizedSenders
 
@@ -300,12 +339,13 @@ def load_config(path: str | None = None) -> NokkerConfig:
                          cache=str(t.get("cache", "none")), vision=bool(t.get("vision", False)))
         for name, t in (raw.get("tiers") or {}).items()
     } or None
-    # `api_keys: []` explicite = AUCUNE clé (bêta OVH), pas la clé par défaut `API_SERVER_KEY → nick` ; absente = défaut.
+    # `api_keys: []` explicite = AUCUNE clé (bêta OVH), pas une clé par défaut ; absente = défaut.
     api_keys = [ApiKeyIdentity(token_env=k["token_env"], sender=k["sender"]) for k in raw.get("api_keys") or []] \
         if "api_keys" in raw else None
     judge_raw = raw.get("judge")
     judge = TierConfig(base_url=judge_raw["base_url"], model=judge_raw["model"],
-                       api_key_env=judge_raw.get("api_key_env", "ROUTER_KEY")) if judge_raw else None
+                       api_key_env=judge_raw.get("api_key_env", "ROUTER_KEY"),
+                       reasoning_off_body=judge_raw.get("reasoning_off_body")) if judge_raw else None
     kwargs: dict[str, Any] = {k: v for k, v in raw.items() if k not in ("tiers", "api_keys", "judge")}
     if tiers:
         kwargs["tiers"] = tiers
@@ -313,6 +353,7 @@ def load_config(path: str | None = None) -> NokkerConfig:
         kwargs["api_keys"] = api_keys
     if judge:
         kwargs["judge"] = judge
+        kwargs["judge_explicit"] = True
     return NokkerConfig(**kwargs)
 
 

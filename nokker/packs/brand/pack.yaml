@@ -1,0 +1,25 @@
+name: brand
+version: 1
+title: Brand
+description: >-
+  Build a brand charter (colours, type, tone) kept in project memory, generate visuals through an image MCP server
+  you choose, and review texts and visuals against the charter.
+tools: [skill_view, skill_list, memory_note, memory, memory_search, memory_get, read_file, search_files, write_file,
+        web_fetch, mcp_server_list, mcp_server_add]
+mcp:
+  images:
+    purpose: Generate or edit images from a text prompt (each generation usually costs credits).
+    examples:
+      - any image-generation service that offers an MCP server (bind its tool names at install)
+      - a local image model wrapped in a small MCP server built with the mcp-builder pack
+    secrets: [IMAGES_API_KEY]
+    tools:
+      generate_image: {default: generate_image, effect: spend}
+  scheduler:
+    optional: true
+    purpose: Read the posts already planned, so the weekly review can check them against the charter.
+    examples:
+      - the same scheduling server as the social pack (for example Postiz)
+    secrets: [SCHEDULER_API_KEY]
+    tools:
+      list_posts: {default: postsListTool, effect: read}

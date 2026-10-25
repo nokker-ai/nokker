@@ -33,6 +33,17 @@ CONTENT_TABLES = [
     "approvals", "approval_events",
     "ledger_entries", "ledger_verdicts", "llm_calls", "verdicts", "nokker_agents",
     "lokkal_machine_load",  # charge des machines Lokkal (020) : lue et écrite en connaissant le locataire
+    "lokkal_relay_calls",  # journal des connecteurs relayés (022) : écrit dans le locataire de la machine
+    "lokkal_relay_approvals",  # approbations fortes relayées (021, X10) : machine authentifiée ou compte, même règle
+    # équipe (023) : locataire du PROJET ; les politiques d'équipe (membres d'autres locataires) dans test_team_rls.py
+    "team_projects", "team_access", "team_members", "team_invites", "team_skills", "team_notes",
+    "team_note_quarantine",
+    "lokkal_machine_resources", "lokkal_handoffs", "lokkal_mirror_notes",  # délégation par besoin (025, X21)
+    "nokker_agent_runs",  # passages des agents Crew (024, X14) : écrits dans le locataire de l'agent
+    # plan et incidents (029, X18) : sources signées, signatures reçues, incidents, cartes, propositions, brief
+    "nokker_alert_sources", "nokker_alert_seen", "nokker_incidents", "nokker_plan_cards", "nokker_plan_proposals",
+    "nokker_plan_briefs",
+    "lokkal_machine_deck",  # deck de chaque machine (028, X15) : machine authentifiée ou compte du deck
 ]
 OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
@@ -278,9 +289,10 @@ def test_real_stores_a_then_b(pg, pod_env):
                 threads.push_context(th, f"bloc {tid}")
                 bub = bubbles.create(thread_id=th, kind="monitor", title=tid)
                 ag = agents.create(name=tid, role="r", model="m")
+                run = agents.new_run(ag.id, "manual", thread_id=th)
                 ledger.record(th, 0, call)
                 ledger.record_verdict(th, 0, verdict)
-                ids[tid] = {"th": th, "appr": appr.id, "thread": t.id, "bub": bub.id, "ag": ag.id}
+                ids[tid] = {"th": th, "appr": appr.id, "thread": t.id, "bub": bub.id, "ag": ag.id, "run": run.id}
         assert ids[A]["th"] != ids[B]["th"]
         for tid, other in ((A, B), (B, A)):
             mine, theirs = ids[tid], ids[other]
@@ -299,6 +311,10 @@ def test_real_stores_a_then_b(pg, pod_env):
                 assert [b.id for b in bubbles.list_thread(mine["th"])] == [mine["bub"]]
                 ags = {a.id for a in agents.list_all()}
                 assert mine["ag"] in ags and theirs["ag"] not in ags
+                assert agents.get_run(theirs["run"]) is None and agents.run_by_thread(theirs["th"]) is None
+                assert agents.get_run(mine["run"]) is not None and agents.run_by_thread(mine["th"]).id == mine["run"]
+                queued = {r.id for r in agents.runs_with_status("queued")}
+                assert mine["run"] in queued and theirs["run"] not in queued
                 assert theirs["th"] not in {c.thread_id for c in ledger.fetch_calls()}
                 assert theirs["th"] not in {v.thread_id for v in ledger.fetch_verdicts()}
                 assert ledger.aggregates(thread_id=mine["th"]).n_calls == 1
@@ -396,3 +412,87 @@ def test_data_consents_isolated_between_tenants(pg):
     for tid in (A, B):
         with tenant_scope(tid), connect(pg["app"], autocommit=True) as conn:
             assert {r[0] for r in conn.execute("SELECT tenant_id FROM data_consents").fetchall()} == {tid}
+
+
+@requires_pg
+def test_crew_agent_and_run_fields_roundtrip_on_postgres(pg, pod_env):
+    """Lot X14 : tous les champs de §9.5 et des passages survivent à Postgres (migration 024, rejouée sans danger)."""
+    from nokker.agents.pg import PgAgents
+    from nokker.store.pg import apply_migrations
+    from nokker.tenancy.context import tenant_scope
+    from nokker.threads.pg import PgThreads
+
+    assert apply_migrations(pg["owner"], strict=True)  # 024 rejouée : aucune erreur, rien ne change
+    agents, threads = PgAgents(dsn=pg["app"]), PgThreads(dsn=pg["app"])
+    try:
+        with tenant_scope(A):
+            a = agents.create(name="Matin", role="veille", model="ship", tools=["web_search"], status="paused",
+                              created_by="us_aaaa", armed=False, instructions="Résume.",
+                              trigger={"kind": "schedule", "cron": "0 7 * * 1-5", "tz": "Europe/Zurich"},
+                              secrets=["API_TOKEN"], budget={"max_calls": 5, "max_cost": 1.0, "currency": "EUR"},
+                              auto_approve=["note_write(notes/*)"], placement=None, project="pj_1")
+            a.next_run_at, a.last_run, a.approved_rules = 1_800_000_000.0, {"run_id": "ar_x", "status": "failed",
+                                                                             "ended_at": 1.0}, "abc"
+            a.webhook_key, a.arm_approval_id = "raw:whsec_test", "appr-1"
+            agents.save(a)
+            got = agents.get(a.id)
+            assert got.trigger == a.trigger and got.budget == a.budget
+            assert (got.secrets, got.auto_approve, got.project, got.armed) == (["API_TOKEN"], ["note_write(notes/*)"],
+                                                                                "pj_1", False)
+            assert got.last_run == a.last_run and got.webhook_key == "raw:whsec_test"
+            assert got.next_run_at == a.next_run_at
+            r1 = agents.new_run(a.id, "schedule", status="queued", scheduled_for=1.0, catch_up=True, event=None,
+                                input="données", approvals=["c1"])
+            r1.created_at = 10.0
+            agents.save_run(r1)
+            r2 = agents.new_run(a.id, "manual", status="succeeded", thread_id="tn_aaaaaaaaaaaa:th_ar_x",
+                                cost={"tokens_in": 1, "tokens_out": 2, "amount": 0.1, "currency": "EUR"})
+            r2.created_at = 20.0
+            agents.save_run(r2)
+            assert agents.live_run(a.id).id == r1.id and agents.get_run(r1.id).catch_up
+            page, nxt = agents.runs(a.id, limit=1)
+            assert [r.id for r in page] == [r2.id] and nxt == r2.id
+            assert [r.id for r in agents.runs(a.id, limit=5, before=nxt)[0]] == [r1.id]
+            assert agents.get_run(r2.id).cost["currency"] == "EUR" and agents.get_run(r1.id).approvals == ["c1"]
+            t = threads.create("passage", "us_aaaa", thread_id="tn_aaaaaaaaaaaa:th_ar_x",
+                               origin={"kind": "agent", "agent_id": a.id, "run_id": r2.id})
+            assert threads.get(t.id).origin == {"kind": "agent", "agent_id": a.id, "run_id": r2.id}
+            agents.delete(a.id)
+            assert agents.get(a.id) is None and agents.get_run(r1.id) is None
+    finally:
+        agents.close()
+        threads.close()
+
+
+@requires_pg
+def test_crew_engine_ticks_each_tenant_in_its_own_scope(pg, pod_env, tmp_path):
+    """L'ordonnanceur passe sur chaque locataire connu, sous SA RLS : un agent de A tourne chez A, jamais vu par B."""
+    from datetime import datetime
+
+    from nokker.agents.pg import PgAgents
+    from nokker.tenancy.context import tenant_scope
+    from tests.unit.agents.conftest import make_world
+
+    w = make_world(tmp_path, [("text", "ok"), ("text", "ok")])
+    w.agents.store = PgAgents(dsn=pg["app"])
+    w.engine.tenants = lambda: [A, B]
+    t0 = datetime.fromisoformat("2026-10-26T05:00:00+00:00").timestamp()
+    w.clock.t = t0
+    w.agents.store.clock = w.clock
+    made = {}
+    try:
+        for tid in (A, B):
+            with tenant_scope(tid):
+                a = w.agents.create_from_body({"name": tid, "role": "r",
+                                               "trigger": {"kind": "schedule", "cron": "*/5 * * * *"}}, "us_x")
+                w.agents.arm(a.id, "us_x")
+                made[tid] = a.id
+        w.clock.t = t0 + 301
+        w.engine.tick()
+        for tid, other in ((A, B), (B, A)):
+            with tenant_scope(tid):
+                runs = w.agents.store.runs(made[tid])[0]
+                assert [r.status for r in runs] == ["succeeded"] and runs[0].thread_id.startswith(tid + ":")
+                assert w.agents.store.get(made[other]) is None and w.agents.store.runs(made[other])[0] == []
+    finally:
+        w.agents.store.close()

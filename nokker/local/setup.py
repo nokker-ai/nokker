@@ -232,6 +232,12 @@ class LocalLink:
             return {"state": "expired"}
         r = self._http().post(self.base_url.rstrip("/") + "/v1/link/token",
                               json={"device_code": self._pending["device_code"]})
+        if r.status_code == 429:  # sondé trop vite (nokker.ai, limite par code et par IP) : toujours en attente
+            try:
+                wait = int((r.json() or {}).get("retry_after_s") or 5)
+            except (ValueError, TypeError, AttributeError):
+                wait = 5
+            return {"state": "pending", "retry_after_s": wait}
         r.raise_for_status()
         d = r.json()
         state = str(d.get("state") or "pending")

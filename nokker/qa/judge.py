@@ -62,7 +62,7 @@ class JudgeTransport(Protocol):
 class HttpJudgeTransport:
     """Transport réel (httpx), un par palier/amont. `extra_body` est fusionné dans CHAQUE requête
     (ex. `{"reasoning_effort": "none"}` sur le Router, ou les échantillonneurs neutralisés de
-    llama.cpp — cf PLAN §2.5, note `nina-qa`/`juges-conformite-banc-2026-09-21`)."""
+    llama.cpp, mesurés sur un banc interne)."""
 
     base_url: str
     model: str
@@ -70,6 +70,12 @@ class HttpJudgeTransport:
     extra_body: dict[str, Any] = field(default_factory=dict)
     top_logprobs: int = 1
     timeout_s: float = 30.0
+    # X8 : appelé après chaque réponse avec (modèle, `usage` de l'amont, secondes) — jetons du juge comptés à part.
+    on_usage: Any = None
+    retry_wait_s: float = 2.0  # une reprise sur 429/502/503/504 ; 0 = aucune
+    # Coffre de valeurs connues (`DeterministicInvariants.known`) pour le filet du fil ; None : motifs seuls.
+    known: Any = field(default=None, repr=False)
+    _plain: bool = field(default=False, init=False, repr=False)  # amont qui a refusé `extra_body`/`top_logprobs`
 
     def __post_init__(self) -> None:
         import httpx
@@ -77,16 +83,52 @@ class HttpJudgeTransport:
         self._client = httpx.Client(timeout=self.timeout_s)
 
     def post(self, body: dict[str, Any]) -> dict[str, Any]:
-        full = {"model": self.model, **body, **self.extra_body}
-        if self.top_logprobs:
-            full["top_logprobs"] = self.top_logprobs
+        import time as _time
+
+        if isinstance(body.get("messages"), list):
+            # Filet du fil (lot fix-batch-1) : la relecture voit le diff reconstruit depuis les arguments du modèle, l'avis
+            # les arguments d'une carte, la porte les arguments de l'action — rien de tout ça n'est passé par une porte de
+            # caviardage, et tout part en rôle `user`, que le Router refuse s'il y voit un secret (le juge se taisait).
+            from nokker.qa.secrets import redact_messages
+
+            body = {**body, "messages": redact_messages(body["messages"], self.known)}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=full, headers=headers)
+        t0 = _time.monotonic()
+        resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=self._body(body, self._plain),
+                                 headers=headers)
+        if resp.status_code == 400 and not self._plain and (self.extra_body or body.get("logprobs")):
+            # X8 : une clé de l'utilisateur ou un modèle local refuse souvent `reasoning_effort: none` (gpt-oss :
+            # « Harmony does not support reasoning_effort='none' », mesuré le 25.10) ou `top_logprobs` : une seule
+            # reprise sans eux, gardée pour la suite (verdict sans probabilité, D13), au lieu d'un juge muet.
+            self._plain = True
+            resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=self._body(body, True),
+                                     headers=headers)
+        if resp.status_code in (429, 502, 503, 504) and self.retry_wait_s > 0:
+            # X8 : clé saturée (le Router plafonne les requêtes par clé) ou amont qui hoquette : une reprise courte,
+            # sinon une relecture ou un avis se perdent en silence.
+            _time.sleep(self.retry_wait_s)
+            resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions",
+                                     json=self._body(body, self._plain), headers=headers)
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code} juge ({self.model}): {resp.text[:300]}")
-        return resp.json()
+        data = resp.json()
+        if self.on_usage is not None:
+            try:
+                self.on_usage(self.model, data.get("usage") or {}, _time.monotonic() - t0)
+            except Exception:  # noqa: BLE001 — un compteur ne fait jamais tomber le juge
+                logger.debug("juge : compteur d'usage en échec", exc_info=True)
+        return data
+
+    def _body(self, body: dict[str, Any], plain: bool) -> dict[str, Any]:
+        if plain:
+            full = {"model": self.model, **{k: v for k, v in body.items() if k not in ("logprobs", "top_logprobs")}}
+            return full
+        full = {"model": self.model, **body, **self.extra_body}
+        if self.top_logprobs and body.get("logprobs"):
+            full["top_logprobs"] = self.top_logprobs
+        return full
 
     def close(self) -> None:
         self._client.close()
@@ -158,6 +200,13 @@ class OpenAICompatJudge:
     transport: JudgeTransport
     model_name: str = "judge"
     cache: bool = True
+    # 1 (défaut) : verdict à un jeton avec logprobs. Plus pour un modèle qui raisonne d'abord (gpt-oss : son premier
+    # jeton est le canal de raisonnement, mesuré le 25.10) : l'option est lue dans le texte final, sans probabilité.
+    verdict_max_tokens: int = 1
+    # Préfixe STABLE du juge (`questions.JUDGE_SYSTEM`, les règles qu'il fait respecter) : envoyé en message système à
+    # chaque question. Trouvé par X8 (25.10) : il n'était envoyé nulle part, le juge des portes jugeait sans les règles
+    # que le banc B-1 lui donnait (`judge_eval.py`). None : pas de message système.
+    system: str | None = None
     _cache_store: dict[str, JudgeAnswer] = field(default_factory=dict, repr=False)
 
     def ask(self, question_id: str, prompt: str, options: list[str]) -> JudgeAnswer:
@@ -168,8 +217,11 @@ class OpenAICompatJudge:
             return JudgeAnswer(choice=cached.choice, probabilities=cached.probabilities,
                                model=cached.model, latency_s=0.0)
 
-        body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 1, "temperature": 0,
-                "logprobs": True}
+        one = self.verdict_max_tokens <= 1
+        messages = ([{"role": "system", "content": self.system}] if self.system else []) + \
+            [{"role": "user", "content": prompt}]
+        body = {"messages": messages, "max_tokens": max(1, self.verdict_max_tokens),
+                "temperature": 0, "logprobs": one}
         t0 = time.monotonic()
         try:
             data = self.transport.post(body)
@@ -187,7 +239,7 @@ class OpenAICompatJudge:
         lp = (choice_block.get("logprobs") or {}).get("content") or []
         top = (lp[0] or {}).get("top_logprobs") or [] if lp else []
 
-        probs = probability_from_top_logprobs(top, options)
+        probs = probability_from_top_logprobs(top, options) if one else None
         chosen = (max(probs, key=probs.get) if probs else None) or parse_choice(content, tuple(options))
         probs = _apply_single_logprob_approximation(probs, chosen, options)
         if chosen is None:
@@ -202,7 +254,7 @@ class OpenAICompatJudge:
 
     def advise(self, prompt: str, max_tokens: int = 150) -> str:
         """2e appel, PAS du port `Judge` (qui n'admet qu'un verdict à 1 token) : un texte court
-        (risque, sauvegarde, retour arrière). Consigne Nick 17.10 : déclenché SEULEMENT quand la
+        (risque, sauvegarde, retour arrière). Consigne produit du 17.10 : déclenché SEULEMENT quand la
         porte a déjà décidé HITL (`gates.py::GatesV1._with_advice`), jamais pour peupler un champ
         `Verdict.advice` qui n'existe pas (cf. docstring de `gates.py`) — l'appelant met ce texte
         dans `Verdict.reason`. Pas de cache : chaque avis est sur mesure (contexte + action)."""

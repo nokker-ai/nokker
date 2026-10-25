@@ -1,20 +1,19 @@
 """`MemoryPort` : rappel CortHeXis par tour (PLAN-P1 §5.2, chantier A-2).
 
 Deux implémentations du même contrat (`MemoryPort` + `ToolSource`, `core/ports.py`), choisies
-PAR CONFIG (`build()` en fin de fichier), jamais basculées au runtime :
+PAR CONFIG (`from_config()` en fin de fichier, appelée par `build_kernel`), jamais basculées au runtime :
 
   (i)  `CorthexisMemory` — MCP `sokkan-memory` existant (instance interne), en
-       lecture seule (S1-S2, INCHANGÉ : c'est le service de prod, `infra/sokkan/memory/` de
-       le dépôt interne — on ne le réécrit pas, on s'y connecte comme le canari,
+       lecture seule (S1-S2, INCHANGÉ : c'est le service de prod du
+       dépôt interne — on ne le réécrit pas, on s'y connecte comme le canari,
        `infra/nokker-canary/config.yaml`). C'est le défaut de `nokker.api.server.build_kernel`.
   (ii) `DirectCorthexisMemory` — paquet `corthexis` 2.1 EN DIRECT (bibliothèque Python en
        process, PAS un second serveur MCP) sur le Postgres + l'embed CPU du compose
-       (`deploy/compose/`), reranker optionnel (S2-S3, ce chantier).
+       (`deploy/lokkal/` : Nokker Lokkal, lot X1b), reranker optionnel (S2-S3).
 
 Les deux appliquent la MÊME politique de seuil, reprise À L'OCTET du hook de prod
-(`infra/sokkan/memory/hook_prompt_recall.py` du dépôt interne, recalée le 03.10.2026 sur 150
-questions du banc : 53 % -> 87 % d'injections justes — note mémoire `sokkan-v3-moteur-memoire`,
-§« Seuil du hook de prod recalé ») :
+(`hook_prompt_recall.py` du dépôt interne, recalée le 03.10.2026 sur 150
+questions du banc : 53 % -> 87 % d'injections justes) :
 
     score >= 0.40
     OU (rerank n'est pas None ET rerank >= 0.5 ET score >= 0.25)
@@ -39,6 +38,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,9 +51,9 @@ logger = logging.getLogger("nokker.memory.corthexis")
 DEFAULT_URL = ""  # aucune instance par défaut : `memory_mcp_url` de la config la nomme
 
 # ───────────────────── seuils du hook de prod (partagés par les deux modes) ─────────────────────
-# Port EXACT de `infra/sokkan/memory/hook_prompt_recall.py` (dépôt interne) : SEUIL / SEUIL_RERANK /
+# Port EXACT de `hook_prompt_recall.py` (dépôt interne) : SEUIL / SEUIL_RERANK /
 # RERANK_OK, et `_nomme()`. Ne pas re-calibrer ici : tout changement de modèle d'embedding se
-# recale SUR LE BANC (règle de la note `sokkan-v3-moteur-memoire`), côté hook de prod, et se
+# recale SUR LE BANC (règle interne), côté hook de prod, et se
 # reporte ici en changeant ces trois constantes — jamais à l'œil.
 RECALL_SCORE_THRESHOLD = 0.40   # = SEUIL
 RECALL_SEUIL_RERANK = 0.25      # = SEUIL_RERANK
@@ -71,7 +71,7 @@ def _tokens(text: str) -> set[str]:
 def named(note_name: str, message: str) -> bool:
     """Port de `hook_prompt_recall._nomme` : nom complet cité (slug, "_"="-"), ou >= 2 segments
     de 4+ lettres du nom présents comme mots entiers (4+ lettres) du message. Un seul mot ne
-    suffit plus depuis le 03.10.2026 (trop de rappels hors sujet — note `corthexis`)."""
+    suffit plus depuis le 03.10.2026 (trop de rappels hors sujet)."""
     slug = (note_name or "").lower().replace("_", "-")
     if not slug:
         return False
@@ -93,6 +93,11 @@ def kept(score: float, rerank: float | None, note_name: str, message: str, *,
     if rerank is not None and rerank >= rerank_ok and score >= rerank_floor:
         return True
     return named(note_name, message)
+
+
+def _no_credentials(text: str) -> str:
+    """Une erreur de connexion peut citer le DSN : jamais le mot de passe dans un journal ni dans une route d'état."""
+    return re.sub(r"(://[^:/@\s]+):[^@\s]+@", r"\1:***@", text)
 
 
 def _tool_specs(source: str) -> list[ToolSpec]:
@@ -253,8 +258,8 @@ def _parse_mcp_recall(rows: list[dict], message: str, threshold: float) -> list[
 class DirectCorthexisMemory:
     """Mode (ii) : paquet `corthexis` 2.1 EN DIRECT — bibliothèque Python en process
     (`corthexis.service.search`/`.get`), PAS un second serveur MCP. Connexion au Postgres +
-    à l'embed CPU du compose (`deploy/compose/` : services `postgres` + `embed`, trivial — mesure
-    MRR/injections/RAM dans la note mémoire `nokker-p0`, § « A-2 »).
+    à l'embed CPU du compose (`deploy/lokkal/` : services `postgres` + `embed` — mesure
+    MRR/injections/RAM dans les notes internes, § « A-2 »).
 
     Configuration : `corthexis` lit ses propres variables `CORTHEXIS_*` au premier appel
     (voir `corthexis.config.env`) — `__post_init__` les pose dans `os.environ` si elles sont
@@ -268,6 +273,15 @@ class DirectCorthexisMemory:
     deep: bool = False              # force le reranker même en profil `standard` (async) — ignoré en `leger`
     projects: tuple[str, ...] | None = None   # scope 2.1 (None = pas de projets, mémoire autonome)
     score_threshold: float = RECALL_SCORE_THRESHOLD
+    # Règle de rappel. None (défaut) : celle du hook de prod (`kept()`, seuil 0,40 calibré AVEC reranker). Posé (Nokker
+    # Lokkal, profil `leger` sans reranker) : celle de l'index local, comme la mémoire de projet (score ≥
+    # `score_threshold` ET ≥ `relative_floor` × le meilleur, OU rerank ≥ `min_rerank`, OU nom de note cité).
+    relative_floor: float | None = None
+    min_rerank: float = RECALL_RERANK_OK
+    _last_error: str = field(default="", init=False, repr=False)
+    _last_warn: float = field(default=0.0, init=False, repr=False)
+    _last_recall_s: float | None = field(default=None, init=False, repr=False)
+    _status: tuple[float, dict] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for env_name, value in (
@@ -284,27 +298,122 @@ class DirectCorthexisMemory:
     def recall(self, query: str, k: int = 5) -> list[Recall]:
         if not query.strip():
             return []
+        started = time.monotonic()
         try:
             from corthexis import service as cx_service
             rows = cx_service.search(query, top_k=max(k, 10), deep=self.deep, projects=self.projects)
-        except Exception:
-            logger.warning("corthexis(direct): recherche indisponible", exc_info=True)
+        except Exception as e:  # noqa: BLE001 — la mémoire en panne ne casse jamais un tour, mais se voit
+            self._failed(f"recherche indisponible : {e}", exc_info=True)
             return []
+        # `corthexis.service.search` ne lève jamais : une panne est une LIGNE `{"error": …}` (base injoignable), un
+        # embed tombé une ligne `degraded` (classement par mots seuls). Les deux se journalisent et entrent dans l'état.
+        rows = [r for r in rows if isinstance(r, dict)]
+        error = next((str(r["error"]) for r in rows if "error" in r), "")
+        if error:
+            self._failed(error)
+            return []
+        degraded = next((str(r["degraded"]) for r in rows if r.get("degraded")), "")
+        if degraded:
+            self._failed(degraded)
+        else:
+            self._last_error = ""
+        out = self._keep([r for r in rows if "info" not in r], query, k)
+        self._last_recall_s = time.monotonic() - started
+        return out
+
+    def _keep(self, rows: list[dict], query: str, k: int) -> list[Recall]:
+        best = max((float(r.get("score") or 0.0) for r in rows), default=0.0)
         out: list[Recall] = []
         for row in rows:
-            if not isinstance(row, dict) or "error" in row or "info" in row:
-                continue
             score = float(row.get("score") or 0.0)
-            note = row.get("note_name") or "?"
+            note = str(row.get("note_name") or "?")
             rerank = row.get("rerank")
             rerank = float(rerank) if rerank is not None else None
-            if not kept(score, rerank, str(note), query, threshold=self.score_threshold):
+            if self.relative_floor is None:
+                ok = kept(score, rerank, note, query, threshold=self.score_threshold)
+            else:
+                ok = (rerank is not None and rerank >= self.min_rerank) or named(note, query) or (
+                    score >= self.score_threshold and score >= self.relative_floor * best)
+            if not ok:
                 continue
-            text = row.get("snippet") or row.get("description") or ""
-            out.append(Recall(note=str(note), text=str(text), score=score, rerank=rerank))
+            # Description d'abord (ce qu'EST la note), puis l'extrait qui a matché — comme en mode (i).
+            desc = " ".join(str(row.get("description") or "").split())
+            snippet = " ".join(str(row.get("snippet") or "").split())
+            text = f"{desc} — extrait : {snippet}" if desc and snippet and snippet not in desc else (desc or snippet)
+            shown = score if self.relative_floor is None else max(score, rerank or 0.0)
+            out.append(Recall(note=note, text=text, score=shown, rerank=rerank))
             if len(out) >= k:
                 break
         return out
+
+    def _failed(self, message: str, *, exc_info: bool = False) -> None:
+        """Panne du rappel : gardée pour l'état (`status`, `doctor`) et journalisée, au plus une fois par minute."""
+        self._last_error = _no_credentials(message)[:300]
+        self._status = None
+        now = time.monotonic()
+        if now - self._last_warn >= 60.0:
+            self._last_warn = now
+            logger.warning("corthexis(direct): %s — le rappel de la mémoire longue est vide ou dégradé",
+                           self._last_error, exc_info=exc_info)
+
+    # ───────────────────────────── état (démarrage, doctor) ─────────────────────────────
+
+    def check(self) -> dict:
+        """État réel : paquet, base (notes, génération d'index active), serveur d'embeddings (un vrai plongement).
+        Ne lève jamais ; `ok` False = la mémoire longue ne répond pas, avec la raison dans `error`."""
+        out: dict[str, Any] = {"mode": "direct", "ok": False, "projects": list(self.projects or []) or None,
+                               "profile": os.environ.get("CORTHEXIS_MEMORY_PROFILE") or self.memory_profile}
+        try:
+            from corthexis import embed as cx_embed
+            from corthexis import service as cx_service
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"paquet corthexis absent de l'image ({e})"
+            return out
+        try:
+            stats = cx_service.get_store().stats()
+            out["store"] = {"ok": True, "notes": stats.get("notes"), "chunks": stats.get("chunks"),
+                            "generation": stats.get("generation"), "model": stats.get("model")}
+        except Exception as e:  # noqa: BLE001
+            out["store"] = {"ok": False}
+            out["error"] = f"base CortHeXis injoignable : {_no_credentials(str(e))}"[:300]
+            return out
+        try:
+            t0 = time.monotonic()
+            vec = cx_embed.get().embed_query("ping", timeout=5.0)
+            out["embed"] = {"ok": bool(vec), "dim": len(vec or []), "ms": round((time.monotonic() - t0) * 1000)}
+        except Exception as e:  # noqa: BLE001
+            out["embed"] = {"ok": False}
+            out["error"] = f"serveur d'embeddings injoignable : {e}"[:300]
+            return out
+        out["ok"] = True
+        if self._last_error:
+            out["last_error"] = self._last_error
+        if self._last_recall_s is not None:
+            out["last_recall_ms"] = round(self._last_recall_s * 1000)
+        return out
+
+    def status(self, max_age_s: float = 15.0) -> dict:
+        """`check()` gardé `max_age_s` secondes : `/healthz` est sondé toutes les 15 s par le compose."""
+        cached = self._status
+        if cached is not None and time.monotonic() - cached[0] < max_age_s:
+            return cached[1]
+        st = self.check()
+        self._status = (time.monotonic(), st)
+        return st
+
+    def warm_up(self) -> None:
+        """Contrôle de démarrage en arrière-plan (le noyau ne l'attend pas) : une base ou un embed injoignable se voit
+        dans le journal en ERREUR, et dans `status()` — jamais une mémoire vide silencieuse."""
+        def _go() -> None:
+            st = self.status(max_age_s=0.0)
+            if st.get("ok"):
+                store = st.get("store") or {}
+                logger.info("mémoire longue CortHeXis (direct) prête : %s note(s), projets %s, embed %s ms",
+                            store.get("notes"), st.get("projects") or "tous", (st.get("embed") or {}).get("ms"))
+            else:
+                logger.error("mémoire longue CortHeXis (direct) INDISPONIBLE au démarrage : %s — rappel vide tant "
+                             "que ce n'est pas réparé (état : GET /v1/local/memory, /healthz)", st.get("error"))
+        threading.Thread(target=_go, name="memory-check", daemon=True).start()
 
     def propose(self, thread_id: str, facts: list[str]) -> None:
         _log_propose("corthexis(direct)", thread_id, facts)
@@ -356,7 +465,7 @@ def build(mode: str | None = None, **kwargs: Any) -> CorthexisMemory | DirectCor
 
     Builder, pas branchement runtime : la session qui construit le noyau (aujourd'hui
     `nokker.api.server.build_kernel`, via son paramètre `memory=`) appelle ceci UNE fois au
-    démarrage ; voir le compose (`deploy/compose/docker-compose.yml`, `NOKKER_MEMORY_MODE`)."""
+    démarrage ; le noyau passe par `from_config()` ci-dessous (`memory_mode`, `NOKKER_MEMORY_MODE`)."""
     mode = (mode or os.environ.get("NOKKER_MEMORY_MODE") or "mcp").strip().lower()
     if mode == "mcp":
         return CorthexisMemory(**kwargs)
@@ -365,14 +474,89 @@ def build(mode: str | None = None, **kwargs: Any) -> CorthexisMemory | DirectCor
     raise ValueError(f"NOKKER_MEMORY_MODE={mode!r} inconnu (attendu : mcp | direct)")
 
 
+MODES = ("mcp", "direct", "off")
+DIRECT_DEFAULT_PROJECTS = ("u-local",)  # = project_memory.USER_PROJECT : les notes de portée user, tous fils confondus
+
+
+def memory_mode(config: Any) -> str:
+    """`memory_mode` de la config, sinon `NOKKER_MEMORY_MODE`, sinon `mcp`. Inconnu : erreur au démarrage."""
+    mode = (getattr(config, "memory_mode", "") or os.environ.get("NOKKER_MEMORY_MODE") or "mcp").strip().lower()
+    if mode not in MODES:
+        raise ValueError(f"memory_mode / NOKKER_MEMORY_MODE = {mode!r} inconnu (attendu : {' | '.join(MODES)})")
+    return mode
+
+
+def from_config(config: Any) -> CorthexisMemory | DirectCorthexisMemory | None:
+    """Mémoire longue d'un noyau (`nokker.api.server.build_kernel`), UNE fois au démarrage.
+
+    - `mcp` : le MCP `memory_mcp_url` (inchangé) ; URL vide = aucune mémoire longue (bêta, voulu : None).
+    - `direct` : `DirectCorthexisMemory` sur le Postgres + l'embed du compose (Nokker Lokkal), scope `projects`
+      (défaut `u-local`, jamais « tout » : les fils `s-…` et les dépôts `p-…` ont leur propre rappel, cloisonné), seuils
+      de l'index local. Construite même si la base ou l'embed ne répondent pas : la panne se voit (journal en erreur,
+      `status()`), elle ne devient jamais une mémoire nulle silencieuse.
+    - `off` : None, explicitement."""
+    mode = memory_mode(config)
+    if mode == "off":
+        logger.info("mémoire longue : désactivée (memory_mode=off)")
+        return None
+    if mode == "mcp":
+        if not config.memory_mcp_url:
+            return None
+        mem = CorthexisMemory(url=config.memory_mcp_url, token=config.memory_token())
+        mem.warm_up()
+        return mem
+    d = dict(getattr(config, "memory_direct", None) or {})
+    projects = d.get("projects", list(DIRECT_DEFAULT_PROJECTS))
+    mem = DirectCorthexisMemory(
+        database_url=os.environ.get(str(d.get("database_url_env") or "CORTHEXIS_DATABASE_URL"), ""),
+        embed_urls=str(d.get("embed_urls") or ""), memory_profile=str(d.get("profile") or "leger"),
+        rerank_url=str(d.get("rerank_url") or ""), deep=bool(d.get("deep", False)),
+        projects=tuple(str(p) for p in projects) if projects is not None else None,
+        score_threshold=float(d.get("min_score", 0.15)), relative_floor=float(d.get("relative_floor", 0.6)),
+        min_rerank=float(d.get("min_rerank", 0.35)))
+    if not os.environ.get("CORTHEXIS_DATABASE_URL"):
+        logger.error("mémoire longue CortHeXis (direct) : CORTHEXIS_DATABASE_URL absente — rappel vide")
+    mem.warm_up()
+    return mem
+
+
+def unwrap(port: Any) -> Any:
+    """La mémoire longue sous ses enveloppes (`TenantMemory.internal`, `ProjectRecallMemory.inner`)."""
+    for _ in range(5):
+        if port is None or hasattr(port, "status") or isinstance(port, CorthexisMemory):
+            return port
+        port = getattr(port, "internal", None) or getattr(port, "inner", None)
+    return port
+
+
+def status_of(port: Any) -> dict:
+    """État de la mémoire longue d'un noyau, pour `/healthz` et `GET /v1/local/memory`. `ok` None : pas de contrôle
+    (mode `mcp` : le service distant a le sien ; aucune mémoire : `mode` off)."""
+    mem = unwrap(port)
+    if mem is None or type(mem).__name__ == "NullMemory":
+        return {"mode": "off", "ok": None}
+    if not hasattr(mem, "status"):
+        return {"mode": "mcp", "ok": None}
+    try:
+        return mem.status()
+    except Exception as e:  # noqa: BLE001 — un état illisible est une panne, pas une exception de route
+        return {"mode": "direct", "ok": False, "error": _no_credentials(str(e))[:300]}
+
+
 __all__ = [
     "DEFAULT_URL",
+    "DIRECT_DEFAULT_PROJECTS",
+    "MODES",
     "RECALL_RERANK_OK",
     "RECALL_SCORE_THRESHOLD",
     "RECALL_SEUIL_RERANK",
     "CorthexisMemory",
     "DirectCorthexisMemory",
     "build",
+    "from_config",
     "kept",
+    "memory_mode",
     "named",
+    "status_of",
+    "unwrap",
 ]

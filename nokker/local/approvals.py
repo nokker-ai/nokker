@@ -7,7 +7,8 @@ d'appareil.
 Portées : `once` (cette carte) ; `session` (règle `allow` en mémoire pour CE fil, jusqu'au redémarrage) ; `always`
 (règle écrite dans les réglages de l'UTILISATEUR, jamais dans le `.nokker/` du dépôt). Les règles proposées sont
 calculées ICI à partir de l'appel (`suggested_rules`) : le client choisit parmi elles, il n'en écrit pas. Une carte
-`strong` (destructif) n'a que `once`.
+`strong` (destructif) n'a que `once`, comme un premier contact ssh (`ssh_trust`, lot X11). Une carte du plancher prod
+(`ops:prod`, lot X11) ne se décide pas du tout au jeton local : clé d'appareil (docs/APPROVALS.md).
 """
 from __future__ import annotations
 
@@ -20,9 +21,27 @@ from typing import Any
 FILE_TOOLS = ("write_file", "patch", "read_file", "search_files")
 
 
-def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None) -> list[str]:
-    if strength == "strong":
+def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None, rule: str | None = None) -> list[str]:
+    """`rule` : la règle qui a produit la carte ; un connecteur relayé (X20) n'a que `once` (nokker.ai veut une carte
+    par appel, une règle durable n'y changerait rien)."""
+    from nokker.qa.permissions import RELAY_CARD_RULE
+
+    if strength == "strong" or rule == RELAY_CARD_RULE:
         return []
+    if tool == "ssh_trust":  # premier contact (lot X11) : une carte par clé d'hôte, jamais de règle
+        return []
+    if tool in ("ssh_run", "ssh_copy"):  # hors prod (une carte prod est forte) : `hôte:commande`, `hôte:chemin`
+        from nokker.tools.ssh import ssh_subject
+
+        subject = ssh_subject(tool, arguments) or ""
+        host, _, rest = subject.partition(":")
+        if not host or not rest:
+            return []
+        out = [f"{tool}({subject})"]
+        words = rest.split(" ")
+        if tool == "ssh_run" and len(words) > 2:
+            out.append(f"{tool}({host}:{' '.join(words[:2])}*)")
+        return out
     if tool in ("terminal", "process_start"):  # process_start : commande en arrière-plan (lot X6)
         cmd = " ".join(str(arguments.get("command", "")).split())
         if not cmd:

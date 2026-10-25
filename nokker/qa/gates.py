@@ -26,6 +26,45 @@ logger = logging.getLogger("nokker.qa.gates")
 
 DEFAULT_DOMAIN_FLAGS = frozenset({"fiscal", "juridique", "montant"})
 
+# Drapeau de domaine et sessions de code. Dans une session de code locale (`nokker code`, session de code Lokkal ;
+# banc X9 §5.2, banc D1 tâche M01), le drapeau est CONSULTATIF : la réponse du code fait n'est jamais remplacée, et une
+# vraie demande de conseil (« dois-je facturer la TVA… ? ») y est seulement tracée. Hors session (la bêta, une
+# conversation Lokkal), tout drapeau escalade, comme dans `main` — revue du train du 2.11, défaut 4 : l'exception
+# « contexte de code » de fix-batch-1 s'appliquait à tout le monde, et une simple date (`25/10/2026`, prise pour un
+# chemin) suffisait à ne plus escalader une question fiscale.
+_ADVICE_QUESTION = re.compile(
+    r"(?i)\b(dois[- ]je|doit[- ]on|je dois|faut[- ]il|est[- ]ce (?:que (?:je|j'|on) (?:dois|peux|doit)|légal|obligatoire|"
+    r"déductible)|ai[- ]je le droit|a[- ]t[- ]on le droit|suis[- ]je (?:obligée?|tenue?)|est[- ]il (?:légal|obligatoire)|"
+    r"quel(?:le)? (?:est le )?taux|combien d'imp[oô]ts?|am i (?:required|allowed)|do i (?:have|need) to|"
+    r"is it (?:legal|deductible|allowed)|should i (?:pay|declare|sign|charge)|muss ich|darf ich|ist es (?:legal|erlaubt))")
+
+
+def domain_verdict(turn: Turn, allowed: frozenset[str] = DEFAULT_DOMAIN_FLAGS,
+                   code_session: Callable[[str], bool] | None = None) -> Verdict | None:
+    """Porte bascule, couche 1 : ESCALATE sur un drapeau de domaine (« escalade humaine » de l'invariant 5) ; None
+    sans drapeau (ou tour déjà escaladé).
+
+    `code_session(thread_id)` vrai (session de code locale : `nokker code`, session de code Lokkal) : le drapeau est
+    seulement CONSULTATIF, la réponse n'est jamais remplacée (ALLOW tracé ; banc X9, 16 tours sur 152 d'une session de
+    code d'un logiciel de facturation perdaient leur réponse) — l'effet réel y passe déjà par les portes d'action et
+    les permissions. Une demande de conseil y est tracée comme telle au ledger. Hors session : ESCALATE, comme `main`."""
+    flags = turn.input.domain_flags & allowed
+    if not flags or turn.escalated:
+        return None
+    rule = f"domaine:{'+'.join(sorted(flags))}"
+    try:
+        in_session = bool(code_session(turn.thread_id)) if code_session is not None else False
+    except Exception:  # noqa: BLE001 — un registre de sessions illisible : la règle générale s'applique
+        logger.warning("gates : session de code illisible", exc_info=True)
+        in_session = False
+    if in_session:
+        advice = bool(_ADVICE_QUESTION.search(turn.input.text or ""))
+        return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:session-code",
+                       reason="session de code locale : drapeau consultatif, réponse gardée"
+                              + (" (demande de conseil fiscal ou juridique : à faire vérifier)" if advice else ""))
+    return Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=1, rule=rule,
+                   reason="drapeau de domaine sans escalade explicite du modèle")
+
 
 @dataclass
 class NullJudge:
@@ -43,30 +82,31 @@ class GatesV0:
     invariants: object  # core.ports.Invariants — typé `object` pour ne pas importer F3 ici (découplage)
     judge: Judge = field(default_factory=NullJudge)
     domain_flags: frozenset[str] = DEFAULT_DOMAIN_FLAGS
+    # Fil → session de code locale ? (posé par `PermissionGates`) ; None : aucune session de code.
+    code_session: Callable[[str], bool] | None = None
 
     def action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> list[Verdict]:
         return [self.invariants.check_action(call, spec, turn)]
 
     def switch(self, reply: str, turn: Turn, tier: Tier) -> list[Verdict]:
-        flags = turn.input.domain_flags & self.domain_flags
-        if flags and not turn.escalated:
-            return [Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=1,
-                             rule=f"domaine:{'+'.join(sorted(flags))}",
-                             reason="drapeau de domaine sans escalade explicite du modèle")]
+        domain = domain_verdict(turn, self.domain_flags, self.code_session)
+        if domain is not None and domain.decision is Decision.ESCALATE:
+            return [domain]
         # Couche 2 : juge nul en attendant B-2 — toujours ALLOW, mais le port Judge est bien exercé.
         answer = self.judge.ask("switch:v0", reply, ["ALLOW"])
-        return [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2, rule="judge-nul",
-                         reason="aucun juge réel avant B-2", probability=None, judge_model=answer.model)]
+        return ([domain] if domain is not None else []) + [
+            Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2, rule="judge-nul",
+                    reason="aucun juge réel avant B-2", probability=None, judge_model=answer.model)]
 
 
-__all__ = ["DEFAULT_DOMAIN_FLAGS", "GatesV0", "GatesV1", "NullJudge"]
+__all__ = ["DEFAULT_DOMAIN_FLAGS", "GatesV0", "GatesV1", "NullJudge", "domain_verdict"]
 
 
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 # `Gates` v1 — chantier B-2/B-3 (PLAN-P1 §2.5/§5.3) : le juge Nina QA réel remplace `NullJudge`.
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 #
-# Doctrine Nick, 17.10.2026 (note mémoire `nokker`, fin de note) : « le juge Nina QA conseille et
+# Doctrine produit du 17.10.2026 : « le juge Nina QA conseille et
 # escalade (fiscal/juridique : il ne tranche pas à la place de l'humain), il ne bloque pas ». Donc :
 #   - DENY reste réservé à la couche 1 (`qa/invariants.py` : SEND_BULK toujours, etc.) — `GatesV1`
 #     n'émet JAMAIS DENY depuis le juge ;
@@ -86,10 +126,10 @@ __all__ = ["DEFAULT_DOMAIN_FLAGS", "GatesV0", "GatesV1", "NullJudge"]
 #     couche 1 + le déclenchement (a)/(b) dès qu'un outil ou un drapeau de domaine est en jeu).
 #
 # ⚠️ Champ manquant au contrat (`core.turn.Verdict`, F2) : le juge produit un AVIS texte (risques,
-# sauvegarde, retour arrière — consigne Nick 17.10) quand il déclenche HITL. `Verdict` n'a pas de
+# sauvegarde, retour arrière — consigne produit du 17.10) quand il déclenche HITL. `Verdict` n'a pas de
 # champ `advice`. PAS AJOUTÉ ICI (mandat B-2 : ne pas toucher `core/*.py`) — l'avis est mis dans
 # `Verdict.reason` en attendant qu'un chantier avec mandat sur `core/turn.py` ajoute ce champ.
-# Signalé aussi dans `nokker-judge-bench/README.md` § B-2 et dans la note mémoire `nokker-p0`.
+# Signalé aussi dans `nokker-judge-bench/README.md` § B-2 et dans les notes internes.
 
 _ASSERTIVE_HINT = re.compile(
     r"\d|chiffre|montant|CHF|EUR|résultat|confirmé|effectué|réalisé|a été (envoyé|créé|supprimé|modifié)",
@@ -117,6 +157,7 @@ class GatesV1:
     thresholds: dict[str, Thresholds] = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     domain_flags: frozenset[str] = DEFAULT_DOMAIN_FLAGS
     context_builder: Callable[[Turn], str] | None = None  # None -> _default_context
+    code_session: Callable[[str], bool] | None = None  # comme GatesV0
 
     # ── porte action (PLAN §2.3 étape 5) ──
     def action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> list[Verdict]:
@@ -157,16 +198,16 @@ class GatesV1:
 
     # ── porte bascule (PLAN §2.3 étape 7) ──
     def switch(self, reply: str, turn: Turn, tier: Tier) -> list[Verdict]:
-        flags = turn.input.domain_flags & self.domain_flags
-        if flags and not turn.escalated:
-            return [Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=1,
-                             rule=f"domaine:{'+'.join(sorted(flags))}",
-                             reason="drapeau de domaine sans escalade explicite du modèle")]
-        necessary = bool(flags) or _tool_effect_used_this_turn(turn) or _looks_assertive(reply)
+        domain = domain_verdict(turn, self.domain_flags, self.code_session)
+        if domain is not None and domain.decision is Decision.ESCALATE:
+            return [domain]
+        head = [domain] if domain is not None else []
+        # Un drapeau gardé en contexte de code compte comme une raison de relire (ce n'est plus une escalade).
+        necessary = domain is not None or _tool_effect_used_this_turn(turn) or _looks_assertive(reply)
         if not necessary:
-            return [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2, rule="judge:non-necessaire",
-                             reason="aucun outil à effet, drapeau ou affirmation détectée ce tour")]
-        return [self._ask_switch(q_id, reply, turn, tier) for q_id in ("R.humain", "R.invention", "R.secret")]
+            return head + [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2, rule="judge:non-necessaire",
+                                   reason="aucun outil à effet, drapeau ou affirmation détectée ce tour")]
+        return head + [self._ask_switch(q_id, reply, turn, tier) for q_id in ("R.humain", "R.invention", "R.secret")]
 
     def _ask_switch(self, question_id: str, reply: str, turn: Turn, tier: Tier) -> Verdict:
         q = QUESTIONS[question_id]
@@ -191,7 +232,7 @@ class GatesV1:
                        reason=reason, probability=p_alert, judge_model=answer.model, latency_s=answer.latency_s,
                        subject="reply")
 
-    # ── avis (2e appel, seulement quand HITL — consigne Nick 17.10) ──
+    # ── avis (2e appel, seulement quand HITL — consigne produit du 17.10) ──
     def _with_advice(self, reason: str, turn: Turn, context: str, call_desc: str) -> str:
         advise = getattr(self.judge, "advise", None)
         if advise is None:

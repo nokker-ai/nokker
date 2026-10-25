@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WORK = os.environ.get("SWEBENCH_WORK", "/var/tmp/swebench")
-IMAGE = os.environ.get("LOKKAL_IMAGE", "ghcr.io/nokker-ai/nokker:0.1.0-rc.5-lokkal")  # Hermes + dépendances du noyau
+IMAGE = os.environ.get("LOKKAL_IMAGE", "ghcr.io/nokker-ai/nokker:0.1.0-rc.5-lokkal")  # bibliothèque amont + dépendances du noyau
 # Point d'accès et modèle des passes publiées (OVH AI Endpoints, URL publique) ; OPENAI_BASE_URL / OPENAI_MODEL les
 # remplacent. La clé n'a pas de défaut : OPENAI_API_KEY, dans l'environnement ou dans --env-file.
 DEFAULT_BASE_URL = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"

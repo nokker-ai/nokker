@@ -94,7 +94,7 @@ function showError(title, detail, opts = {}) {
 // réglage haptique du téléphone.
 function knockHaptic() {
   if (!tg?.HapticFeedback) return;
-  // Nick 18.10 : trois coups ÉGAUX et FORTS, au rythme exact du son A (130 ms) — pas de dégressif.
+  // Décision produit du 18.10 : trois coups ÉGAUX et FORTS, au rythme exact du son A (130 ms) — pas de dégressif.
   [["heavy", 0], ["heavy", 130], ["heavy", 260]].forEach(([style, delay]) => {
     setTimeout(() => {
       try {

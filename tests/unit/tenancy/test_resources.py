@@ -22,7 +22,7 @@ FORBIDDEN = {"mail_search", "calendar_list", "browser_navigate", "memory_search"
 
 
 class FakeMcp:
-    """Remplace `McpToolSource` : `workspace` (mail, agenda de Alice) et `browser` (brosim de Alice)."""
+    """Remplace `McpToolSource` : `workspace` (mail, agenda de Alice) et `browser` (navigateur partagé de Alice)."""
 
     calls: list[str] = []
 

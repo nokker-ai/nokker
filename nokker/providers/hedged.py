@@ -12,6 +12,7 @@ ici (c'est le rôle de `StreamInterrupted`, loop.py)."""
 from __future__ import annotations
 
 import contextvars
+import inspect
 import logging
 import threading
 from collections.abc import Callable
@@ -41,7 +42,8 @@ class HedgedProvider:
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
                  session_key: str, max_tokens: int = 2048,
-                 on_delta: Callable[[str], None] | None = None) -> Completion:
+                 on_delta: Callable[[str], None] | None = None,
+                 on_tool_delta: Callable[[int, str, str, str], None] | None = None) -> Completion:
         lock = threading.Lock()
         started = threading.Event()  # primaire engagé (résultat ou premier morceau reçu)
         done = threading.Event()
@@ -59,9 +61,21 @@ class HedgedProvider:
             assert on_delta is not None
             on_delta(piece)
 
+        def relay_tool(index: int, call_id: str, name: str, piece: str) -> None:
+            # Arguments d'outil en direct (X22) : comme un morceau de texte, le client les a vus — plus de bascule.
+            with lock:
+                if state["abandoned"]:
+                    return
+                state["emitted"] = True
+                started.set()
+            assert on_tool_delta is not None
+            on_tool_delta(index, call_id, name, piece)
+
         def run() -> None:
             try:
                 kw: dict[str, Any] = {"on_delta": relay} if on_delta is not None else {}
+                if on_tool_delta is not None and _accepts(primary, "on_tool_delta"):
+                    kw["on_tool_delta"] = relay_tool
                 res = primary.complete(messages, tools, reasoning=reasoning, session_key=session_key,
                                        max_tokens=max_tokens, **kw)
                 with lock:
@@ -93,6 +107,8 @@ class HedgedProvider:
             logger.warning("amont %s sans réponse après %.1fs : repli sur %s", self.primary.model,
                            self.hedge_after_s, self.fallback.model)
             kw2: dict[str, Any] = {"on_delta": on_delta} if on_delta is not None else {}
+            if on_tool_delta is not None and _accepts(self.fallback, "on_tool_delta"):
+                kw2["on_tool_delta"] = on_tool_delta
             return self.fallback.complete(messages, tools, reasoning=reasoning, session_key=session_key,
                                           max_tokens=max_tokens, **kw2)
         done.wait()
@@ -102,6 +118,8 @@ class HedgedProvider:
                 raise err
             logger.warning("amont %s en échec (%s) : repli sur %s", self.primary.model, err, self.fallback.model)
             kw3: dict[str, Any] = {"on_delta": on_delta} if on_delta is not None else {}
+            if on_tool_delta is not None and _accepts(self.fallback, "on_tool_delta"):
+                kw3["on_tool_delta"] = on_tool_delta
             return self.fallback.complete(messages, tools, reasoning=reasoning, session_key=session_key,
                                           max_tokens=max_tokens, **kw3)
         return state["result"]
@@ -109,6 +127,14 @@ class HedgedProvider:
     def close(self) -> None:
         for p in (self.primary, self.fallback):
             getattr(p, "close", lambda: None)()
+
+
+def _accepts(provider: Any, keyword: str) -> bool:
+    """Le `complete` de ce provider DÉCLARE-t-il ce mot-clé ? (même règle que `core/loop.py::accepts_on_delta`)"""
+    try:
+        return keyword in inspect.signature(provider.complete).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _close_quietly(provider: Any) -> None:

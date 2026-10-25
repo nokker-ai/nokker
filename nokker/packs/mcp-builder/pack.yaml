@@ -1,0 +1,8 @@
+name: mcp-builder
+version: 1
+title: MCP builder
+description: >-
+  Create an MCP server (skeleton, tools, tests), run and test it in the sandbox, then add it to the configuration
+  with its credentials referenced by name from the vault. Adding a server goes through an approval card.
+tools: [skill_view, skill_list, read_file, search_files, write_file, patch, terminal, process_start, process_list,
+        process_logs, process_stop, web_fetch, mcp_server_list, mcp_server_add, mcp_server_remove]

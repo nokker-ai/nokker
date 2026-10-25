@@ -28,6 +28,7 @@ from nokker.connectors.net import ALLOWED_PORTS, IMPLICIT_TLS, TIMEOUT_S, check_
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.previews.ssrf import ResolvedHop
+from nokker.tools.effects import is_trash_destination, mail_move_effect
 
 PRESETS: dict[str, dict[str, Any]] = {
     "gmail": {"imap_host": "imap.gmail.com", "imap_port": 993, "smtp_host": "smtp.gmail.com", "smtp_port": 465},
@@ -315,7 +316,9 @@ _SPECS: list[ToolSpec] = [
             "message_id": {"type": "string", "description": "id renvoyé par mail_search / mail_read"},
             "destination": {"type": "string", "description": "inbox | archive | spam | label:<nom>"},
             "reason": {"type": "string", "description": "facultatif : pourquoi"}}},
-        effect=Effect.WRITE, source="connector:mail"),
+        # Vers la corbeille (`label:Trash`, `label:[Gmail]/Corbeille`…) : DESTRUCTIVE, comme `mail_trash` (carte
+        # forte) ; ailleurs : écriture réversible. Même règle chez nokker.ai quand l'outil est relayé (X20b).
+        effect=Effect.WRITE, effect_of=mail_move_effect, source="connector:mail"),
     ToolSpec(
         name="mail_trash",
         description="Met un message de ta boîte à la corbeille (récupérable tant que le fournisseur la garde). Action "
@@ -339,14 +342,19 @@ class MailConnector:
     """`ToolSource` mail d'un compte. `imap_factory()` / `smtp_factory()` rendent une session déjà authentifiée (tests)."""
 
     def __init__(self, settings: dict[str, Any], secret: str, *, imap_factory: Callable[[], Any] | None = None,
-                 smtp_factory: Callable[[], Any] | None = None) -> None:
+                 smtp_factory: Callable[[], Any] | None = None, locality: str | None = None) -> None:
         self.s = normalize_settings(settings)
         self._secret = secret
+        self.locality = locality  # docs/LOKKAL.md §6.7 : « cloud » chez nokker.ai, « local » dans Lokkal
         self._imap_factory = imap_factory or (lambda: connect_imap(self.s, secret))
         self._smtp_factory = smtp_factory or (lambda: connect_smtp(self.s, secret))
 
     def specs(self) -> list[ToolSpec]:
-        return list(_SPECS)
+        if self.locality is None:
+            return list(_SPECS)
+        from dataclasses import replace
+
+        return [replace(sp, locality=self.locality) for sp in _SPECS]
 
     @contextmanager
     def _imap(self) -> Iterator[Any]:
@@ -588,6 +596,11 @@ class MailConnector:
             if dest.lower() not in ("inbox", "archive", "spam") and not dest.lower().startswith("label:"):
                 raise ConnectorError("bad_settings", "destination : inbox | archive | spam | label:<nom>")
             target = self._folder(roles, dest)
+            if target == roles.get("trash") and not is_trash_destination(dest):
+                # Corbeille sous un nom que la table des effets ne reconnaît pas (dossier marqué \Trash par le
+                # serveur) : l'appel a été classé « rangement », il ne doit pas supprimer. La corbeille a son outil.
+                raise ConnectorError("unsupported", "ce dossier est la corbeille du compte : utiliser mail_trash "
+                                                    "(action destructive, carte d'approbation)")
             src, uid = self._open_message(m, str(a.get("message_id") or ""), readonly=False)
             if src == target:
                 return {"moved": False, "reason": "déjà dans ce dossier", "folder": target}

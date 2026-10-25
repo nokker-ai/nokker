@@ -5,7 +5,7 @@ registre d'outils, préfixe, connexions Postgres (`app.tenant_id` → RLS). Il v
 soumis à un pool de threads doit passer par `submit_in_context` (un ThreadPoolExecutor ne copie pas le contexte).
 
 Pas de valeur par défaut silencieuse : hors d'un `tenant_scope`, `current_tenant()` lève `NoTenant`. Un chemin qui a
-oublié de fixer le locataire échoue au lieu de tomber dans celui de Nick (`INTERNAL_TENANT`).
+oublié de fixer le locataire échoue au lieu de tomber dans le locataire interne (`INTERNAL_TENANT`).
 """
 from __future__ import annotations
 

@@ -244,6 +244,11 @@ class LLMSummarizer:
         self.retries = max(0, retries)
 
     def _call(self, messages: list[dict[str, Any]]) -> tuple[str, str | None]:
+        from nokker.qa.secrets import redact_messages
+
+        # La transcription part en rôle `user` : réponses et arguments d'outils du modèle n'y sont pas passés par une porte
+        # de caviardage (lot fix-batch-1, filet du fil).
+        messages = redact_messages(messages)
         c = self._complete
         if hasattr(c, "complete"):
             comp = c.complete(messages, [], reasoning=False, session_key=SESSION_KEY, max_tokens=self.max_tokens)

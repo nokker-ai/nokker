@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS approvals (
     error           TEXT
 );
 
+-- 25.10.2026 (docs/LOKKAL.md §7.4.9) : `ToolCall.id` de l'appel qui a posé la carte, repris par le `tool.result` publié
+-- après l'exécution. Nullable : les cartes d'avant n'en ont pas.
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS call_id TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals (status);
 CREATE INDEX IF NOT EXISTS idx_approvals_thread ON approvals (thread_id, turn_index);
 

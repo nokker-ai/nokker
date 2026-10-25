@@ -1,4 +1,4 @@
-"""Sous-agents (nokker/tools/delegate.py, Nokker Lokkal L3) : sans Hermes ni docker.
+"""Sous-agents (nokker/tools/delegate.py, Nokker Lokkal L3) : sans l'amont ni docker.
 
 Partie 1 : faux `kernel_factory`, faux `run` git (cas de finalisation), repli relative-paths, concurrence, délai
 d'inactivité, schéma de sortie, profondeur, exclude. Partie 2 : vrai git local (dépôt temporaire)."""

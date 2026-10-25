@@ -4,7 +4,7 @@ docs/LOKKAL-CLI.md §3.3).
 Avant qu'un outil modifie le dossier de travail, le noyau en prend une photo ; le modèle (ou l'utilisateur, via la
 CLI) peut ensuite lister les points, voir ce qui a changé et revenir en arrière.
 
-Reprise de Hermes au niveau de ses BRIQUES : `tools.checkpoint_manager.CheckpointManager` (un dépôt git « fantôme »
+Reprise de la bibliothèque d'agent amont au niveau de ses BRIQUES : `tools.checkpoint_manager.CheckpointManager` (un dépôt git « fantôme »
 partagé sous `$HERMES_HOME/checkpoints`, `GIT_DIR` dans ce magasin, `GIT_WORK_TREE` = le dossier : rien n'est écrit
 dans le dépôt de l'utilisateur, ledger des fichiers écrits par l'agent, `restore(safe=True)` qui laisse en place ce
 que l'utilisateur a modifié à la main) et `tools.checkpoint_maintenance` (purge).
@@ -14,7 +14,7 @@ le `GIT_DIR` est toujours le nôtre (les hooks lus sont ceux du magasin, jamais 
 on force en plus `core.hooksPath=/dev/null` dans l'environnement de chaque sous-processus git du gestionnaire
 (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, ce que le gestionnaire ne sait pas faire seul).
 
-Hermes n'est importé qu'à la première utilisation : sans lui (CI unitaire), le module se charge, les schémas
+L'amont n'est importé qu'à la première utilisation : sans lui (CI unitaire), le module se charge, les schémas
 existent, l'enveloppe est transparente et les outils répondent « points de retour indisponibles ».
 """
 from __future__ import annotations
@@ -98,21 +98,21 @@ def _system_git_env(base: Any = None) -> dict[str, str]:
     return dict(base if base is not None else os.environ)
 
 
-def _hermes_checkpoints(home: Path | None = None) -> Any | None:
-    """Module `tools.checkpoint_manager` (hooks coupés), ou None si Hermes est absent."""
+def _upstream_checkpoints(home: Path | None = None) -> Any | None:
+    """Module `tools.checkpoint_manager` (hooks coupés), ou None si l'amont est absent."""
     global _cm_module
     with _lock:
         _prepare_home(home)
         if _cm_module is None:
             try:
-                from tools import checkpoint_manager as cm  # Hermes (dépendance épinglée, docs/REPO.md)
+                from tools import checkpoint_manager as cm  # amont (dépendance épinglée, docs/REPO.md)
             except Exception:  # noqa: BLE001 — absent (CI unitaire)
                 _cm_module = False
             else:
                 if not getattr(cm._git_env, "_nokker_hooks_off", False):
                     cm._git_env = _no_user_hooks(cm._git_env)
                     if sys.platform != "win32":
-                        # Hermes lance un worker de gestionnaire de paquets (~1,7 s) à CHAQUE appel git pour
+                        # L'amont lance un worker de gestionnaire de paquets (~1,7 s) à CHAQUE appel git pour
                         # constater que, sous POSIX, c'est le git du système qui sert : on saute ce détour.
                         cm.selected_git_env = _system_git_env
                 _cm_module = cm
@@ -121,7 +121,7 @@ def _hermes_checkpoints(home: Path | None = None) -> Any | None:
 
 def make_manager(home: Path | None = None, *, max_snapshots: int = 20, max_total_size_mb: int = 500,
                  max_file_size_mb: int = 10) -> Any | None:
-    cm = _hermes_checkpoints(home)
+    cm = _upstream_checkpoints(home)
     if cm is None:
         return None
     return cm.CheckpointManager(enabled=True, max_snapshots=max_snapshots, max_total_size_mb=max_total_size_mb,
@@ -130,8 +130,8 @@ def make_manager(home: Path | None = None, *, max_snapshots: int = 20, max_total
 
 def auto_prune(home: Path | None = None) -> dict[str, Any]:
     """Purge au démarrage du noyau : points de plus de 7 jours, dossiers disparus, plafond 500 Mo, au plus une fois
-    par jour. Ne lève jamais ; `{"skipped": True, "error": …}` sans Hermes."""
-    if _hermes_checkpoints(home) is None:
+    par jour. Ne lève jamais ; `{"skipped": True, "error": …}` sans l'amont."""
+    if _upstream_checkpoints(home) is None:
         return {"skipped": True, "error": UNAVAILABLE}
     try:
         from tools.checkpoint_maintenance import maybe_auto_prune_checkpoints
@@ -178,7 +178,7 @@ class CheckpointingToolSource:
     Délègue `specs`, `call`, `turn_done` et `close` à `inner`. Autour de `call` : `new_turn()` quand `turn_index`
     change pour ce fil ; `ensure_checkpoint(root, "avant <outil>")` si `call_effect` n'est pas READ ;
     `record_agent_write(chemin hôte)` après un `write_file`/`patch` réussi. Un échec de capture est journalisé et
-    n'empêche JAMAIS l'appel. Sans Hermes (`manager` None) : transparente."""
+    n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente."""
 
     def __init__(self, inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None,
                  manager: Any | None = None) -> None:

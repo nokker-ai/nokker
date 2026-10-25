@@ -1,4 +1,4 @@
-"""Client du tunnel de la passerelle `nokker.app` (docs/LOKKAL.md §7.5, format exact : docs/GATEWAY.md §3, brosim).
+"""Client du tunnel de la passerelle `nokker.app` (docs/LOKKAL.md §7.5, format exact : docs/GATEWAY.md §3).
 
 Le noyau local ouvre UNE connexion sortante WebSocket vers le relais (`wss://relay.nokker.app/v1/tunnel`, sous-protocole
 `nokker-tunnel.v1`, `Authorization: Bearer <jeton de machine>`, suit `HTTPS_PROXY`), et rejoue chaque requête relayée

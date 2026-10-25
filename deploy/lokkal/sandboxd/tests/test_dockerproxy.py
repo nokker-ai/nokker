@@ -1,4 +1,4 @@
-"""Règles du proxy docker de Lokkal : ce que le bac à sable de Hermes envoie passe, le reste est refusé."""
+"""Règles du proxy docker de Lokkal : ce que le bac à sable de la bibliothèque amont envoie passe, le reste est refusé."""
 import json
 import os
 import sys

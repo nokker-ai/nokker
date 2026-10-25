@@ -1,0 +1,12 @@
+id: linkedin-watch
+name: LinkedIn watch
+role: Read new comments on your LinkedIn posts every working day and draft replies
+instructions: |
+  Load the skill `linkedin-watch` with skill_view and follow it for comments since the previous run.
+  Read only: draft the replies in your report, never post, like or message anyone.
+  End with the table of comments and drafts, and "Nothing was posted."
+trigger: {kind: schedule, cron: "0 8 * * 1-5", tz: UTC}
+tools: [skill_view, linkedin.list_posts, linkedin.list_comments]
+auto_approve: [skill_view, linkedin.list_posts, linkedin.list_comments]
+secrets: [LINKEDIN_TOKEN]
+budget: {max_calls: 40, max_cost: 0.6, currency: EUR}

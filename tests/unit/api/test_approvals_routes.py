@@ -634,3 +634,59 @@ def test_miniapp_files_are_never_cached_and_versioned(tmp_path):
     assert 'href="style.css?v=' in html and 'src="approve.js?v=' in html
     js = _miniapp_versioned("approve.js", (MINIAPP_DIR / "approve.js").read_bytes(), MINIAPP_DIR).decode()
     assert '"./approve-core.js?v=' in js
+
+
+def test_decision_during_a_running_turn_answers_approved_within_the_bound_and_executes_after(monkeypatch):
+    """Revue du train du 2.11, défaut 7 : la route de la Mini App attendait la fin du tour en cours sur le fil, sans
+    borne (risque de 524 Cloudflare à 100 s alors que la décision est enregistrée). Elle attend au plus
+    `DECISION_WAIT_S` (45 s), puis répond 200 avec la carte telle qu'elle est (`approved`) ; l'exécution suit en fond.
+    La Mini App affiche « Approuvé — Nina va rendre compte sur le fil d'origine » pour `approved`."""
+    import threading
+    import time
+
+    from nokker.api import server as server_mod
+    from tests.unit.approvals.conftest import telegram_init_data
+
+    monkeypatch.setattr(server_mod, "DECISION_WAIT_S", 0.5)
+    telegram_bot_token = "123456:FAKE-BOT-TOKEN"
+    approvals = InMemoryApprovals(telegram_bot_token=telegram_bot_token)
+    kernel, tools = make_kernel_with_approvals(approvals)
+    srv = start_full_server(kernel, approvals=approvals, api_keys={"key-alice": "alice"},
+                            telegram_bot_token=telegram_bot_token)
+    held = threading.Event()
+    release = threading.Event()
+    try:
+        priv, spki = gen_keypair()
+        init_data = telegram_init_data(telegram_bot_token, 1000000001)
+        device = json.loads(_post(srv, "/v1/devices", {"public_key_spki": spki, "name": "iPhone",
+                                                       "init_data": init_data}, bearer="key-alice").read())
+        approvals.confirm_device_cli(device["code"])
+        from nokker.core.turn import TurnInput
+
+        kernel.run_turn(TurnInput("fil-1", "le disque est plein sur hote21", sender="alice"))
+        approval_id = json.loads(_get(srv, "/v1/approvals", bearer="key-alice").read())[0]["id"]
+        thread = approvals.get(approval_id).thread_id
+
+        def busy_turn():  # un autre tour tourne sur le même fil (modèle lent)
+            with kernel.turn_locks.get(thread):
+                held.set()
+                release.wait(20)
+
+        threading.Thread(target=busy_turn, daemon=True).start()
+        assert held.wait(5)
+        ch = json.loads(_post(srv, f"/v1/approvals/{approval_id}/challenge", {}, bearer="key-alice").read())
+        sig = sign_p1363(priv, f"{ch['challenge']}.approve".encode("utf-8"))
+        t0 = time.monotonic()
+        decided = json.loads(_post(srv, f"/v1/approvals/{approval_id}/decision",
+                                   {"decision": "approve", "device_id": device["id"], "challenge": ch["challenge"],
+                                    "signature": sig, "init_data": init_data}, bearer="key-alice").read())
+        assert time.monotonic() - t0 < 3  # borné, pas la durée du tour en cours
+        assert decided["status"] == "approved" and tools.called == []  # décision enregistrée, exécution à venir
+        release.set()
+        end = time.monotonic() + 10
+        while time.monotonic() < end and approvals.get(approval_id).status != "executed":
+            time.sleep(0.02)
+        assert approvals.get(approval_id).status == "executed" and tools.called == ["infra_lvextend"]
+    finally:
+        release.set()
+        srv.stop()

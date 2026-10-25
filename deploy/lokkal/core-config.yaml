@@ -1,7 +1,15 @@
-# Noyau Nokker — config de Nokker Lokkal (compose local, docs/LOKKAL.md §3 et §7). Modèle pour le compose de brosim.
+# Noyau Nokker — config de Nokker Lokkal (compose local, docs/LOKKAL.md §3 et §7). Modèle pour le compose local.
 # Aucun secret ici : clés lues dans l'environnement (ROUTER_KEY ; plus tard le coffre local, §7.1).
 pg_dsn_env: NOKKER_PG_DSN            # Postgres pgvector du compose
-memory_mcp_url: ""                   # CortHeXis en mode direct (NOKKER_MEMORY_MODE=direct), pas sokkan-memory
+memory_mcp_url: ""                   # pas de MCP : CortHeXis en direct, ci-dessous
+# Mémoire longue (X1b, docs/LOKKAL.md §7.13) : bibliothèque CortHeXis dans le noyau, sur le Postgres (base corthexis)
+# et l'embed du compose (CORTHEXIS_DATABASE_URL, CORTHEXIS_EMBED_URLS). Rappel par tour sur les notes de portée user
+# (`u-local`, écrites par memory_note), dans tous les fils ; une base ou un embed injoignable se voit au démarrage
+# (journal), dans /healthz (`memory`) et GET /v1/local/memory (nokker doctor).
+memory_mode: direct
+memory_direct:
+  projects: [u-local]
+  profile: leger
 api_keys: []                         # seul le jeton local (local.token_path) et les sessions d'appareils passent
 telegram_ids: {}
 extra_go_senders: [local-owner]      # le propriétaire de la machine donne les GO
@@ -18,11 +26,30 @@ tiers:
     model: qwen/qwen3.5-397b-a17b
     api_key_env: ROUTER_KEY
     vision: true
-judge_enabled: false
+  # small: EN ATTENTE DE D1 (décision produit, banc interne). Sans ce palier, le trivial part en Ship (repli X8).
+  #   base_url: https://router.sokkan.ch/v1
+  #   model: <petit modèle retenu par D1>
+  #   api_key_env: ROUTER_KEY
+# Multi-modèle et juge allumés (X8, docs/LOKKAL.md §7.12). Routage par tour : trivial → small, conversation → Ship,
+# code → Deep. Choix NEUTRE en attendant D1 : un seul modèle (le 397B déjà servi) sur tous les paliers et pour le juge.
+route:
+  policy: v1                                   # v0 : Ship partout, Deep sur signaux (défaut du code)
+  classifier: rules                            # rules : aucun appel ; model : petit palier, 1 jeton, tour ambigu
+  code_to_deep: true
+judge_enabled: false                 # portes action/bascule du juge (couche 2) : < 90 % au banc B-1, éteintes
+judge_review: true                   # le juge relit le diff du tour avant « terminé » (renvoi à l'auteur, 1 fois)
+judge_review_rounds: 1
+judge_advice: true                   # avis court + niveau de risque sur les cartes fortes (format de X10)
+# judge: EN ATTENTE DE D1 — sans ce bloc, le juge est le palier Ship (ici le 397B, raisonnement coupé).
+#   base_url: https://router.sokkan.ch/v1
+#   model: <juge retenu par D1>
+#   api_key_env: ROUTER_KEY
 web_search_enabled: true
 context_enabled: true
-context_corthexis:
+context_corthexis:                             # never clear sur le moteur CortHeXis (docs/NEVER-CLEAR.md §11)
+  enabled: true                                # épisodes clos indexés (pgvector + embed) ; sans : lexical seulement
   root_dir: /opt/data/session-memory           # racine en lecture seule : tout l'état sous /opt/data
+  profile: leger
 previews_cache_dir: /opt/data/previews
 host: 0.0.0.0                        # dans le container ; le compose ne publie le port que sur 127.0.0.1 de l'hôte
 port: 8742
@@ -41,6 +68,12 @@ local:
   project_memory: true                         # mémoire de projet (X1, docs/LOKKAL.md §7.11) : AGENTS.md / NOKKER.md /
                                                # CLAUDE.md importés dans CortHeXis, notes apprises ; défaut du code : off
   project_memory_core_tokens: 800              # noyau toujours injecté ; le reste est rappelé par pertinence
+  relayed_connectors: true                     # connecteurs posés chez nokker.ai (mail, agenda) appelés par le lien de
+                                               # compte (X20, docs/LOKKAL.md §7.12) ; défaut du code : off
+  ops: true                                    # ops (X11, docs/LOKKAL.md §7.14) : ssh_hosts/run/copy/trust sur les
+                                               # hôtes de /opt/data/hosts.yaml (clés au coffre, known_hosts à côté),
+                                               # plancher prod = carte forte, journal d'audit chaîné
+                                               # /opt/data/audit/audit.jsonl ; défaut du code : off
   code:
     roots_env: NOKKER_HOST_WORKSPACE           # dossier(s) de l'utilisateur séparés par « : », montés au même chemin
     host_roots: {}                             # racine vue par le noyau -> vue par le démon, si différente

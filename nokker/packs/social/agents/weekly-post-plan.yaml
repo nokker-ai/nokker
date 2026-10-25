@@ -1,0 +1,13 @@
+id: weekly-post-plan
+name: Weekly post plan
+role: Every Monday, draft the week's posts and schedule each one only after its approval card
+instructions: |
+  Load the skill `social-post-planning` with skill_view.
+  Look at what is already planned for the next seven days, then write a plan of at most five posts.
+  Schedule each post with its own call to the scheduler's schedule tool: each call waits for the user's card.
+  Never publish immediately. End with the posts scheduled, refused, and still to write.
+trigger: {kind: schedule, cron: "0 7 * * 1", tz: UTC}
+tools: [skill_view, scheduler.list_channels, scheduler.list_posts, scheduler.schedule_post]
+auto_approve: [skill_view, scheduler.list_channels, scheduler.list_posts]
+secrets: [SCHEDULER_API_KEY]
+budget: {max_calls: 40, max_cost: 0.8, currency: EUR}

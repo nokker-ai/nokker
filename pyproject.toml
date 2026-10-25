@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nokker"
 version = "0.0.1"
-description = "Nokker — harness multi-modèle (noyau) : contexte dynamique CortHeXis, juge Nina QA, multi-modèle. Hermes en dépendance épinglée."
+description = "Nokker — harness multi-modèle (noyau) : contexte dynamique CortHeXis, juge Nina QA, multi-modèle. Bibliothèque d'agent amont en dépendance épinglée."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.14"   # hermes-agent pin core deps en python_version >= 3.14, rien en dessous (voir Dockerfile)
@@ -26,10 +26,10 @@ dependencies = [
                          # docs/LICENSES-DEPENDENCIES.md.
 ]
 
-# hermes-agent (branche patchée hermes-nokker, D0 : notre harness, pas un fork ; Hermes
+# hermes-agent (branche patchée hermes-nokker, D0 : notre harness, pas un fork ; l'amont
 # fournit des briques derrière nos interfaces — gateway/canaux, STT, client MCP) n'est PAS
 # déclaré ci-dessus : upstream bloque volontairement tout build de wheel/sdist pour ce paquet
-# (hermes-nokker/setup.py — "Hermes is distributed via the shell installer, Docker image, or
+# (hermes-nokker/setup.py — "[upstream] is distributed via the shell installer, Docker image, or
 # Nix. [...] use an editable install instead"), donc un simple `… @ git+…` dans `dependencies`
 # échoue toujours (pip tente un build de wheel même pour une URL VCS, et un `#egg=name[extras]`
 # est rejeté par pip récent : "invalid-egg-fragment"). La seule install qui marche est un clone
@@ -51,7 +51,7 @@ dependencies = [
 # `/usr/local/bin/nokker`, « le dernier paquet installé gagne »), cassant le contrat de sortie actuel
 # de l'image (`CMD ["gateway", "run"]`) — RÉGRESSION TROUVÉE EN RÉEL (smoke CI, build job échoué le
 # 17.10.2026 : le conteneur crashait au démarrage, `ModuleNotFoundError: mcp`, parce que `nokker`
-# pointait vers `nokker.cli:main` au lieu du binaire Hermes). `nokker/cli.py` reste appelable par
+# pointait vers `nokker.cli:main` au lieu du binaire amont). `nokker/cli.py` reste appelable par
 # `python -m nokker` (voir `nokker/__main__.py`) tant que F7 ne bascule pas la CMD de l'image.
 
 [project.optional-dependencies]
@@ -68,11 +68,20 @@ nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*
           "approvals/migrations/*.sql", "store/migrations/*.sql", "agents/migrations/*.sql",
           "api/miniapp/*.html", "api/miniapp/*.js", "api/miniapp/*.css", "prompts/*.md", "onboarding/terms/*.md",
           "tools/browser_pool_tools.json",
+          "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*",
           "admin/ui/*.html"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py314"
+
+# Lint baseline (no rewrite of existing code for the linter):
+# - F811: pytest fixtures imported from another module, then requested as test arguments (false positive).
+# - E702: the gateway relay tests keep their compact `a; b` setup lines.
+[tool.ruff.lint.per-file-ignores]
+"tests/unit/test_live_input.py" = ["F811"]
+"tests/unit/test_pages.py" = ["F811"]
+"deploy/gateway/tests/*.py" = ["E702"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

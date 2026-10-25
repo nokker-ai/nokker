@@ -43,6 +43,7 @@ MAX_BODY = 50 << 20
 CHUNK = 256 << 10
 MAX_IN_FLIGHT = 64
 RESPONSE_TIMEOUT = 60
+DELEGATION_RESPONSE_TIMEOUT = 900   # délégation (X21) : chat/completions synchrone d'un agent, jusqu'à 15 min
 STREAM_IDLE = 3600
 RECHECK_EVERY = 600
 PAGE_RE = re.compile(r"^[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*$")
@@ -104,7 +105,8 @@ class Settings:
 # --------------------------------------------------------------------------------------------- identités
 MachineCheck = Callable[[str], Awaitable[Machine | None]]
 TokenCheck = Callable[[str], Awaitable[dict | None]]
-CorePost = Callable[[str, dict], Awaitable[tuple[int, Any]]]   # (statut, JSON) ; statut 0 = noyau injoignable
+CorePost = Callable[..., Awaitable[tuple[int, Any]]]   # (chemin, corps, client_ip=…) → (statut, JSON) ; 0 = injoignable
+Presence = Callable[[str, bool], Awaitable[None]]               # (jeton de machine, en ligne)
 
 
 class CoreClient:
@@ -127,10 +129,25 @@ class CoreClient:
             log.warning("vérification de machine impossible : %s", e)
             return None
 
-    async def post(self, path: str, body: dict) -> tuple[int, Any]:
-        """Appel du relais lui-même à nokker.ai (connexion par la passerelle, §7.3)."""
+    async def presence(self, token: str, online: bool) -> None:
+        """Présence du tunnel (X15) : nokker.ai marque la machine en ligne / hors ligne sans attendre le prochain
+        passage. Au mieux : un échec n'affecte pas le tunnel."""
         try:
-            async with self.http.post(f"{self.s.core_url}{path}", json=body,
+            async with self.http.post(f"{self.s.core_url}/v1/gateway/presence", json={"online": online},
+                                      headers={"Authorization": f"Bearer {token}"},
+                                      timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status >= 300:
+                    log.debug("présence refusée : %s", r.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.debug("présence impossible : %s", type(e).__name__)
+
+    async def post(self, path: str, body: dict, client_ip: str = "") -> tuple[int, Any]:
+        """Appel du relais lui-même à nokker.ai (connexion par la passerelle, §7.3). `client_ip` : l'IP du navigateur
+        (CF-Connecting-IP reçu de Cloudflare), transmise pour que les limites de débit du noyau soient par IP et pas
+        celles de l'adresse du relais ; le noyau n'est joignable que par cloudflared et le relais (NetworkPolicy)."""
+        headers = {"CF-Connecting-IP": client_ip} if client_ip else {}
+        try:
+            async with self.http.post(f"{self.s.core_url}{path}", json=body, headers=headers,
                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
                 try:
                     data = await r.json(content_type=None)
@@ -203,10 +220,13 @@ class Registry:
             await old.ws.close(code=4001, message=b"remplace par une connexion plus recente")
             old.fail_all()
 
-    def drop(self, t: Tunnel) -> None:
-        if self.by_name.get(t.machine.name) is t:
+    def drop(self, t: Tunnel) -> bool:
+        """Retire le tunnel ; True s'il était le tunnel courant (pas un tunnel déjà remplacé)."""
+        current = self.by_name.get(t.machine.name) is t
+        if current:
             del self.by_name[t.machine.name]
         t.fail_all()
+        return current
 
 
 # --------------------------------------------------------------------------------------------- application
@@ -270,9 +290,11 @@ class RateLimit:
 
 class Relay:
     def __init__(self, s: Settings, check_machine: MachineCheck, check_token: TokenCheck,
-                 core_post: CorePost | None = None):
+                 core_post: CorePost | None = None, presence: Presence | None = None):
         self.s = s
         self.check_machine, self.check_token, self.core_post = check_machine, check_token, core_post
+        self.presence = presence
+        self._bg: set[asyncio.Task] = set()
         self.reg = Registry()
         self.used_jti: dict[str, float] = {}       # jti des jetons de pages consommés → expiration
         self.gw_rate = RateLimit(*GW_RATE)
@@ -334,6 +356,7 @@ class Relay:
         t = Tunnel(m, ws, tok)
         await self.reg.put(t)
         log.info("tunnel ouvert : %s (%s)", m.name, m.machine_id)
+        self._signal(tok, True)
         keep = asyncio.create_task(self._keepalive(t))
         try:
             async for msg in ws:
@@ -349,9 +372,17 @@ class Relay:
                     t.deliver(f)
         finally:
             keep.cancel()
-            self.reg.drop(t)
+            if self.reg.drop(t):                 # remplacé par une connexion plus récente : toujours en ligne
+                self._signal(tok, False)
             log.info("tunnel fermé : %s", m.name)
         return ws
+
+    def _signal(self, token: str, online: bool) -> None:
+        if self.presence is None:
+            return
+        task = asyncio.create_task(self.presence(token, online))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
 
     async def _keepalive(self, t: Tunnel) -> None:
         """Ping toutes les 25 s ; revérifie le compte toutes les 10 min (inférence, révocation, nom)."""
@@ -381,6 +412,9 @@ class Relay:
             tenant = claims_tenant(claims) if claims else None
             if tenant != t.machine.tenant or (claims.get("machine") not in (None, t.machine.machine_id)):
                 return web.json_response({"error": {"message": "unauthorized"}}, status=401)
+            if claims.get("scope") == "lokkal:session" or claims.get("delegation"):
+                return await self.forward(req, t, req.path_qs, tenant, extra={},
+                                          response_timeout=DELEGATION_RESPONSE_TIMEOUT)
         elif req.method not in ("GET", "HEAD"):
             return web.Response(status=405, text="méthode refusée\n")
         return await self.forward(req, t, req.path_qs, tenant, extra={})
@@ -482,7 +516,7 @@ class Relay:
         rt = req.cookies.get(RT_COOKIE, "")
         if action == "logout":
             if rt:
-                await self.core_post("/v1/gateway/revoke", {"refresh_token": rt})
+                await self.core_post("/v1/gateway/revoke", {"refresh_token": rt}, client_ip=ip)
             r = web.Response(status=204, headers=ns)
             self._clear_rt(r)
             return r
@@ -495,11 +529,11 @@ class Relay:
             except (ValueError, KeyError, TypeError):
                 return web.json_response({"error": "invalid_request"}, status=400, headers=ns)
             st, data = await self.core_post("/v1/gateway/token",
-                                            {"code": code, "code_verifier": verifier, "host": host})
+                                            {"code": code, "code_verifier": verifier, "host": host}, client_ip=ip)
             return self._grant(st, data, clear_on_refusal=False)
         if not rt:
             return web.json_response({"error": "invalid_grant"}, status=401, headers=ns)
-        st, data = await self.core_post("/v1/gateway/refresh", {"refresh_token": rt, "host": host})
+        st, data = await self.core_post("/v1/gateway/refresh", {"refresh_token": rt, "host": host}, client_ip=ip)
         return self._grant(st, data, clear_on_refusal=True)
 
     def _grant(self, st: int, data: Any, clear_on_refusal: bool) -> web.Response:
@@ -524,7 +558,8 @@ class Relay:
         r.del_cookie(RT_COOKIE, path="/", secure=True, httponly=True, samesite="Strict")
 
     async def forward(self, req: web.Request, t: Tunnel, path: str, tenant: str | None, extra: dict,
-                      pages_host: str | None = None, location_prefix: str | None = None) -> web.StreamResponse:
+                      pages_host: str | None = None, location_prefix: str | None = None,
+                      response_timeout: float | None = None) -> web.StreamResponse:
         if t.closed.is_set():
             return web.Response(status=502, text="machine hors ligne\n")
         if req.content_length and req.content_length > MAX_BODY:
@@ -568,7 +603,7 @@ class Relay:
                     await emit(prev, True)
                 prev = data
             await emit(prev or b"", False)
-            f = await asyncio.wait_for(st.queue.get(), RESPONSE_TIMEOUT)
+            f = await asyncio.wait_for(st.queue.get(), response_timeout or RESPONSE_TIMEOUT)
             if f.get("t") != "res":
                 return web.Response(status=502, text="machine injoignable\n")
             out = {k: v for k, v in f.get("headers", []) if k.lower() not in STRIP_RES}
@@ -627,7 +662,7 @@ async def main() -> None:
     s = Settings.from_env()
     http = aiohttp.ClientSession()
     core = CoreClient(s, http)
-    relay = Relay(s, core.machine, core.token, core.post)
+    relay = Relay(s, core.machine, core.token, core.post, core.presence)
     runner = web.AppRunner(make_app(relay), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()

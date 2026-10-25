@@ -1,6 +1,6 @@
 """Commandes en arrière-plan (lot X6, nokker/tools/processes.py, docs/LOKKAL.md §7.7).
 
-Joué sans Hermes : l'environnement est un vrai bash de l'hôte (`ShellEnv`, même contrat que `execute` de Hermes),
+Joué sans l'amont : l'environnement est un vrai bash de l'hôte (`ShellEnv`, même contrat que `execute` de l'amont),
 donc les vrais scripts de lancement, d'état et d'arrêt tournent, avec de vrais groupes de processus. Chaque test
 arrête ce qu'il lance (fixture `cleanup`)."""
 from __future__ import annotations
@@ -30,7 +30,7 @@ PY = sys.executable
 
 
 class ShellEnv:
-    """`execute` de Hermes réduit à l'essentiel : un bash, dans le dossier, sortie et code de retour."""
+    """`execute` de l'amont réduit à l'essentiel : un bash, dans le dossier, sortie et code de retour."""
 
     def __init__(self, cwd: str):
         self.cwd = cwd
@@ -81,6 +81,29 @@ def _wait(pred, timeout=5.0):
             return True
         time.sleep(0.05)
     return pred()
+
+
+def _tampered(sig: str) -> str:
+    """La signature avec son dernier caractère CHANGÉ — `sig[:-1] + "0"` ne changeait rien quand elle finissait déjà
+    par « 0 » (une fois sur seize : test instable)."""
+    return sig[:-1] + ("1" if sig[-1] == "0" else "0")
+
+
+class _ReservedPort:
+    """Un port libre tenu (lié, sans écoute, SO_REUSEADDR) jusqu'à ce que le serveur de test s'y lie : entre « trouver
+    un port libre » et « le serveur l'ouvre », un autre processus de la machine ne peut plus le prendre (instable sous
+    charge). `http.server` pose aussi SO_REUSEADDR : Linux le laisse se lier à côté d'un socket qui n'écoute pas."""
+
+    def __init__(self) -> None:
+        import socket
+
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+
+    def release(self) -> None:
+        self.sock.close()
 
 
 # ─────────────────────────────── table des processus ───────────────────────────────
@@ -149,8 +172,12 @@ def test_a_recycled_pid_is_never_signalled(tmp_path, tables):
 
 def test_logs_are_tailed_and_clipped(tmp_path, tables):
     t = _table(tmp_path, tables)
-    p = t.start(f"{PY} -c \"[print('ligne', i) for i in range(5000)]\"")
-    assert _wait(lambda: t.logs(p.id)["state"] == "exited")
+    # Le journal est préparé par le test et recopié par `cat` : plus de démarrage d'interpréteur Python dans le délai
+    # (sous charge, il dépassait les 5 s et le test lisait un journal à moitié écrit sans le savoir).
+    (tmp_path / "lignes.txt").write_text("".join(f"ligne {i}\n" for i in range(5000)))
+    p = t.start("cat lignes.txt")
+    assert _wait(lambda: t.logs(p.id)["state"] == "exited", timeout=30), "processus pas fini"
+    assert t.logs(p.id)["returncode"] == 0  # code de sortie écrit d'un coup (fichier renommé), jamais lu vide
     got = t.logs(p.id, tail=10)
     assert got["output"].splitlines() == [f"ligne {i}" for i in range(4990, 5000)] and got["truncated"]
     assert t.logs(p.id, tail=10**6)["tail"] == 2000  # borné
@@ -179,7 +206,11 @@ def test_preview_signer(tmp_path):
     cap = url.split("/")[5]
     assert url.startswith("/v1/local/preview/bg_0123abcd/") and url.endswith("/") and exp == 4600.0
     assert s.verify("bg_0123abcd", cap) and not s.verify("bg_99999999", cap)
-    assert not s.verify("bg_0123abcd", cap[:-1] + "0") and not s.verify("bg_0123abcd", "x")
+    assert not s.verify("bg_0123abcd", _tampered(cap)) and not s.verify("bg_0123abcd", "x")
+    for secret in (bytes([i]) * 32 for i in range(40)):  # signatures qui finissent par « 0 » comprises
+        signer = PreviewSigner(secret=secret, clock=lambda: clock[0])
+        good = signer.link("bg_0123abcd")[0].split("/")[5]
+        assert signer.verify("bg_0123abcd", good) and not signer.verify("bg_0123abcd", _tampered(good))
     clock[0] = 5000.0
     assert not s.verify("bg_0123abcd", cap)
 
@@ -216,7 +247,7 @@ def test_specs_follow_the_flag_and_effects(tmp_path, monkeypatch):
         def detect_dangerous_command(c):
             return (c.startswith("rm -rf"), "rm", "rm")
 
-    monkeypatch.setattr(code, "_hermes_detection", lambda: Det)
+    monkeypatch.setattr(code, "_upstream_detection", lambda: Det)
     start = specs["process_start"]
     assert start.effect_for({"command": "npm run dev"}) is Effect.WRITE  # comme terminal
     assert start.effect_for({"command": "tail -f app.log"}) is Effect.READ
@@ -293,14 +324,6 @@ def _get(port, path, token=None, headers=None):
         return e.code, dict(e.headers), e.read()
 
 
-def _free_port() -> int:
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatch):
     from nokker.api.server import make_handler
     from nokker.approvals.memory import InMemoryApprovals
@@ -322,7 +345,8 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
     port = httpd.server_address[1]
     api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    dev = _free_port()
+    reserved = _ReservedPort()
+    dev = reserved.port
     try:
         status, body = _req(port, "/v1/local/sessions", token=api.token, body={"cwd": str(app)})
         tid = body["thread_id"]
@@ -330,9 +354,13 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         monkeypatch.setattr(src, "_open", lambda t: code.Workspace(env=ShellEnv(str(app)), ops=None, todos=None,
                                                                    cwd=str(app)))
         ctx = ToolContext(thread_id=tid, turn_index=0, channel="api")
-        started = json.loads(src.call("process_start", {"command": f"{PY} -m http.server {dev} --bind 127.0.0.1",
+        started = json.loads(src.call("process_start", {"command": f"{PY} -u -m http.server {dev} --bind 127.0.0.1",
                                                         "port": dev}, ctx).content)
         pid = started["id"]
+        # Prêt quand le serveur le dit (il écoute), pas au bout d'un délai fixe ; le port réservé est alors rendu.
+        assert _wait(lambda: "Serving HTTP" in src.call("process_logs", {"id": pid}, ctx).content, timeout=30), \
+            src.call("process_logs", {"id": pid}, ctx).content
+        reserved.release()
         assert _req(port, "/v1/local/processes")[0] == 401
         status, listing = _req(port, "/v1/local/processes", token=api.token)
         assert status == 200 and [(p["thread_id"], p["id"], p["port"]) for p in listing["processes"]] == [
@@ -340,7 +368,6 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         assert _req(port, f"/v1/local/processes/{pid}/link", body={})[0] == 401
         status, link = _req(port, f"/v1/local/processes/{pid}/link", token=api.token, body={})
         assert status == 200 and link["url"].endswith("/") and link["port"] == dev
-        _wait(lambda: _get(port, link["url"])[0] == 200)
         status, headers, page = _get(port, link["url"])  # l'iframe : sans en-tête d'authentification
         assert status == 200 and b"bonjour" in page and headers["Content-Type"].startswith("text/html")
         assert headers["Content-Security-Policy"].startswith("sandbox") and "allow-same-origin" not in \
@@ -350,7 +377,7 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         status, headers, _ = _get(port, link["url"] + "static")  # redirection de l'appli : gardée sous le préfixe
         assert status == 301 and headers["Location"] == link["url"] + "static/"
         assert _get(port, link["url"] + "absent.txt")[0] == 404
-        bad = link["url"].replace(link["url"].split("/")[5], link["url"].split("/")[5][:-1] + "0")
+        bad = link["url"].replace(link["url"].split("/")[5], _tampered(link["url"].split("/")[5]))
         assert _get(port, bad)[0] == 404
         assert _get(port, link["url"], headers={"X-Nokker-Relay": "1"})[0] == 404  # jamais par la passerelle
         assert _req(port, "/v1/local/processes/bg_00000000/link", token=api.token, body={})[0] == 404
@@ -358,6 +385,7 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         assert _get(port, link["url"])[0] == 502  # arrêté : plus rien à montrer
         assert _req(port, f"/v1/local/processes/{pid}/link", token=api.token, body={})[0] == 404
     finally:
+        reserved.release()
         api.code.close()
         httpd.shutdown()
 
@@ -380,13 +408,13 @@ def test_config_flag_defaults_off(tmp_path):
 
 # ─────────────────────────────── bac à sable docker (essai réel) ───────────────────────────────
 # Comme test_code.py : joué seulement avec NOKKER_TEST_DOCKER_ROOT (dossier vu au même chemin par le démon et par ce
-# processus) et Hermes importable.
+# processus) et l'amont importable.
 
-HERMES = __import__("importlib.util").util.find_spec("tools") is not None
+UPSTREAM = __import__("importlib.util").util.find_spec("tools") is not None
 
 
-@pytest.mark.skipif(not (HERMES and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
-                    reason="NOKKER_TEST_DOCKER_ROOT absent ou Hermes non importable")
+@pytest.mark.skipif(not (UPSTREAM and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
+                    reason="NOKKER_TEST_DOCKER_ROOT absent ou amont non importable")
 def test_docker_background_server_logs_preview_and_cleanup(monkeypatch):
     import shutil
     import uuid

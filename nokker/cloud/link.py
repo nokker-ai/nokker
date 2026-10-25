@@ -50,18 +50,53 @@ def _b64u_dec(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+class SigningKeyError(ValueError):
+    """Clé de la passerelle illisible ou d'un mauvais type. Le message dit pourquoi, JAMAIS la clé (pas d'exception
+    chaînée de `cryptography` non plus)."""
+
+
+def _signing_key(pem: bytes) -> Any:
+    """La clé privée EC P-256 du PEM, ou `SigningKeyError` avec la cause la plus probable d'une clé mal collée."""
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    text = pem.decode("utf-8", "replace").strip()
+    if text[:1] in ("\"", "'") and text[-1:] == text[:1]:
+        raise SigningKeyError("guillemets autour du PEM (la valeur doit commencer par -----BEGIN)")
+    if "-----BEGIN" not in text:
+        raise SigningKeyError("pas un PEM (aucune ligne -----BEGIN)")
+    if "PUBLIC KEY-----" in text and "PRIVATE KEY-----" not in text:
+        raise SigningKeyError("clé publique au lieu de la clé privée")
+    if "\\n" in text and "\n" not in text:
+        raise SigningKeyError("retours à la ligne échappés (\\n) au lieu de vrais retours à la ligne")
+    if "-----END" not in text:
+        raise SigningKeyError("PEM tronqué (aucune ligne -----END)")
+    try:
+        key = load_pem_private_key(text.encode(), password=None)
+    except TypeError:
+        raise SigningKeyError("clé chiffrée par un mot de passe (attendu : PEM non chiffré)") from None
+    except (ValueError, UnsupportedAlgorithm):
+        raise SigningKeyError("PEM illisible (tronqué, corrompu ou mal recopié)") from None
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        kind = type(key).__name__.replace("PrivateKey", "").lstrip("_") or "inconnu"
+        raise SigningKeyError(f"mauvais type de clé ({kind} au lieu d'EC P-256, ES256)")
+    if not isinstance(key.curve, ec.SECP256R1):
+        raise SigningKeyError(f"mauvaise courbe ({key.curve.name} au lieu de P-256, ES256)")
+    return key
+
+
 @dataclass
 class Signer:
-    """Clé ES256 de nokker.ai (PEM, secret du déploiement) : signe les jetons et publie le JWKS."""
+    """Clé ES256 de nokker.ai (PEM, secret du déploiement) : signe les jetons et publie le JWKS. Une clé illisible ou
+    qui n'est pas une clé privée EC P-256 lève `SigningKeyError` (jamais la clé dans le message)."""
 
     private_pem: bytes
     kid: str = "nokker-gw-1"
     issuer: str = ISSUER  # = base_url de nokker.ai (cloud_link) ; vérifié tel quel par le relais et le noyau local
 
     def __post_init__(self) -> None:
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-        self._key = load_pem_private_key(self.private_pem, password=None)
+        self._key = _signing_key(self.private_pem)
 
     @classmethod
     def generate(cls, kid: str = "nokker-gw-1") -> Signer:
@@ -105,11 +140,21 @@ class Signer:
                           "scope": "pages", "iat": t, "exp": t + min(ttl_s, 60), "jti": uuid.uuid4().hex})
 
     def delegation_token(self, account: str, tenant: str, machine: str, web_session: str, ttl_s: int = 300,
-                         now: float | None = None) -> str:
+                         now: float | None = None, handoff: str | None = None,
+                         crew: dict[str, str] | None = None) -> str:
+        """Jeton de délégation (§7.5) ; `handoff` nomme la demande de relais (X21) dont la session Lokkal rendra les
+        résultats suivants (après une carte décidée au téléphone) par `POST /v1/gateway/handoffs/{id}/result`.
+        `crew` (X15) : `{op: run|check|move, id}` — le jeton n'ouvre alors QUE la route de cette opération sur la
+        machine (`nokker/local/crew.py::allows`), jamais une session."""
         t = int(now or time.time())
-        return self.sign({"iss": self.issuer, "aud": AUDIENCE, "sub": account, "tenant": tenant, "machine": machine,
-                          "scope": "lokkal:session", "web_session": web_session, "iat": t, "exp": t + ttl_s,
-                          "jti": uuid.uuid4().hex})
+        claims = {"iss": self.issuer, "aud": AUDIENCE, "sub": account, "tenant": tenant, "machine": machine,
+                  "scope": "lokkal:session", "web_session": web_session, "iat": t, "exp": t + ttl_s,
+                  "jti": uuid.uuid4().hex}
+        if handoff:
+            claims["handoff"] = handoff
+        if crew:
+            claims["crew"] = {"op": str(crew.get("op") or ""), "id": str(crew.get("id") or "")}
+        return self.sign(claims)
 
 
 class TokenError(ValueError):
@@ -170,6 +215,12 @@ class Machine:
     # posée ici seulement par `LinkService.machines_with_load`.
     load: dict[str, Any] | None = None
     load_at: float | None = None  # heure de nokker.ai à la réception (pas l'horloge de la machine)
+    # Inventaire des ressources `local` par noms (lot X21, migration 025) : posé par `machines_with_load` seulement.
+    resources: dict[str, Any] | None = None
+    resources_at: float | None = None
+    # Présence signalée par le relais (`POST /v1/gateway/presence`) : heure de la fermeture du tunnel, None = en ligne
+    # ou inconnu. Une charge reçue APRÈS cette heure vaut retour en ligne (docs/LOKKAL.md §7.19).
+    offline_at: float | None = None
 
 
 @dataclass
@@ -189,6 +240,7 @@ class MemoryLinkStore:
         self.requests: dict[str, _Request] = {}
         self.machines: dict[str, Machine] = {}
         self.loads: dict[str, tuple[str, dict[str, Any], float]] = {}  # machine → (locataire, charge, reçue à)
+        self.resources: dict[str, tuple[str, dict[str, Any], float]] = {}  # machine → (locataire, inventaire, reçu à)
         self.lock = threading.Lock()
 
     def add_request(self, r: _Request) -> None:
@@ -238,6 +290,11 @@ class MemoryLinkStore:
         with self.lock:
             return [m for m in self.machines.values() if m.account == account and not m.revoked]
 
+    def tenant_has_machine(self, tenant: str) -> bool:
+        """Au moins une machine liée (jeton relevé) et non révoquée pour ce locataire."""
+        with self.lock:
+            return any(m.tenant == tenant and not m.revoked and m.token_sha256 for m in self.machines.values())
+
     def seen(self, machine_id: str, at: float) -> None:
         with self.lock:
             if machine_id in self.machines:
@@ -252,6 +309,15 @@ class MemoryLinkStore:
         with self.lock:
             return {mid: (v[1], v[2]) for mid in machine_ids if (v := self.loads.get(mid)) and v[0] == tenant}
 
+    def set_resources(self, machine_id: str, tenant: str, resources: dict[str, Any], at: float) -> None:
+        with self.lock:
+            self.resources[machine_id] = (tenant, resources, at)
+
+    def resources_of(self, tenant: str, machine_ids: list[str]) -> dict[str, tuple[dict[str, Any], float]]:
+        """Inventaires des machines demandées, de CE locataire seulement (comme la RLS de la migration 025)."""
+        with self.lock:
+            return {mid: (v[1], v[2]) for mid in machine_ids if (v := self.resources.get(mid)) and v[0] == tenant}
+
 
 @dataclass
 class LinkService:
@@ -264,19 +330,74 @@ class LinkService:
     clock: Any = time.time
     store: Any = field(default_factory=MemoryLinkStore)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Présence par machine, au mieux et en mémoire du processus (le relais la renvoie à chaque ouverture ou fermeture
+    # de tunnel ; la fraîcheur de la charge X5 reste l'autorité) : id de machine -> heure de la fermeture.
+    _offline: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    # Appelé avec le locataire quand ses machines liées changent (jeton relevé, révocation) : `serve` y branche
+    # `TenantRegistry.forget`, pour que les outils Lokkal du compte (`lokkal_session`, `lokkal_handoff`) suivent.
+    on_change: Any = None
+    # Borne PAR CODE contre la devinette d'un `user_code` (8 car. parmi 28) : un code exposé à ce nombre de codes faux,
+    # tous comptes et IP confondus, depuis sa création meurt (la machine relance `nokker link`). P(trouvé) ≤ 1000/28^8.
+    # En mémoire du processus (un seul réplica) : après un redémarrage, un code en cours repart d'un budget plein.
+    max_guesses_per_code: int = 1000
+    _guesses: int = field(default=0, init=False, repr=False)  # codes faux saisis depuis le démarrage (approve, pending)
+    _baseline: dict[str, tuple[int, float]] = field(default_factory=dict, init=False, repr=False)  # code → (_guesses, exp.)
+
+    def _changed(self, tenant: str) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(tenant)
+        except Exception:  # noqa: BLE001 — le lien est fait ; seul le jeu d'outils du compte attendra
+            import logging
+
+            logging.getLogger("nokker.cloud.link").warning("on_change(%s) en échec", tenant, exc_info=True)
+
+    def has_machine(self, tenant: str) -> bool:
+        """Le locataire a-t-il au moins une machine liée et non révoquée ? (outils Lokkal du compte)"""
+        return bool(self.store.tenant_has_machine(tenant))
+
+    def presence(self, machine: Machine, online: bool) -> None:
+        """Tunnel ouvert (`online`) ou fermé sans remplaçant, dit par le relais."""
+        with self._lock:
+            if online:
+                self._offline.pop(machine.id, None)
+            else:
+                self._offline[machine.id] = self.clock()
 
     def device(self, machine_name: str) -> dict[str, Any]:
         device_code = secrets.token_urlsafe(32)
         user_code = "-".join("".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(4)) for _ in range(2))
+        expires_at = self.clock() + self.ttl_s
         self.store.add_request(_Request(device_sha=_sha(device_code), user_code=user_code,
-                                        machine_name=machine_name[:60], expires_at=self.clock() + self.ttl_s))
+                                        machine_name=machine_name[:60], expires_at=expires_at))
+        with self._lock:
+            now = self.clock()
+            for code in [k for k, (_, exp) in self._baseline.items() if exp < now]:
+                del self._baseline[code]
+            self._baseline[user_code] = (self._guesses, expires_at)
         return {"device_code": device_code, "user_code": user_code, "verification_uri": f"{self.base_url}/link",
                 "expires_in": self.ttl_s, "interval": 5}
 
+    def _lookup(self, user_code: str) -> _Request | None:
+        """La demande en attente pour ce code, sous `_lock`. Un code inconnu ou expiré compte comme un essai faux ; un
+        code exposé à `max_guesses_per_code` essais faux depuis sa création est retiré (même réponse qu'inconnu)."""
+        code = user_code.strip().upper()
+        req = self.store.pending_by_code(code) if code else None
+        if req is None or self.clock() > req.expires_at:
+            self._guesses += 1
+            return None
+        start = self._baseline.setdefault(code, (self._guesses, req.expires_at))[0]
+        if self._guesses - start >= self.max_guesses_per_code:
+            self.store.drop_request(req.device_sha)
+            self._baseline.pop(code, None)
+            return None
+        return req
+
     def approve(self, user_code: str, account: str, tenant: str, decision: str = "approve") -> dict[str, Any]:
         with self._lock:
-            req = self.store.pending_by_code(user_code.strip().upper())
-            if req is None or self.clock() > req.expires_at:
+            req = self._lookup(user_code)
+            if req is None:
                 raise LookupError("code inconnu ou expiré")
             if decision != "approve":
                 req.state = "denied"
@@ -296,8 +417,9 @@ class LinkService:
     def pending(self, user_code: str) -> dict[str, Any] | None:
         """Le flux en attente pour ce code, SANS effet de bord (page /link : montrer la machine avant d'approuver) ;
         None pour un code inconnu comme expiré (pas d'oracle)."""
-        req = self.store.pending_by_code(user_code.strip().upper())
-        if req is None or self.clock() > req.expires_at:
+        with self._lock:
+            req = self._lookup(user_code)
+        if req is None:
             return None
         return {"machine_name": req.machine_name, "expires_in": max(0, int(req.expires_at - self.clock()))}
 
@@ -318,6 +440,7 @@ class LinkService:
             token = secrets.token_urlsafe(32)  # créé ici, rendu une seule fois, gardé en empreinte
             self.store.set_token(m.id, _sha(token))
             self.store.drop_request(req.device_sha)
+        self._changed(m.tenant)
         return {"state": "approved", "api_key": token, "machine_token": token, "account": m.account,
                 "machine_id": m.id, "relay_host": m.host, "inference_base": f"{self.base_url}/v1/inference"}
 
@@ -329,6 +452,7 @@ class LinkService:
         if m is None:
             return False
         self.store.revoke(m.id)
+        self._changed(m.tenant)
         return True
 
     def machines_of(self, account: str) -> list[Machine]:
@@ -349,21 +473,45 @@ class LinkService:
         self.store.set_load(machine.id, machine.tenant, load, self.clock())
         return load
 
+    def report_resources(self, machine: Machine, raw: Any) -> dict[str, Any] | None:
+        """Inventaire envoyé par la machine (`POST /v1/gateway/machine/resources`, lot X21) : noms seulement, nettoyés
+        (un chemin, un contenu sont jetés), une ligne courante par machine. None si le corps n'est pas un inventaire."""
+        from nokker.local.resources import clean_resources
+
+        res = clean_resources(raw)
+        if res is None:
+            return None
+        self.store.set_resources(machine.id, machine.tenant, res, self.clock())
+        return res
+
     def machines_with_load(self, account: str, tenant: str) -> list[Machine]:
-        """Les machines du compte (« mes machines »), chacune avec sa dernière charge connue."""
+        """Les machines du compte (« mes machines »), chacune avec sa dernière charge et son inventaire connus."""
         machines = self.store.of_account(account)
-        loads = self.store.loads_of(tenant, [m.id for m in machines]) if machines else {}
+        ids = [m.id for m in machines]
+        loads = self.store.loads_of(tenant, ids) if machines else {}
+        res_of = getattr(self.store, "resources_of", None)
+        inventories = res_of(tenant, ids) if machines and res_of is not None else {}
         from dataclasses import replace
 
-        return [replace(m, load=loads[m.id][0], load_at=loads[m.id][1]) if m.id in loads else m for m in machines]
+        out = []
+        for m in machines:
+            if m.id in loads:
+                m = replace(m, load=loads[m.id][0], load_at=loads[m.id][1])
+            if m.id in inventories:
+                m = replace(m, resources=inventories[m.id][0], resources_at=inventories[m.id][1])
+            if m.id in self._offline:
+                m = replace(m, offline_at=self._offline[m.id])
+            out.append(m)
+        return out
 
     def revoke_machine(self, account: str, machine_id: str) -> bool:
         m = self.machine_of(account, machine_id)
         if m is None:
             return False
         self.store.revoke(m.id)
+        self._changed(m.tenant)
         return True
 
 
-__all__ = ["AUDIENCE", "ISSUER", "LinkService", "Machine", "MemoryLinkStore", "Signer", "TokenError", "slug",
-           "verify_token"]
+__all__ = ["AUDIENCE", "ISSUER", "LinkService", "Machine", "MemoryLinkStore", "Signer", "SigningKeyError", "TokenError",
+           "slug", "verify_token"]

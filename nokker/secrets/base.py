@@ -46,7 +46,9 @@ class SecretInfo:
     updated_at: datetime | None
 
     def as_dict(self) -> dict[str, str | None]:
-        return {"name": self.name, "updated_at": self.updated_at.isoformat() if self.updated_at else None}
+        # Le coffre local est `local` (docs/LOKKAL.md §6.7, X21) : ni le miroir ni l'inventaire ne l'envoient.
+        return {"name": self.name, "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+                "locality": "local"}
 
 
 @runtime_checkable

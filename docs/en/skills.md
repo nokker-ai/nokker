@@ -48,5 +48,6 @@ Audit events: `installed`, `install_refused`, `removed`, `skill_hidden`.
 
 - Project skills in `<folder>/.nokker/skills`: **planned**. The catalogue supports them, but installed sessions only
   load your user folder today.
-- A curated set of bundled skills: **planned**. Today the catalogue is what you install.
+- Bundled skills: the [agent packs](packs.md) ship with Nokker and install their skills with `pack_install`. A
+  broader curated catalogue is **planned**.
 - Writing audit events to Nokker's cost and activity ledger: **planned**. For now they go to the core log.

@@ -4,7 +4,9 @@
 dépend d'aucune identité réseau, celui qui a un shell root sur l'hôte EST déjà un opérateur de confiance).
 `nokker erase` / `nokker devices remove <code>` : effacement d'un compte testeur, retrait d'un appareil
 (nokker/admin/erase.py, à blanc par défaut). `nokker secret set|list|rm`, `nokker vault migrate|status` : coffre local
-(nokker/secrets/cli.py, lot X4). `nokker migrate` : migrations Postgres en propriétaire (job d'init de la bêta, `NOKKER_PG_OWNER_DSN`).
+(nokker/secrets/cli.py, lot X4). `nokker audit export|verify` : journal d'audit chaîné (nokker/ledger/audit.py, lot
+X11). `nokker review` : relecture d'un diff ou d'une PR par le juge (nokker/review/, lot X13). `nokker migrate` :
+migrations Postgres en propriétaire (job d'init de la bêta, `NOKKER_PG_OWNER_DSN`).
 Volontairement minimal pour le reste (pas de `setup`/`doctor` — chantiers périphérie, §5.5).
 
 La CLI est une frontière (docs/TENANCY.md §2) : les commandes qui touchent des données s'exécutent dans le locataire de
@@ -136,6 +138,8 @@ def _cmd_code(args: argparse.Namespace) -> int:
             "pending_calls": [brief(c) for c in turn.pending_approvals],
             "tool_calls_full": [brief(c) for m in turn.messages for c in m.tool_calls],
             "loop_rules": [v.rule for v in turn.verdicts if v.rule.startswith("loop:")],
+            "judge": [{"rule": v.rule, "decision": v.decision.value, "reason": v.reason, "model": v.judge_model,
+                       "latency_s": v.latency_s} for v in turn.verdicts if v.rule.startswith("judge:")],
             "llm_calls": [{"tier": c.tier.value, "model": c.model, "prompt": c.usage.prompt,
                            "completion": c.usage.completion, "reasoning": c.usage.reasoning,
                            "cached": c.usage.cached, "latency_s": c.latency_s, "reason": c.route_reason}
@@ -198,6 +202,15 @@ def _cmd_hooks(args: argparse.Namespace) -> int:
     trust_project_hooks(settings, root, sha)
     print(f"confiance enregistrée dans {settings} : {root} ({sha[:12]}…)")
     return 0
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    """`nokker review` (lot X13) : relecture d'un diff ou d'une PR par le juge (nokker/review/cli.py)."""
+    from nokker.review.cli import run
+
+    if not args.review_config and args.config:
+        args.review_config = args.config
+    return run(args)
 
 
 def _cmd_costs(args: argparse.Namespace) -> int:
@@ -325,12 +338,21 @@ def build_parser() -> argparse.ArgumentParser:
             hp.add_argument("--sha256", required=True, help="l'empreinte relue (nokker hooks show), recopiée")
         hp.set_defaults(func=_cmd_hooks, unscoped=True)
 
+    from nokker.review.cli import add_review_arguments
+
+    review_p = sub.add_parser("review", help="relecture d'un diff ou d'une PR par le juge, par ligne (lot X13)")
+    add_review_arguments(review_p).set_defaults(func=_cmd_review, unscoped=True)
+
     from nokker.secrets.cli import add_secret_subparsers
 
     add_secret_subparsers(sub)  # coffre local (X4) : secret set|list|rm, vault migrate|status
 
     costs_p = add_costs_subparser(sub)
     costs_p.set_defaults(func=_cmd_costs)
+
+    from nokker.ledger.audit import add_audit_subparser
+
+    add_audit_subparser(sub)  # journal d'audit chaîné (X11) : audit export|verify
 
     devices_p = sub.add_parser("devices", help="appareils enrôlés (approbations fortes, docs/APPROVALS.md)")
     devices_sub = devices_p.add_subparsers(dest="devices_command", required=True)
@@ -342,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p.add_argument("--apply", action="store_true", help="valide (sinon : à blanc, compte rendu seulement)")
     remove_p.set_defaults(func=_cmd_devices_remove, unscoped=True)
 
-    erase_p = sub.add_parser("erase", help="efface un compte testeur et son locataire (docs/BACKUP-DRP.md §6), à blanc par défaut")
+    erase_p = sub.add_parser("erase", help="efface un compte testeur et son locataire, à blanc par défaut")
     who = erase_p.add_mutually_exclusive_group(required=True)
     who.add_argument("--email")
     who.add_argument("--account", help="identifiant us_…")

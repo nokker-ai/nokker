@@ -309,6 +309,33 @@ def test_machine_load_sent_by_the_machine_read_in_my_machines(cloud):
     assert _call(port, "/v1/gateway/machine/load", load, token=mt)[0] == 401
 
 
+def test_presence_from_the_relay_marks_the_machine_offline_until_it_comes_back(cloud):
+    """Lot X15 (docs/LOKKAL.md §7.19) : le relais dit tunnel fermé → la machine n'est plus éligible, même avec une
+    charge encore fraîche ; tunnel rouvert (ou nouvelle charge) → de nouveau en ligne. Jeton de machine exigé."""
+    from nokker.cloud import http as cloud_http
+    from nokker.cloud.placement import is_online
+
+    port, _, _ = cloud
+    tok = _linked(port, "presence")
+    mt = tok["machine_token"]
+    load = {"ram": {"total_mb": 8192, "free_mb": 4096}, "cpu": {"count": 4, "load1": 0.2}}
+    assert _call(port, "/v1/gateway/machine/load", load, token=mt)[0] == 200
+    links = cloud_http._cloud.links
+
+    def online() -> bool:
+        [m] = [x for x in links.machines_with_load("us_pierre", "tn_pierre") if x.id == tok["machine_id"]] or [None]
+        return m is not None and is_online(m, links.clock())
+
+    assert online()
+    assert _call(port, "/v1/gateway/presence", {"online": False})[0] == 401
+    assert _call(port, "/v1/gateway/presence", {"online": "non"}, token=mt)[0] == 400
+    status, ack = _call(port, "/v1/gateway/presence", {"online": False}, token=mt)
+    assert status == 200 and ack == {"stored": True, "online": False}
+    assert not online()  # charge fraîche, mais tunnel fermé depuis
+    assert _call(port, "/v1/gateway/presence", {"online": True}, token=mt)[0] == 200
+    assert online()
+
+
 def test_local_reporter_reaches_the_cloud_route(cloud, tmp_path):
     """Le vrai `LoadReporter` contre la vraie route : la mesure de la machine passe le nettoyage telle quelle."""
     import httpx

@@ -1,0 +1,21 @@
+name: jobs
+version: 1
+title: Job search
+description: >-
+  Search job offers through a job-offers API you connect yourself, keep a shortlist, write cover letters as drafts
+  and track applications. Sending an application always goes through an approval card.
+connectors: [mail]
+tools: [skill_view, skill_list, read_file, search_files, write_file, memory_note, web_fetch, mail_search, mail_read,
+        mail_draft, mail_send, mcp_server_list, mcp_server_add]
+mcp:
+  jobs:
+    purpose: Search job offers, read one offer, list your applications and submit one when you approve.
+    examples:
+      - the API of a job platform where you have an account, exposed as an MCP server (bind its tool names)
+      - a public job-offers API wrapped in a small MCP server built with the mcp-builder pack
+    secrets: [JOBS_API_TOKEN]
+    tools:
+      search_offers: {default: search_jobs, effect: read}
+      get_offer: {default: get_job, effect: read}
+      list_applications: {default: list_applications, effect: read}
+      submit_application: {default: submit_application, effect: send_external}

@@ -6,6 +6,8 @@ Table outil → kind :
   - `session_send` → `notify` côté destinataire : produit par `hub.BubbleHub.send_message`, pas ici.
   - `page_create`, et `write_file`/`patch` sur une page du fil → `artifact` (§10 ; bloc `nokker:page` du résultat,
     posé par `nokker/pages/tools.py`) ; le hub garde UNE bulle par page et par fil.
+  - `lokkal_handoff` → `handoff` (relais web → Lokkal, docs/LOKKAL.md §7.16 ; bloc `nokker:handoff` posé par
+    `nokker/cloud/handoff.py`), actions `accept` / `refuse` de l'utilisateur.
 
 Aperçus (§5, chantier `nokker/previews/`, en parallèle) : le producteur `search` appelle
 `Producers.request_previews(bubble)` après création — no-op par défaut, injectable (le service d'aperçus
@@ -120,6 +122,16 @@ class Producers:
                 return ProducedBubble(kind="artifact", title=str(st.get("title") or st.get("path"))[:200], state=st,
                                       status="working")
             return None
+        if call.name == "lokkal_handoff":
+            from nokker.cloud.handoff import bubble_state, handoff_state
+
+            st = handoff_state(result.content)
+            if st is None:
+                return None
+            state, status, title = bubble_state(st)
+            return ProducedBubble(kind="handoff", title=title, state=state, status=status,
+                                  actions=[{"id": "accept", "label": "Passer le relais", "primary": True},
+                                           {"id": "refuse", "label": "Non"}])
         if is_monitor_tool(call.name, spec):
             st = monitor_state(call.name, call.arguments, result.content)
             title = f"{st['metric']} {st['target']}".strip()

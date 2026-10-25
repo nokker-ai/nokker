@@ -38,22 +38,22 @@ def _enc_approval(a: Approval) -> dict[str, Any]:
             "strength": a.strength, "rule": a.rule, "reason": a.reason, "advice": a.advice,
             "status": a.status, "created_at": a.created_at, "expires_at": a.expires_at,
             "decided_by": a.decided_by, "decided_via": a.decided_via, "decided_at": a.decided_at,
-            "result_summary": a.result_summary, "error": a.error}
+            "result_summary": a.result_summary, "error": a.error, "call_id": a.call_id}
 
 
 def _row_to_approval(row: tuple) -> Approval:
     (aid, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, reason, advice,
-     status, created_at, expires_at, decided_by, decided_via, decided_at, result_summary, error) = row
+     status, created_at, expires_at, decided_by, decided_via, decided_at, result_summary, error, call_id) = row
     return Approval(id=aid, thread_id=thread_id, turn_index=turn_index, channel=channel, tool_name=tool_name,
                     arguments=dict(arguments), args_sha256=args_sha256, strength=strength, rule=rule,
                     reason=reason or "", advice=advice, status=status, created_at=created_at,
                     expires_at=expires_at, decided_by=decided_by, decided_via=decided_via,
-                    decided_at=decided_at, result_summary=result_summary, error=error)
+                    decided_at=decided_at, result_summary=result_summary, error=error, call_id=call_id)
 
 
 _APPROVAL_COLUMNS = ("id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, "
                     "reason, advice, status, created_at, expires_at, decided_by, decided_via, decided_at, "
-                    "result_summary, error")
+                    "result_summary, error, call_id")
 
 
 @dataclass
@@ -94,10 +94,10 @@ class PgApprovals(BaseApprovals):
             cur.execute(
                 "INSERT INTO approvals (id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, "
                 "strength, rule, reason, advice, status, created_at, expires_at, decided_by, decided_via, "
-                "decided_at, result_summary, error) "
+                "decided_at, result_summary, error, call_id) "
                 "VALUES (%(id)s, %(thread_id)s, %(turn_index)s, %(channel)s, %(tool_name)s, %(arguments)s, "
                 "%(args_sha256)s, %(strength)s, %(rule)s, %(reason)s, %(advice)s, %(status)s, %(created_at)s, "
-                "%(expires_at)s, %(decided_by)s, %(decided_via)s, %(decided_at)s, %(result_summary)s, %(error)s) "
+                "%(expires_at)s, %(decided_by)s, %(decided_via)s, %(decided_at)s, %(result_summary)s, %(error)s, %(call_id)s) "
                 "ON CONFLICT (id) DO UPDATE SET status=%(status)s, decided_by=%(decided_by)s, "
                 "decided_via=%(decided_via)s, decided_at=%(decided_at)s, result_summary=%(result_summary)s, "
                 "error=%(error)s, arguments=%(arguments)s, args_sha256=%(args_sha256)s",

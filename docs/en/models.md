@@ -15,6 +15,21 @@ verification address, you approve it in your account, and the install receives a
   `DELETE /v1/local/link` (unlink: the key is revoked on a best-effort basis and removed locally either way).
 - Which models the Router serves, and the quotas of your plan, are shown in your account.
 
+Linking also brings your account's online connectors (mail, calendar) into Lokkal sessions as **relayed connectors**:
+the call goes through the link and runs on nokker.ai, which keeps the password; the machine never receives it.
+
+- Reading (search, read a message, list events) needs no card.
+- Writing inside your account (a draft, moving a message, an event without guests) asks for a card on every call,
+  whatever the permission mode and your `allow` rules.
+- Sending to someone else (a mail, an invitation to guests) and deleting (including moving a message to the trash)
+  need a **strong card signed on your phone**, which nokker.ai checks itself before it runs the call
+  ([security.md](security.md)).
+- Bulk sending, spending and secrets are never relayed.
+
+nokker.ai decides the class of each tool, not the machine; a tool it does not know is treated as a send. Each call is
+logged on both sides, without its arguments or result. Flag `local.relayed_connectors` (on in the install).
+**Rolling out** with the same train.
+
 Status: the local side is in the install. The account side (link approval page, inference relay) ships on nokker.ai
 with the early-access release train: **rolling out**. Until then the link answers with a clear error and the page
 offers "my own key or a local model".
@@ -40,9 +55,38 @@ approvals do not depend on the model.
 
 ## What the default model drives
 
-The model chosen in onboarding serves both of Lokkal's tiers (the conversational one and the deep one). Routing a turn
-across several different models, and a reviewer model checking the work, are **planned** for Lokkal: today the install
-runs one model for everything, and the reviewer step is off.
+Lokkal routes each turn to one of three tiers:
+
+- **small** (`tiers.small`): greetings and thanks on their own ("thanks!", "hello");
+- **conversational** (`tiers.ship`): questions, explanations, writing, actions on your tools;
+- **deep** (`tiers.deep`): writing, fixing or testing code.
+
+The tier is picked from the message by fixed rules, once per turn. A short reply such as "ok", "yes" or "go ahead" is
+never small talk: it may be an approval, so it never goes to the small tier. A conversational turn that starts writing
+files moves to the deep tier for the rest of the turn. If a tier is not configured, the turn goes to the nearest one
+that is, without an error.
+
+**Reviewer.** Before a coding turn says it is done, a reviewer model reads what the turn actually wrote (the diff sent
+to the file tools, plus the output of the last commands) and answers "OK" or a short list of problems. With problems,
+the writing model gets one chance to fix them (`judge_review_rounds`). The reviewer advises, it does not block: if it
+fails or times out, the answer goes out as written.
+
+**Advice on strong approvals.** A strong approval card (an action that is hard to undo, such as a destructive command)
+carries a short advice from the reviewer and a risk level: `advice` and `advice_risk` (`low`, `medium` or `high`) in
+`GET /v1/approvals/{id}`.
+
+Settings in the core config: `route.policy: v1` (three tiers), `tiers.small`, `judge` (the reviewer model; without it
+the conversational model reviews), `judge_review`, `judge_advice`. All are off in the core's code defaults and on in the
+Lokkal install.
+
+Status:
+
+- routing, the reviewer and the card advice are in the install, on by default;
+- which models serve the small tier and the reviewer is being measured: until that choice ships, the install runs the
+  default model for every tier and for the reviewer. Dedicated small and reviewer models on the Router: **rolling out**;
+- with your own endpoint or a local model, everything runs on that one model (the small tier folds into the
+  conversational one);
+- the advice shown on approvals from your phone ships with phone approvals: **rolling out**.
 
 ## Images in a request
 
@@ -74,5 +118,6 @@ only: Lokkal does not guess what your provider charges. Qwen3.5-397B-A17B on OVH
 ## Memory and embeddings
 
 Memory runs on your machine, in the install's database, with a small embedding service that downloads its model on first
-start (about 330 MB, then works offline). Nothing about your memory leaves the machine unless you opt in to the
-subscriber mirror, which is **planned** and not part of the early-access release.
+start (about 330 MB, then works offline). Nothing about your memory leaves the machine unless you turn on the
+subscriber mirror (`local.mirror`, off in the install, **rolling out**), which copies your threads and your `user`
+notes, never your project notes by default and never your work folder.

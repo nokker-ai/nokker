@@ -62,13 +62,13 @@ def test_non_member_cannot_read_thread(hub):
 
 
 def test_unknown_session_id_creates_thread_with_provisional_title(hub, rec):
-    t = hub.ensure_thread_for_turn("session-hermes-42", "alice", "x" * 100)
-    assert t.id == "session-hermes-42" and t.owner == "alice" and t.title == "x" * 48
+    t = hub.ensure_thread_for_turn("session-gw-42", "alice", "x" * 100)
+    assert t.id == "session-gw-42" and t.owner == "alice" and t.title == "x" * 48
     assert rec.of("thread.updated")
-    assert hub.ensure_thread_for_turn("session-hermes-42", "alice", "autre").title == "x" * 48
+    assert hub.ensure_thread_for_turn("session-gw-42", "alice", "autre").title == "x" * 48
     with pytest.raises(ThreadForbidden):
-        hub.ensure_thread_for_turn("session-hermes-42", "bruno", "intrus")
-    hub.ensure_thread_for_turn("session-hermes-42", None, "serveur ouvert")  # dev : pas de contrôle
+        hub.ensure_thread_for_turn("session-gw-42", "bruno", "intrus")
+    hub.ensure_thread_for_turn("session-gw-42", None, "serveur ouvert")  # dev : pas de contrôle
 
 
 # ─────────────── bulles : droits, version ───────────────
@@ -286,13 +286,13 @@ class FakeAgentsHub:
     def __init__(self):
         self.created: list[dict] = []
 
-    def create_agent(self, *, name, role, model, tools, created_by):
-        self.created.append({"name": name, "role": role, "model": model, "tools": tools,
-                             "created_by": created_by})
+    def create_from_body(self, body, created_by):
+        # §9.5 : l'activation passe par la même validation que POST /v1/agents
+        self.created.append({**body, "created_by": created_by})
         from nokker.agents.types import Agent
 
-        return Agent(id="ag_test00001", name=name, role=role, model=model, tools=tools,
-                    created_by=created_by)
+        return Agent(id="ag_test00001", name=body["name"], role=body["role"], model=body.get("model", ""),
+                     tools=body.get("tools", []), created_by=created_by)
 
 
 def test_agent_draft_activation_creates_agent_closes_bubble_and_publishes(hub, rec):
@@ -374,7 +374,10 @@ def test_agent_draft_tool_creates_bubble_with_activate_action_and_clamps_fill(hu
     bubbles = hub.bubbles.list_thread(t.id)
     assert len(bubbles) == 1 and bubbles[0].kind == "agent_draft"
     assert bubbles[0].state == {"name": "Veille", "role": "scout", "model": "ship",
-                                "tools": ["web_search"], "fill": 1.0}  # fill borné à 1
+                                "tools": ["web_search"], "fill": 1.0,  # fill borné à 1
+                                # §9.5 : ce que l'activation créera, validé et normalisé
+                                "instructions": "", "trigger": {"kind": "manual"}, "secrets": [], "budget": None,
+                                "auto_approve": []}
     assert bubbles[0].actions == [{"id": "activate", "label": "Activer", "primary": True}]
     # pas membre du fil -> refusé, pas de carte en plus
     ko = src.call("agent_draft", {"name": "x", "role": "y"}, ToolContext(t.id, 0, "api", "bruno"))

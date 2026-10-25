@@ -111,7 +111,7 @@ def test_discover_never_goes_above_the_mounted_root(tmp_path):
 
 
 def test_project_key_is_the_remote_without_credentials_or_the_git_root(tmp_path):
-    https = make_repo(tmp_path / "a", "https://nick:ghp_jeton1234567890@GitHub.com/acme/app.git")
+    https = make_repo(tmp_path / "a", "https://alice:ghp_jeton1234567890@GitHub.com/acme/app.git")
     ssh = make_repo(tmp_path / "b", "git@github.com:acme/app")
     key_a, label, base = project_key(https, tmp_path)
     assert key_a == "remote:github.com/acme/app" and label == "github.com/acme/app" and base == https.resolve()

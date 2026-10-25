@@ -3,8 +3,8 @@
 Some commands never return: a dev server, a `watch` build, `tail -f`. The `terminal` tool waits for a command to
 finish, so the agent starts these in the background instead, keeps working, and reads their output when it needs to.
 
-Status: **rolling out**. Enabled by the Lokkal install (`local.background_processes: true` in the core config); off in
-a core started without that setting.
+Status: on in the Lokkal install (`local.background_processes: true` in the core config); off in a core started
+without that setting. Port previews are a first version, with the limits listed below.
 
 ## Tools the agent has
 

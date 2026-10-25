@@ -35,8 +35,8 @@ created since are not deleted, and your edits are overwritten for the files cove
 /rollback [hash|n]    go back to a point; shows an approval card, then lists restored and kept files
 ```
 
-These slash commands depend on a local tool route of the core that is **planned** (see [cli.md](cli.md)). The tools
-above are already available to the agent, so "roll back to the previous snapshot" works in plain words.
+These slash commands call the tools above directly, without a model turn (see [cli.md](cli.md#slash-commands)). You
+can also ask in plain words: "roll back to the previous snapshot".
 
 `git` must be installed on the host for diffs and restore points; `nokker doctor` checks it.
 

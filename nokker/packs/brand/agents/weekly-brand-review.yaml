@@ -1,0 +1,13 @@
+id: weekly-brand-review
+name: Weekly brand review
+role: Every Thursday, review the posts planned for next week against the brand charter
+instructions: |
+  Load the skill `brand-review` with skill_view.
+  Find the brand charter with memory_search ("brand charter"); if it is missing, report that and stop.
+  List the posts planned for the next seven days with the scheduler's list-posts tool and review each one.
+  Read only: change nothing, schedule nothing. End with the review table and the verdict.
+trigger: {kind: schedule, cron: "0 9 * * 4", tz: UTC}
+tools: [skill_view, memory_search, memory_get, scheduler.list_posts]
+auto_approve: [skill_view, memory_search, memory_get, scheduler.list_posts]
+secrets: [SCHEDULER_API_KEY]
+budget: {max_calls: 30, max_cost: 0.5, currency: EUR}

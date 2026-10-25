@@ -25,7 +25,15 @@ from zoneinfo import ZoneInfo
 from nokker.context import index as episode_index
 from nokker.context.memory import MemoryEpisodeStore, MemoryReservoirStore
 from nokker.context.summarize import ExtractiveSummarizer, message_chars, turn_tokens
-from nokker.context.text import clip, content_words, distinctive_words
+from nokker.context.text import (
+    clip,
+    constraint_clauses,
+    content_words,
+    distinctive_words,
+    is_constraint,
+    is_revocation,
+    sentences,
+)
 from nokker.context.transcript import render_episode
 from nokker.context.types import (
     ContextBudgets,
@@ -45,6 +53,29 @@ logger = logging.getLogger("nokker.context.manager")
 ZURICH = ZoneInfo("Europe/Zurich")
 STUB_PREVIEW_CHARS = 200
 MARKER_NEW = "/new"
+REVOCATIONS_K = 6  # revirements gardés en couche 3 (les plus récents)
+REVOCATION_HEADER = ("Revirements de la session, du plus ancien au plus récent : chacun REMPLACE ce qui avait été décidé "
+                     "avant lui sur le même sujet, et fait foi sur tout épisode ou message plus ancien (puis le dépôt, "
+                     "git log) :")
+CONSTRAINTS_K = 8  # exigences de tâche gardées en couche 3 (les plus récentes)
+CONSTRAINT_HEADER = ("Exigences posées pendant les tâches, du plus ancien au plus récent : elles restent en vigueur tant "
+                     "qu'un revirement plus récent ne les annule pas. Le code qui les porte peut sembler inutilisé dans "
+                     "le dépôt (il sert des appelants extérieurs) : avant de supprimer, renommer ou nettoyer, vérifie "
+                     "que tu ne les casses pas :")
+
+
+def conclusion_of(turn: Turn) -> str:
+    """Dernier texte du modèle dans le tour (sa conclusion), sinon la réponse rendue (qu'une porte a pu remplacer)."""
+    for m in reversed(turn.messages):
+        if m.role == "assistant" and (m.content or "").strip():
+            return m.content
+    return turn.reply or ""
+
+
+def revocation_sentences(text: str) -> str:
+    """Les seules phrases de revirement d'un message (« Reviens au point-virgule. »), le message entier à défaut."""
+    picked = [x for x in sentences(text) if is_revocation(x)]
+    return " ".join(picked) if picked else " ".join((text or "").split())
 
 
 def shed_key(turn_index: int, call_id: str) -> str:
@@ -240,7 +271,9 @@ class ContextManager:
         """Corps de la note CortHeXis d'un épisode : résumé + TOUS les messages de l'utilisateur (bornés), UN PAR
         PARAGRAPHE — l'indexeur découpe sur les paragraphes : un message par morceau, pour qu'un fait du milieu d'un
         épisode de bavardage ne soit pas noyé dans l'embedding d'un morceau de remplissage (mesuré, §11)."""
-        lines = [f"[T{t.index}] {clip(t.input.text, 320)}" for t in turns if (t.input.text or "").strip()]
+        lines = [f"[T{t.index}] {clip(t.input.text, 320)}"
+                 + (f" → conclusion : {clip(conclusion_of(t), 240)}" if is_revocation(t.input.text) else "")
+                 for t in turns if (t.input.text or "").strip()]
         text = "\n\n".join(lines)
         return self._clean(f"{ep.summary}\n\n## Messages de l'utilisateur\n\n{text[:12000]}")
 
@@ -419,12 +452,62 @@ class ContextManager:
         header = ("[Mémoire de la session]\n(La fenêtre ne montre que l'épisode courant : pour toute information absente, "
                   "appelle recall_context(query) AVANT de répondre que tu ne sais pas.)")
         index_line = self._index_line(rest, thread_id) if rest else ""
-        fixed = len(header) + len(index_line) + sum(len(x) for x in day_lines) + 40
+        cons = self._constraint_lines(thread_id, int(budget_chars * 0.25))
+        revs = self._revocation_lines(thread_id, int(budget_chars * 0.4))
+        fixed = (len(header) + len(index_line) + sum(len(x) for x in day_lines)
+                 + sum(len(x) + 1 for x in (*cons, *revs)) + 40)
         room = max(0, budget_chars - fixed)
         cap = max(100, room // max(1, len(chosen)) - 90) if chosen else 0
         lines = [self._fmt(e, cap) for e in chosen]
-        text = "\n".join([header, *day_lines, *lines, *([index_line] if index_line else []), "[/Mémoire]"])
+        # Exigences puis revirements juste après l'en-tête (la coupe de sûreté ci-dessous ne peut pas les emporter),
+        # dans cet ordre : un revirement plus récent l'emporte sur une exigence.
+        text = "\n".join([header, *cons, *revs, *day_lines, *lines, *([index_line] if index_line else []),
+                          "[/Mémoire]"])
         return text if len(text) <= budget_chars + 200 else text[: budget_chars + 150] + "\n[/Mémoire]"
+
+    def revocations(self, thread_id: str) -> list[tuple[Turn, Episode]]:
+        """Les tours de revirement (`text.is_revocation`) des épisodes clos, du plus ancien au plus récent."""
+        self._turn_docs(thread_id)
+        return list(self._tidx.get(thread_id, {}).get("revs", []))
+
+    def _revocation_lines(self, thread_id: str, budget_chars: int) -> list[str]:
+        """Couche 3 : les revirements EN VIGUEUR, avec la conclusion du modèle (c'est elle qui nomme ce qui a été annulé
+        quand l'utilisateur parle par référence : « annule ce changement-là »). Toujours présents tant que le fil
+        dure : une annulation ne partage pas le vocabulaire de ce qu'elle annule, la recherche ne la remonte pas
+        (banc X9, §5.1). Les plus récents d'abord gardés, rendus dans l'ordre chronologique."""
+        out: list[str] = []
+        used = len(REVOCATION_HEADER) + 1
+        for t, ep in reversed(self.revocations(thread_id)[-REVOCATIONS_K:]):
+            concl = clip(self._clean(conclusion_of(t)), 160)
+            line = (f"- T{t.index} ({ep.id}) « {clip(self._clean(t.input.text), 200)} »"
+                    + (f" → conclusion : « {concl} »" if concl else ""))
+            if used + len(line) + 1 > budget_chars:
+                break
+            out.append(line)
+            used += len(line) + 1
+        return [REVOCATION_HEADER, *reversed(out)] if out else []
+
+    def constraints(self, thread_id: str) -> list[tuple[Turn, Episode]]:
+        """Les tours qui posent une exigence de préservation (`text.is_constraint`, hors revirements) dans les
+        épisodes clos, du plus ancien au plus récent."""
+        self._turn_docs(thread_id)
+        return list(self._tidx.get(thread_id, {}).get("cons", []))
+
+    def _constraint_lines(self, thread_id: str, budget_chars: int) -> list[str]:
+        """Couche 3 : les exigences posées au fil des tâches (banc X9, RESULTS.md §10.3 : « réexporte total_ht … pour
+        ne rien casser chez les appelants », perdue 35 tours plus tard par un « nettoyage : imports inutilisés » qui ne
+        partage aucun mot avec elle). Même raison que les revirements : la recherche ne remonte pas une exigence pour
+        une demande qui ne la nomme pas. Seules les propositions qui la portent ; les plus récentes d'abord gardées,
+        rendues dans l'ordre chronologique."""
+        out: list[str] = []
+        used = len(CONSTRAINT_HEADER) + 1
+        for t, ep in reversed(self.constraints(thread_id)[-CONSTRAINTS_K:]):
+            line = f"- T{t.index} ({ep.id}) « {clip(self._clean(constraint_clauses(t.input.text)), 220)} »"
+            if used + len(line) + 1 > budget_chars:
+                break
+            out.append(line)
+            used += len(line) + 1
+        return [CONSTRAINT_HEADER, *reversed(out)] if out else []
 
     def _index_line(self, older: list[Episode], thread_id: str) -> str:
         counts: Counter[str] = Counter()
@@ -455,9 +538,14 @@ class ContextManager:
                     prev = merged.get(eid, (by_id[eid], 0.0))[1]
                     merged[eid] = (by_id[eid], max(prev, h.score))
             hits = sorted(merged.values(), key=lambda p: (-p[1], -p[0].seq))[:b.relevant_episodes_k]
-        found = self.search_turns(thread_id, query, k=3, min_score=0.5)
+        found = self._scored_turns(thread_id, query, k=3, min_score=0.5)
         if not hits and not found:
             return ""
+        # Ordre CHRONOLOGIQUE (et plus par score) : entre deux extraits qui se contredisent, le modèle doit voir lequel
+        # est le plus récent (banc X9, §5.1 : la virgule du T73 passait après le point-virgule du T42, sans son
+        # annulation du T76).
+        hits = sorted(hits, key=lambda p: p[0].seq)
+        found = sorted(found, key=lambda f: f[1].index)
         lines = []
         for e, score in hits:
             n = (e.last_turn - e.first_turn + 1) if e.last_turn is not None else 0
@@ -465,11 +553,23 @@ class ContextManager:
             # L'extrait que le MOTEUR a jugé le plus proche passe d'abord (il porte le sens), les lignes lexicales après.
             sem_text = clip(sem[e.id].text, 280) if e.id in sem and sem[e.id].text else ""
             best = " | ".join(x for x in (sem_text, lex) if x)
-            lines.append(f"- {e.id} (#{e.seq + 1}, {e.day or '?'}, {n} tours) « {clip(e.title, 60)} » — "
+            span = f"T{e.first_turn}-T{e.last_turn}" if e.last_turn is not None else f"T{e.first_turn}"
+            lines.append(f"- {e.id} (#{e.seq + 1}, {span}, {e.day or '?'}, {n} tours) « {clip(e.title, 60)} » — "
                          f"{best or clip(e.summary, 300)} (pertinence {score:.2f})")
+        revs = self.revocations(thread_id)
+        rev_ids = {t.index for t, _ in revs}
         if found:
             lines.append("Messages retrouvés :")
-            lines.extend(found)
+            lines.extend(self._fmt_turn_hit(sc, t, ep) + (" — REVIREMENT : remplace ce qui précède sur ce sujet"
+                                                          if t.index in rev_ids else "") for sc, t, ep in found)
+        oldest = min([e.first_turn for e, _ in hits] + [t.index for _, t, _ in found])
+        shown = {t.index for _, t, _ in found}
+        later = [(t, ep) for t, ep in revs if t.index > oldest and t.index not in shown][-4:]
+        if later:  # le bloc renvoie lui-même aux revirements plus récents que ses extraits (détail en couche 3)
+            lines.append("Plus récent que ces extraits — revirement(s) qui REMPLACE(NT) ce qui précède sur le même "
+                         "sujet et fait foi : " + " ; ".join(
+                             f"T{t.index} « {clip(self._clean(revocation_sentences(t.input.text)), 160)} »"
+                             for t, _ in later))
         return "[Épisodes pertinents]\n" + "\n".join(lines) + "\n[/Épisodes]"
 
     def layer3_ids(self, thread_id: str) -> set[str]:
@@ -569,7 +669,7 @@ class ContextManager:
         qu'une fois ; l'épisode courant est exclu (déjà dans la fenêtre). Reconstruit à froid après un redémarrage."""
         with self._lock(thread_id):
             st = self.state(thread_id)
-            idx = self._tidx.setdefault(thread_id, {"upto": -1, "docs": []})
+            idx = self._tidx.setdefault(thread_id, {"upto": -1, "docs": [], "revs": [], "cons": []})
             closed = [e for e in self.episodes.list(thread_id, closed_only=True)]
             if not closed or st.last_turn_index < 0:
                 return []
@@ -581,7 +681,16 @@ class ContextManager:
                     ep = next((e for lo, hi, e in spans if lo <= t.index <= hi), None)
                     if ep is None:
                         continue
-                    toks = set(content_words(t.input.text)) | set(distinctive_words(t.input.text))
+                    text = t.input.text or ""
+                    if is_revocation(text):
+                        # Un revirement s'exprime par référence (« reviens au point-virgule », « annule ce
+                        # changement-là ») : la conclusion du modèle, qui nomme ce qui a été annulé, porte le
+                        # vocabulaire qui manque au message pour qu'une question sur le sujet le retrouve.
+                        text = f"{text}\n{self._clean(conclusion_of(t))}"
+                        idx["revs"].append((t, ep))
+                    elif is_constraint(text):  # le « … doit rester » d'un revirement est déjà dans sa section
+                        idx["cons"].append((t, ep))
+                    toks = set(content_words(text)) | set(distinctive_words(text))
                     idx["docs"].append((t, toks, ep))
                 idx["upto"] = top
             return idx["docs"]
@@ -589,6 +698,13 @@ class ContextManager:
     def search_turns(self, thread_id: str, query: str, k: int = 5, min_score: float = 0.34) -> list[str]:
         """Recherche au niveau des MESSAGES de l'utilisateur dans les épisodes clos : filet de sécurité quand le résumé
         n'a pas gardé un fait (idf calculé sur les messages du fil)."""
+        return [self._fmt_turn_hit(sc, t, ep) for sc, t, ep in self._scored_turns(thread_id, query, k, min_score)]
+
+    @staticmethod
+    def _fmt_turn_hit(score: float, t: Turn, ep: Episode) -> str:
+        return f"- T{t.index} ({ep.id}, {ep.day or '?'}) « {clip(t.input.text, 220)} » (pertinence {score:.2f})"
+
+    def _scored_turns(self, thread_id: str, query: str, k: int, min_score: float) -> list[tuple[float, Turn, Episode]]:
         terms = episode_index.query_terms(query)
         docs = self._turn_docs(thread_id) if terms else []
         if not docs:
@@ -609,9 +725,7 @@ class ContextManager:
                 continue
             if mass >= episode_index.MIN_MASS and mass / total >= min_score:
                 scored.append((mass / total, t, ep))
-        scored = sorted(scored, key=lambda s: (-s[0], -s[1].index))[:k]
-        return [f"- T{t.index} ({ep.id}, {ep.day or '?'}) « {clip(t.input.text, 220)} » (pertinence {sc:.2f})"
-                for sc, t, ep in scored]
+        return sorted(scored, key=lambda s: (-s[0], -s[1].index))[:k]
 
     @staticmethod
     def _page(text: str, offset: int, max_chars: int, label: str) -> str:
@@ -621,4 +735,4 @@ class ContextManager:
         return f"[{label}, caractères {offset}-{end} sur {len(text)}]\n{chunk}{tail}"
 
 
-__all__ = ["MARKER_NEW", "ContextManager", "day_of", "shed_key", "stub_text"]
+__all__ = ["MARKER_NEW", "ContextManager", "conclusion_of", "day_of", "revocation_sentences", "shed_key", "stub_text"]

@@ -1,7 +1,7 @@
 """Outils de code (nokker/tools/code.py, Nokker Lokkal L0).
 
-Partie 1, toujours jouée (CI unitaire, sans Hermes) : schémas, effets, classement prudent des commandes, refus.
-Partie 2, jouée seulement si Hermes est importable (image nokker, ou PYTHONPATH vers hermes-nokker avec ses
+Partie 1, toujours jouée (CI unitaire, sans l'amont) : schémas, effets, classement prudent des commandes, refus.
+Partie 2, jouée seulement si l'amont est importable (image nokker, ou PYTHONPATH vers hermes-nokker avec ses
 dépendances) : un vrai dossier de travail en backend local — écrire, lire, patcher (remplacement et V4A),
 chercher, lancer les tests, tenir le plan, refuser ce qui sort du dossier."""
 from __future__ import annotations
@@ -17,8 +17,8 @@ from nokker.core.turn import Effect
 from nokker.tools import code
 from nokker.tools.code import CODE_TOOLS, CodeToolSource, classify_command
 
-HERMES = importlib.util.find_spec("tools") is not None and importlib.util.find_spec("tools.file_operations") is not None
-needs_hermes = pytest.mark.skipif(not HERMES, reason="Hermes (tools.file_operations) non importable")
+UPSTREAM = importlib.util.find_spec("tools") is not None and importlib.util.find_spec("tools.file_operations") is not None
+needs_upstream = pytest.mark.skipif(not UPSTREAM, reason="amont (tools.file_operations) non importable")
 CTX = ToolContext(thread_id="t-code", turn_index=0, channel="api")
 
 
@@ -50,9 +50,9 @@ def test_read_only_detection(command, read_only):
     assert code._read_only(command) is read_only
 
 
-def test_without_hermes_classification_is_never_read(monkeypatch):
-    monkeypatch.setattr(code, "_hermes_detection", lambda: None)
-    assert classify_command("ls") is Effect.WRITE  # pas de READ sans la détection de Hermes
+def test_without_upstream_classification_is_never_read(monkeypatch):
+    monkeypatch.setattr(code, "_upstream_detection", lambda: None)
+    assert classify_command("ls") is Effect.WRITE  # pas de READ sans la détection de l'amont
     assert classify_command("python3 -m pytest") is Effect.DESTRUCTIVE
     assert code.hardline_reason("rm -rf /") is None
 
@@ -67,7 +67,7 @@ def test_with_a_detector_dangerous_is_destructive(monkeypatch):
         def detect_dangerous_command(c):
             return (c.startswith("rm -rf"), "rm", "rm")
 
-    monkeypatch.setattr(code, "_hermes_detection", lambda: Det)
+    monkeypatch.setattr(code, "_upstream_detection", lambda: Det)
     assert classify_command("ls") is Effect.READ
     assert classify_command("python3 -m pytest") is Effect.WRITE
     assert classify_command("rm -rf build") is Effect.DESTRUCTIVE
@@ -96,7 +96,7 @@ def test_local_backend_confines_file_tools_to_the_root(tmp_path, monkeypatch):
     assert r.is_error and r.content.startswith("REFUSÉ")
 
 
-# ─────────────────────────────── avec Hermes ───────────────────────────────
+# ─────────────────────────────── avec l'amont ───────────────────────────────
 
 
 @pytest.fixture
@@ -114,7 +114,7 @@ def _j(result):
     return json.loads(result.content)
 
 
-@needs_hermes
+@needs_upstream
 def test_write_read_patch_search_in_a_real_workspace(local):
     src, work = local
     _j(src.call("write_file", {"path": "pkg/calc.py", "content": "def add(a, b):\n    return a - b\n"}, CTX))
@@ -135,7 +135,7 @@ def test_write_read_patch_search_in_a_real_workspace(local):
     assert miss.is_error
 
 
-@needs_hermes
+@needs_upstream
 def test_terminal_runs_tests_and_classifies(local):
     src, work = local
     (work / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test(self):\n"
@@ -150,7 +150,7 @@ def test_terminal_runs_tests_and_classifies(local):
     assert refused.is_error and "jamais exécuté" in refused.content
 
 
-@needs_hermes
+@needs_upstream
 def test_todo_plan_and_workspaces_per_thread(local):
     src, _ = local
     plan = [{"id": "1", "content": "reproduire", "status": "in_progress"},
@@ -163,11 +163,11 @@ def test_todo_plan_and_workspaces_per_thread(local):
 
 # ─────────────────────────────── bac à sable docker ───────────────────────────────
 # Joué seulement avec NOKKER_TEST_DOCKER_ROOT : un dossier vu au MÊME chemin par le démon docker et par ce processus
-# (sur l'hôte, ou monté au même chemin dans le container du noyau), et Hermes importable.
+# (sur l'hôte, ou monté au même chemin dans le container du noyau), et l'amont importable.
 
 
-@pytest.mark.skipif(not (HERMES and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
-                    reason="NOKKER_TEST_DOCKER_ROOT absent ou Hermes non importable")
+@pytest.mark.skipif(not (UPSTREAM and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
+                    reason="NOKKER_TEST_DOCKER_ROOT absent ou amont non importable")
 def test_docker_sandbox_end_to_end(monkeypatch):
     import shutil
     import subprocess

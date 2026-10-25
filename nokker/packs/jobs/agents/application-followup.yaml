@@ -1,0 +1,11 @@
+id: application-followup
+name: Application follow-up
+role: Every Friday, check answers to applications and draft polite follow-ups
+instructions: |
+  Load the skill `application-tracking` with skill_view and follow it.
+  Save follow-ups as drafts with mail_draft only; never send. End with the status table and the drafts saved.
+trigger: {kind: schedule, cron: "0 14 * * 5", tz: UTC}
+tools: [skill_view, jobs.list_applications, mail_search, mail_read, mail_draft]
+auto_approve: [skill_view, jobs.list_applications, mail_search, mail_read, mail_draft]
+secrets: [JOBS_API_TOKEN]
+budget: {max_calls: 50, max_cost: 0.8, currency: EUR}

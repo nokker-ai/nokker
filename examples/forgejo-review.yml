@@ -1,0 +1,42 @@
+# Nokker review on Forgejo Actions: copy to .forgejo/workflows/nokker-review.yml in your repository.
+# Secrets: NOKKER_REVIEW_TOKEN (a Forgejo access token of a reviewer account, scope write:repository) and
+# NOKKER_REVIEW_API_KEY. Variables: NOKKER_REVIEW_BASE_URL, NOKKER_REVIEW_MODEL.
+# The job runs inside the Nokker image (it must contain git); no Node.js or checkout action is needed.
+name: nokker review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: docker
+    container:
+      image: ghcr.io/nokker-ai/nokker:0.1.0-rc.5-lokkal   # pin the release that ships `nokker review`
+    steps:
+      - name: Fetch base and head (read only)
+        env:
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR: ${{ github.event.pull_request.number }}
+          TOKEN: ${{ secrets.NOKKER_REVIEW_TOKEN }}
+        run: |
+          set -eu
+          git init -q /tmp/pr
+          cd /tmp/pr
+          # The token goes through the environment, not the command line.
+          export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: token $TOKEN" \
+                 GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+          git fetch -q --no-tags "$SERVER/$REPO.git" \
+            "+refs/heads/$BASE_REF:refs/remotes/origin/base" "+refs/pull/$PR/head:refs/remotes/origin/pr"
+      - name: Review
+        env:
+          OPENAI_BASE_URL: ${{ vars.NOKKER_REVIEW_BASE_URL }}
+          NOKKER_REVIEW_MODEL: ${{ vars.NOKKER_REVIEW_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.NOKKER_REVIEW_API_KEY }}
+          NOKKER_REVIEW_TOKEN: ${{ secrets.NOKKER_REVIEW_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python -m nokker review --repo /tmp/pr --base origin/base --head origin/pr \
+            --platform forgejo --pr "$PR" --post --json

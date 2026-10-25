@@ -9,7 +9,7 @@ une fois, et 5 essais faux le brûlent. front1 l'envoie avec un gabarit figé, s
 
 Un appareil né d'un code se connecte et discute, mais ne décide JAMAIS d'une approbation (`approved_via`
 « email-code:… », refusé par `BaseApprovals._verify_proof`) : l'approbation forte reste à l'appareil de l'invitation
-et à Telegram (décision de Nick, 21.10.2026).
+et à Telegram (décision produit du 21.10.2026).
 """
 from __future__ import annotations
 

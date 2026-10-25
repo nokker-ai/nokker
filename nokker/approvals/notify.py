@@ -40,6 +40,21 @@ class NullNotifier:
 
 
 @dataclass
+class ChainNotifier:
+    """Plusieurs notificateurs à la suite ; l'échec de l'un n'empêche pas les autres (Lokkal : celui de la config, puis
+    le dépôt des cartes fortes chez nokker.ai, lot X10)."""
+
+    notifiers: tuple[ApprovalNotifier, ...]
+
+    def notify(self, approval: Approval) -> None:
+        for n in self.notifiers:
+            try:
+                n.notify(approval)
+            except Exception:  # noqa: BLE001
+                logger.exception("notificateur %s en échec pour l'approbation %s", type(n).__name__, approval.id)
+
+
+@dataclass
 class TelegramNotifier:
     """Bot API `sendMessage`, bouton inline `web_app` (Mini App, `startapp=<approval_id>`). Désactivé
     par défaut (`NokkerConfig.approvals_telegram_enabled = False`) — `nokker/api/server.py` ne construit
@@ -58,7 +73,10 @@ class TelegramNotifier:
                 f"Effet : {approval.rule} ({approval.strength})\n"
                 f"Raison : {approval.reason}")
         if approval.advice:
-            text += f"\nAvis de Nina : {approval.advice}"
+            from nokker.qa.review import RISK_LABEL_FR, parse_advice
+
+            risk, advice = parse_advice(approval.advice)  # X8 : `[risk:<niveau>] <texte>`
+            text += f"\nAvis de Nina{f' (risque {RISK_LABEL_FR[risk]})' if risk else ''} : {advice}"
         keyboard = {"inline_keyboard": [[{
             "text": "Ouvrir la carte",
             "web_app": {"url": f"{self.mini_app_url}?startapp={approval.id}"},
@@ -74,4 +92,4 @@ class TelegramNotifier:
                 logger.exception("notify telegram: envoi échoué (chat_id=%s, approval=%s)", chat_id, approval.id)
 
 
-__all__ = ["ApprovalNotifier", "NullNotifier", "TelegramNotifier"]
+__all__ = ["ApprovalNotifier", "ChainNotifier", "NullNotifier", "TelegramNotifier"]

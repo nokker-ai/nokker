@@ -62,6 +62,9 @@ Under each turn, a dim line gives its cost: `12.4 k tokens · €0.03` (the term
 Each tool call shows its effect in plain words (read, write, destructive, send, spend, secret), then its duration.
 Results are folded to three lines: press `o` (with an empty input) or type `/out` to unfold, `/tools` to unfold all.
 Sub-agents appear as indented lines under the call that started them.
+While the model writes a file (`write_file`, `patch`, `page_create`), its last six lines scroll in dim text under the
+tool line, secrets already redacted; nothing is written before the call runs (or its card is approved), and the block
+folds when the result arrives.
 
 A new session on a local folder starts in **`accept_edits`** mode: edits inside the folder go through without a card,
 commands ask, destructive actions ask with a stronger card. See [permissions.md](permissions.md).
@@ -92,8 +95,10 @@ Arrow keys, digits and Enter. For a test command (`pytest`, `unittest`, `npm tes
   of the suggestions the core computed for that card; the client cannot invent one.
 - A destructive card offers **once** only: no session or always scope.
 - Esc does not decide. Ctrl+C refuses the card and cancels the turn. A card expires after 300 s and counts as a refusal.
-- A card that comes from the web (through the gateway) and is strong must be decided on an enrolled device, never in
-  the terminal.
+- A destructive card can be approved here, once. Some strong cards cannot be approved in the terminal at all: a change
+  on a `prod` host, a send or delete through a connector of your nokker.ai account, and a strong card that comes from
+  the web through the gateway. They wait for an enrolled device, such as your phone (see [security.md](security.md));
+  you can still refuse them here.
 
 ### Cancelling
 
@@ -115,8 +120,7 @@ displayed card and cancels the turn, otherwise quits.
 | `/plan` | The session's work plan, with each step's state |
 | `/agents` | Sub-agents of the thread: goal, state, last tool, duration |
 | `/cost` | Cost of the session (thread and its sub-agents) and of the day (UTC): tokens, and the amount when the model has a price |
-
-| `/memory [note\|forget <note>]` | Project memory: learned notes and instruction sections; one note; forget it (**planned**, see [memory.md](memory.md)) |
+| `/memory [note\|forget <note>]` | Project memory: learned notes and instruction sections; one note; forget it. **Planned** in the terminal; the core side is ready (see [memory.md](memory.md)) |
 | `/cancel` | Cancel the running turn (Esc too) |
 | `/out` | Unfold or fold the preview of the last tool call (`o` too) |
 | `/tools` | Unfold or fold all previews |
@@ -130,10 +134,12 @@ displayed card and cancels the turn, otherwise quits.
 | `/help` | The list above |
 | `/quit` (`/exit`) | Leave |
 
-`/diff`, `/checkpoints`, `/rollback`, `/skills`, `/plan` and `/agents` only work in a code session. They call a local
-tool route of the core (`POST /v1/local/tools/call`) that is **planned**: the client side is ready, and the core side
-is being merged. Until then, ask the agent in plain words ("list the restore points", "roll back to the previous
-one"): the same tools are available to it.
+`/diff`, `/checkpoints`, `/rollback`, `/skills`, `/plan` and `/agents` only work in a code session. They call the
+tools directly, without a model turn, through a local route of the core (`POST /v1/local/tools/call`, local token,
+the session's own thread only). Only an allow-listed set of tools can be called this way, through the same gates as
+the agent: `/rollback` still shows its approval card. While a turn is running on the thread, the route answers 409.
+
+`/agents` lists the sub-agents of the thread. Scheduled agents are another thing: see [agents.md](agents.md).
 
 ## Cost per turn
 

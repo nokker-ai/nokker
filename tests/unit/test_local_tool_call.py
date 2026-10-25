@@ -17,6 +17,7 @@ from nokker.local.api import LOCAL_OWNER
 from nokker.tools.registry import Registry
 from tests.unit.api.test_approvals_routes import make_kernel_with_approvals
 from tests.unit.test_local_api import _api, _req
+from tests.unit.test_thread_serialization import _wait
 
 _EFFECTS = {"checkpoint_list": Effect.READ, "checkpoint_create": Effect.WRITE,
             "checkpoint_restore": Effect.DESTRUCTIVE, "todo": Effect.READ, "terminal": Effect.DESTRUCTIVE}
@@ -100,7 +101,9 @@ def test_card_of_a_direct_call_does_not_relaunch_the_loop(tmp_path):
         kernel.run_turn = lambda *a, **k: runs.append(a)  # la boucle ne doit pas être relancée
         status, _ = _req(port, f"/v1/local/approvals/{card.id}/decide", token=api.token,
                          body={"decision": "approve", "scope": "once"})
-        assert status == 200 and runs == []
+        assert status == 202 and runs == []  # réponse tout de suite, l'outil tourne en fond (§7.4.9)
+        assert _wait(lambda: published)
+        assert runs == []
         assert l3.calls == [("checkpoint_restore", {"hash": "abc"}, DIRECT_CHANNEL)]
         assert published == [(thread, card.id, "checkpoint_restore", '{"checkpoint_restore": "ok"}', False, LOCAL_OWNER)]
         assert any("[hors tour]" in n for n in kernel._owner_notes[thread])
@@ -141,7 +144,7 @@ def test_checkpoint_create_needs_no_card_in_accept_edits():
 
 
 def test_direct_result_reaches_the_owner_on_a_thread_without_turns():
-    """Vu par features sur lokkal-g1 (24.10) : fil ouvert, aucun tour, carte directe décidée → audience vide au hub,
+    """Vu en recette sur une machine de test (24.10) : fil ouvert, aucun tour, carte directe décidée → audience vide au hub,
     l'événement ne partait chez personne."""
     events = []
     hub = build_hub(NokkerConfig(web_search_enabled=False, approvals_enabled=False), EventBus())

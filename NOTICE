@@ -10,7 +10,8 @@ The full text of the original MIT license, which continues to apply to the porti
 of this software derived from Hermes Agent, is in LICENSES/MIT-hermes-agent.txt.
 
 Upstream base: Hermes Agent v0.22.2 (commit d923a5eb487a17c0a68801bba9ef0f56c81040a8,
-released 2026-10-15), tracked on the `vendor/hermes` branch of this repository.
+released 2026-10-15), consumed through the pinned fork nokker-ai/hermes-nokker@nokker-hermes-v0.22.2-n1
+(https://github.com/nokker-ai/hermes-nokker).
 
 Third-party components bundled with or fetched by this software keep their own
 licenses; see docs/LICENSES-DEPENDENCIES.md.

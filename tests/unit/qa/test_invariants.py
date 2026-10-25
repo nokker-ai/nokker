@@ -371,7 +371,7 @@ def test_mail_move_to_trash_label_is_destructive():
 
 
 def test_browser_code_upload_and_dialog_accept_take_a_card():
-    """C2 / C3 / F1 (recos suivies par Nick, 24.10) : evaluate = carte forte, envoi de fichier = carte, accepter une
+    """C2 / C3 / F1 (recommandations retenues, 24.10) : evaluate = carte forte, envoi de fichier = carte, accepter une
     boîte de dialogue = carte forte ; la refuser passe. Même règle pour le pool des testeurs."""
     from nokker.tools.browser_pool import BrowserPoolSource
     from nokker.tools.effects import EffectsTable
@@ -382,7 +382,7 @@ def test_browser_code_upload_and_dialog_accept_take_a_card():
     dialog = t.annotate(spec("browser_handle_dialog", Effect.WRITE))
     assert dialog.effect_for({"accept": True}) is Effect.DESTRUCTIVE
     assert dialog.effect_for({"accept": False}) is Effect.WRITE
-    up = tc("browser_file_upload", paths=["/root/.ssh/id_ed25519"])
+    up = tc("browser_file_upload", paths=["/home/user/.ssh/id_ed25519"])
     assert inv().check_action(up, t.annotate(spec("browser_file_upload", Effect.WRITE)),
                               turn_with_text("finis l'inscription")).decision is Decision.HITL
     pool = {s.name: s for s in BrowserPoolSource(base_url="http://pool.invalid", api_token=lambda: "").specs()}

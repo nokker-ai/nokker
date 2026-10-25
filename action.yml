@@ -1,0 +1,126 @@
+# Nokker review : action composite (lot X13, docs/en/review.md). Elle lance `python -m nokker review` dans l'image du
+# noyau, sur le dépôt monté en lecture seule. Aucun code de la PR n'est exécuté : seul `git diff` lit le dépôt, sans
+# hooks ni pilote de diff.
+#
+# Emballage (image, release, Marketplace) : équipe release. Publication sur le GitHub Marketplace = décision D3.
+# L'image par défaut ci-dessous est À ÉPINGLER à la release qui contient `nokker review` ET git (absent de l'image du
+# noyau au 25.10) ; idéalement par digest.
+name: Nokker review
+description: Line-by-line pull request review by the Nokker judge. Advisory only, it never approves.
+author: nokker-ai
+branding:
+  icon: eye
+  color: gray-dark
+
+inputs:
+  base-url:
+    description: OpenAI-compatible endpoint of the review model (for example https://api.example.com/v1).
+    required: true
+  model:
+    description: Model name at that endpoint.
+    required: true
+  api-key:
+    description: API key of the endpoint. Pass it from a secret.
+    required: false
+    default: ""
+  github-token:
+    description: Token used to post the review. Needs pull-requests write.
+    required: false
+    default: ${{ github.token }}
+  post:
+    description: Post the review on the pull request ("false" = dry run, report only).
+    required: false
+    default: "true"
+  request-changes:
+    description: Post REQUEST_CHANGES when the verdict is changes_requested (default posts a COMMENT review).
+    required: false
+    default: "false"
+  fail-on-changes:
+    description: Fail the step when the verdict is changes_requested.
+    required: false
+    default: "false"
+  max-tokens:
+    description: Total input token budget for the review.
+    required: false
+    default: "100000"
+  exclude:
+    description: Space-separated glob patterns of files not to review.
+    required: false
+    default: ""
+  files:
+    description: Send the whole changed files as context ("true"), in addition to the diff.
+    required: false
+    default: "false"
+  lang:
+    description: Language of the review (en or fr).
+    required: false
+    default: en
+  image:
+    description: Container image that runs the review.
+    required: false
+    default: ghcr.io/nokker-ai/nokker:0.1.0-rc.5-lokkal
+
+outputs:
+  verdict:
+    description: ok or changes_requested (empty when nothing could be reviewed).
+    value: ${{ steps.review.outputs.verdict }}
+  report:
+    description: Path of the JSON report.
+    value: ${{ steps.review.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: review
+      shell: bash
+      # Toutes les valeurs passent par l'environnement, jamais interpolées dans le script (injection de commande).
+      env:
+        OPENAI_BASE_URL: ${{ inputs.base-url }}
+        OPENAI_API_KEY: ${{ inputs.api-key }}
+        NOKKER_REVIEW_MODEL: ${{ inputs.model }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        NR_POST: ${{ inputs.post }}
+        NR_REQUEST_CHANGES: ${{ inputs.request-changes }}
+        NR_FAIL_ON_CHANGES: ${{ inputs.fail-on-changes }}
+        NR_MAX_TOKENS: ${{ inputs.max-tokens }}
+        NR_EXCLUDE: ${{ inputs.exclude }}
+        NR_FILES: ${{ inputs.files }}
+        NR_LANG: ${{ inputs.lang }}
+        NR_IMAGE: ${{ inputs.image }}
+        NR_BASE: ${{ github.event.pull_request.base.sha }}
+        NR_HEAD: ${{ github.event.pull_request.head.sha }}
+        NR_PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        if [ -z "$NR_PR" ] || [ -z "$NR_BASE" ] || [ -z "$NR_HEAD" ]; then
+          echo "::error::nokker review runs on pull_request events only"; exit 2
+        fi
+        if ! git -C "$GITHUB_WORKSPACE" -c core.hooksPath=/dev/null cat-file -e "$NR_BASE^{commit}" 2>/dev/null; then
+          echo "::error::base commit missing: use actions/checkout with fetch-depth: 0"; exit 2
+        fi
+        args=(--repo /repo --base "$NR_BASE" --head "$NR_HEAD" --pr "$NR_PR" --platform github --json
+              --max-tokens "$NR_MAX_TOKENS" --lang "$NR_LANG")
+        [ "$NR_POST" = "true" ] && args+=(--post)
+        [ "$NR_REQUEST_CHANGES" = "true" ] && args+=(--request-changes)
+        [ "$NR_FAIL_ON_CHANGES" = "true" ] && args+=(--fail-on-changes)
+        [ "$NR_FILES" = "true" ] && args+=(--files)
+        for g in $NR_EXCLUDE; do args+=(--exclude "$g"); done
+        report="$RUNNER_TEMP/nokker-review.json"
+        rc=0
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE:/repo:ro" -v "$GITHUB_EVENT_PATH:/run/event.json:ro" \
+          -e OPENAI_BASE_URL -e OPENAI_API_KEY -e NOKKER_REVIEW_MODEL -e GITHUB_TOKEN \
+          -e GITHUB_REPOSITORY -e GITHUB_API_URL -e GITHUB_SERVER_URL -e GITHUB_ACTIONS \
+          -e GITHUB_EVENT_PATH=/run/event.json \
+          --entrypoint python "$NR_IMAGE" -m nokker review "${args[@]}" > "$report" || rc=$?
+        verdict=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict") or "")' "$report" 2>/dev/null || true)
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        python3 - "$report" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null <<'PY' || true
+        import json, sys
+        r = json.load(open(sys.argv[1]))
+        print(f"## Nokker review: {r.get('verdict') or r.get('error', 'no verdict')}\n\n{r.get('summary', '')}\n")
+        for c in r.get("comments", []):
+            print(f"- `{c['path']}:{c['line']}` ({c['side']}) **{c['severity']}**: {c['body']}")
+        PY
+        exit "$rc"

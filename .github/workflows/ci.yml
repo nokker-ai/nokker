@@ -1,0 +1,95 @@
+# Public CI: lint, unit tests and integration tests on every push to main and on every pull request.
+# No secrets, read-only token. Actions and images are pinned by commit sha / digest.
+#
+# The pinned agent library (hermes-nokker) cannot be installed from a wheel or a VCS URL: upstream blocks every
+# wheel/sdist build on purpose. It is cloned at its pinned tag, checked against the expected commit, then installed
+# editable with its extras (see the comment in pyproject.toml and the Dockerfile).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+  RUFF_VERSION: "0.15.10"
+  HERMES_REPO: https://github.com/nokker-ai/hermes-nokker.git
+  HERMES_TAG: nokker-hermes-v0.22.2-n1
+  HERMES_COMMIT: a4ba9e76baf89ae026c2fa058e0853dc9a2fbf47   # a tag can move, a commit cannot
+  HERMES_EXTRAS: messaging,stt-whisper
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with: {python-version: "${{ env.PYTHON_VERSION }}"}
+      - run: pip install "ruff==${RUFF_VERSION}"
+      - run: ruff check .
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the pinned agent library (editable, with extras)
+        run: |
+          git clone --depth 1 --branch "$HERMES_TAG" "$HERMES_REPO" "$RUNNER_TEMP/hermes-src"
+          test "$(git -C "$RUNNER_TEMP/hermes-src" rev-parse HEAD)" = "$HERMES_COMMIT"
+          pip install -e "$RUNNER_TEMP/hermes-src[$HERMES_EXTRAS]"
+      - name: Install nokker
+        run: pip install -e ".[dev]"
+      - name: pytest tests/unit
+        run: pytest tests/unit -q
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a   # pg16
+        env:
+          POSTGRES_PASSWORD: nokker-ci   # throwaway database of this job, not a secret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      NOKKER_TEST_PG_DSN: postgresql://postgres:nokker-ci@127.0.0.1:5432/postgres
+      # Disposable OpenBao started by tests/integration/test_secrets_openbao_real.py through the runner's docker.
+      NOKKER_TEST_OPENBAO_IMAGE: openbao/openbao@sha256:597f62847dd382382056a1d6704d50465908c2040038c4611832a23269a67112   # 2.4.1
+      # Tests that need the Nokker Router or a llama.cpp server skip themselves when these are unset.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the pinned agent library (editable, with extras)
+        run: |
+          git clone --depth 1 --branch "$HERMES_TAG" "$HERMES_REPO" "$RUNNER_TEMP/hermes-src"
+          test "$(git -C "$RUNNER_TEMP/hermes-src" rev-parse HEAD)" = "$HERMES_COMMIT"
+          pip install -e "$RUNNER_TEMP/hermes-src[$HERMES_EXTRAS]"
+      - name: Install nokker
+        run: pip install -e ".[dev]"
+      - name: pytest tests/integration
+        run: pytest tests/integration -q -rs

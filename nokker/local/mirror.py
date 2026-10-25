@@ -9,7 +9,13 @@ pendant de `nokker/cloud/mirror.py`.
 - **tirage** : `GET /v1/mirror/turns?since=` range les tours des sessions web sous `mirror-web-<fil>` (lecture seule),
   curseur `mirror_cursor`.
 Le fil de fond n'a pas de requête autour de lui : il pose lui-même le locataire du noyau local (`tenant`), sinon un
-magasin Postgres refuse tout (NoTenant). Rien du dossier de travail ne part : seulement les tours.
+magasin Postgres refuse tout (NoTenant). Rien du dossier de travail ne part : seulement les tours et les notes.
+
+Notes de mémoire (lot X21, docs/LOKKAL.md §6.7) : `push_notes_once` envoie à `POST /v1/mirror/notes` les notes dont la
+localité permet la sortie (`both` : notes de l'utilisateur, notes d'un projet mis en miroir), jamais une note `local`
+(note de projet par défaut) : le filtre `nokker/core/locality.py::outbound` est appliqué JUSTE avant l'envoi. Une note
+oubliée, ou un projet retiré du miroir, part en `forget` (effacement propagé, §6.3). Empreinte par note dans l'état
+local (`mirror_notes_sent`) : seul ce qui a changé repart.
 
 Effacement propagé (§6.3) :
 - le propriétaire efface les copies de sa machine chez nokker.ai (`erase_remote`, route locale
@@ -21,6 +27,8 @@ Effacement propagé (§6.3) :
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -28,6 +36,7 @@ from typing import Any
 
 import httpx
 
+from nokker.core import locality
 from nokker.store.pg import turn_from_dict
 from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
 
@@ -55,6 +64,7 @@ class MirrorWorker:
     push_s: float = 5.0
     pull_s: float = 30.0
     client: Any = None
+    notes: Any = None  # nokker.context.project_memory.ProjectMemory (X1) ; None = pas de notes en miroir
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _refused: int = field(default=0, init=False, repr=False)
 
@@ -97,6 +107,38 @@ class MirrorWorker:
         self.state["mirror_push_cursor"] = last
         self.save()
         return len(batch)
+
+    def push_notes_once(self) -> int:
+        """Envoie les notes nouvelles ou changées dont la localité permet la sortie, et l'oubli de celles qui ne sont
+        plus candidates ; rend le nombre de notes envoyées (oublis compris). Rien n'est noté envoyé sans 200."""
+        if self.notes is None or self.state.get("mirror_paused"):
+            return 0
+        current: dict[str, tuple[str, dict[str, Any]]] = {}
+        for n in locality.outbound(self.notes.notes_for_mirror(), locality.of):  # filtre à l'envoi
+            d = {"project": n.project, "name": n.name, "kind": n.kind, "scope": n.scope, "locality": n.locality,
+                 "title": n.title, "text": n.text, "created": n.created, "derived_from": n.derived_from}
+            sha = hashlib.sha256(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            current[f"{n.project}/{n.name}"] = (sha, d)
+        sent: dict[str, str] = dict(self.state.get("mirror_notes_sent") or {})
+        notes = [d for key, (sha, d) in current.items() if sent.get(key) != sha][:BATCH]
+        forget = [{"project": k.split("/", 1)[0], "name": k.split("/", 1)[1]} for k in sent if k not in current][:BATCH]
+        if not notes and not forget:
+            return 0
+        try:
+            r = self._http().post(self.base_url.rstrip("/") + "/v1/mirror/notes", headers=self._headers(),
+                                  json={"notes": notes, "forget": forget})
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.info("miroir : envoi des notes reporté (%s)", type(e).__name__)
+            return 0
+        for d in notes:
+            key = f"{d['project']}/{d['name']}"
+            sent[key] = current[key][0]
+        for f in forget:
+            sent.pop(f"{f['project']}/{f['name']}", None)
+        self.state["mirror_notes_sent"] = sent
+        self.save()
+        return len(notes) + len(forget)
 
     def pull_once(self) -> int:
         params = {"since": self.state["mirror_cursor"]} if self.state.get("mirror_cursor") else {}
@@ -146,6 +188,7 @@ class MirrorWorker:
         r.raise_for_status()
         self.state["mirror_paused"] = True
         self.state.pop("mirror_push_cursor", None)  # une reprise renvoie tout
+        self.state.pop("mirror_notes_sent", None)  # notes comprises
         self.save()
         return int(r.json().get("erased_turns", 0))
 
@@ -167,6 +210,7 @@ class MirrorWorker:
                 if ticks * self.push_s >= self.pull_s:
                     ticks = 0
                     self.pull_once()
+                    self.push_notes_once()
             except Exception:  # noqa: BLE001 — un fil de fond qui meurt arrête le miroir en silence
                 logger.warning("miroir : passage en échec, repris au suivant", exc_info=True)
 

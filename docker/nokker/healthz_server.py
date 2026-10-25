@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nokker /healthz aggregator — nokker (noyau), not upstream Hermes.
+"""Nokker /healthz aggregator — nokker (noyau), not the upstream agent library.
 
 Migrated unchanged from hermes-nokker (P0 "Fork" livrable 2) in F0: this stays a
 product-side, stdlib-only aggregator, now started directly by docker/entrypoint.sh instead
@@ -17,9 +17,9 @@ rebased quarterly — see UPSTREAM.md), this is a standalone stdlib-only
 aggregator wired in purely additively: a new s6 service
 (docker/s6-rc.d/healthz/) that the existing `COPY docker/s6-rc.d/` and
 `COPY --link . .` Dockerfile steps already pick up. Zero lines of upstream
-Hermes code are touched.
+code are touched.
 
-Stdlib only (http.server + urllib) — no dependency on Hermes' venv, so it
+Stdlib only (http.server + urllib) — no dependency on the upstream venv, so it
 starts even if the app layer fails later in boot.
 """
 from __future__ import annotations

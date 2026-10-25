@@ -31,7 +31,7 @@ services:
   core:
     <<: *hardening
     image: ${NOKKER_IMAGE:-ghcr.io/nokker-ai/nokker}:${NOKKER_VERSION:?NOKKER_VERSION absent du .env}-lokkal
-    # entrypoint et pas command (l'ENTRYPOINT de l'image lance la gateway Hermes, comme `command:` du chart en k8s)
+    # entrypoint et pas command (l'ENTRYPOINT de l'image lance la passerelle amont, comme `command:` du chart en k8s)
     entrypoint: ["python3", "-m", "nokker", "--config", "/etc/nokker/config.yaml", "serve"]
     init: true
     depends_on:

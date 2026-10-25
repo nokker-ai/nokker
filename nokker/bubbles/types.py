@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 KINDS = frozenset({"monitor", "search", "notify", "timer", "script", "media", "agent_draft", "approval",
-                    "episode", "artifact"})  # episode : mémoire de session délestée (docs/NEVER-CLEAR.md §3) ;
-# artifact : page créée en session (docs/BUBBLES.md §10), créée par le noyau seulement
+                    "episode", "artifact", "handoff", "plan_split", "brief"})  # episode : mémoire de session délestée (docs/NEVER-CLEAR.md
+# §3) ; artifact : page créée en session (docs/BUBBLES.md §10), créée par le noyau seulement ; handoff : relais d'une
+# session web vers une machine Lokkal (docs/LOKKAL.md §7.16, X21), créée par le noyau seulement ; plan_split :
+# proposition de découpe d'une carte du plan, brief : brief du matin rangé dans le fil de son passage (docs/LOKKAL.md
+# §7.18, X18), créées par le noyau seulement
 STATUSES = frozenset({"idle", "working", "done", "failed"})
 MODES = frozenset({"move", "copy"})
 

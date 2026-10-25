@@ -41,18 +41,33 @@ The code is open source (Apache-2.0); the relay is a Nokker service, so the gate
   limited to `GET` and `HEAD` of the web interface files. A local token is refused by the relay, and the core also
   refuses a local token on a relayed request.
 - **The core checks again.** It re-verifies the token itself and keeps its own approval cards. Any destructive action
-  asked from the web needs a **strong approval card**, decided on an enrolled device (phone or passkey), with the
-  WebAuthn origin `https://<name>.nokker.app`.
+  asked from the web needs a **strong approval card**, signed on an enrolled device with a passkey on
+  `https://app.nokker.ai` (see [Approving from your phone](#approving-from-your-phone)), never with the local token.
 - **No cookies shared.** Control cookies use the `__Host-` prefix. The relay strips `Cookie` toward your machine and
   `Set-Cookie` from it.
 - **Pages are sandboxed.** They are served with `Content-Security-Policy: sandbox allow-scripts allow-forms
   allow-popups` (no `allow-same-origin`: a page can read no cookie or storage), `X-Content-Type-Options: nosniff` and
-  `Referrer-Policy: no-referrer`. They are **private by default**: you open them through a short-lived signed link. A
-  page can be made **public** page by page, on purpose, for subscribers or verified accounts, and then carries a report
-  link.
-- **A web session never touches your machine directly.** A hosted session that needs something local opens a Lokkal
-  session through the gateway; that session has its own local gates and approvals, and the web side only receives the
-  result.
+  `Referrer-Policy: no-referrer`. They are **private**: you open them through a short-lived signed link. Making a page
+  public is **planned** (below).
+- **A web session never touches your machine directly.** A hosted session that needs something that lives on your
+  machine (a repository, an ssh host, a connector set up in Lokkal) never receives it. It proposes a hand-over: a card
+  in the web thread that names the machine and the task. If you accept, a Lokkal session opens on that machine with the
+  task, works with that machine's permissions and cards, and only its final answer comes back to the web thread. The
+  machine tells nokker.ai the **names** of its resources, never paths or contents.
+
+## Approving from your phone
+
+When a strong card waits on a linked machine, the machine posts it to your account and you get a link to
+`app.nokker.ai/approve/…` (and a Telegram message with that link, if you paired Telegram). You sign with a passkey
+that verifies you. nokker.ai only carries the signature: your machine checks it against your device's public key, the
+card's challenge and the hash of the exact arguments, and uses it once. What the page shows, and who wrote it: see
+[security.md](security.md#4-what-you-see-when-you-sign).
+
+## Several machines
+
+Each linked machine has its own tunnel and its own `<name>.nokker.app`. Machines report their load (free RAM, CPU,
+GPU, sessions) every 60 s, so nokker.ai can place agent runs on the least loaded eligible machine and show one deck
+for all of them: see [agents.md](agents.md#several-machines).
 
 ## Limits of the tunnel
 
@@ -61,7 +76,8 @@ the first response byte, and 1 h of inactivity for an open stream.
 
 ## Not yet
 
-- Public pages and the Public Suffix List registration of `nokker.app` (so two gateways cannot share cookies): **planned**.
-  Until then pages are private and cookies are `__Host-`, which already isolates each name.
+- Public pages (made public page by page, on purpose, with a report link) and the Public Suffix List registration of
+  `nokker.app` (so two gateways cannot share cookies): **planned**. Until then pages are private and cookies are
+  `__Host-`, which already isolates each name.
 - Pages served from a subscriber mirror when your machine is off: **planned**.
 - Sharing one gateway between several members of a company account: not in the first version.

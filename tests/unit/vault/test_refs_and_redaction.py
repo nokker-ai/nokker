@@ -74,7 +74,7 @@ def test_mcp_headers_read_from_vault_at_each_session(vault):
 def test_connector_secret_reference_resolved_when_building_the_source(vault, monkeypatch):
     seen = {}
     monkeypatch.setattr("nokker.connectors.provider.build_connector",
-                        lambda kind, settings, secret: seen.setdefault(kind, secret))
+                        lambda kind, settings, secret, **kw: seen.setdefault(kind, secret))
 
     class Cred:
         settings, secret = {}, "secret:MAIL_PW"

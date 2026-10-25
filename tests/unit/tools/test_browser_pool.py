@@ -87,7 +87,7 @@ def test_busy_pool_and_internal_tenant():
         r = src.call("browser_navigate", {"url": "https://ex.test"}, ctx())
     assert r.is_error and "occupé" in r.content and "30 s" in r.content
     with tenant_scope(INTERNAL_TENANT):
-        assert src.call("browser_navigate", {}, ctx()).is_error  # l'interne a brosim, pas le pool
+        assert src.call("browser_navigate", {}, ctx()).is_error  # l'interne a son navigateur partagé, pas le pool
 
 
 def test_browser_close_at_turn_end_only_if_the_turn_browsed():

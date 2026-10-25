@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 # Nokker (nokker) — image minimale pour le socle F0.
 #
-# Contrairement à l'image P0 (hermes-nokker, construite depuis la SOURCE Hermes
-# complète avec le runtime s6-overlay amont), cette image installe hermes-agent comme
+# Contrairement à l'image P0 (hermes-nokker, construite depuis la SOURCE complète
+# de la bibliothèque d'agent amont avec le runtime s6-overlay amont), cette image installe hermes-agent comme
 # DÉPENDANCE ÉPINGLÉE (pip, depuis la branche patchée hermes-nokker — D0, PLAN-P1
 # §2.1/§2.2). Le binaire `nokker` que fournit cette dépendance (alias de couche de marque,
 # docs/BRAND.md) suffit à tenir le contrat de sortie F0 : `gateway run` + `/healthz` 200,
 # comme l'image P0. Le noyau propre (nokker/core, context, qa, route…) n'est pas encore
 # écrit (squelette vide posé par F0, cf. docs/PLAN-P1.md) — les chantiers F2+ brancheront
-# la vraie CMD de ce Dockerfile sur `nokker/api/server.py` au lieu de la gateway Hermes brute.
+# la vraie CMD de ce Dockerfile sur `nokker/api/server.py` au lieu de la passerelle amont brute.
 #
 # hermes-nokker (public : https://github.com/nokker-ai/hermes-nokker, tag nokker-hermes-v0.22.2-n1) est cloné
 # EN AMONT du build, comme étape du workflow (.github/workflows/lokkal-images.yml), dans `hermes-src/`, pas dans
@@ -70,14 +70,24 @@ COPY nokker ./nokker
 RUN pip install --no-cache-dir --no-deps -e .; \
     pip install --no-cache-dir "mcp==2.0.0" "psycopg[binary]>=3.2" "httpx>=0.28" "pyyaml>=6.0" "cryptography>=42" "httpcore>=1.0" "trafilatura>=2.3"
 
-# --- moteur CortHeXis (mémoire sémantique du « never clear », nokker/context/corthexis_index.py) ---
-# Dépôt public, archive du tag (pas de git dans l'image). `--no-deps` : ses dépendances lourdes ne servent pas ici
-# (le noyau n'utilise que l'indexeur, la recherche hybride pgvector et les clients d'embeddings HTTP) — les seules
-# manquantes sont installées à part (vérifié dans un venv propre le 19.10.2026).
-RUN pip install --no-cache-dir --no-deps "https://github.com/ninabot-ch/corthexis/archive/refs/tags/v2.1.2.tar.gz"; \
-    pip install --no-cache-dir "psycopg-pool>=3.2" "pgvector>=0.3" "numpy>=1.26"
+# --- moteur CortHeXis : mémoire longue directe de Lokkal (nokker/memory/corthexis.py, X1b), mémoire de session du
+# « never clear » (nokker/context/corthexis_index.py), mémoire de projet (X1) ---
+# Dépôt public, archive du COMMIT du tag v2.1.2 (un tag se déplace, un commit non) vérifiée par sha256 (pas de git dans
+# l'image). `--no-deps` : ses dépendances lourdes ne servent pas ici (le noyau n'utilise que l'indexeur, la recherche
+# hybride pgvector et les clients d'embeddings HTTP ; son `mcp<2` contredirait notre mcp 2.0) — les seules manquantes
+# sont installées à part (vérifié dans un venv propre le 19.10.2026). Le build échoue si l'un des modules du mode direct
+# ne s'importe pas : une image sans mémoire longue ne sort plus (trou trouvé le 25.10, lot X1).
+ARG CORTHEXIS_COMMIT=8607271381c7045661834c2103366640d5ef2749
+ARG CORTHEXIS_SHA256=fb1c7772629bb8eb1667b84294bbacb5448d17afc392cd8a70878b4d14750d95
+RUN set -eu; \
+    curl -fsSL -o /tmp/corthexis.tar.gz "https://github.com/ninabot-ch/corthexis/archive/${CORTHEXIS_COMMIT}.tar.gz"; \
+    echo "${CORTHEXIS_SHA256}  /tmp/corthexis.tar.gz" | sha256sum -c -; \
+    pip install --no-cache-dir --no-deps /tmp/corthexis.tar.gz; rm /tmp/corthexis.tar.gz; \
+    pip install --no-cache-dir "psycopg-pool>=3.2" "pgvector>=0.3" "numpy>=1.26"; \
+    python3 -c "import corthexis.service, corthexis.indexer, corthexis.embed, corthexis.store, pgvector.psycopg, \
+psycopg_pool, numpy; from importlib.metadata import version; assert version('corthexis') == '2.1.2', version('corthexis')"
 
-# --- /healthz additif (nokker, pas Hermes — voir docker/nokker/healthz_server.py) ---
+# --- /healthz additif (nokker, pas l'amont — voir docker/nokker/healthz_server.py) ---
 COPY docker/nokker/healthz_server.py ./docker/nokker/healthz_server.py
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -109,6 +119,9 @@ RUN set -eu; \
     echo "$sum  /tmp/docker.tgz" | sha256sum -c -; \
     tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
     rm /tmp/docker.tgz; docker --version
+# git : `nokker review` (X13, action GitHub/Forgejo) lit le diff de la PR dans cette image ; pas dans l'image bêta.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* && git --version
 
 # --- Stage par défaut (dernier du fichier) = l'image de la BÊTA, identique à `runtime` : rien de docker en prod ---
 FROM runtime AS beta

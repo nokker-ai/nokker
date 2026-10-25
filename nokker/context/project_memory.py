@@ -272,11 +272,18 @@ class Note:
     derived_from: str = ""
     created: str = ""
     links: list[str] = field(default_factory=list)
+    mirrored: bool = False  # projet mis en miroir (choix par projet, docs/LOKKAL.md §6.3)
+
+    @property
+    def locality(self) -> str:
+        """docs/LOKKAL.md §6.7 (X21) : une note de l'utilisateur vit des deux côtés ; une note de projet parle du code,
+        elle reste sur la machine sauf si son projet est mis en miroir."""
+        return "both" if self.scope == "user" or self.mirrored else "local"
 
     def to_json(self) -> dict[str, Any]:
         return {"name": self.name, "kind": self.kind, "scope": self.scope, "title": self.title,
                 "origin": self.origin, "derived_from": self.derived_from, "created": self.created,
-                "links": self.links}
+                "links": self.links, "locality": self.locality}
 
 
 @dataclass
@@ -341,6 +348,14 @@ class ProjectMemory:
                 self._cores[thread_id] = (-1, *self._render_core(st))
         except Exception:
             logger.warning("mémoire de projet : ouverture en échec (fil %s)", thread_id, exc_info=True)
+
+    def catch_up(self) -> None:
+        """Au démarrage : les notes de portée user (`u-local`, lues aussi par la mémoire longue directe dans tous les
+        fils, X1b) repartent une fois à l'indexeur, même si aucune session de code ne s'ouvre ; il saute l'inchangé."""
+        with self._lock:
+            if USER_PROJECT not in self._indexed and (self.root / USER_PROJECT).is_dir():
+                self._indexed.add(USER_PROJECT)
+                self._enqueue(USER_PROJECT)
 
     def _session(self, thread_id: str) -> _Session | None:
         """La session du fil ; un sous-agent `<fil>/sa-<id>` a celle de son parent (même dépôt)."""
@@ -419,11 +434,52 @@ class ProjectMemory:
 
     # ── notes apprises ──
 
+    def _manifest(self, project: str) -> dict[str, Any]:
+        p = self.root / project / MANIFEST
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+        except (OSError, ValueError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def is_mirrored(self, project: str) -> bool:
+        """Projet mis en miroir (choix explicite par projet, docs/LOKKAL.md §6.3 et §6.7) ; non par défaut."""
+        return project != USER_PROJECT and self._manifest(project).get("mirror") is True
+
+    def set_mirrored(self, project: str, on: bool) -> bool:
+        """Pose le choix de miroir d'un projet connu (dossier existant) ; False si le projet est inconnu."""
+        if project == USER_PROJECT or not re.fullmatch(r"p-[0-9a-f]{16}", project) or not (self.root / project).is_dir():
+            return False
+        with self._lock:
+            manifest = self._manifest(project)
+            manifest["mirror"] = bool(on)
+            _atomic_write(self.root / project / MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=1))
+        return True
+
+    def projects(self) -> list[dict[str, Any]]:
+        """Projets connus de la machine (pour l'écran du miroir) : nom opaque, libellé, choix de miroir."""
+        out = []
+        for d in sorted(self.root.glob("p-*")) if self.root.is_dir() else []:
+            m = self._manifest(d.name)
+            out.append({"project": d.name, "label": str(m.get("label") or ""), "mirror": m.get("mirror") is True})
+        return out
+
+    def notes_for_mirror(self) -> list[Note]:
+        """Notes candidates au miroir : celles de l'utilisateur (`both`) et celles des projets mis en miroir. Les
+        sections importées des fichiers du dépôt n'y sont jamais (elles suivent les fichiers, jamais en miroir par
+        défaut, §6.3). Le miroir refiltre par localité juste avant l'envoi (`nokker/core/locality.py::outbound`)."""
+        out = self.learned(USER_PROJECT)
+        for d in sorted(self.root.glob("p-*")) if self.root.is_dir() else []:
+            if self.is_mirrored(d.name):
+                out.extend(self.learned(d.name))
+        return out
+
     def learned(self, project: str) -> list[Note]:
         d = self.root / project
         out: list[Note] = []
         if not d.is_dir():
             return out
+        mirrored = self.is_mirrored(project)
         for p in sorted(d.glob("*.md")):
             if p.name.startswith(SOURCE_PREFIX.replace("-", "_")):
                 continue
@@ -439,11 +495,12 @@ class ProjectMemory:
                             kind=str(f["type"]), scope=str(f.get("scope") or "project"),
                             title=str(f.get("description") or ""), text=text, origin=str(f.get("origin") or ""),
                             derived_from=str(f.get("derived_from") or ""), created=str(f.get("created") or ""),
-                            links=list(f.get("links") or [])))
+                            links=list(f.get("links") or []), mirrored=mirrored))
         return out
 
-    def _all_learned(self, st: _Session) -> list[Note]:
-        return self.learned(USER_PROJECT) + self.learned(st.project)
+    def _all_learned(self, st: _Session | None) -> list[Note]:
+        """Notes de portée user, plus celles du projet de la session (un fil sans session de code : user seules)."""
+        return self.learned(USER_PROJECT) + (self.learned(st.project) if st is not None else [])
 
     # ── noyau injecté ──
 
@@ -563,9 +620,12 @@ class ProjectMemory:
             return ToolResult(call_id="", name="memory_note", content=msg, is_error=True)
 
         st = self._session(ctx.thread_id)
-        if st is None:
-            return err("pas de session de code sur ce fil : la mémoire de projet suit le dossier de la session")
         kind, scope = str(args.get("kind") or ""), str(args.get("scope") or "project")
+        if st is None and scope != "user":
+            # Fil sans dossier (conversation du web local, X1b) : pas de projet, mais la mémoire longue (portée user,
+            # rappelée dans tous les fils) reste possible, aux mêmes conditions (les mots de l'utilisateur, cités).
+            return err("pas de session de code sur ce fil : la mémoire de projet suit le dossier de la session ; ici "
+                       "seule la portée user est possible (ce que l'utilisateur dit valoir partout, cité dans quote)")
         derived = str(args.get("derived_from") or "agent")
         title = " ".join(str(args.get("title") or "").split())
         text = str(args.get("text") or "").strip()
@@ -587,12 +647,12 @@ class ProjectMemory:
             if len(quote) < MIN_QUOTE or quote not in said:
                 return err("portée user : cite dans `quote` les mots de l'utilisateur de CE tour (au moins "
                            f"{MIN_QUOTE} caractères, tels quels) ; sinon portée project")
-        project = USER_PROJECT if scope == "user" else st.project
+        project = USER_PROJECT if scope == "user" or st is None else st.project
         title, text = self.scrub(title), self.scrub(text)
         links = [str(x) for x in (args.get("links") or []) if str(x).strip()]
         with self._lock:
             known = {n.name: n for n in self._all_learned(st)}
-            known_sources = {s.name for secs in st.sections.values() for s in secs}
+            known_sources = {s.name for secs in st.sections.values() for s in secs} if st is not None else set()
             unknown = [x for x in links if x not in known and x not in known_sources]
             if unknown:
                 return err(f"liens vers des notes inconnues : {', '.join(unknown)} (`memory` list)")
@@ -623,21 +683,19 @@ class ProjectMemory:
             text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
             return ToolResult(call_id="", name="memory", content=text, is_error=is_error)
 
-        st = self._session(ctx.thread_id)
-        if st is None:
-            return res("pas de session de code sur ce fil", True)
+        st = self._session(ctx.thread_id)  # None : fil sans session de code, notes de portée user seules (X1b)
         action, name = str(args.get("action") or "list"), str(args.get("name") or "").strip()
         with self._lock:
             notes = {n.name: n for n in self._all_learned(st)}
-            sources = {s.name: s for secs in st.sections.values() for s in secs}
+            sources = {s.name: s for secs in st.sections.values() for s in secs} if st is not None else {}
             if action == "list":
                 core = self.core_names(ctx.thread_id)
-                return res({"project": st.label, "notes": [{**n.to_json(), "in_core": n.name in core}
-                                                           for n in notes.values()],
+                return res({"project": st.label if st is not None else None,
+                            "notes": [{**n.to_json(), "in_core": n.name in core} for n in notes.values()],
                             "sources": [{"path": rel, "sections": [{"name": s.name, "title": s.title,
                                                                     "in_core": s.name in core}
                                                                    for s in st.sections.get(rel, [])]}
-                                        for rel in st.files]})
+                                        for rel in (st.files if st is not None else [])]})
             if action == "view":
                 if name in notes:
                     n = notes[name]
@@ -745,8 +803,17 @@ class ProjectRecallMemory:
         return self.inner.recall(query, k)
 
     def recall_for(self, thread_id: str, query: str, k: int = 5) -> list[Recall]:
-        hits = list(self.inner.recall(query, k)) + self.project.recall(thread_id, query, k)
-        return sorted(hits, key=lambda r: -r.score)[:k]
+        """Les deux rappels fusionnés SANS doublon (X1b) : la mémoire longue directe lit `u-local` comme le rappel du
+        projet, et une règle de portée user est déjà dans le noyau — une note n'entre qu'une fois dans la fenêtre (le
+        meilleur score), et jamais si le noyau la porte déjà."""
+        in_core = self.project.core_names(thread_id)
+        best: dict[str, Recall] = {}
+        for r in [*self.inner.recall(query, k), *self.project.recall(thread_id, query, k)]:
+            if r.note in in_core:
+                continue
+            if r.note not in best or r.score > best[r.note].score:
+                best[r.note] = r
+        return sorted(best.values(), key=lambda r: -r.score)[:k]
 
     def propose(self, thread_id: str, facts: list[str]) -> None:
         self.inner.propose(thread_id, facts)
@@ -793,6 +860,7 @@ def from_local_config(local: dict[str, Any], state_dir: Path | None) -> ProjectM
 def install(kernel: Any, memory: ProjectMemory) -> None:
     """Branche la mémoire de projet sur un noyau déjà construit : noyau injecté par le Context Engine, rappel du
     projet derrière la mémoire longue (`TenantMemory.internal`), caviardage des invariants sur ce qui est écrit."""
+    memory.catch_up()
     memory.scrub = kernel.invariants.scrub_output
     kernel.context.project_memory = memory
     port = kernel.memory

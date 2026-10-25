@@ -1,4 +1,4 @@
-"""Types du noyau Nokker — aucun import de Hermes, aucun import d'un autre paquet nokker.
+"""Types du noyau Nokker — aucun import de la bibliothèque amont, aucun import d'un autre paquet nokker.
 
 Tout ce qui traverse une frontière de pilier (contexte, juge, multi-modèle) est décrit ici.
 Les objets sont des dataclasses simples, sérialisables en JSON (store Postgres, ledger, API).
@@ -11,9 +11,10 @@ from typing import Any
 
 
 class Tier(str, enum.Enum):
-    """Paliers de modèle (PLAN-P1 §2.6). Jamais de palier « frontier » : décision Nick du 16.10."""
+    """Paliers de modèle (PLAN-P1 §2.6). Jamais de palier « frontier » : décision produit du 16.10."""
 
     LOCAL = "local"  # Magnitude : classe de tâche, juge, résumés
+    SMALL = "small"  # petit palier (X8, docs/LOKKAL.md §7.17) : le trivial (politesses), par le Router ou un modèle local
     SHIP = "ship"  # route par défaut (-eu ; -swiss si le fil exige la zone CH)
     DEEP = "deep"  # 397B OVH en débordement transitoire (D11, 17.10), 122B dès qu'il est servi
 
@@ -209,7 +210,7 @@ class Turn:
     injected: list[str] = field(default_factory=list)
     # En-tête du message du tour tel qu'envoyé au modèle (date, épisodes pertinents, rappel, contexte reçu), figé au
     # premier assemblage du tour et REJOUÉ TEL QUEL par l'historique : le prompt du tour suivant reprend alors le
-    # précédent octet pour octet (cache de préfixe entre tours, option A de Nick, 20.10.2026). Vide = tour d'avant
+    # précédent octet pour octet (cache de préfixe entre tours, option A, décision produit du 20.10.2026). Vide = tour d'avant
     # ce changement, rejoué comme avant (injected + texte).
     head: str = ""
     # Images jointes au message humain (X7) : références seulement, persistées avec le tour (append-only) ; les octets

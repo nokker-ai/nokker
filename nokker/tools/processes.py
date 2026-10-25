@@ -96,7 +96,7 @@ def _q(s: str) -> str:
 
 
 class ProcessTable:
-    """Les processus en arrière-plan d'UN fil, dans UN environnement (Hermes : `execute(command, …)`).
+    """Les processus en arrière-plan d'UN fil, dans UN environnement (amont : `execute(command, …)`).
 
     `log_dir` : où vont les journaux, tel que l'environnement le voit. `host_logs` : le noyau voit ce dossier
     (backend local) — lecture des journaux en direct et fiches de ménage ; sinon tout passe par l'environnement."""
@@ -131,7 +131,10 @@ class ProcessTable:
             pid = f"bg_{secrets.token_hex(4)}"
             log = f"{self.log_dir}/{pid}.log"
             exit_file = log[:-4] + ".exit"
-            inner = f"bash -c {_q(command)} > {_q(log)} 2>&1 < /dev/null; echo $? > {_q(exit_file)}"
+            # Code de sortie écrit puis renommé (atomique) : `echo $? > f` crée le fichier VIDE avant d'écrire, et un
+            # `_refresh` tombé entre les deux lisait « fini, sans code de sortie » (test instable sous charge, 25.10).
+            inner = (f"bash -c {_q(command)} > {_q(log)} 2>&1 < /dev/null; echo $? > {_q(exit_file + '.tmp')} && "
+                     f"mv -f {_q(exit_file + '.tmp')} {_q(exit_file)}")
             # Une ligne par commande : `a && b &` détacherait toute la liste (et ses descripteurs) dans un sous-shell.
             script = (f"mkdir -p {_q(self.log_dir)} && : > {_q(log)} || exit 1\nset -m\n"
                       f"env NOKKER_BG={pid} bash -c {_q(inner)} > /dev/null 2>&1 < /dev/null &\n"

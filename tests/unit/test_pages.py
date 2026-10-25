@@ -185,7 +185,7 @@ def test_routes_serve_private_pages_with_sandbox_headers(tmp_path):
 
 
 def test_pages_are_off_until_clients_know_the_kind(tmp_path):
-    """54, 24.10 : la CLI des releases rc.5 plante sur un kind de bulle inconnu → pas de `page_create` par défaut."""
+    """Recette du 24.10 : la CLI des releases rc.5 plante sur un kind de bulle inconnu → pas de `page_create` par défaut."""
     from tests.unit.test_local_api import _api
 
     api = _api(tmp_path)

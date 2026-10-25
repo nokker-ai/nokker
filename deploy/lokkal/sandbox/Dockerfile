@@ -3,9 +3,10 @@
 # (HTTP(S)_PROXY posé par dockerproxy), pip / npm / git / curl le suivent.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git openssh-client less jq ripgrep fd-find patch file unzip xz-utils procps \
+      ca-certificates curl git openssh-client netcat-openbsd less jq ripgrep fd-find patch file unzip xz-utils procps \
       build-essential pkg-config python3 python3-pip python3-venv python3-dev nodejs npm \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && printf '# Lokkal : pas de route directe depuis le bac à sable ; ssh sort par le proxy egress (CONNECT), comme\n# pip et git. egress refuse les plages privées (LAN, box) : seuls les hôtes publics sont joignables.\nHost *\n    ProxyCommand nc -X connect -x egress:3128 %%h %%p\n' > /etc/ssh/ssh_config.d/10-nokker-egress.conf \
     && rm -rf /var/lib/apt/lists/*
 # pip sans --break-system-packages dans un container jetable ; pas de cache disque inutile
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \

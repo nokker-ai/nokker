@@ -69,6 +69,11 @@ FAMILIES: tuple[Family, ...] = (
         r"\bskills?\b", r"\bcomp[ée]tences?\b", r"\bproc[ée]dures?\b", r"\bmode d'emploi\b",
         r"\bcomment (faire|on fait|proc[ée]der)\b", r"\bcomment faire pour\b", r"\bhow (do i|to)\b",
         r"\bplaybook\b", r"\bworkflow\b")),
+    # Packs d'agents (lot X16) : compétences + modèles d'agents proposés.
+    Family("Packs", ("pack_*",), ("pack_list", "pack_install"), _rx(
+        r"\bpacks?\b", r"\bmod[eè]les? d'agents?\b", r"\bagent templates?\b")),
+    Family("Serveurs MCP", ("mcp_server_*",), ("mcp_server_*",), _rx(
+        r"\bmcp\b", r"\bserveurs? mcp\b", r"\bmcp servers?\b")),
     Family("Points de retour", ("checkpoint_*",), ("checkpoint_*",), _rx(
         r"\brollback\b", r"\broll back\b", r"\brevien[st]?\b", r"\brevenir\b", r"\ben arri[eè]re\b",
         r"\bannule", r"\bd[ée]fai[st]", r"\bcheckpoints?\b", r"\brestor", r"\brestaure", r"\bundo\b",

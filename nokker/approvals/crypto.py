@@ -212,11 +212,14 @@ def sha256_bytes(data: bytes) -> bytes:
 
 def verify_webauthn_assertion(public_key_spki: str, client_data_json_b64url: str, authenticator_data_b64url: str,
                               signature_der_b64url: str, *, expected_challenge: bytes, expected_origin: str,
-                              expected_type: str = "webauthn.get", require_uv: bool = False) -> None:
+                              expected_type: str = "webauthn.get", require_uv: bool = False,
+                              expected_rp_id: str | None = None) -> None:
     """Lève `WebAuthnError` si l'assertion ne vérifie pas. `expected_challenge` : 32 octets attendus
     EXACTEMENT dans `clientDataJSON.challenge` une fois décodé (ADR : `sha256(challenge + "." +
     decision)` pour une décision, `sha256(challenge)` pour une connexion — calculé par l'appelant,
-    jamais ici). `require_uv` : `True` pour une approbation `strong` (docs/APPROVALS.md §1)."""
+    jamais ici). `require_uv` : `True` pour une approbation `strong` (docs/APPROVALS.md §1).
+    `expected_rp_id` : si posé, `rpIdHash` (32 premiers octets de `authenticatorData`) doit valoir
+    `sha256(expected_rp_id)` — exigé pour une décision venue par nokker.ai (docs/LOKKAL.md §7.3)."""
     try:
         client_data_json = b64url_decode(client_data_json_b64url)
         authenticator_data = b64url_decode(authenticator_data_b64url)
@@ -242,6 +245,9 @@ def verify_webauthn_assertion(public_key_spki: str, client_data_json_b64url: str
 
     if len(authenticator_data) < 37:
         raise WebAuthnError("authenticatorData trop court (< 37 octets)")
+    if expected_rp_id is not None and not hmac.compare_digest(
+            authenticator_data[:32], hashlib.sha256(expected_rp_id.encode("utf-8")).digest()):
+        raise WebAuthnError(f"rpIdHash de authenticatorData ne correspond pas à {expected_rp_id!r}")
     flags = authenticator_data[32]
     user_present = bool(flags & 0x01)
     user_verified = bool(flags & 0x04)

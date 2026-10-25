@@ -64,7 +64,7 @@ def test_rejects_other_blocked_ipv4_ranges(url, label):
 
 @pytest.mark.parametrize("url", ["http://100.64.0.1/", "http://100.64.12.34/", "http://100.127.255.254/"])
 def test_rejects_cgnat_tailscale_range(url):
-    """100.64.0.0/10 est le réseau Tailscale (hote1/HOTE21/hote2 y vivent) — refusé explicitement, pas
+    """100.64.0.0/10 est le réseau CGNAT (celui des réseaux privés type Tailscale) — refusé explicitement, pas
     seulement « parce que `is_private` le couvrirait peut-être »."""
     with pytest.raises(SsrfBlocked, match="CGNAT"):
         resolve_and_check(url)

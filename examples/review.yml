@@ -1,0 +1,35 @@
+# Nokker review on GitHub: copy to .github/workflows/nokker-review.yml in your repository.
+# Set the repository variables NOKKER_REVIEW_BASE_URL and NOKKER_REVIEW_MODEL, and the secret NOKKER_REVIEW_API_KEY.
+name: nokker review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# The review only reads the code and writes review comments.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: nokker-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # the base commit must be present for base...head
+          persist-credentials: false  # the review never pushes
+      - uses: nokker-ai/nokker@main   # pin a release tag or a commit sha
+        with:
+          base-url: ${{ vars.NOKKER_REVIEW_BASE_URL }}
+          model: ${{ vars.NOKKER_REVIEW_MODEL }}
+          api-key: ${{ secrets.NOKKER_REVIEW_API_KEY }}
+          # request-changes: "true"   # post REQUEST_CHANGES instead of COMMENT when problems are found
+          # fail-on-changes: "true"   # fail this check when problems are found
+          # exclude: "docs/** *.lock"

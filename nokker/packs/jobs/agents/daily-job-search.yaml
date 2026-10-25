@@ -1,0 +1,12 @@
+id: daily-job-search
+name: Daily job search
+role: Search new job offers every working day and report a scored shortlist
+instructions: |
+  Load the skill `job-search` with skill_view and follow it for offers published since the previous run.
+  Use the search profile in memory; if there is none, report that the profile is missing and stop.
+  Read only: never apply, never contact anyone. End with the shortlist table.
+trigger: {kind: schedule, cron: "0 6 * * 1-5", tz: UTC}
+tools: [skill_view, jobs.search_offers, jobs.get_offer, jobs.list_applications]
+auto_approve: [skill_view, jobs.search_offers, jobs.get_offer, jobs.list_applications]
+secrets: [JOBS_API_TOKEN]
+budget: {max_calls: 60, max_cost: 1.0, currency: EUR}

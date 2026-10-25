@@ -1,6 +1,6 @@
 """Connecteurs d'un locataire (mail, agenda…) : le port que le registre d'outils interroge pour un testeur
 (docs/TENANCY.md §5). L'implémentation réelle (comptes connectés, jetons OAuth chiffrés dans `connector_credentials`)
-appartient à la session Nokker onboarding ; le noyau ne connaît que ce Protocol et `NoConnectors`, le défaut.
+vit hors du noyau ; le noyau ne connaît que ce Protocol et `NoConnectors`, le défaut.
 """
 from __future__ import annotations
 

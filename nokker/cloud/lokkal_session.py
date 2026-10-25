@@ -36,6 +36,10 @@ class LokkalSessionTools:
     scheme: str = "https"
     client: Any = None  # httpx.Client injectable (tests)
 
+    def available_for(self, tenant_id: str) -> bool:
+        """Outil proposé seulement à un compte qui a une machine liée et non révoquée (`TenantRegistry`)."""
+        return self.links.has_machine(tenant_id)
+
     def specs(self) -> list[ToolSpec]:
         return [ToolSpec(name=TOOL, description="Confie une tâche à ta machine liée (Nokker Lokkal), dans un dossier ; "
                                                 "rend sa réponse.", parameters=_SPEC, effect=Effect.DESTRUCTIVE)]

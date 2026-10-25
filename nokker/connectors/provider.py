@@ -21,8 +21,10 @@ class ConnectorProvider:
     moment de construire la source ; nom absent ou coffre scellé → connecteur sauté et journalisé (sans valeur)."""
 
     def __init__(self, store: ConnectorStore, account_for_tenant: Callable[[str], Any],
-                 resolve: Callable[[str], str] | None = None) -> None:
+                 resolve: Callable[[str], str] | None = None, locality: str = "cloud") -> None:
+        # `locality` (docs/LOKKAL.md §6.7) : « cloud » chez nokker.ai, « local » dans Lokkal ; portée par chaque outil.
         self.store, self._account_for_tenant, self._resolve = store, account_for_tenant, resolve
+        self.locality = locality
 
     def sources_for(self, tenant_id: str) -> list[ToolSource]:
         found = self._account_for_tenant(tenant_id)
@@ -35,7 +37,7 @@ class ConnectorProvider:
                 cred = self.store.get(account_id, kind)
                 if cred is not None:
                     secret = self._resolve(cred.secret) if self._resolve else cred.secret
-                    out.append(build_connector(kind, cred.settings, secret))
+                    out.append(build_connector(kind, cred.settings, secret, locality=self.locality))
             except ConnectorError as exc:
                 logger.warning("connecteur %s ignoré pour %s : %s", kind, tenant_id, exc.code)
             except SecretsError as exc:

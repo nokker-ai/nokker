@@ -11,12 +11,32 @@ erreur de config (`bad_name`) ; un nom absent du coffre est `missing` (message s
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+import contextlib
+from collections.abc import Iterable, Iterator, Mapping
+from contextvars import ContextVar
 from typing import Any
 
 from nokker.secrets.base import SecretsError, SecretsProvider, check_name
 
 REF_PREFIX = "secret:"
+# Passage d'un agent Crew (lot X14) : seuls les NOMS que l'agent déclare se résolvent pendant le passage ; None = pas
+# de restriction (sessions ordinaires).
+_ALLOWED: ContextVar[frozenset[str] | None] = ContextVar("nokker_secret_names", default=None)
+
+
+@contextlib.contextmanager
+def secrets_scope(names: Iterable[str]) -> Iterator[None]:
+    """Restreint la résolution des références `secret:NOM` aux `names` pour la durée du bloc (fil d'exécution et
+    contextes copiés depuis lui)."""
+    token = _ALLOWED.set(frozenset(names))
+    try:
+        yield
+    finally:
+        _ALLOWED.reset(token)
+
+
+def allowed_names() -> frozenset[str] | None:
+    return _ALLOWED.get()
 
 
 def ref_name(value: object) -> str | None:
@@ -56,6 +76,10 @@ class SecretResolver:
 
     def value(self, name: str) -> str:
         check_name(name)
+        allowed = _ALLOWED.get()
+        if allowed is not None and name not in allowed:
+            raise SecretsError(f"référence secret:{name} : nom non déclaré par cet agent (secrets de la carte)",
+                               "not_allowed")
         if self.provider is None:
             raise SecretsError(f"référence secret:{name} : pas de coffre sur cette instance")
         try:
@@ -84,4 +108,4 @@ class SecretResolver:
         return {str(k): str(self.resolve(v)) for k, v in (mapping or {}).items()}
 
 
-__all__ = ["REF_PREFIX", "SecretResolver", "ref_name", "refs_in"]
+__all__ = ["REF_PREFIX", "SecretResolver", "allowed_names", "ref_name", "refs_in", "secrets_scope"]

@@ -56,7 +56,9 @@ mcp_tool_servers:
 |---|---|
 | MCP servers (`token`, `headers`) | resolved each time a session to the server opens: a changed value is picked up without a restart |
 | connectors (mail, calendar): the stored credential can be `secret:NAME` | resolved when the connector is built and when it is tested |
-| environment of a process the core starts (stdio MCP, ssh, agents) | the resolver is ready (`SecretResolver.env`); ssh hosts and agents use it as they land (planned) |
+| ssh hosts (`hosts.yaml`, `key: secret:NAME`) | read at each call, handed to the sandbox on stdin, never in the model's context ([ops.md](ops.md)) |
+| [agents](agents.md) (`secrets: [NAME]`) | resolved before each run; a missing name skips the run. During a run, only the names the agent declares resolve; any other reference fails |
+| environment of a process the core starts (stdio MCP) | the resolver is ready; injecting values into a sandbox environment is **planned** |
 
 A missing name fails with a clear message that names it (`secret:NAME : nom absent du coffre`), never with a value.
 A sealed OpenBao makes the reference fail the same way.

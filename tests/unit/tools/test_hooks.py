@@ -3,7 +3,7 @@
 Partie 1, toujours jouée : filtre `outil(motif)`, blocage par `pre_tool`, note de `post_tool`, délai, charge utile
 caviardée, hooks du dépôt refusés puis acceptés après confiance (et de nouveau refusés si le bloc change), mode plan,
 sous-agents, drapeau éteint, route de confiance, boucle du noyau et `nokker hooks`.
-Partie 2 : une vraie commande (Hermes, backend local), et le bac à sable docker avec NOKKER_TEST_DOCKER_ROOT."""
+Partie 2 : une vraie commande (amont, backend local), et le bac à sable docker avec NOKKER_TEST_DOCKER_ROOT."""
 from __future__ import annotations
 
 import importlib.util
@@ -18,8 +18,8 @@ from nokker.core.turn import Message, ToolResult, TurnInput
 from nokker.qa.permissions import Mode
 from nokker.tools.hooks import HookRunner, hooks_sha256, parse_hooks
 
-HERMES = importlib.util.find_spec("tools") is not None and importlib.util.find_spec("tools.file_operations") is not None
-needs_hermes = pytest.mark.skipif(not HERMES, reason="Hermes (tools.file_operations) non importable")
+UPSTREAM = importlib.util.find_spec("tools") is not None and importlib.util.find_spec("tools.file_operations") is not None
+needs_upstream = pytest.mark.skipif(not UPSTREAM, reason="amont (tools.file_operations) non importable")
 TH = "th_hooks"
 CTX = ToolContext(thread_id=TH, turn_index=0, channel="api")
 
@@ -375,7 +375,7 @@ def test_cli_show_and_trust_require_the_reread_fingerprint(tmp_path, capsys):
 # ─────────────────────────────── vraies commandes ───────────────────────────────
 
 
-@needs_hermes
+@needs_upstream
 def test_real_command_gets_the_payload_on_stdin_and_is_bounded(tmp_path, monkeypatch):
     from nokker.tools.code import CodeToolSource
 
@@ -394,7 +394,7 @@ def test_real_command_gets_the_payload_on_stdin_and_is_bounded(tmp_path, monkeyp
         src.close()
 
 
-@needs_hermes
+@needs_upstream
 def test_hardline_hook_never_runs(tmp_path):
     sb = FakeSandbox()
     runner, _ = _runner(tmp_path, sb, {"pre_tool": [{"command": "rm -rf /"}]})
@@ -403,8 +403,8 @@ def test_hardline_hook_never_runs(tmp_path):
     assert r.is_error and "jamais exécutée" in r.content and sb.ran == []
 
 
-@pytest.mark.skipif(not (HERMES and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
-                    reason="NOKKER_TEST_DOCKER_ROOT absent ou Hermes non importable")
+@pytest.mark.skipif(not (UPSTREAM and os.environ.get("NOKKER_TEST_DOCKER_ROOT")),
+                    reason="NOKKER_TEST_DOCKER_ROOT absent ou amont non importable")
 def test_hooks_run_inside_the_docker_sandbox(tmp_path, monkeypatch):
     import shutil
     import uuid

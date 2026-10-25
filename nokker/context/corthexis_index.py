@@ -27,6 +27,10 @@ logger = logging.getLogger("nokker.context.corthexis_index")
 DEFAULT_MIN_SCORE = 0.15  # score hybride (profil sans reranker) — mesuré : pertinent 0,21-0,34, hors sujet ≤ 0,12
 DEFAULT_MIN_RERANK = 0.35  # score du reranker (profils standard/gpu) — mesuré : pertinent 0,84, mauvais ≈ 0,02
 RELATIVE_FLOOR = 0.6  # un résultat doit valoir au moins 60 % du meilleur
+# Une indexation à la fois dans le processus, tous index confondus (mémoire de session, mémoire de projet) : au premier
+# démarrage, sans génération d'index active, deux passes simultanées en créeraient chacune une, et la seconde activée
+# rendrait invisibles les notes de la première jusqu'à leur prochaine réindexation (X1b).
+_INDEX_LOCK = threading.Lock()
 
 
 def project_of(thread_id: str) -> str:
@@ -126,7 +130,8 @@ class CorthexisSemanticIndex:
 
         cfg = IndexConfig.from_env(memory_dir=self.root / project, project=project, normalize=False,
                                    write_index=False, chunk_target=self.chunk_target)
-        rep = Indexer(cx_service.get_store(), cx_service.embedder(), cfg).run()
+        with _INDEX_LOCK:
+            rep = Indexer(cx_service.get_store(), cx_service.embedder(), cfg).run()
         for w in getattr(rep, "warnings", []) or []:
             logger.warning("corthexis(session %s): %s", project, w)
 

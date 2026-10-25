@@ -46,8 +46,8 @@ jobs:
           V="$INPUT_VERSION"; [ -n "$V" ] || V="${GITHUB_REF_NAME#lokkal-v}"
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "version invalide : $V"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
-      # hermes-nokker (Hermes patché, MIT) : dépôt public de l'organisation (24.10), cloné sans clé.
-      - name: Hermes épinglé
+      # hermes-nokker (bibliothèque d'agent amont patchée, MIT) : dépôt public de l'organisation (24.10), cloné sans clé.
+      - name: Bibliothèque amont épinglée
         if: matrix.hermes
         uses: actions/checkout@v4
         with:

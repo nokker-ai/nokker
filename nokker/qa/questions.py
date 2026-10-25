@@ -1,13 +1,13 @@
 """Questions atomiques du juge Nina QA — couche 2 (PLAN-P1 §2.5/§5.3, chantier B-2).
 
 Catalogue IDENTIQUE (texte, options, polarité « fautive ») à celui du banc étiqueté B-1
-(`infra/sokkan/nokker-judge-bench/decisions.jsonl`, `build_bench.py::Q`) : une mesure
+(dépôt interne, `build_bench.py::Q`) : une mesure
 B1 sur le banc ne vaut que si le juge en production pose EXACTEMENT ces questions. Toute retouche
 d'une question est une NOUVELLE version (`PROMPT_VERSION`), publiée à côté, jamais à la place
 (même règle que `judge_eval.py::PROMPT_VERSION`) — sinon les seuils calibrés en B-2/calibrate.py
 ne s'appliquent plus au juge réel.
 
-Primitives (nina-qa, décision Nick 18.09.2026) :
+Primitives (nina-qa, décision produit du 18.09.2026) :
   - Noul   = Oui/Non (1 token)
   - Choice = une lettre parmi N (1 token)
   - Score  = un chiffre sur une échelle ordonnée (1 token)

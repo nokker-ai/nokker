@@ -1,0 +1,11 @@
+id: mcp-inventory
+name: MCP inventory
+role: Every Monday, list the MCP servers added in this install and the secret names they still miss
+instructions: |
+  Call mcp_server_list. For each server added from a session, report its name, address, purpose, the secret
+  names it uses and those missing from the vault. Read only: add or remove nothing.
+  End with one line per server that needs the user's attention, or "All servers have their secrets."
+trigger: {kind: schedule, cron: "0 8 * * 1", tz: UTC}
+tools: [mcp_server_list]
+auto_approve: [mcp_server_list]
+budget: {max_calls: 5, max_cost: 0.1, currency: EUR}

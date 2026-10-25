@@ -1,11 +1,44 @@
-# Project memory
+# Memory
 
 An instruction file cannot hold everything a project needs. In Nokker Lokkal, `AGENTS.md`, `NOKKER.md` and
-`CLAUDE.md` are only the entry point: the project's memory lives in CortHeXis, the memory engine that runs inside your
-install, and it grows as you work.
+`CLAUDE.md` are only the entry point: the memory lives in CortHeXis, the memory engine that runs inside your install
+(in the core process, on the Postgres database and the embedding server of the compose), and it grows as you work.
 
-Status: **rolling out**. It is on in the Lokkal compose (`local.project_memory: true`) and off by default in the core
-itself. The `/memory` slash command is **planned** in the terminal client; the core route it uses is ready.
+CortHeXis holds three memories, kept apart from each other:
+
+| Memory | What it holds | Where it is recalled |
+|---|---|---|
+| **long-term** | your `user` notes: what you said holds everywhere | every thread, with or without a folder |
+| **project** | the instruction files of a repository and what was learned in it | the code sessions of that repository |
+| **session** | the closed episodes of a thread (summary and your messages) | that thread only |
+
+Status: all three are on in the Lokkal install (`memory_mode: direct`, `local.project_memory: true`,
+`context_corthexis.enabled: true`) and off by default in the core itself. The `/memory` slash command is **planned**
+in the terminal client; the core route it uses is ready. Sharing project memory with a team is **beta**
+([teams.md](teams.md)).
+
+## Long-term memory
+
+At every turn, the notes of your long-term memory closest to your message are added to the turn's memory block
+(`[Rappel mémoire]`), in every thread: a code session, or a plain conversation in the local web app. Nothing is
+recalled when nothing is close enough. The agent can also search it (`memory_search`, `memory_get`).
+
+It is written with `memory_note` at the `user` scope (see [What the agent learns](#what-the-agent-learns)): the note
+must quote your own words from the current turn. In a thread without a code session, the `user` scope is the only one
+available. The agent does not yet write anything to it on its own from the conversation: no automatic extraction of
+facts, no nightly consolidation. What it remembers is what was noted, and you can list or forget it with `memory`.
+
+Only the owner of the install gets this memory: any other account the core serves recalls nothing from it and does
+not see the `memory_*` tools.
+
+### Is it working?
+
+When the core starts, it checks the database and the embedding server in the background and logs either "ready" or
+"UNAVAILABLE" with the reason (`nokker logs`). A memory that cannot answer never fails silently:
+
+- `GET /healthz` carries `"memory": "ok" | "down" | "off"`; the core itself keeps answering;
+- `GET /v1/local/memory` (local token) gives the detail: mode, projects read, number of notes, embedding model and
+  dimension, the last error if any, the duration of the last recall.
 
 ## Instruction files
 
@@ -66,20 +99,31 @@ memory {"action": "view", "name": "<note>"}
 memory {"action": "forget", "name": "<note>"}
 ```
 
-The terminal client calls it without a model turn through `POST /v1/local/tools/call` (planned slash command:
-`/memory`, `/memory <note>`, `/memory forget <note>`). Forgetting moves the note out of the index into a `.forgotten`
+A client can call it without a model turn through `POST /v1/local/tools/call` (the terminal slash commands
+`/memory`, `/memory <note>`, `/memory forget <note>` are planned). Forgetting moves the note out of the index into a `.forgotten`
 folder: nothing is destroyed. A section of an instruction file cannot be forgotten: edit the file, the memory follows.
 
 ## Where it is stored
 
 Notes are Markdown files under `~/.nokker/state/project-memory/` (one folder per project; one more, `u-local`, for
-your `user` notes), indexed in the background in the Postgres database of the compose. A project is identified by its
+your `user` notes, which is your long-term memory), indexed in the background in the Postgres database of the
+compose. The files are the source of truth: the index can be rebuilt from them. A project is identified by its
 git remote URL (without credentials), so two clones of the same repository share their memory; without a remote, by
 the path of the repository root.
 
 ## Settings
 
-In the core configuration, under `local`:
+Long-term memory, at the top level of the core configuration:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `memory_mode` | `mcp` (`direct` in the Lokkal compose) | `direct`: CortHeXis inside the core; `off`: none. The `NOKKER_MEMORY_MODE` variable is read when the key is absent |
+| `memory_direct.projects` | `[u-local]` | the CortHeXis projects recalled at every turn |
+| `memory_direct.min_score` | `0.15` | relevance floor of the recall (with `relative_floor`, `0.6` of the best result) |
+
+The database and the embedding server are the compose's (`CORTHEXIS_DATABASE_URL`, `CORTHEXIS_EMBED_URLS`).
+
+Project memory, under `local`:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -88,4 +132,5 @@ In the core configuration, under `local`:
 | `project_memory_dir` | `<state_dir>/project-memory` | where notes are stored |
 | `project_memory_min_score` | `0.15` | relevance floor of the recall |
 
-With `project_memory: false` nothing changes: no tool, no memory block, the same system prompt.
+With `project_memory: false` nothing changes: no tool, no memory block, the same system prompt; `memory_note` is then
+unavailable, so nothing new reaches the long-term memory either.

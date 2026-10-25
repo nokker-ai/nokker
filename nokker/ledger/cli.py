@@ -21,7 +21,7 @@ def add_costs_subparser(subparsers: argparse._SubParsersAction) -> argparse.Argu
     p = subparsers.add_parser("costs", help="Coûts et agrégats du ledger (T5, A3, A5).")
     p.add_argument("--day", help="YYYY-MM-DD (défaut : tout le ledger, pas seulement aujourd'hui).")
     p.add_argument("--thread", dest="thread_id", help="Limiter à un fil (thread_id).")
-    p.add_argument("--tier", choices=["local", "ship", "deep"], help="Limiter à un palier.")
+    p.add_argument("--tier", choices=["local", "small", "ship", "deep"], help="Limiter à un palier.")
     p.set_defaults(_nokker_ledger_cmd=costs_command)
     return p
 
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     sur son propre parser et son propre ledger déjà construit."""
     parser = argparse.ArgumentParser(prog="python -m nokker.ledger.cli")
     parser.add_argument("--dsn", help="DSN Postgres ; sans lui, ledger en mémoire (vide, pour lire prices.yaml etc).")
-    parser.add_argument("--tenant", default=INTERNAL_TENANT, help="locataire lu (RLS, docs/TENANCY.md §4)")
+    parser.add_argument("--tenant", default=INTERNAL_TENANT, help="locataire lu (RLS)")
     sub = parser.add_subparsers(dest="command", required=True)
     add_costs_subparser(sub)
     args = parser.parse_args(argv)

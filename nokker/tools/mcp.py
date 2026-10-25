@@ -149,8 +149,8 @@ class McpToolSource:
     core_tools: frozenset[str] = frozenset()
     effects: dict[str, Effect] = field(default_factory=dict)
     timeout_s: float = 30.0
-    # Outil appelé en fin de tour si le tour a utilisé ce serveur (ex. `browser_close` pour brosim : un onglet
-    # gardé ouvert bloque le suivant sur un site hostile — 2 onglets max par compte ; Nick 20.10). None = rien.
+    # Outil appelé en fin de tour si le tour a utilisé ce serveur (ex. `browser_close` pour le navigateur partagé : un onglet
+    # gardé ouvert bloque le suivant sur un site hostile — 2 onglets max par compte ; décision produit du 20.10). None = rien.
     close_on_turn_end: str | None = None
     # En-têtes résolus à l'ouverture de chaque session (références `secret:NOM`, nokker/secrets/refs.py) ; prime sur
     # `headers` quand il est posé.

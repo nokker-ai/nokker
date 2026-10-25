@@ -18,7 +18,7 @@ iPhone Duo), Mini App Telegram. Base `https://<hôte>/v1`, JSON, flux en SSE. Co
   (signature brute IEEE P1363, ou WebAuthn pour le web — docs/APPROVALS.md §3.4/§3.6), puis `POST /v1/sessions` contre
   ce défi signé. Durée 12 h, **pas encore de renouvellement** (refaire la danse à l'expiration — limite documentée).
   Le jeton porte l'utilisateur VÉRIFIÉ (`alice`, `bruno`) : c'est ce `sender` que voient les invariants, donc un GO
-  peut venir d'un client vérifié (pas du proxy Hermes, qui reste `gateway-proxy-unverified`).
+  peut venir d'un client vérifié (pas du proxy de la passerelle amont, qui reste `gateway-proxy-unverified`).
 - Les clés d'API statiques (`api_keys` de la config) restent pour les bancs et les ponts serveur-à-serveur.
 - La Mini App Telegram n'utilise PAS cette danse : elle présente `initData` (en-tête `X-Telegram-Init-Data` sur
   toute méthode, ou champ `init_data` du corps en POST), validé et résolu en `sender` via
@@ -33,7 +33,7 @@ iPhone Duo), Mini App Telegram. Base `https://<hôte>/v1`, JSON, flux en SSE. Co
 | GET | `/v1/approvals?status=pending` | cartes en attente |
 | GET | `/v1/approvals/{id}` | une carte : outil, arguments, effet, raison, avis de Nina, niveau, expiration (forme JSON exacte : docs/APPROVALS.md §5) |
 | POST | `/v1/approvals/{id}/challenge` | défi à signer |
-| POST | `/v1/approvals/{id}/decision` | décision (signature brute, WebAuthn, ou TOTP — docs/APPROVALS.md §3.3-§3.5), déclenche l'exécution + le tour de continuation si approuvée |
+| POST | `/v1/approvals/{id}/decision` | décision (signature brute, WebAuthn, ou TOTP — docs/APPROVALS.md §3.3-§3.5), déclenche l'exécution + le tour de continuation si approuvée ; répond après l'exécution (`executed`/`failed`) si elle tient en 45 s, sinon avec la carte `approved` (l'exécution suit en fond) |
 | POST | `/v1/devices` · GET `/v1/devices` · DELETE `/v1/devices/{id}` | appareils de l'utilisateur |
 | POST | `/v1/devices/{id}/confirm` | confirme un appareil `pending` par TOTP (alternative à `python -m nokker devices approve <code>`) |
 | POST | `/v1/devices/{id}/session-challenge` | défi de connexion (sans identité préalable — c'est lui qui en établit une) |
@@ -54,13 +54,13 @@ Cloudflare (approve.nokker.ai → nginx :8743 → noyau :8742) coupe et Safari a
 
 **Pour tous les clients** : les en-têtes SSE partent tout de suite (`X-Accel-Buffering: no` pour nginx), le tour
 tourne dans un fil de travail, et un **commentaire SSE `: ping`** part toutes les ~10 s tant que rien d'autre ne
-sort. Les commentaires sont ignorés par tout parseur SSE (spec), par le SDK (`sse.ts`) et par la gateway Hermes
+sort. Les commentaires sont ignorés par tout parseur SSE (spec), par le SDK (`sse.ts`) et par la passerelle amont
 (`_consume_sse_line` ne lit que les lignes `data: `). Sans opt-in, le corps est **octet pour octet** celui d'avant,
 pings exceptés : rôle, réponse complète + `usage`, `finish_reason: "stop"`, `[DONE]` (vérifié contre `origin/main`
 et par `tests/unit/api/test_stream.py`). Une erreur du tour APRÈS les en-têtes part en `data: {"error": {"message"}}`
 sans `[DONE]` (avant : HTTP 500).
 
-**Jetons en direct — opt-in `X-Nokker-Stream-Tokens: 1`** (le client web le pose ; la gateway Hermes ne le pose
+**Jetons en direct — opt-in `X-Nokker-Stream-Tokens: 1`** (le client web le pose ; la passerelle amont ne le pose
 pas, elle concatène TOUT `delta.content` reçu et ne doit jamais voir de texte partiel) :
 
 1. `delta: {"role": "assistant"}` d'emblée (`model: "nokker"` dans les chunks en direct) ;
@@ -84,7 +84,8 @@ reset le retire. Le texte d'un appel final s'affiche AVANT le verdict de la port
 `turn.delta` sur `/v1/events` reste unique par tour (réponse complète juste avant `turn.done`). Côté amont,
 `SokkanProvider` passe en `stream: true` (+ `stream_options.include_usage`) seulement quand le noyau lui donne un
 `on_delta`, reconstitue la même `Completion` (content, tool_calls par index, usage) et ne réessaie que tant
-qu'aucun morceau n'a été remis.
+qu'aucun morceau n'a été remis — et seulement dans le budget de l'appel (`call_budget_s`, défaut 180 s, réessais
+compris ; docs/LOKKAL.md §7.17 point 11).
 
 ## Événements (`/v1/events`, SSE, `id:` + `event:` + `data:` JSON)
 

@@ -89,8 +89,9 @@ them.
 - **Hardline commands** (`rm -rf /`, `mkfs`, fork bombs and the like) are refused with no card and cannot be approved,
   even by a rule.
 - A destructive card can only be decided **once**. No session or always scope.
-- A strong card coming from the web (gateway) is decided on an enrolled device (phone, passkey), never with the local
-  token.
+- Some strong cards are never decided with the local token: a change on a `prod` host ([ops.md](ops.md)), a send or
+  delete through a connector of your nokker.ai account ([models.md](models.md)), and a strong card coming from the web
+  (gateway). They are signed on an enrolled device (a passkey). See [security.md](security.md).
 - Approvals are bound to the exact arguments: if they change after the card is shown, the decision is refused.
 - Secrets handled by tools are replaced by handles before they reach the model's context.
 

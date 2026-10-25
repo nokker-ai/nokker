@@ -29,6 +29,8 @@ class Thread:
     updated_at: float = field(default_factory=time.time)
     working: bool = False
     last_snippet: str = ""
+    # Fil d'un passage d'agent (docs/BUBBLES.md §9.5) : {"kind": "agent", "agent_id", "run_id"} ; None ailleurs.
+    origin: dict[str, Any] | None = None
 
     def is_member(self, user: str | None) -> bool:
         """Propriétaire ou membre. Un fil sans propriétaire (serveur ouvert, aucun `sender` vérifié) n'a
@@ -52,9 +54,12 @@ def _iso(ts: float | None) -> str | None:
 
 def thread_to_json(t: Thread, bubble_count: int = 0) -> dict[str, Any]:
     members = list(dict.fromkeys([*(m for m in [t.owner] if m), *t.members]))
-    return {"id": t.id, "title": t.title, "owner": t.owner, "members": members,
-            "created_at": _iso(t.created_at), "updated_at": _iso(t.updated_at), "working": t.working,
-            "unread": 0, "bubble_count": bubble_count, "last_snippet": t.last_snippet}
+    out = {"id": t.id, "title": t.title, "owner": t.owner, "members": members,
+           "created_at": _iso(t.created_at), "updated_at": _iso(t.updated_at), "working": t.working,
+           "unread": 0, "bubble_count": bubble_count, "last_snippet": t.last_snippet}
+    if t.origin:
+        out["origin"] = dict(t.origin)  # absent pour les fils ordinaires (§9.5)
+    return out
 
 
 __all__ = ["Thread", "ThreadError", "ThreadForbidden", "ThreadNotFound", "thread_to_json"]

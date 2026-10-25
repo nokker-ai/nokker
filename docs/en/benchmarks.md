@@ -55,5 +55,5 @@ conditions and the tasks on which Lokkal and the reference differ.
 
 ### Next
 
-The full 500 tasks, once the multi-model router, the judge and the long-session context are in. This sample is
-a checkpoint, not a leaderboard entry.
+The full 500 tasks, with the tier routing and the reviewer described in [models.md](models.md) switched on. This
+sample is a checkpoint, not a leaderboard entry.

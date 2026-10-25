@@ -1,6 +1,6 @@
 """`/v1/chat/completions` OpenAI-compatible en SSE + `/healthz` + `/metrics` — PLAN-P1 §2.8.
 
-Contrat consommé par la gateway Hermes en mode proxy (`gateway/run_turn.py` dans hermes-nokker) :
+Contrat consommé par la passerelle amont en mode proxy (`gateway/run_turn.py` dans hermes-nokker) :
   - `GATEWAY_PROXY_URL` + `_run_agent_inner` (`:4264`) aiguillent vers `_run_agent_via_proxy` (`:2752`) ;
   - requête : `POST {proxy_url}/v1/chat/completions`, `Authorization: Bearer <GATEWAY_PROXY_KEY>`,
     `X-Hermes-Session-Id: <session_id>`, corps `{"model": "hermes-agent", "messages": [...], "stream": true}` ;
@@ -13,14 +13,14 @@ Streaming (P1, 19.10.2026, `_stream_turn`) : en `stream: true` les en-têtes SSE
 tourne dans un fil de travail et un commentaire `: ping` part toutes les ~10 s tant que rien d'autre ne sort
 (Cloudflare coupe à 100 s sans octet ; tour réel de ~2 min mesuré sur le canari). Sans opt-in, le corps est,
 pings exceptés, celui d'avant (rôle, réponse + usage, stop, `[DONE]`) : `_consume_sse_line` ne lit que les
-lignes `data: ` — la gateway Hermes ne voit aucune différence. Les jetons en direct sont réservés aux clients qui
+lignes `data: ` — la passerelle amont ne voit aucune différence. Les jetons en direct sont réservés aux clients qui
 posent `X-Nokker-Stream-Tokens: 1` (le web) : la gateway concatène TOUT `delta.content` reçu, elle ne doit donc
 jamais recevoir de texte partiel ni de reset. Contrat : docs/CLIENT-API.md §Streaming.
 
-**Sécurité de `Turn.sender`** (consigne Nick/F2, 17.10.2026) : il ne vient JAMAIS d'un champ que le
+**Sécurité de `Turn.sender`** (consigne produit F2, 17.10.2026) : il ne vient JAMAIS d'un champ que le
 client contrôle (`user` du corps, un en-tête arbitraire) — seulement de la clé Bearer effectivement
 présentée, résolue via `NokkerConfig.api_key_map()` (secret que seul le vrai appelant détient). La
-gateway Hermes en mode proxy ne transmet AUCUNE identité vérifiable aujourd'hui (corps strictement
+passerelle amont en mode proxy ne transmet AUCUNE identité vérifiable aujourd'hui (corps strictement
 `{model, messages, stream}`, aucun en-tête d'identité — vérifié dans son code) : tant qu'elle n'en
 transmet pas, un appel qui arrive par ce chemin avec la clé Bearer PARTAGÉE du proxy (si c'est la seule
 configurée) résout `sender` à l'identité attachée à CETTE clé en config — pas à « n'importe qui » ; il
@@ -51,7 +51,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from nokker.agents.hub import AgentsHub
 from nokker.agents.memory import InMemoryAgents
-from nokker.agents.types import agent_to_json
+from nokker.agents.types import (
+    AgentConflict, AgentError, AgentMissing, AgentNotFound, agent_to_json, run_to_json,
+)
 from nokker.approvals import crypto as approvals_crypto
 from nokker.approvals.base import BaseApprovals
 from nokker.approvals.errors import (
@@ -74,12 +76,16 @@ from nokker.context.engine_v1 import ContextEngineV1
 from nokker.context.manager import ContextManager
 from nokker.context.tools import RecallContextSource
 from nokker.context.types import ContextBudgets
-from nokker.core.loop import Kernel
+from nokker.core.loop import DIRECT_CHANNEL, Kernel
 from nokker.core.ports import Approval, Invariants, Proof
-from nokker.core.turn import LLMCall, Tier, Turn, TurnInput, Usage
+from nokker.core.turn import Decision, Gate, LLMCall, Tier, Turn, TurnInput, Usage, Verdict
+from nokker.core.turn_lock import TurnLocks
 from nokker.ledger.costs import InMemoryLedger, LedgerBackend, PostgresLedger
 from nokker.ledger.metrics import render as render_metrics
-from nokker.memory.corthexis import CorthexisMemory
+from nokker.ledger.turn_cost import root_thread
+from nokker.memory.corthexis import CorthexisMemory  # noqa: F401 — nom public du module (tests, appelants)
+from nokker.memory.corthexis import from_config as memory_from_config
+from nokker.memory.corthexis import status_of as memory_status
 from nokker.images import ImageError, ImageStore, parse_attachments, sniff_media_type, split_content
 from nokker.providers.sokkan import SokkanProvider
 from nokker.qa.calibrate import DEFAULT_THRESHOLDS, load_thresholds_file
@@ -87,13 +93,18 @@ from nokker.qa.escalate import EscalatorV0
 from nokker.qa.gates import GatesV0, GatesV1
 from nokker.qa.invariants import Allowlist, DeterministicInvariants, GoAuthorizedSenders
 from nokker.qa.judge import HttpJudgeTransport, OpenAICompatJudge
+from nokker.qa.review import CardAdvisor, DiffReviewer, parse_advice
 from nokker.qa.secrets import KnownSecrets
-from nokker.route.policy import PolicyV0
+from nokker.route.classify import ModelClassifier
+from nokker.route.policy import PolicyV0, PolicyV1
 from nokker.store.pg import MemoryStore, PgStore, apply_migrations
 from nokker import feedback as feedback_mod
 from nokker.connectors import http as connectors_http
 from nokker.cloud import http as cloud_http
 from nokker.onboarding import http as onboarding_http
+from nokker.incidents import http as incidents_http
+from nokker.plan import http as plan_http
+from nokker.team import http as team_http
 from nokker.telegram import http as telegram_http
 from nokker.connectors.provider import ConnectorProvider as ConnectorsForTenant
 from nokker.connectors.service import Connectors
@@ -110,6 +121,7 @@ from nokker.threads.types import ThreadError, ThreadForbidden, ThreadNotFound
 from nokker.tools.effects import EffectsTable, SecretScrubbingToolSource
 from nokker.tools.mcp import McpToolSource
 from nokker.tools.registry import Registry, builtin_core_source
+from nokker.ledger.audit import AuditedTools
 from nokker.local.api import LOCAL_OWNER, LocalApi
 from nokker.tools.web import WebToolSource
 
@@ -150,6 +162,9 @@ def _anon_enroll_allowed(now: float | None = None) -> bool:
 _RE_APPROVAL_ONE = re.compile(r"^/v1/approvals/([^/]+)$")
 _RE_APPROVAL_CHALLENGE = re.compile(r"^/v1/approvals/([^/]+)/challenge$")
 _RE_APPROVAL_DECISION = re.compile(r"^/v1/approvals/([^/]+)/decision$")
+# Attente maximale de `POST /v1/approvals/{id}/decision` (Mini App, web) : sous les 100 s de Cloudflare, tour en cours
+# sur le fil compris ; au-delà, la carte part telle qu'elle est (`approved`) et l'exécution suit en fond.
+DECISION_WAIT_S = 45.0
 _RE_DEVICE_ONE = re.compile(r"^/v1/devices/([^/]+)$")
 _RE_DEVICE_CONFIRM = re.compile(r"^/v1/devices/([^/]+)/confirm$")
 _RE_DEVICE_SESSION_CHALLENGE = re.compile(r"^/v1/devices/([^/]+)/session-challenge$")
@@ -175,6 +190,11 @@ MAX_CHAT_BODY = 32 * 1024 * 1024
 _RE_BUBBLE_ONE = re.compile(r"^/v1/bubbles/([^/]+)$")
 _RE_BUBBLE_OP = re.compile(r"^/v1/bubbles/([^/]+)/(close|transfer|share)$")
 _RE_BUBBLE_ACTION = re.compile(r"^/v1/bubbles/([^/]+)/actions/([^/]+)$")
+# Crew (docs/BUBBLES.md §9.4, §9.5)
+_RE_AGENT = re.compile(r"^/v1/agents/(ag_[0-9a-f]{12})(?:/(arm|disarm|run|runs|webhook-secret|move))?$")
+_RE_AGENT_RUN_CANCEL = re.compile(r"^/v1/agents/(ag_[0-9a-f]{12})/runs/(ar_[0-9a-f]{16})/cancel$")
+_RE_AGENT_WEBHOOK = re.compile(r"^/v1/agents/(ag_[0-9a-f]{12})/webhooks/([A-Za-z0-9_.-]{1,64})$")
+MAX_WEBHOOK_BODY = 64 * 1024
 
 
 def build_invariants(config: NokkerConfig) -> DeterministicInvariants:
@@ -261,15 +281,73 @@ def build_agents(config: NokkerConfig, events: EventBus | None = None) -> Agents
     return AgentsHub(store=store, publish=events.publish if events is not None else None)
 
 
-def build_judge(config: NokkerConfig) -> OpenAICompatJudge:
-    """B-2 : backend par défaut mesuré sur le banc B-1 (`nokker-judge-bench/README.md` § B-2
-    mesures) — Ship sans raisonnement (`reasoning_effort: "none"`, SEULE variante qui coupe
-    vraiment le raisonnement sur le Router SOKKAN, cf `providers/sokkan.py`), `top_logprobs=1`
-    (plafond mesuré du Router)."""
-    transport = HttpJudgeTransport(base_url=config.judge.base_url, model=config.judge.model,
-                                   api_key=config.judge.api_key(), extra_body={"reasoning_effort": "none"},
-                                   top_logprobs=1)
-    return OpenAICompatJudge(transport=transport, model_name=config.judge.model)
+def judge_transport(config: NokkerConfig, timeout_s: float = 30.0, known: Any = None) -> HttpJudgeTransport:
+    """Transport du juge (`config.judge_config()` : `judge:` du YAML, sinon le palier Ship). Raisonnement coupé par
+    `reasoning_off_body` du juge s'il est posé, sinon `reasoning_effort: "none"` (SEULE variante qui coupe vraiment le
+    raisonnement sur le Router SOKKAN, cf `providers/sokkan.py`) ; un amont qui le refuse (gpt-oss, clé de
+    l'utilisateur) est repris sans (`HttpJudgeTransport`, X8). `top_logprobs=1` (plafond mesuré du Router). `known` :
+    coffre des invariants, pour le caviardage de tout ce que le juge envoie (motifs seuls sans lui)."""
+    j = config.judge_config()
+    extra = j.reasoning_off_body if j.reasoning_off_body is not None else {"reasoning_effort": "none"}
+    return HttpJudgeTransport(base_url=j.base_url, model=j.model, api_key=j.api_key(), extra_body=dict(extra),
+                              top_logprobs=1, timeout_s=timeout_s, known=known)
+
+
+def build_judge(config: NokkerConfig, known: Any = None) -> OpenAICompatJudge:
+    """B-2 : backend par défaut mesuré sur le banc B-1 (`nokker-judge-bench/README.md` § B-2 mesures)."""
+    from nokker.qa.questions import JUDGE_SYSTEM
+
+    return OpenAICompatJudge(transport=judge_transport(config, known=known), model_name=config.judge_config().model,
+                             verdict_max_tokens=config.judge_verdict_max_tokens, system=JUDGE_SYSTEM)
+
+
+def judge_tier(config: NokkerConfig) -> Tier:
+    """Palier sous lequel les jetons du juge sont comptés : celui qui sert le même modèle, sinon Ship."""
+    model = config.judge_config().model
+    for name, t in config.tiers.items():
+        if t.model == model:
+            try:
+                return Tier(name)
+            except ValueError:
+                continue
+    return Tier.SHIP
+
+
+def build_reviewer(config: NokkerConfig, known: Any = None) -> DiffReviewer | None:
+    """X8 : relecture du diff avant « terminé » (`judge_review`), None si éteinte."""
+    if not config.judge_review:
+        return None
+    return DiffReviewer(transport=judge_transport(config, timeout_s=60.0, known=known),
+                        model_name=config.judge_config().model,
+                        rounds=max(0, int(config.judge_review_rounds)), max_tokens=int(config.judge_max_tokens),
+                        tier=judge_tier(config))
+
+
+def build_advisor(config: NokkerConfig, known: Any = None) -> CardAdvisor | None:
+    """X8 : avis et niveau de risque sur les cartes fortes (`judge_advice`), None si éteint."""
+    if not config.judge_advice:
+        return None
+    return CardAdvisor(transport=judge_transport(config, timeout_s=20.0, known=known),
+                       model_name=config.judge_config().model,
+                       max_tokens=max(160, int(config.judge_max_tokens) // 2), tier=judge_tier(config))
+
+
+def build_policy(config: NokkerConfig, providers: dict) -> PolicyV0:
+    """Politique de palier : v0 (défaut) ou v1, trois paliers (X8, `route.policy: v1`). `providers` est lu à chaque
+    tour (un palier retiré à chaud, ex. modèle choisi à l'onboarding, se replie sans redémarrage)."""
+    route = config.route or {}
+    if str(route.get("policy", "v0")) != "v1":
+        return PolicyV0()
+    classifier = None
+    small = config.tiers.get("small")
+    if str(route.get("classifier", "rules")) == "model" and small is not None:
+        extra = small.reasoning_off_body if small.reasoning_off_body is not None else {"reasoning_effort": "none"}
+        classifier = ModelClassifier(
+            transport=HttpJudgeTransport(base_url=small.base_url, model=small.model, api_key=small.api_key(),
+                                         extra_body=dict(extra), top_logprobs=0, timeout_s=5.0),
+            max_tokens=int(route.get("classifier_max_tokens", 1)), model_name=small.model)
+    return PolicyV1(available=lambda: tuple(providers), classifier=classifier,
+                    code_to_deep=bool(route.get("code_to_deep", True)))
 
 
 def build_gates(config: NokkerConfig, invariants: Invariants) -> GatesV0 | GatesV1:
@@ -277,7 +355,8 @@ def build_gates(config: NokkerConfig, invariants: Invariants) -> GatesV0 | Gates
         return GatesV0(invariants=invariants)  # juge < 90 % au banc B-1 : invariants seuls (cf config.py)
     thresholds = load_thresholds_file(config.judge_thresholds_path) if config.judge_thresholds_path \
         else dict(DEFAULT_THRESHOLDS)
-    return GatesV1(invariants=invariants, judge=build_judge(config), thresholds=thresholds)
+    return GatesV1(invariants=invariants, judge=build_judge(config, known=getattr(invariants, "known", None)),
+                   thresholds=thresholds)
 
 
 def build_context_manager(config: NokkerConfig, store: Any, hub: BubbleHub | None = None) -> ContextManager:
@@ -344,9 +423,15 @@ def build_connector_store(config: NokkerConfig) -> Any:
 
 
 def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any, ledger: Any,
-                         store: Any = None) -> None:
+                         store: Any = None, connector_store: Any = None, invariants: Any = None,
+                         limits: Any = None) -> None:
     """nokker.ai, côté cloud du lien Lokkal (nokker/cloud/) : seulement si `cloud_link` est configuré ET la clé de
-    signature présente ; sinon aucune route (la bêta d'avant ne change pas)."""
+    signature présente ; sinon aucune route (la bêta d'avant ne change pas). Connecteurs relayés (lot X20) : en plus
+    `cloud_link.relayed_connectors: true` et un magasin de connecteurs (`connector_store`).
+
+    Inférence relayée (`/v1/inference/*`) : plafonds `limits` (ceux des tours du noyau, `kernel.limits`), modèles des
+    paliers qui partagent le point d'accès de Deep (même URL, même clé), débit `cloud_link.inference_rate_max` par
+    machine et `cloud_link.inference_calls_per_day` par compte."""
     cl = config.cloud_link or {}
     if not cl:
         cloud_http.configure(None)
@@ -354,12 +439,23 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
     import os
 
     from nokker.cloud.http import CloudLink
-    from nokker.cloud.link import LinkService, Signer
+    from nokker.cloud.link import LinkService, Signer, SigningKeyError
 
-    pem = os.environ.get(cl.get("signing_key_env") or "NOKKER_GATEWAY_SIGNING_KEY", "")
+    key_env = cl.get("signing_key_env") or "NOKKER_GATEWAY_SIGNING_KEY"
+    pem = os.environ.get(key_env, "")
     if not pem:
         logger.warning("cloud_link configuré sans clé de signature : routes du lien Lokkal désactivées")
-        cloud_http.configure(None)
+        cloud_http.configure(None, state="no_key")
+        return
+    try:
+        signer = Signer(private_pem=pem.encode(), issuer=(cl.get("base_url") or "https://app.nokker.ai").rstrip("/"))
+    except SigningKeyError as e:
+        # Clé mal collée (PEM tronqué, guillemets, autre type de clé) : le noyau démarre quand même, `cloud_link` reste
+        # inerte comme sans clé (aucune route, aucun outil de plus) et /healthz dit `gateway: invalid_key`. La cause
+        # est dite, la valeur jamais (ni ici ni par une exception chaînée).
+        logger.error("clé de passerelle illisible : lien Lokkal éteint (%s ; variable %s, valeur non affichée)",
+                     e, key_env)
+        cloud_http.configure(None, state="invalid_key")
         return
     deep = config.tiers.get("deep") or next(iter(config.tiers.values()))
 
@@ -373,10 +469,11 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
         acc = tenancy.account(account) if hasattr(tenancy, "account") else None
         return getattr(acc, "tenant_id", None)
 
-    def record_usage(tenant: str, machine: str, usage: dict, seconds: float) -> None:
+    def record_usage(tenant: str, machine: str, usage: dict, seconds: float, model: str = "") -> None:
+        # Appelé dans tenant_scope(tenant) (nokker/cloud/http.py) : le ledger Postgres est sous RLS.
         if ledger is None:
             return
-        call = LLMCall(tier=Tier.DEEP, model=deep.model, reasoning=False, prefix_sha256="", layer_tokens={},
+        call = LLMCall(tier=Tier.DEEP, model=model or deep.model, reasoning=False, prefix_sha256="", layer_tokens={},
                        usage=Usage(prompt=int(usage.get("prompt_tokens") or 0),
                                    completion=int(usage.get("completion_tokens") or 0)),
                        latency_s=seconds, route_reason=f"lokkal:{machine}")
@@ -387,25 +484,167 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
 
     # `link_store`, pas `store` : `store` est le magasin du NOYAU (miroir) — le même nom écrasait l'un par l'autre et
     # /v1/mirror/erase appelait erase_mirror_copies sur le magasin des liens (trouvé le 24.10).
+    from nokker.cloud.approvals import MemoryRelayStore, RelayService
+
     if dsn:
-        from nokker.cloud.pg import PgGatewayAuthStore, PgLinkStore
+        from nokker.cloud.pg import PgGatewayAuthStore, PgLinkStore, PgRelayStore
 
         link_store: Any = PgLinkStore(dsn)
         auth_store: Any = PgGatewayAuthStore(dsn)
+        relay_store: Any = PgRelayStore(dsn)
     else:
         from nokker.cloud.link import MemoryLinkStore
 
-        link_store, auth_store = MemoryLinkStore(), MemoryGatewayAuthStore()
+        link_store, auth_store, relay_store = MemoryLinkStore(), MemoryGatewayAuthStore(), MemoryRelayStore()
     links = LinkService(base_url=cl.get("base_url") or "https://app.nokker.ai",
                         gateway_domain=cl.get("gateway_domain") or "nokker.app", store=link_store)
-    signer = Signer(private_pem=pem.encode(), issuer=(cl.get("base_url") or "https://app.nokker.ai").rstrip("/"))
+    relay = None
+    handoffs = mirror_notes = None
+    if cl.get("handoffs", True):
+        # Délégation web → Lokkal par besoin (X21, docs/LOKKAL.md §7.16) ; `cloud_link.handoffs: false` l'éteint.
+        from nokker.cloud.handoff import HandoffService, MemoryHandoffStore
+        from nokker.cloud.mirror import MemoryMirrorNotes
+
+        if dsn:
+            from nokker.cloud.pg import PgHandoffStore, PgMirrorNotes
+
+            handoff_store: Any = PgHandoffStore(dsn)
+            mirror_notes = PgMirrorNotes(dsn)
+        else:
+            handoff_store, mirror_notes = MemoryHandoffStore(), MemoryMirrorNotes()
+        handoffs = HandoffService(links=links, signer=signer, store=handoff_store)
+    if cl.get("relayed_connectors") and connector_store is not None:
+        from nokker.cloud.relay import ConnectorRelay, MemoryRelayAudit, PgRelayAudit
+
+        def record_relay(tenant: str, machine: str, entry: dict) -> None:
+            # Compté au ledger du locataire, à côté de l'inférence de la machine (fil `lokkal-<machine>`).
+            if ledger is None:
+                return
+            refused = entry.get("outcome") == "refused"
+            ledger.record_verdict(scoped_thread_id(tenant, f"lokkal-{machine}"), 0, Verdict(
+                gate=Gate.ACTION, decision=Decision.DENY if refused else Decision.ALLOW, layer=1,
+                rule=f"relay:{entry.get('connector')}:{entry.get('tool')}",
+                reason=str(entry.get("code") or entry.get("outcome") or ""), subject=entry.get("audit_id")))
+
+        # Envoi externe et destructif (X20b) : carte forte vérifiée ICI contre les appareils du compte de la machine,
+        # avec la routine de la machine (`verify_signed_decision`) et le défi que la machine a déposé (boîte aux lettres
+        # X10). Sans backend d'approbations, aucun de ces outils ne passe.
+        relay = ConnectorRelay(store=connector_store, audit=PgRelayAudit(dsn) if dsn else MemoryRelayAudit(),
+                               redact=invariants.redact_result if invariants is not None else None,
+                               record=record_relay, verifier=approvals,
+                               devices_of=(lambda acc: approvals.list_devices(acc)) if approvals is not None else None,
+                               cards=relay_store, origin=links.base_url)
+    mirror_allowed = (lambda acc: "*" in cl.get("mirror_accounts", []) or acc in cl.get("mirror_accounts", [])) \
+        if cl.get("mirror") else None
+    crew = None
+    relay_service = RelayService(store=relay_store, known=getattr(invariants, "known", None))
+    if cl.get("crew", False):  # opt-in explicite : la bêta ne lance aucun ordonnanceur sans décision (arbitrage dev 25.10)
+        # Deck multi-machines et agents placés (X15, docs/LOKKAL.md §7.19) ; `cloud_link.crew: true` l'allume (éteint par défaut). Agents
+        # « web » : drapeau d'offre `web_agents` + comptes (`web_agents_accounts`, « * » = tous) tant que l'abonnement
+        # n'est pas lu, et moteur NOKKER_CREW_ENGINE=1.
+        from nokker.cloud.crew import CloudCrew, MemoryDeckStore
+
+        web = cl.get("web_agents_accounts", [])
+        if dsn:
+            from nokker.cloud.pg import PgDeckStore
+
+            deck_store: Any = PgDeckStore(dsn)
+        else:
+            deck_store = MemoryDeckStore()
+        crew = CloudCrew(links=links, signer=signer, deck_store=deck_store,
+                         web_allowed=lambda acc: bool(cl.get("web_agents")) and ("*" in web or acc in web),
+                         web_engine=crew_engine_enabled(config), titles_allowed=mirror_allowed,
+                         approvals_relay=relay_service,
+                         agent_tenant=lambda a: tenant_of(a.created_by) if is_account(a.created_by) else None)
     cloud_http.configure(CloudLink(
+        relay=relay, handoffs=handoffs, mirror_notes=mirror_notes, crew=crew,
         links=links, signer=signer, identity=identity, tenant_of=tenant_of,
         gateway_auth=GatewayAuth(links=links, signer=signer, store=auth_store),
+        # Approbations fortes par la passerelle (lot X10) : boîte aux lettres ; appareils du compte = ceux du backend
+        # d'approbations (mêmes enrôlements que le web), dont la machine vérifie elle-même les preuves.
+        # X20c : le résumé d'une carte relayée est caviardé avec les secrets connus du noyau de nokker.ai.
+        approvals_relay=relay_service,
+        devices_of=(lambda acc: approvals.list_devices(acc)) if approvals is not None else None,
         router_base=deep.base_url, router_key=deep.api_key, record_usage=record_usage, store=store,
+        # Inférence relayée : modèles des paliers servis par le même point d'accès que Deep, plafonds du noyau.
+        models=frozenset(t.model for t in config.tiers.values() if t.base_url == deep.base_url and t.model),
+        default_model=deep.model, limits=limits,
+        inference_rate_max=int(cl.get("inference_rate_max", 60)),
+        inference_calls_per_day=int(cl.get("inference_calls_per_day", 2000)),
+        # Connexion par la passerelle : `token|refresh|revoke` par minute et par IP (celle du relais, §7.3).
+        gateway_rate_max=int(cl.get("gateway_rate_max", cloud_http.GATEWAY_RATE_MAX)),
         # Miroir (L5, abonnés) : drapeau `mirror` + liste de comptes (« * » = tous) tant que l'abonnement n'est pas lu.
-        mirror_allowed=(lambda acc: "*" in cl.get("mirror_accounts", []) or acc in cl.get("mirror_accounts", []))
-        if cl.get("mirror") else None))
+        mirror_allowed=mirror_allowed))
+
+
+def configure_team(config: NokkerConfig, tenancy: Tenancy, agents: Any = None, scrub: Any = None) -> None:
+    """Équipe (lot X17, nokker/team/) : seulement drapeau `team` allumé ; sinon aucune route, rien ne change. Le miroir
+    des notes de projet suit la même règle d'abonnement que celui des tours (`cloud_link.mirror`)."""
+    if not config.team:
+        team_http.configure(None)
+        return
+    from nokker.team.service import Team
+    from nokker.team.store import MemoryTeamStore, PgTeamStore
+
+    dsn = config.pg_dsn()
+    cloud = cloud_http._cloud
+    team_http.configure(Team(store=PgTeamStore(dsn) if dsn else MemoryTeamStore(), tenancy=tenancy, agents=agents,
+                             mirror_allowed=cloud.mirror_allowed if cloud is not None else None, scrub=scrub))
+
+
+def configure_plan_operate(config: NokkerConfig, kernel: Kernel, *, agents: AgentsHub | None, hub: BubbleHub | None,
+                           approvals: BaseApprovals | None, tenancy: Tenancy, events: EventBus | None) -> None:
+    """Plan et incidents (lot X18, docs/LOKKAL.md §7.18) : drapeaux `plan` et `operate`, éteints par défaut (aucune
+    route, aucun outil, aucun bloc de contexte). Les passages d'agents (alertes, brief) passent par le moteur Crew."""
+    dsn = config.pg_dsn()
+    publish = events.publish if events is not None else None
+    scrub = kernel.invariants.scrub_output
+    operate = None
+    if config.operate:
+        from nokker.incidents.service import Operate
+        from nokker.incidents.store import MemoryIncidents, PgIncidents
+        from nokker.store.conn import known_tenants
+
+        operate = Operate(store=PgIncidents(dsn) if dsn else MemoryIncidents(), agents=agents, approvals=approvals,
+                          publish=publish, scrub=scrub, tenants=(lambda: known_tenants(dsn)) if dsn else None)
+    incidents_http.configure(operate)
+    if not config.plan:
+        plan_http.configure(None)
+        return
+    from nokker.plan.service import Plan
+    from nokker.plan.store import MemoryPlan, PgPlan
+    from nokker.plan.tools import PlanToolSource
+    from nokker.plan.types import PlanError
+
+    check_project = None
+    if config.team:
+        def check_project(sender: str, pid: str) -> str:
+            from nokker.team.model import TeamError
+
+            team = team_http.service()
+            account = tenancy.account(sender) if is_account(sender) else None
+            if team is None or account is None:
+                raise PlanError("projet inconnu", status=404, code="not_found")
+            try:
+                return team.check_agent_project(account, pid)
+            except TeamError as e:
+                raise PlanError(e.message, status=e.status, code=e.code) from None
+
+    plan = Plan(store=PgPlan(dsn) if dsn else MemoryPlan(), agents=agents, hub=hub, history=kernel.store.history,
+                operate=lambda: incidents_http.service(), has_tool=lambda name: kernel.tools.spec(name) is not None,
+                check_project=check_project, publish=publish, scrub=scrub)
+    plan_http.configure(plan)
+    kernel.context.plan = plan  # consignes héritées dans le message système des fils qui travaillent sur une carte
+    if hub is not None:
+        hub.plan = plan  # bulles `plan_split` : accepter / refuser
+    tools = PlanToolSource(plan=plan)
+    registry = getattr(kernel.tools, "internal", None)
+    if registry is not None and hasattr(kernel.tools, "tester_sources"):
+        registry.sources.append(tools)
+        kernel.tools.tester_sources.append(tools)
+    elif hasattr(kernel.tools, "sources"):
+        kernel.tools.sources.append(tools)
+    kernel.tools.refresh()
 
 
 def configure_onboarding(config: NokkerConfig, tenancy: Tenancy, approvals: Any) -> None:
@@ -472,6 +711,13 @@ def configure_telegram(config: NokkerConfig, tenancy: Tenancy, kernel: Kernel, h
         from nokker.telegram.notify import TesterApprovalNotifier
 
         approvals.tester_notifier = TesterApprovalNotifier(tenancy=tenancy, bot=bot, app_url=config.app_url)
+    if cloud_http._cloud is not None and cloud_http._cloud.approvals_relay is not None:
+        # Carte forte déposée par une machine liée (lot X10) : un message au Telegram appairé du compte, avec le lien
+        # vers la page de décision (sendMessage seulement ; on ne décide rien dans Telegram).
+        from nokker.cloud.approvals import RelayedApprovalNotifier
+
+        cloud_http._cloud.notify_approval = RelayedApprovalNotifier(
+            tenancy=tenancy, bot=bot, app_url=cloud_http._cloud.links.base_url)
 
 
 def tool_loading(config: NokkerConfig) -> str:
@@ -567,10 +813,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     if dsn:
         apply_migrations(dsn)
 
-    if memory is None and config.memory_mcp_url:
-        memory = CorthexisMemory(url=config.memory_mcp_url, token=config.memory_token())
-        memory.warm_up()
-    # `memory_mcp_url` vide (bêta OVH) : aucune connexion à sokkan-memory, ni rappel ni outils memory_*, pour personne.
+    if memory is None:
+        # `memory_mode` (ou NOKKER_MEMORY_MODE) : `mcp` = sokkan-memory par `memory_mcp_url`, inchangé ; `direct` =
+        # CortHeXis dans le processus sur le Postgres + l'embed du compose (Nokker Lokkal, X1b) ; `off`.
+        memory = memory_from_config(config)
+    # Mode mcp et `memory_mcp_url` vide (bêta OVH) : aucune mémoire longue, ni rappel ni outils memory_*, pour personne.
     memory_sources = [memory] if memory is not None else []
 
     effects = EffectsTable.load(config.effect_overrides)
@@ -602,7 +849,7 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     internal_tools = Registry(sources=[core_source, *context_sources, *memory_sources, *mcp_sources, *web_sources,
                                        *bubble_sources, *(extra_sources or [])])
     # Pool de navigateurs de la bêta (docs/BROWSER-POOL.md) : un Chrome isolé par testeur, seulement si l'adresse du
-    # gestionnaire est posée (secret du déploiement) ; l'interne garde brosim.
+    # gestionnaire est posée (secret du déploiement) ; l'interne garde son navigateur partagé.
     browser_sources = []
     pool_url = os.environ.get(config.browser_pool_url_env or "", "")
     if pool_url:
@@ -610,7 +857,7 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
 
         token_env = config.browser_pool_token_env
         browser_sources.append(BrowserPoolSource(base_url=pool_url, api_token=lambda: os.environ.get(token_env, "")))
-    # Testeur : JAMAIS mcp_sources (workspace, brosim de Nick) ni memory_sources (sokkan-memory).
+    # Testeur : JAMAIS mcp_sources (workspace, navigateur partagé de l'opérateur) ni memory_sources (sokkan-memory).
     tools = TenantRegistry(internal=internal_tools, tester_sources=[core_source, *context_sources, *web_sources,
                                                                     *bubble_sources, *browser_sources],
                            connectors=connectors)
@@ -623,7 +870,6 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     gates = build_gates(config, inv)
     escalator = TenantEscalator(EscalatorV0(addressee=config.escalation_addressee))  # jamais chez un testeur
     limits = TenantLimits.from_config(config.tenant_limits, dsn)
-    policy = LimitedPolicy(inner=PolicyV0(), limits=limits)
     if ctx_manager is not None:
         ctx_manager.scrub = inv.scrub_output
         context: ContextEngineV0 = ContextEngineV1(tools=tools, prefix_path=config.prefix_path,
@@ -640,6 +886,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         except ValueError:
             logger.warning("config: palier inconnu ignoré: %s", name)
             continue
+        if tier is Tier.SMALL and tier_cfg.api_key_env and not tier_cfg.api_key():
+            # Petit palier sans clé (Lokkal sans lien de compte, clé de l'utilisateur ailleurs) : pas de palier, la
+            # politique se replie sur Ship (X8) au lieu d'un appel qui échoue à chaque politesse.
+            logger.info("config : petit palier sans clé (%s), ignoré", tier_cfg.api_key_env)
+            continue
         extra = {"reasoning_off_body": tier_cfg.reasoning_off_body} if tier_cfg.reasoning_off_body is not None else {}
         main_provider = SokkanProvider(base_url=tier_cfg.base_url, api_key=tier_cfg.api_key(),
                                        model=tier_cfg.model, vision=tier_cfg.vision, **extra)
@@ -653,8 +904,9 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         else:
             providers[tier] = main_provider
 
+    policy = LimitedPolicy(inner=build_policy(config, providers), limits=limits)
     ledger = ledger if ledger is not None else build_ledger(config)
-    # P1 (18.10.2026) : câblé par défaut (`approvals_enabled=True`, doctrine Nick — jamais d'action à
+    # P1 (18.10.2026) : câblé par défaut (`approvals_enabled=True`, doctrine produit — jamais d'action à
     # effet exécutée sans preuve). `approvals=` explicite (banc, test) prime toujours sur la config.
     appr = approvals if approvals is not None else (build_approvals(config) if config.approvals_enabled else None)
     tenant_memory = TenantMemory(memory if memory is not None else NullMemory())
@@ -662,7 +914,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     kernel = Kernel(store=store, context=context, memory=tenant_memory, invariants=inv, gates=gates,
                     escalator=escalator, policy=policy, providers=providers, tools=tools, ledger=ledger,
                     approvals=appr, tool_loading=tool_loading(config), observer=hub, limits=limits,
-                    images=ImageStore(Path(images_root)) if images_root else None)
+                    images=ImageStore(Path(images_root)) if images_root else None,
+                    reviewer=build_reviewer(config, known=getattr(inv, "known", None)),
+                    advisor=build_advisor(config, known=getattr(inv, "known", None)))
+    if isinstance(policy.inner, PolicyV1):
+        policy.inner.available = lambda: tuple(kernel.providers)  # les paliers servis à cet instant (X8)
     if hub is not None:
         hub.kernel = kernel
         if hub.scrub is None:
@@ -708,13 +964,16 @@ def approval_to_json(a: Approval) -> dict[str, Any]:
     -> `"xxx"`) pour l'affichage ; dates en ISO 8601 UTC (jamais un epoch nu : `approve.js` fait
     `Date.parse(expiresAtIso)`)."""
     effect = a.rule.split(":")[1] if a.rule.startswith("effect:") else None
+    # X8 (docs/LOKKAL.md §7.17) : l'avis du juge est rangé `[risk:<niveau>] <texte>` ; rendu séparé ici.
+    advice_risk, advice = parse_advice(a.advice)
     return {
         "id": a.id, "thread_id": a.thread_id, "turn_index": a.turn_index, "channel": a.channel,
         "tool_name": a.tool_name, "arguments": a.arguments, "args_sha256": a.args_sha256, "effect": effect,
-        "rule": a.rule, "reason": a.reason, "advice": a.advice, "strength": a.strength, "status": a.status,
+        "rule": a.rule, "reason": a.reason, "advice": advice, "advice_risk": advice_risk, "strength": a.strength,
+        "status": a.status,
         "created_at": _iso(a.created_at), "expires_at": _iso(a.expires_at), "decided_by": a.decided_by,
         "decided_via": a.decided_via, "decided_at": _iso(a.decided_at), "result_summary": a.result_summary,
-        "error": a.error,
+        "error": a.error, "call_id": a.call_id,
     }
 
 
@@ -727,7 +986,7 @@ def device_to_json(d: Device) -> dict[str, Any]:
 
 
 def _display_name(user_id: str) -> str:
-    """`nick` -> `Nick`, `nick_s` -> `Nick S` (docs/BUBBLES.md §9.2) — mise en forme SEULEMENT (pas
+    """`alice` -> `Alice`, `alice_b` -> `Alice B` (docs/BUBBLES.md §9.2) — mise en forme SEULEMENT (pas
     une table de vrais prénoms en config : volontairement simple pour P1)."""
     words = [w for w in re.split(r"[_\-\s]+", (user_id or "").strip()) if w]
     return " ".join(w.capitalize() for w in words) if words else (user_id or "")
@@ -831,10 +1090,80 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
     if executor is not None and hub is not None:
         executor.on_direct = lambda a, content, is_error: hub.direct_result(a.thread_id, a.id, a.tool_name, content,
                                                                             is_error, owner=a.decided_by)
+        executor.on_result = lambda a, content, is_error, ms: hub.approval_result(
+            a.thread_id, a.turn_index, a.call_id, a.id, a.tool_name, content, is_error, ms=ms, owner=a.decided_by)
+    # File par fil (docs/LOKKAL.md §7.4.9) : les verrous du noyau, ceux que prend `run_turn` (et `hub.thread_lock`).
+    turn_locks = kernel.turn_locks if isinstance(getattr(kernel, "turn_locks", None), TurnLocks) else TurnLocks()
+    cancel_epochs: dict[str, int] = {}  # fil racine -> nombre d'annulations (une suite en file d'avant est abandonnée)
+
+    def schedule_decision(decided: Approval, *, continue_rejected: bool = False) -> tuple[str, threading.Event]:
+        """Exécution d'une carte décidée EN FOND, dans la file de son fil : l'outil puis le tour de suite attendent la
+        fin du tour en cours (celui qui a posé la carte, le plus souvent), jamais en parallèle. Rend `("none" | "queued" |
+        "running", fin)` : `none` = rien ne tourne (refus, sauf `continue_rejected`) ; `queued` = un tour tourne ou
+        attend sur le fil ; `running` = le travail part tout de suite. `fin` est posé quand tout est fini."""
+        done = threading.Event()
+        runs = executor is not None and (decided.status == "approved"
+                                         or (continue_rejected and decided.status == "rejected"))
+        if not runs:
+            done.set()
+            return "none", done
+        lock = turn_locks.get(decided.thread_id)
+        root = root_thread(decided.thread_id)
+        epoch = cancel_epochs.get(root, 0)
+        ticket = lock.reserve()
+
+        def job() -> None:
+            try:
+                lock.acquire(ticket=ticket)
+                try:
+                    if cancel_epochs.get(root, 0) != epoch and decided.status == "approved":
+                        # Fil annulé pendant que la suite attendait : l'outil n'est pas lancé (comme une carte retirée).
+                        with tenant_scope(tenant_of_thread(decided.thread_id)):
+                            a = approvals.mark_failed(decided.id, "annulé par l'utilisateur")
+                        if decided.channel == DIRECT_CHANNEL and executor.on_direct is not None:
+                            executor.on_direct(a, "annulé par l'utilisateur", True)
+                        elif executor.on_result is not None:
+                            executor.on_result(a, "annulé par l'utilisateur", True, None)
+                        return
+                    executor.run(decided)
+                finally:
+                    lock.release()
+            except Exception:  # noqa: BLE001 — l'échec est sur la carte (mark_failed) ; la réponse est déjà partie
+                logger.exception("ApprovalExecutor.run a levé pour l'approbation %s", decided.id)
+            finally:
+                done.set()
+
+        try:
+            threading.Thread(target=contextvars.copy_context().run, args=(job,), daemon=True,
+                             name=f"approval-{decided.id[:12]}").start()
+        except Exception:
+            lock.cancel(ticket)  # jamais une place réservée sans travail derrière : le fil resterait bloqué
+            done.set()
+            raise
+        return ("running" if ticket.immediate else "queued"), done
+    crew_engine = getattr(agents, "engine", None) if agents is not None else None
+    if executor is not None and crew_engine is not None:
+        # Moteur Crew (X14) : la carte forte d'armement est un geste du noyau ; la suite d'un fil de passage tourne avec
+        # le noyau du passage (ses portes, son budget, ses secrets).
+        from nokker.agents.engine import ARM_TOOL
+
+        executor.handlers[ARM_TOOL] = crew_engine.on_arm_decision
+        executor.kernel_for = crew_engine.kernel_for
+
+    def apply_local_decision(decided: Approval) -> None:
+        """Une carte décidée pour la machine (jeton local, ou téléphone par nokker.ai, lot X10) : approuvée, l'exécuteur
+        lance l'outil et la suite du tour, dans la file du fil. UN SEUL chemin pour les deux origines de la décision ;
+        ici on attend la fin (la relève de nokker.ai, déjà dans son propre fil d'exécution, rend ensuite l'issue)."""
+        schedule_decision(decided)[1].wait()
+
+    if local_api is not None:
+        local_api.apply_decision = apply_local_decision  # pour les décisions venues par nokker.ai (serve)
 
     def cancel_thread(thread_id: str) -> int:
-        """Arrête le tour en cours du fil et retire ses cartes en attente (une carte approuvée après l'annulation
-        n'exécute plus rien). Rend le nombre de cartes retirées."""
+        """Arrête le tour en cours du fil, retire ses cartes en attente (une carte approuvée après l'annulation
+        n'exécute plus rien) et abandonne les suites de décisions encore en file. Rend le nombre de cartes retirées."""
+        root = root_thread(thread_id)
+        cancel_epochs[root] = cancel_epochs.get(root, 0) + 1
         kernel.cancel(thread_id)
         n = 0
         if approvals is not None:
@@ -867,6 +1196,12 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 # Le jeton local ne sort jamais de la machine : présenté par la passerelle, il est refusé (§7.5).
                 self._json(403, {"error": {"message": "jeton local refusé par la passerelle"}})
                 return False
+            if local_api is not None and self.headers.get("X-Nokker-Relay") and not local_api.delegation_allows(
+                    self.command, urlparse(self.path).path, self.headers.get("X-Session-Id"),
+                    self.headers.get("Authorization")):
+                # Jeton de délégation de nokker.ai (X21) : les routes de SA session seulement, rien d'autre de la machine.
+                self._json(403, {"error": {"message": "délégation : routes de la session déléguée seulement"}})
+                return False
             return True
 
         def _local_route(self, method: str, path: str) -> bool:
@@ -894,6 +1229,13 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return True
             if path == "/v1/local/cost" and method == "GET":
                 self._local_cost()
+                return True
+            if path == "/v1/local/memory" and method == "GET":
+                # État de la mémoire longue (X1b, docs/LOKKAL.md §7.13) : contrôle « mémoire » de `nokker doctor`.
+                if not self._local_owner():
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                    return True
+                self._json(200, memory_status(kernel.memory))
                 return True
             body = self._read_json_body() if method in ("POST", "PUT") else {}
             out = local_api.handle(method, path, self.headers.get("Authorization"), body,
@@ -1107,14 +1449,20 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
         def _local_approvals(self, method: str, path: str) -> None:
             """Cartes des sessions locales, décidées avec le jeton local (docs/LOKKAL.md §7.4.3)."""
             from nokker.local.approvals import append_user_rule, suggested_rules
-            from nokker.qa.permissions import Rule
+            from nokker.qa.permissions import RELAY_CARD_RULE, Rule
 
             if approvals is None:
                 self._json(404, {"error": {"message": "approbations désactivées"}})
                 return
             if path == "/v1/local/approvals" and method == "GET":
+                # `forwarded` (X10) : carte forte déposée chez nokker.ai, le lien est parti au téléphone ; faux sinon
+                # (machine non liée, relais éteint, dépôt pas encore fait) : elle se décide au terminal. Un dépôt
+                # plus tard publie `approval.forwarded`.
+                relay = local_api.remote_approvals if local_api is not None else None
                 self._json(200, {"approvals": [
-                    {**approval_to_json(a), "suggested_rules": suggested_rules(a.tool_name, a.arguments, a.strength)}
+                    {**approval_to_json(a),
+                     "suggested_rules": suggested_rules(a.tool_name, a.arguments, a.strength, a.rule),
+                     "forwarded": a.strength == "strong" and relay is not None and relay.forwarded(a.id)}
                     for a in approvals.pending()]})
                 return
             m = re.match(r"^/v1/local/approvals/([^/]+)/decide$", path)
@@ -1127,11 +1475,29 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if card is None:
                 self._json(404, {"error": {"message": "carte inconnue"}})
                 return
+            from nokker.tools.ssh import is_prod_card
+
+            if is_prod_card(card.rule) and decision == "approve":
+                # Plancher prod (lot X11, docs/LOKKAL.md §7.14) : le jeton local est un fichier de la machine, que le
+                # modèle peut lire en backend local ; approuver une commande à effet sur la prod se signe à la clé
+                # d'appareil (refuser reste possible au jeton local).
+                self._json(403, {"error": {"message": "carte prod : signe-la avec ta clé d'appareil "
+                                                      "(POST /v1/approvals/{id}/decision, docs/APPROVALS.md)",
+                                           "code": "device_key_required"}})
+                return
             if card.strength == "strong" and self.headers.get("X-Nokker-Relay"):
                 # À distance, une carte forte se signe avec la clé d'appareil (app.nokker.ai, téléphone), §7.3.
                 self._json(403, {"error": {"message": "carte forte : décide-la sur app.nokker.ai ou ton téléphone"}})
                 return
-            allowed = suggested_rules(card.tool_name, card.arguments, card.strength)
+            if card.strength == "strong" and card.rule == RELAY_CARD_RULE and decision == "approve":
+                # Envoi externe ou destructif d'un compte nokker.ai (X20b) : nokker.ai n'exécute que sur une carte
+                # signée par un appareil du compte ; approuvée ici, elle serait brûlée sans rien envoyer. Refuser reste
+                # possible en local.
+                self._json(403, {"error": {"code": "strong_approval_required",
+                                           "message": "envoi externe d'un compte nokker.ai : à signer sur ton "
+                                                      "téléphone (app.nokker.ai) ; la carte attend"}})
+                return
+            allowed = suggested_rules(card.tool_name, card.arguments, card.strength, card.rule)
             if scope not in ("once", "session", "always") or (scope != "once" and rule not in allowed):
                 self._json(400, {"error": {"message": "portée ou règle invalide (choisir parmi suggested_rules)"}})
                 return
@@ -1148,13 +1514,13 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     append_user_rule(local_api.settings_path, rule)
                     if Rule.parse(rule) not in perms.allow:
                         perms.allow.append(Rule.parse(rule))
-            if decided.status == "approved" and executor is not None:
-                try:
-                    executor.run(decided)
-                except Exception:  # noqa: BLE001 — l'échec est sur la carte (mark_failed), la réponse part
-                    logger.exception("ApprovalExecutor.run a levé pour l'approbation %s", decided.id)
+            # Réponse tout de suite (§7.4.9) : l'outil et le tour de suite tournent en fond, dans la file du fil, et se
+            # suivent par les événements (`tool.result` de l'appel en attente, `turn.*` de la suite).
+            continuation, _ = schedule_decision(decided)
             final = approvals.get(decided.id) or decided
-            self._json(200, {**approval_to_json(final), "scope": scope, "rule": rule if scope != "once" else None})
+            self._json(202 if continuation != "none" else 200,
+                       {**approval_to_json(final), "approval_id": decided.id, "continuation": continuation,
+                        "scope": scope, "rule": rule if scope != "once" else None})
 
         def _write_chunk(self, data: bytes) -> None:
             self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
@@ -1265,11 +1631,19 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             path = urlparse(self.path).path
             if self._local_route("GET", path):
                 return
+            if incidents_http.handle(self, "GET", path) or plan_http.handle(self, "GET", path):  # X18, drapeaux
+                return
             if cloud_http.handle(self, "GET", path):  # nokker.ai : lien Lokkal, passerelle, inférence relayée
                 return
             if path == "/healthz":
                 # version du noyau et plus vieux client accepté : le client terminal (Lokkal) s'y compare
-                self._json(200, {"status": "ok", "version": NOKKER_VERSION, "min_client_version": MIN_CLIENT_VERSION})
+                # `memory` (X1b) : ok | down (mode direct, base ou embed injoignable : détail par GET /v1/local/memory)
+                # | mcp | off. Le noyau reste « ok » : une mémoire en panne ne l'empêche pas de répondre.
+                mem = memory_status(kernel.memory)
+                mem_state = mem["mode"] if mem.get("ok") is None else ("ok" if mem["ok"] else "down")
+                # `gateway` : on | off | no_key | invalid_key (lien Lokkal de nokker.ai, `cloud_http.gateway_state`).
+                self._json(200, {"status": "ok", "version": NOKKER_VERSION, "min_client_version": MIN_CLIENT_VERSION,
+                                 "memory": mem_state, "gateway": cloud_http.gateway_state()})
                 return
             if path == "/metrics":
                 if ledger is None:
@@ -1291,7 +1665,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             # Onboarding (nokker/onboarding/http.py) : routes publiques, sans session (le testeur n'a pas encore de compte).
             if onboarding_http.handle(self, "GET", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                 return
-            if path.startswith("/v1/connectors") or path in ("/v1/account", "/v1/account/usage"):
+            if path.startswith("/v1/connectors") or path in ("/v1/account", "/v1/account/usage") \
+                    or (team_http.enabled() and team_http.is_team_path(path)):
                 self._account_route("GET", path)
                 return
 
@@ -1307,16 +1682,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
 
             # /v1/agents, /v1/users (docs/BUBBLES.md §9.2/§9.4) : INDÉPENDANTS de `hub`/`approvals` —
             # Crew et la liste de partage n'ont besoin que d'une identité résolue.
-            if agents is not None and path == "/v1/agents":
-                sender = self._resolve_identity()
-                if sender is None:
-                    self._json(401, {"error": {"message": "unauthorized"}})
-                    return
-                tid = self._tenant_for(sender)
-                if tid is None:
-                    return
-                with tenant_scope(tid):
-                    self._json(200, [agent_to_json(a) for a in agents.list_agents() if agent_tenant(a) == tid])
+            if agents is not None and (path == "/v1/agents" or path.startswith("/v1/agents/")):
+                self._agents_route("GET", path)
                 return
 
             if path == "/v1/users":
@@ -1552,7 +1919,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             path = urlparse(self.path).path
             if self._local_route("PUT", path):
                 return
-            if path.startswith("/v1/connectors") or path == "/v1/account/consent":
+            if path.startswith("/v1/connectors") or path == "/v1/account/consent" \
+                    or (team_http.enabled() and team_http.is_team_path(path)):
                 self._account_route("PUT", path)
                 return
             self._json(404, {"error": {"message": "not found"}})
@@ -1587,7 +1955,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         self._json(404, {"error": {"message": "not found"}})
                     else:
                         self._json(200, kernel.limits.usage(account.account_id))
-                elif onboarding_http.account_route(self, method, path, account):
+                elif onboarding_http.account_route(self, method, path, account) \
+                        or team_http.handle(self, method, path, account):  # équipe (X17), drapeau `team`
                     pass
                 elif not connectors_http.handle(self, method, path, account):
                     self._json(404, {"error": {"message": "not found"}})
@@ -1595,6 +1964,14 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
         def do_PATCH(self) -> None:
             path = urlparse(self.path).path
             if self._local_route("PATCH", path):
+                return
+            if incidents_http.handle(self, "PATCH", path) or plan_http.handle(self, "PATCH", path):  # X18, drapeaux
+                return
+            if team_http.enabled() and team_http.is_team_path(path):
+                self._account_route("PATCH", path)
+                return
+            if agents is not None and path.startswith("/v1/agents/"):
+                self._agents_route("PATCH", path)
                 return
             if hub is None or not path.startswith(("/v1/threads", "/v1/bubbles")):
                 self._json(404, {"error": {"message": "not found"}})
@@ -1655,6 +2032,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             path = urlparse(self.path).path
             if self._local_route("POST", path):
                 return
+            if incidents_http.handle(self, "POST", path) or plan_http.handle(self, "POST", path):  # X18, drapeaux
+                return
             if cloud_http.handle(self, "POST", path):  # nokker.ai : lien Lokkal, passerelle, inférence relayée
                 return
             if path != "/v1/chat/completions":
@@ -1663,14 +2042,15 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 if path == "/v1/telegram/webhook":
                     telegram_http.webhook(self)
                     return
-                if path == "/v1/telegram/pairing" or path == "/v1/feedback" or path.startswith("/v1/connectors"):
+                if path == "/v1/telegram/pairing" or path == "/v1/feedback" or path.startswith("/v1/connectors") \
+                        or (team_http.enabled() and team_http.is_team_path(path)):
                     self._account_route("POST", path)
                     return
                 if hub is not None and path.startswith(("/v1/threads", "/v1/bubbles")):
                     self._bubbles_route("POST", path, self._read_json_body())
                     return
-                if agents is not None and path == "/v1/agents":
-                    self._handle_agents_post()
+                if agents is not None and (path == "/v1/agents" or path.startswith("/v1/agents/")):
+                    self._agents_route("POST", path)
                     return
                 self._handle_approvals_post(path)
                 return
@@ -1696,7 +2076,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._json(400, {"error": {"message": "invalid JSON"}})
                 return
 
-            # `X-Session-Id` (docs/CLIENT-API.md, docs/BUBBLES.md §1) ou `X-Hermes-Session-Id` (gateway Hermes),
+            # `X-Session-Id` (docs/CLIENT-API.md, docs/BUBBLES.md §1) ou `X-Hermes-Session-Id` (passerelle amont),
             # préfixé par le locataire d'un testeur (docs/TENANCY.md §3) : même X-Session-Id, fils distincts.
             client_session = (self.headers.get("X-Session-Id") or self.headers.get("X-Hermes-Session-Id")
                               or str(uuid.uuid4()))
@@ -1761,12 +2141,18 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
             model_name = turn.calls[-1].model if turn.calls else "nokker"
-            self._json(200, {
+            out = {
                 "id": completion_id, "object": "chat.completion", "created": created, "model": model_name,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": turn.reply},
                              "finish_reason": "stop"}],
                 "usage": _usage_dict(turn),
-            })
+            }
+            delegated = getattr(local_api, "delegated", None) if local_api is not None else None
+            if delegated is not None and delegated.is_delegated(thread_id):
+                from nokker.local.delegation import turn_extension
+
+                out["nokker"] = turn_extension(turn)  # session déléguée (X21) : réponse finale ou carte en attente
+            self._json(200, out)
 
         def _run_turn(self, inp: TurnInput, sink: Any) -> Turn:
             if hub is not None:
@@ -1777,7 +2163,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
         def _stream_turn(self, inp: TurnInput, tokens: bool) -> None:
             """`stream: true` (P1, 19.10.2026) : en-têtes SSE TOUT DE SUITE, tour dans un fil de travail,
             `: ping` toutes les `STREAM_PING_S` tant que rien d'autre ne part (Cloudflare coupe à 100 s sans
-            octet). Sans `tokens` (gateway Hermes, tout client OpenAI) : à la fin, EXACTEMENT les trois chunks
+            octet). Sans `tokens` (passerelle amont, tout client OpenAI) : à la fin, EXACTEMENT les trois chunks
             d'avant (rôle, réponse + usage, stop) puis `[DONE]` — seuls les commentaires `: ping` s'ajoutent,
             ignorés par tout parseur SSE. Avec `tokens` (`X-Nokker-Stream-Tokens: 1`) : rôle d'emblée, deltas
             caviardés en direct, `nokker.reset` quand un appel finit en outils, puis un chunk final
@@ -1838,7 +2224,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     elif kind == "reset":
                         self._sse(_chunk({}, nokker={"reset": True}))
                 if "error" in outcome:
-                    # En-têtes déjà partis : l'erreur part dans le flux, sans `[DONE]` (la gateway Hermes
+                    # En-têtes déjà partis : l'erreur part dans le flux, sans `[DONE]` (la passerelle amont
                     # rapporte alors une réponse interrompue au lieu d'un texte vide présenté comme complet).
                     self._sse({"error": {"message": str(outcome["error"])}})
                     self.wfile.write(b"0\r\n\r\n")
@@ -1870,11 +2256,29 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 logger.info("client parti pendant le tour %s (le tour continue)", inp.thread_id)
                 self.close_connection = True
 
-        def _handle_agents_post(self) -> None:
-            """`POST /v1/agents` (docs/BUBBLES.md §9.4) — Crew minimal : crée l'agent directement
-            (status `armed`, pas d'exécution réelle), publie `agent.created`. Indépendant de `hub`."""
+        def _agents_route(self, method: str, path: str) -> None:
+            """Crew (docs/BUBBLES.md §9.4, §9.5). Identité vérifiée du locataire sur toutes les routes, sauf le webhook
+            signé (`POST /v1/agents/{id}/webhooks/{hook}`, pas d'identité : la signature HMAC de l'agent en tient lieu).
+            Un agent d'un autre locataire n'existe pas (404). Erreurs `{"error": {"message"}}` : 400 champ invalide,
+            404 inconnu, 409 état (passage déjà en cours, échéance passée, rejeu), 503 moteur ou approbations absents."""
+            from nokker.agents.hub import EngineUnavailable
+
             assert agents is not None
-            body = self._read_json_body()
+            m = _RE_AGENT_WEBHOOK.match(path)
+            if m and method == "POST":
+                engine = getattr(agents, "engine", None)
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if engine is None:
+                    self._json(404, {"error": {"message": "not found"}})
+                elif length > MAX_WEBHOOK_BODY:
+                    self._json(413, {"error": {"message": f"corps au-delà de {MAX_WEBHOOK_BODY // 1024} Kio"}})
+                else:
+                    raw = self.rfile.read(length) if length else b""
+                    from nokker.agents.engine import SIG_HEADER
+
+                    self._json(*engine.webhook(m.group(1), m.group(2), raw, self.headers.get(SIG_HEADER)))
+                return
+            body = self._read_json_body() if method in ("POST", "PATCH") else {}
             sender = self._resolve_identity(body)
             if sender is None:
                 self._json(401, {"error": {"message": "unauthorized"}})
@@ -1882,23 +2286,108 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             tid = self._tenant_for(sender)
             if tid is None:
                 return
-            with tenant_scope(tid):
-                self._create_agent(body, sender)
+            try:
+                with tenant_scope(tid):
+                    self._agents_dispatch(method, path, body, sender, tid)
+            except AgentNotFound as e:
+                self._json(404, {"error": {"message": f"inconnu : {e}"}})
+            except AgentMissing as e:  # déménagement refusé (X15) : ce qui manque à la destination, par noms
+                self._json(409, {"error": {"message": str(e), "missing": e.missing}})
+            except AgentConflict as e:
+                self._json(409, {"error": {"message": str(e)}})
+            except EngineUnavailable as e:
+                self._json(503, {"error": {"message": str(e)}})
+            except AgentError as e:
+                self._json(400, {"error": {"message": str(e)}})
 
-        def _create_agent(self, body: dict[str, Any], sender: str) -> None:
+        def _agent_project(self, body: dict[str, Any], sender: str) -> dict[str, Any] | None:
+            """Champ `project` d'un agent (équipe, X17) : drapeau `team` éteint = champ ignoré ; allumé = il faut être au
+            moins membre du projet (sinon 404, comme un projet inconnu). None = réponse d'erreur déjà envoyée."""
+            if "project" not in body:
+                return body
+            team = team_http.service()
+            if team is None or not body.get("project"):
+                return {k: v for k, v in body.items() if k != "project"} if team is None else body
+            from nokker.team.model import TeamError
+
+            account = tenancy.account(sender) if is_account(sender) else None
+            try:
+                if account is None:
+                    raise TeamError(404, "not_found", "projet inconnu")
+                return {**body, "project": team.check_agent_project(account, str(body.get("project")))}
+            except TeamError as e:
+                self._json(e.status, {"error": {"code": e.code, "message": e.message}})
+                return None
+
+        def _agents_dispatch(self, method: str, path: str, body: dict[str, Any], sender: str, tid: str) -> None:
             assert agents is not None
-            name = str(body.get("name", "")).strip()
-            role = str(body.get("role", "")).strip()
-            if not name or not role:
-                self._json(400, {"error": {"message": "name/role requis"}})
+            if path == "/v1/agents":
+                if method == "GET":
+                    self._json(200, [agent_to_json(a) for a in agents.list_agents() if agent_tenant(a) == tid])
+                elif method == "POST":
+                    body = self._agent_project(body, sender)
+                    if body is None:
+                        return
+                    self._json(201, agent_to_json(agents.create_from_body(body, sender)))
+                else:
+                    self._json(404, {"error": {"message": "not found"}})
                 return
-            tools = body.get("tools")
-            if tools is not None and not isinstance(tools, list):
-                self._json(400, {"error": {"message": "tools doit être une liste"}})
+            m = _RE_AGENT_RUN_CANCEL.match(path)
+            m1 = _RE_AGENT.match(path)
+            agent_id = (m or m1).group(1) if (m or m1) else None
+            if agent_id is None:
+                self._json(404, {"error": {"message": "not found"}})
                 return
-            agent = agents.create_agent(name=name, role=role, model=str(body.get("model", "")).strip(),
-                                        tools=[str(t) for t in (tools or [])], created_by=sender)
-            self._json(201, agent_to_json(agent))
+            if m1 and m1.group(2) == "move" and method == "POST":
+                # Déménagement (X15, LOKKAL §6.7) : l'agent peut vivre sur une machine (connu par son deck), pas ici.
+                self._json(200, agent_to_json(agents.move(agent_id, body.get("to"), sender, tid)))
+                return
+            a = agents.get_agent(agent_id)
+            if agent_tenant(a) != tid:
+                raise AgentNotFound(agent_id)  # un agent d'un autre locataire n'existe pas ici
+            if m and method == "POST":
+                self._json(200, run_to_json(agents.cancel_run(agent_id, m.group(2), sender)))
+                return
+            op = m1.group(2) if m1 else None
+            if op is None and method == "GET":
+                self._json(200, agent_to_json(a))
+            elif op is None and method == "PATCH":
+                body = self._agent_project(body, sender)
+                if body is None:
+                    return
+                self._json(200, agent_to_json(agents.patch_agent(agent_id, body, sender)))
+            elif op is None and method == "DELETE":
+                agents.delete_agent(agent_id, sender)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif op == "arm" and method == "POST":
+                agent, approval_id = agents.arm(agent_id, sender)
+                if approval_id:
+                    self._json(202, {"approval_id": approval_id, "agent": agent_to_json(agent)})
+                else:
+                    self._json(200, agent_to_json(agent))
+            elif op == "disarm" and method == "POST":
+                self._json(200, agent_to_json(agents.disarm(agent_id, sender)))
+            elif op == "run" and method == "POST":
+                self._json(202, {"run_id": agents.run_now(agent_id, sender).id})
+            elif op == "runs" and method == "GET":
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    limit = int((q.get("limit") or ["20"])[0])
+                except ValueError:
+                    raise AgentError("limit : entier attendu") from None
+                runs, nxt = agents.list_runs(agent_id, limit=limit, before=(q.get("before") or [None])[0])
+                self._json(200, {"runs": [run_to_json(r) for r in runs], "next_before": nxt})
+            elif op == "webhook-secret" and method == "POST":
+                from nokker.agents.engine import SIG_HEADER
+
+                key, hook = agents.webhook_secret(agent_id)
+                self._json(200, {"secret": key, "url": f"/v1/agents/{agent_id}/webhooks/{hook}",
+                                 "header": SIG_HEADER,
+                                 "signature": "t=<epoch>,v1=<hex HMAC-SHA256(secret, \"<t>.\" + corps brut)>"})
+            else:
+                self._json(404, {"error": {"message": "not found"}})
 
         def _handle_approvals_post(self, path: str) -> None:
             """Tout `POST` qui n'est pas `/v1/chat/completions` — `/v1/devices`, `/v1/devices/{id}/confirm`
@@ -1930,7 +2419,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     # (`devices approve <code>`) ou par le TOTP de CET utilisateur. Débit borné.
                     claimed = str(body.get("user", "")).strip().lower()
                     # Sans locataire interne (bêta OVH), un appareil ne naît que d'une invitation : même 401 pour
-                    # tout nom, pour ne pas révéler lesquels existent (trouvé par Nick sur app.nokker.ai le 21.10).
+                    # tout nom, pour ne pas révéler lesquels existent (trouvé en recette sur app.nokker.ai le 21.10).
                     if (not internal_tenant or not claimed or not approvals.is_authorized(claimed)
                             or not _anon_enroll_allowed()):
                         self._json(401, {"error": {"message": "unauthorized"}})
@@ -2041,11 +2530,14 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 except (ApprovalError, DeviceError) as e:
                     self._json(_approvals_error_status(e), {"error": {"message": str(e)}})
                     return
-                if executor is not None:
-                    try:
-                        executor.run(decided)
-                    except Exception:  # noqa: BLE001 — la décision est déjà actée ; l'exécution est best-effort ici
-                        logger.exception("ApprovalExecutor.run a levé pour l'approbation %s", decided.id)
+                # Même file par fil que la décision locale (§7.4.9). La réponse reste celle d'après l'exécution
+                # (executed/failed, lus par la Mini App) quand elle tient dans `DECISION_WAIT_S` ; sinon (un tour
+                # tourne encore sur le fil) : 200 avec la carte telle qu'elle est (`approved`), l'exécution suit en
+                # fond — la Mini App affiche alors « Approuvé, Nina va rendre compte sur le fil d'origine ». Sans
+                # borne, Cloudflare coupait à 100 s (524) alors que la décision était enregistrée (revue du 2.11).
+                if not schedule_decision(decided, continue_rejected=True)[1].wait(DECISION_WAIT_S):
+                    logger.info("décision %s : exécution encore en file après %.0f s, réponse sans attendre",
+                                decided.id, DECISION_WAIT_S)
                 final = approvals.get(decided.id) or decided
                 self._json(200, approval_to_json(final))
                 return
@@ -2082,11 +2574,16 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             path = urlparse(self.path).path
             if self._local_route("DELETE", path):
                 return
-            if path.startswith("/v1/connectors"):
+            if incidents_http.handle(self, "DELETE", path) or plan_http.handle(self, "DELETE", path):  # X18, drapeaux
+                return
+            if path.startswith("/v1/connectors") or (team_http.enabled() and team_http.is_team_path(path)):
                 self._account_route("DELETE", path)
                 return
             if hub is not None and _RE_THREAD_ONE.match(path):
                 self._bubbles_route("DELETE", path, {})
+                return
+            if agents is not None and path.startswith("/v1/agents/"):
+                self._agents_route("DELETE", path)
                 return
             if approvals is None:
                 self._json(404, {"error": {"message": "not found"}})
@@ -2131,6 +2628,43 @@ def _start_notify_sweeper(hub: BubbleHub, period_s: float = 30.0) -> None:
     threading.Thread(target=loop, daemon=True, name="nokker-notify-sweeper").start()
 
 
+def crew_engine_enabled(config: NokkerConfig) -> bool:
+    """Le moteur tourne dans Lokkal (sauf `local.crew.enabled: false`) ; ailleurs (nokker.ai) seulement sur demande
+    explicite (`NOKKER_CREW_ENGINE=1`) : des agents qui tournent chez nokker.ai, c'est une décision d'offre (§6.7)."""
+    if config.local:
+        return bool((config.local.get("crew") or {}).get("enabled", True))
+    return os.environ.get("NOKKER_CREW_ENGINE", "").strip() == "1"
+
+
+def start_crew_engine(config: NokkerConfig, agents_hub: AgentsHub, kernel: Kernel, *, hub: BubbleHub | None,
+                      approvals: BaseApprovals | None, tenancy: Tenancy, local_api: Any | None, remote: Any = None,
+                      local_runs: bool = True, start: bool = True) -> Any:
+    """Moteur Crew (lot X14, docs/BUBBLES.md §9.5) : passages réels des agents, ordonnanceur en fil de fond. Les
+    secrets d'un passage viennent du coffre local (X4) ; sans coffre, un agent qui en déclare est `skipped`."""
+    from nokker.agents.engine import AgentEngine
+    from nokker.store.conn import known_tenants
+
+    account_tenant = account_tenant_fn(tenancy)
+    dsn = config.pg_dsn()
+    vault = local_api.vault if local_api is not None else None
+    setup = local_api.setup if local_api is not None else None
+    if setup is not None:
+        agents_hub.local_machine = lambda: setup.state.get("machine_id")
+    crew = config.local.get("crew") or {} if config.local else {}
+    engine = AgentEngine(
+        hub=agents_hub, kernel=kernel, bubbles=hub, approvals=approvals,
+        resolver=vault.resolver if vault is not None else None,
+        tenants=(lambda: known_tenants(dsn)) if dsn else None,
+        tenant_of=lambda a: (account_tenant(a.created_by) or "") if is_account(a.created_by) else INTERNAL_TENANT,
+        tick_s=float(crew.get("tick_s", 15)), max_concurrent=int(crew.get("max_concurrent", 2)),
+        misfire_s=float(crew.get("misfire_s", 6 * 3600)), remote=remote, local_runs=local_runs)
+    if start:
+        engine.start()
+    logger.info("crew : moteur des agents lancé (tick %.0f s, %d passages en même temps au plus)", engine.tick_s,
+                engine.max_concurrent)
+    return engine
+
+
 def build_tenancy(config: NokkerConfig) -> Tenancy:
     """Comptes et locataires (docs/TENANCY.md) : Postgres si un DSN est configuré, mémoire sinon (dev, tests)."""
     dsn = config.pg_dsn()
@@ -2159,6 +2693,14 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
 
             code_prefix = _code_prefix(code_prefix, project_memory=True)
         config = dataclasses.replace(config, prefix_path=code_prefix, profile_path=None)
+    config_mcp_names = [str(s.get("name") or "") for s in config.mcp_tool_servers]
+    if local_api is not None:
+        # Lot X16 : serveurs MCP ajoutés depuis une session (`mcp_server_add`, carte) et effets déclarés par les packs
+        # installés, lus AU DÉMARRAGE seulement. Un effet de pack ne fait que relever la table (jamais la baisser) ;
+        # un nom de serveur déjà pris par config.yaml l'emporte.
+        from nokker.tools.packs import user_home, with_user_extensions
+
+        config = with_user_extensions(config, user_home(local_api.state_dir))
     events = EventBus() if (config.approvals_enabled or config.bubbles_enabled or config.agents_enabled) else None
     hub = build_hub(config, events) if config.bubbles_enabled else None
     # Crew minimal (docs/BUBBLES.md §9.4) : indépendant de `hub`/`approvals` — posé sur `hub.agents_hub`
@@ -2176,12 +2718,14 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             if config.approvals_enabled else None
         connector_store = build_connector_store(config)
         resolve = local_api.vault.resolver().resolve if local_api is not None and local_api.vault is not None else None
-        provider = ConnectorsForTenant(connector_store, tenancy.account_for_tenant, resolve=resolve) \
-            if connector_store else None
+        # Localité des connecteurs (docs/LOKKAL.md §6.7) : posés dans Lokkal = `local`, chez nokker.ai = `cloud`.
+        locality = "local" if local_api is not None else "cloud"
+        provider = ConnectorsForTenant(connector_store, tenancy.account_for_tenant, resolve=resolve,
+                                       locality=locality) if connector_store else None
         delegate = None
         extra = None
         if local_api is not None:
-            # Sous-agents (L3, couloir features) : l'enfant est une copie du noyau parent (mêmes portes, approbations,
+            # Sous-agents (L3) : l'enfant est une copie du noyau parent (mêmes portes, approbations,
             # fournisseurs, max_tokens, max_calls) autour du registre filtré par `delegate`.
             import dataclasses as _dc
 
@@ -2190,25 +2734,85 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             parent: dict[str, Kernel] = {}
             # Hooks (X3) : le registre filtré de l'enfant en est entouré aussi ; le coureur ne lance chez un sous-agent
             # que les hooks d'un bloc `"subagents": true` (héritage explicite, nokker/tools/hooks.py).
+            def child_tools(registry: Any) -> Any:
+                # Même enveloppe que le registre du parent : hooks (X3), puis journal d'audit (X11) par-dessus.
+                tools = local_api.hooks.wrap(registry) if local_api.hooks is not None else registry
+                audited = getattr(parent["k"], "tools", None)
+                return audited.wrap(tools) if isinstance(audited, AuditedTools) else tools
+
             delegate = DelegateToolSource(
                 lambda registry, thread_id, observer: _dc.replace(
-                    parent["k"], observer=observer,
-                    tools=local_api.hooks.wrap(registry) if local_api.hooks is not None else registry),
+                    parent["k"], observer=observer, tools=child_tools(registry)),
                 local_api.code, emit=events.publish if events is not None else None, parent_observer=hub)
             extra = [*local_api.tool_sources(), delegate]
+            # Packs d'agents et serveurs MCP ajoutés (lot X16) : installer pose des compétences scannées et PROPOSE
+            # des agents (bulles agent_draft) ; ajouter un serveur écrit un fichier lu au prochain démarrage.
+            from nokker.bubbles.tools import propose_agent_draft
+            from nokker.tools.mcp_config import FILE_NAME as _MCP_FILE, McpConfigToolSource
+            from nokker.tools.packs import PackToolSource, user_home
+
+            _hub = hub
+
+            def _propose(args: dict[str, Any], ctx: Any, extra_state: dict[str, Any]) -> Any:
+                return propose_agent_draft(_hub, ctx, args, extra_state)
+
+            _vault = local_api.vault
+            ext_dir = user_home(local_api.state_dir)  # le même dossier que celui lu au démarrage
+            extra.append(PackToolSource(home=ext_dir, propose=_propose if _hub is not None else None))
+            extra.append(McpConfigToolSource(
+                path=ext_dir / _MCP_FILE,
+                known_secrets=(lambda: [i.name for i in _vault.list()]) if _vault is not None else None,
+                configured=lambda: list(config_mcp_names)))
+            if local_api.relayed_enabled and local_api.setup is not None:
+                # Connecteurs relayés (lot X20, drapeau `local.relayed_connectors`) : les connecteurs posés chez
+                # nokker.ai, appelés par le lien de compte ; l'identifiant reste là-bas. En dernier : un outil local
+                # du même nom passe devant.
+                from nokker.local.relayed import RelayedConnectors
+
+                _setup = local_api.setup
+                local_api.relayed = RelayedConnectors(
+                    base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
+                    token=lambda: _setup.vault.get("machine_token"), approvals=approvals,
+                    journal_path=(local_api.state_dir or Path("~/.config/nokker").expanduser()) / "relay-audit.jsonl")
+                extra.append(local_api.relayed)
         kernel = build_kernel(config, ledger=ledger, approvals=approvals, hub=hub, connectors=provider,
                               extra_sources=extra, secrets=local_api.vault if local_api is not None else None)
         if delegate is not None:
             parent["k"] = kernel
             delegate.bind(getattr(kernel.tools, "internal", kernel.tools))
-        connectors_http.configure(Connectors(connector_store, resolve=resolve) if connector_store else None)
+        if local_api is not None and local_api.relayed is not None:
+            local_api.relayed.on_change = lambda: kernel.tools.refresh()  # liste changée : l'index du tour suit
+            local_api.relayed.start()  # relue toutes les 60 s ; machine non liée : aucun outil, aucun appel
+        connectors_http.configure(Connectors(connector_store, resolve=resolve, locality=locality)
+                                  if connector_store else None)
         configure_onboarding(config, tenancy, approvals)
-        configure_cloud_link(config, tenancy, approvals, ledger, store=kernel.store)
-        if cloud_http._cloud is not None:  # skill « sessions Lokkal » (§6.4) pour les comptes : outil DESTRUCTIVE
+        configure_cloud_link(config, tenancy, approvals, ledger, store=kernel.store,
+                             connector_store=connector_store if local_api is None else None,
+                             invariants=kernel.invariants, limits=kernel.limits)
+        configure_team(config, tenancy, agents=agents_hub, scrub=kernel.invariants.scrub_output)
+        configure_plan_operate(config, kernel, agents=agents_hub, hub=hub, approvals=approvals, tenancy=tenancy,
+                               events=events)
+        if cloud_http._cloud is not None:  # skill « sessions Lokkal » (§6.4) pour les comptes liés : outil DESTRUCTIVE
             from nokker.cloud.lokkal_session import LokkalSessionTools
 
             kernel.tools.tester_sources.append(LokkalSessionTools(links=cloud_http._cloud.links,
                                                                   signer=cloud_http._cloud.signer))
+            if cloud_http._cloud.handoffs is not None:
+                # Délégation par besoin (X21) : le modèle PROPOSE (outil READ), l'utilisateur accepte (bulle ou route) ;
+                # le résultat revient en bulle et dans le contexte du fil web.
+                from nokker.cloud.handoff import HandoffTools, bubble_updater
+
+                service = cloud_http._cloud.handoffs
+                service.scrub = kernel.invariants.scrub_output
+                if hub is not None:
+                    hub.handoffs = service
+                    service.on_update = bubble_updater(hub)
+                kernel.tools.tester_sources.append(HandoffTools(service=service,
+                                                                tenant_of=cloud_http._cloud.tenant_of))
+            # Ces deux outils n'existent que pour un compte qui a une machine liée et non révoquée (`available_for`) :
+            # un lien ou une révocation reconstruit le jeu d'outils de son locataire.
+            if hasattr(kernel.tools, "forget"):
+                cloud_http._cloud.links.on_change = kernel.tools.forget
             kernel.tools.refresh()
         configure_feedback(config, kernel)
         configure_telegram(config, tenancy, kernel, hub, approvals)
@@ -2240,6 +2844,18 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                                       vision=config.vision_for_model(model))
             kernel.providers[Tier.SHIP] = provider
             kernel.providers[Tier.DEEP] = provider
+            # X8 : hors du point d'accès du petit palier (clé de l'utilisateur, modèle local), un seul modèle — le petit
+            # palier part (la politique se replie sur Ship) et le juge non choisi en config suit le modèle choisi.
+            small = config.tiers.get("small")
+            if small is None or small.base_url.rstrip("/") != base_url.rstrip("/"):
+                kernel.providers.pop(Tier.SMALL, None)
+            if not config.judge_explicit:
+                for role in (kernel.reviewer, kernel.advisor):
+                    t = getattr(role, "transport", None)
+                    if t is not None:
+                        t.base_url, t.api_key, t.model = base_url, api_key, model
+                        t._plain = False  # le nouvel amont accepte peut-être `reasoning_effort`
+                        role.model_name = model
 
         local_api.on_default_model = use_default_model
         try:
@@ -2255,7 +2871,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             # accept_edits par défaut : chaque écriture du dossier est photographiée (points de retour), donc
             # réversible ; les commandes et le destructif restent demandés.
             mode=config.local.get("mode"), fallback=Mode.ACCEPT_EDITS,
-            user_settings=Path(config.local.get("settings_path") or "~/.config/nokker/settings.json").expanduser()))
+            user_settings=Path(config.local.get("settings_path") or "~/.config/nokker/settings.json").expanduser()),
+            code_session=lambda tid: local_api.code.for_thread(tid) is not None)
         perms = kernel.gates.permissions
         if local_api.hooks_enabled:
             # Hooks des sessions (lot X3, drapeau `local.hooks`) : autour du registre du noyau, donc de tout appel
@@ -2267,9 +2884,23 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                                          mode_of=perms.mode_for, emit=events.publish if events is not None else None)
             kernel.tools = local_api.hooks.wrap(kernel.tools)
 
+        team_rules = None
+        if config.local.get("team") and local_api.setup is not None:
+            # Équipe (X17, drapeau `local.team`) : les règles des projets qui déclarent le dépôt restreignent le fil.
+            from nokker.local.team import TeamRules
+
+            setup = local_api.setup
+            team_rules = TeamRules(base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
+                                   token=lambda: setup.vault.get("machine_token") or "", state=setup.state,
+                                   save=setup._save)
+
         def on_session_open(thread_id: str, cwd: str) -> dict[str, Any] | None:
             # Le dépôt restreint son fil (comme `nokker code`), AVANT les hooks : en mode plan, aucun ne tourne.
             perms.restrict_for_thread(thread_id, Path(cwd) / ".nokker" / "settings.json")
+            if team_rules is not None:  # puis les projets d'équipe du dépôt (restreindre seulement, X17)
+                from nokker.local.team import restrict_session
+
+                restrict_session(perms, team_rules, thread_id, cwd, local_api._root_of(cwd) or cwd)
             return {"hooks": local_api.hooks.open_session(thread_id, cwd)} if local_api.hooks is not None else None
 
         local_api.on_session_open = on_session_open
@@ -2278,6 +2909,39 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
 
             local_api.project_memory.emit = events.publish if events is not None else None
             install_project_memory(kernel, local_api.project_memory)
+        if local_api.ssh is not None:
+            # Ops (lot X11, drapeau `local.ops`) : plancher par rôle devant les permissions, puis le journal d'audit
+            # autour du registre ENTIER (hooks compris), donc de tout appel exécuté (tour, appel direct, carte
+            # approuvée ; les sous-agents reçoivent la même enveloppe, `child_tools`).
+            from nokker.tools.ssh import REMOTE_TOOLS
+
+            perms_gates = kernel.gates
+            perms_gates.floors.append(local_api.ssh.floor)
+            kernel.tools = AuditedTools(inner=kernel.tools, log=local_api.audit, scrub=kernel.invariants.scrub_output,
+                                        describe=[local_api.ssh.describe], remote=frozenset(REMOTE_TOOLS))
+            logger.info("lokkal : ops allumé (inventaire %s, journal %s)", local_api.ssh.hosts_path,
+                        local_api.audit.path)
+    cloud_crew = cloud_http._cloud.crew if cloud_http._cloud is not None and local_api is None else None
+    if agents_hub is not None and cloud_crew is not None:
+        # nokker.ai (X15) : `placement` auto / web / machines du compte, déménagement, deck ; le moteur tourne pour
+        # envoyer les passages aux machines, et n'exécute ici (agents `web`) qu'avec NOKKER_CREW_ENGINE=1.
+        from nokker.cloud.crew import CloudPlacement
+
+        agents_hub.placement_policy = CloudPlacement(links=cloud_crew.links, web_allowed=cloud_crew.web_allowed)
+        agents_hub.mover = cloud_crew
+        cloud_http._cloud.agents = agents_hub
+    crew_engine = None
+    if agents_hub is not None and (crew_engine_enabled(config) or cloud_crew is not None):
+        crew_engine = start_crew_engine(config, agents_hub, kernel, hub=hub, approvals=approvals, tenancy=tenancy,
+                                        local_api=local_api, remote=cloud_crew,
+                                        local_runs=crew_engine_enabled(config),
+                                        start=local_api is None)  # Lokkal : lancé une fois le retour vers nokker.ai posé
+        if cloud_crew is not None:
+            cloud_crew.engine = crew_engine
+        # `agent_draft` décrit les déclencheurs selon la présence du moteur (posé ici, après le noyau) : l'index se relit.
+        refresh = getattr(kernel.tools, "refresh", None)
+        if callable(refresh):
+            refresh()
     if config.admin_enabled:
         start_admin(config)
     # Sans clé d'API configurée, le serveur n'est PLUS ouvert par défaut (bêta OVH : `api_keys: []`, seuls les jetons de
@@ -2302,7 +2966,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         local_api.mirror = MirrorWorker(
             store=kernel.store, base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
             token=lambda: setup.vault.get("machine_token") or "", state=setup.state,
-            save=setup._save)  # le propriétaire local est dans le locataire interne
+            save=setup._save,  # le propriétaire local est dans le locataire interne
+            notes=local_api.project_memory)  # notes `both` seulement (X21) ; None : pas de notes en miroir
         local_api.mirror.start()
         logger.info("lokkal : miroir web ⇄ machine lancé")
     if local_api is not None:
@@ -2320,11 +2985,60 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             except Exception:  # noqa: BLE001 — coffre sans clé : machine considérée non liée
                 return None
 
+        if local_api.inventory is not None:
+            # Inventaire des ressources `local` (X21), par NOMS : connecteurs posés dans Lokkal, serveurs MCP déclarés.
+            def local_connectors() -> list[str]:
+                if connectors_http._connectors is None:
+                    return []
+                return [c["kind"] for c in connectors_http._connectors.cards(LOCAL_OWNER)
+                        if c.get("state") not in (None, "absent")]
+
+            local_api.inventory.connectors = local_connectors
+            local_api.inventory.mcp = lambda: [str(m.get("name") or "") for m in config.mcp_tool_servers]
+        if agents_hub is not None and crew_engine is not None:
+            # Agents du deck multi-machines (X15) : passages demandés par nokker.ai, déménagements, deck publié avec la
+            # charge (noms et états ; titres des fils seulement s'ils sont en miroir).
+            from nokker.local.crew import LocalCrew
+
+            def title_of(thread_id: str) -> str | None:
+                t = hub.threads.get(thread_id) if hub is not None else None
+                return getattr(t, "title", None) if t is not None else None
+
+            local_api.crew = LocalCrew(
+                hub=agents_hub, base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai",
+                token=machine_token, owner=LOCAL_OWNER, active=active.threads, sessions=local_api.code.sessions,
+                approvals=approvals, title_of=title_of, mirrored=lambda: local_api.mirror is not None)
+            crew_engine.on_guest = local_api.crew.report
+        if crew_engine is not None:
+            crew_engine.start()  # reprise après redémarrage : un passage invité interrompu est rendu à nokker.ai
         local_api.load = LoadReporter(
             base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai", token=machine_token,
             measure=lambda: measure(version=NOKKER_VERSION, sessions=len(local_api.code.sessions()),
-                                    active_turns=active.count(), gpus=nvidia_gpus))
+                                    active_turns=active.count(), gpus=nvidia_gpus),
+            resources=local_api.inventory.collect if local_api.inventory is not None else None,
+            deck=local_api.crew.snapshot if local_api.crew is not None else None)
         local_api.load.start()
+        if local_api.delegated is not None:
+            # Tours des sessions déléguées par nokker.ai (X21) : leur réponse, et elle seule, repart vers le fil web
+            # (y compris la suite d'un tour après une carte décidée sur la machine ou au téléphone).
+            kernel.run_turn = local_api.delegated.wrap(kernel.run_turn)
+    if local_api is not None and approvals is not None and local_api.setup is not None \
+            and config.local.get("remote_approvals", True):
+        # Approbations fortes depuis le téléphone (lot X10, docs/LOKKAL.md §7.3) : une carte forte part à nokker.ai
+        # quand la machine est liée (jeton relu à chaque passage), la preuve revient et se vérifie ICI, puis la carte
+        # est appliquée par le même chemin que la décision locale.
+        from nokker.approvals.notify import ChainNotifier
+        from nokker.local.remote_approvals import RemoteApprovals
+
+        setup = local_api.setup
+        local_api.remote_approvals = RemoteApprovals(
+            base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai", token=machine_token,
+            account=lambda: setup.state.get("account"), approvals=approvals, apply=local_api.apply_decision,
+            scrub=kernel.invariants.scrub_output, decided_by=LOCAL_OWNER, state=setup.state, save=setup._save)
+        approvals.notifier = ChainNotifier((approvals.notifier, local_api.remote_approvals))
+        if local_api.relayed is not None:  # X20b : la signature vérifiée d'une carte forte part avec l'appel relayé
+            local_api.relayed.signed = local_api.remote_approvals.signed_proof
+        local_api.remote_approvals.start()
     if local_api is not None and config.local.get("relay_url"):
         if local_api.start_tunnel(config.local["relay_url"], f"http://127.0.0.1:{config.port}",
                                   config.local.get("web_base")):

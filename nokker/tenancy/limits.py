@@ -1,7 +1,7 @@
 """Quotas des testeurs (docs/TENANCY.md §5) : par compte (`Turn.sender`), des tours sur deux fenêtres, et des appels
 Deep. Le locataire interne n'a aucun quota.
 
-Offre Solo (décision de Nick, 22.10.2026) : 40 tours par jour et 200 par semaine. Le jour repart à 12:00 UTC, la
+Offre Solo (décision produit du 22.10.2026) : 40 tours par jour et 200 par semaine. Le jour repart à 12:00 UTC, la
 semaine le lundi à 06:00 UTC. Les deux fenêtres ne s'alignent pas : chacune a son compteur (`turns` sur la date du
 début du jour, `week_turns` sur la date du lundi), jamais une somme de jours.
 

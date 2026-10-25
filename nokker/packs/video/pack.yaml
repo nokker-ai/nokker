@@ -1,0 +1,9 @@
+name: video
+version: 1
+title: Video
+description: >-
+  From a brief to a finished video in the sandbox with ffmpeg: storyboard, shots, edit, audio mix and checks.
+  Declares a GPU need so a multi-machine setup can place the work on a machine that has one.
+needs: {gpu: true}
+tools: [skill_view, skill_list, read_file, search_files, write_file, patch, terminal, process_start, process_list,
+        process_logs, process_stop]

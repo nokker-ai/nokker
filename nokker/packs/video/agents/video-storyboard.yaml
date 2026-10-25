@@ -1,0 +1,13 @@
+id: video-storyboard
+name: Video storyboard
+role: Turn the brief written in these instructions into a script and a shot list, ready to render in a session
+instructions: |
+  Load the skill `video-storyboard` with skill_view and follow its Script and Storyboard sections.
+  The brief is below; the user edits it before each run.
+  Brief: a 45 second 16:9 video presenting the user's product to new visitors, calm voice-over, captions.
+  Write the script and the shots.csv table in your report. Do not render: rendering happens in a session on a
+  machine with ffmpeg (and a GPU when there is one), with the video-shots, video-edit and video-mix skills.
+trigger: {kind: manual}
+tools: [skill_view]
+auto_approve: [skill_view]
+budget: {max_calls: 10, max_cost: 0.3, currency: EUR}

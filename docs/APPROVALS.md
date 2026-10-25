@@ -6,7 +6,7 @@
 > `nokker/api/miniapp/`) et le chantier clients (`nokker-apps` : SDK, CLI, web, faux serveur) — §3/§5
 > portent les noms RÉELS, pas des hypothèses.
 
-Doctrine Nick (17.10) : Nokker a tous les droits, l'humain reste maître de sa demande et de ses conséquences. Il n'y a
+Doctrine produit (17.10) : Nokker a tous les droits, l'humain reste maître de sa demande et de ses conséquences. Il n'y a
 pas de classifieur bloquant. Une action à effet que les invariants mettent en `HITL` n'est **jamais exécutée** sans une
 approbation **prouvée cryptographiquement** par un humain autorisé (un opérateur de la config, ou son suppléant s'il est injoignable). L'avis de
 Nina (risques, sauvegarde, retour arrière) accompagne la carte et ne bloque rien.
@@ -18,7 +18,7 @@ Nina (risques, sauvegarde, retour arrière) accompagne la carte et ne bloque rie
 | `strong` | clé d'appareil libérée par biométrie : Mini App Telegram (BiometricManager, signature + `initData` vérifié), WebAuthn/passkey (Touch ID, Face ID, Windows Hello) **avec flag UV**, app native (Secure Enclave / StrongBox) — une signature d'appareil SANS cette preuve biométrique (clé logicielle CLI : trousseau ou fichier 0600, sans `initData` Telegram) est refusée (`ProofInvalid`, durcissement du 18.10.2026) | `DESTRUCTIVE` |
 | `standard` | `strong` **ou** TOTP (web sans passkey) **ou** simple signature d'appareil par une clé logicielle (CLI, sans biométrie) | `SEND_EXTERNAL` hors allowlist, `SPEND` |
 
-`SEND_BULK` reste **toujours `DENY`** (décision Nick 17.10, `qa/invariants.py`) — jamais soumis à une approbation,
+`SEND_BULK` reste **toujours `DENY`** (décision produit du 17.10, `qa/invariants.py`) — jamais soumis à une approbation,
 donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `strength`, posé par
 `DeterministicInvariants.check_action`) ; un GO textuel dans le message ne remplace jamais une approbation `strong`.
 
@@ -56,6 +56,10 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
   [/Approbation]
   ```
   Un refus produit le même tour de continuation, sans appel d'outil (`Résultat : refusé par <decided_by>.`).
+  **File par fil (25.10, docs/LOKKAL.md §7.4.9)** : l'outil et le tour de continuation passent par la file du fil,
+  après le tour en cours (jamais en parallèle : même index, contexte perdu) ; la sortie de l'outil est publiée en
+  `tool.result` (même `call_id` que l'appel en attente, `approval_id`) avant la continuation. La décision locale
+  répond tout de suite (`202`, `continuation`) ; cette route-ci attend encore la fin de l'exécution.
 - **Journal** : chaque transition est append-only (table `approval_events`, `_append_event`). Rien n'est effacé.
 
 ## 3. Preuve
@@ -75,7 +79,7 @@ L'appareil reste `pending` jusqu'à confirmation par un moyen déjà de confianc
   `Approvals.enroll_totp_secret`, hors API — provisionné par un outil d'exploitation, jamais relu/renvoyé).
   Le TOTP doit être celui du **propriétaire** de l'appareil (`device.user`).
 
-### 3.1bis Enrôlement d'un navigateur sans identité préalable (autorisé par Nick le 18.10.2026)
+### 3.1bis Enrôlement d'un navigateur sans identité préalable (décision produit du 18.10.2026)
 
 Un navigateur neuf n'a ni clé d'API, ni session, ni initData. Il envoie `POST /v1/devices` sans preuve avec en plus
 `"user": "alice"` (utilisateur DÉCLARÉ, qui doit être un utilisateur autorisé — `GoAuthorizedSenders`). L'appareil

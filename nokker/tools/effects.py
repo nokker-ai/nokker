@@ -13,6 +13,7 @@ Ce module fournit :
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,8 +24,7 @@ from nokker.qa.secrets import KnownSecrets, redact
 
 # ─────────────────────────────── table par défaut ───────────────────────────────
 #
-# Dérivée du banc `infra/sokkan/openclaw-eval/tasks.py` (ids des outils stubés) et du canari
-# (`infra/nokker-workspace-mcp/`). Un nom absent de cette table → WRITE (défaut prudent).
+# Dérivée d'un banc interne (ids des outils stubés) et du canari. Un nom absent de cette table → WRITE (défaut prudent).
 
 DEFAULT_EFFECTS: dict[str, Effect] = {
     # calendar_* (nina-calendar / workspace MCP)
@@ -66,7 +66,7 @@ DEFAULT_EFFECTS: dict[str, Effect] = {
     "memory_search": Effect.READ,
     "memory_get": Effect.READ,
     "memory_write": Effect.WRITE,
-    # browser_* (brosim)
+    # browser_* (navigateur partagé)
     "browser_navigate": Effect.READ,
     # Lecture seule (21.10.2026) : sans entrée ici, le défaut prudent WRITE les privait du dédoublonnage des lectures.
     "browser_snapshot": Effect.READ,
@@ -79,7 +79,7 @@ DEFAULT_EFFECTS: dict[str, Effect] = {
     "browser_click": Effect.WRITE,
     "browser_fill": Effect.WRITE,
     "browser_submit": Effect.SEND_EXTERNAL,
-    # Carnet d'incidents (24.10, recos suivies par Nick) : du code arbitraire dans un Chrome connecté (C2), un fichier
+    # Carnet d'incidents (24.10, recommandations retenues) : du code arbitraire dans un Chrome connecté (C2), un fichier
     # local envoyé à un site (C3) ; `browser_handle_dialog` : par argument, ci-dessous (F1).
     "browser_evaluate": Effect.DESTRUCTIVE,
     "browser_file_upload": Effect.SEND_EXTERNAL,
@@ -99,13 +99,30 @@ DEFAULT_EFFECTS: dict[str, Effect] = {
 }
 
 
-def _mail_move_effect(arguments: dict) -> Effect:
+# Noms de la corbeille selon le fournisseur : libellé système Gmail `TRASH`, dossiers IMAP usuels (`Trash`, `Deleted
+# Items` d'Outlook, `Deleted Messages` d'iCloud, `Éléments supprimés`…), quelques langues. Comparés au DERNIER morceau
+# du chemin (`[Gmail]/Corbeille`, `INBOX.Trash`), sans casse ; « Corbeille à papier » ou « Trash-notes » n'en sont pas.
+# Un nom absent d'ici mais que le serveur marque `\Trash` est refusé par le connecteur mail lui-même (`mail_move`).
+TRASH_NAMES = frozenset({"trash", "corbeille", "bin", "deleted", "deleted items", "deleted messages",
+                         "éléments supprimés", "elements supprimes", "papierkorb", "gelöschte elemente", "cestino",
+                         "posta eliminata", "papelera", "elementos eliminados", "lixeira", "lixo"})
+
+
+def is_trash_destination(destination: Any) -> bool:
+    """`destination` de `mail_move` (`label:<nom>` ou nom nu) qui désigne la corbeille du fournisseur."""
+    dest = str(destination or "").strip()
+    if dest.lower().startswith("label:"):
+        dest = dest[6:]
+    dest = dest.strip().strip("\"'").strip()
+    last = re.split(r"[/.]", dest)[-1] if dest else ""
+    return " ".join(last.split()).casefold() in TRASH_NAMES
+
+
+def mail_move_effect(arguments: dict) -> Effect:
     """`label:TRASH` = la corbeille par l'outil de rangement (le serveur workspace accepte tout libellé existant,
-    système compris) : même porte que `mail_trash` (carnet d'incidents B2, 24.10)."""
-    dest = str(arguments.get("destination") or "").strip().lower()
-    if dest.startswith("label:") and dest[6:].strip() in {"trash", "corbeille", "bin"}:
-        return Effect.DESTRUCTIVE
-    return Effect.WRITE
+    système compris) : même porte que `mail_trash` (carnet d'incidents B2, 24.10). Même règle pour le connecteur mail
+    du compte (`connectors/mail.py`) et pour sa classe chez nokker.ai quand il est relayé (`cloud/relay.py`)."""
+    return Effect.DESTRUCTIVE if is_trash_destination((arguments or {}).get("destination")) else Effect.WRITE
 
 
 def _calendar_effect(arguments: dict) -> Effect:
@@ -122,7 +139,7 @@ def _dialog_effect(arguments: dict) -> Effect:
 
 # Effet qui dépend des ARGUMENTS d'un outil MCP (`ToolSpec.effect_of`) ; l'effet de la table reste le repli.
 ARGUMENT_EFFECTS: dict[str, Callable[[dict], Effect]] = {
-    "mail_move": _mail_move_effect,
+    "mail_move": mail_move_effect,
     "calendar_create": _calendar_effect,
     "calendar_update": _calendar_effect,
     "browser_handle_dialog": _dialog_effect,

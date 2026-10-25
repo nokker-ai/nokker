@@ -117,7 +117,7 @@ def test_score_threshold_is_040_by_default():
 
 
 # ─────────────────────── A-2 : règle d'injection du hook de prod (named/kept) ───────────────────────
-# Port de `infra/sokkan/memory/hook_prompt_recall.py` (dépôt interne) : score>=0.40, OU rerank>=0.5
+# Port de `hook_prompt_recall.py` (dépôt interne) : score>=0.40, OU rerank>=0.5
 # avec score>=0.25, OU le nom de la note cité dans le message.
 
 def test_named_full_slug_cited():

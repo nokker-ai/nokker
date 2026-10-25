@@ -1,7 +1,7 @@
 """Interfaces (ports) du noyau. Chaque pilier est derrière UN port ; la boucle ne connaît que ces ports.
 
 Règle : une implémentation ne dépend que de `nokker.core.turn` et de sa propre bibliothèque.
-Les briques Hermes (gateway, STT, client MCP) se branchent derrière ces ports, jamais dans la boucle.
+Les briques de la bibliothèque amont (passerelle, STT, client MCP) se branchent derrière ces ports, jamais dans la boucle.
 """
 from __future__ import annotations
 
@@ -29,6 +29,11 @@ class ToolSpec:
     # Lecture dont le résultat change d'un appel à l'autre sans qu'aucun outil n'écrive (journal d'un processus en
     # arrière-plan) : jamais resservie par le cache des lectures du tour (`core/loop.py::_tool_step`).
     fresh: bool = False
+    # Localité (docs/LOKKAL.md §6.7) : où vit la ressource que l'outil touche. « cloud » = chez nokker.ai, avec un
+    # identifiant qui n'en sort pas (connecteur posé au web ; dans Lokkal : connecteur relayé, lot X20) ; « local » =
+    # sur la machine (connecteur posé dans Lokkal) ; « both » = des deux côtés ; None = non déclaré, là où tourne le
+    # noyau (outils intégrés). Valeurs et filtre à l'envoi : `nokker/core/locality.py` (lot X21).
+    locality: str | None = None
 
     def effect_for(self, arguments: dict[str, Any]) -> Effect:
         """Effet de CET appel : `effect_of(arguments)` si l'outil classe ses appels, sinon `effect`."""
@@ -68,6 +73,9 @@ class ToolContext:
     turn_index: int
     channel: str
     sender: str | None = None
+    # Carte approuvée qui a déclenché CET appel (posée par `approvals/executor.py`), None sinon : un connecteur relayé
+    # (lot X20) en envoie la preuve à nokker.ai.
+    approval_id: str | None = None
 
 
 class ToolRegistry(Protocol):
@@ -229,7 +237,9 @@ class Provider(Protocol):
     `on_delta: Callable[[str], None] | None = None` (morceaux de `content` bruts, dans l'ordre) et renvoie
     exactement la même `Completion` qu'en non-streamé. Ce mot-clé ne fait PAS partie du Protocol : le
     noyau ne le passe qu'aux providers dont la signature de `complete` le déclare (`core/loop.py::
-    accepts_on_delta`) — un provider qui l'ignore (faux providers des tests, amont sans SSE) reste valide."""
+    accepts_on_delta`) — un provider qui l'ignore (faux providers des tests, amont sans SSE) reste valide.
+    Même règle pour `on_tool_delta: Callable[[int, str, str, str], None] | None = None` (X22 : index de l'appel
+    d'outil dans le flux, son id, son nom, morceau BRUT de ses `arguments`)."""
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
                  session_key: str, max_tokens: int = 2048) -> Completion: ...
@@ -284,6 +294,9 @@ class Approval:
     decided_at: float | None = None
     result_summary: str | None = None  # contenu (déjà `redact_result`) du `ToolResult` d'exécution
     error: str | None = None
+    # `ToolCall.id` de l'appel qui a posé la carte (docs/LOKKAL.md §7.4.9) : le `tool.result` publié après l'exécution
+    # porte ce `call_id`, et le client ferme l'appel resté « en attente ». None pour une carte d'avant ce champ.
+    call_id: str | None = None
 
 
 @dataclass
@@ -297,12 +310,17 @@ class Challenge:
     nonce: str
     exp: float
     aud: str = "nokker-approval"
+    # Outil de la carte, lié au défi quand il est posé (cartes relayées par nokker.ai, lots X10/X20b) : une preuve
+    # signée pour un outil ne vaut pas pour un autre. Absent du JSON quand il n'est pas posé (défis locaux).
+    tool: str | None = None
 
     def canonical(self) -> str:
         import json
 
         payload = {"approval_id": self.approval_id, "args_sha256": self.args_sha256, "nonce": self.nonce,
                    "exp": self.exp, "aud": self.aud}
+        if self.tool is not None:
+            payload["tool"] = self.tool
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -377,6 +395,10 @@ class TurnObserver(Protocol):
         ...
 
     def turn_done(self, turn: Turn) -> None: ...
+
+    # Optionnel (X22, écriture en direct) : `tool_input_delta(turn, data)` — le noyau ne l'appelle que si
+    # l'observateur le déclare. `data` = {call_id, name, seq, text, path?, field?, truncated?, discarded?}, texte DÉJÀ
+    # caviardé avec retenue (`core/live_input.py`) ; l'observateur publie `tool.input.delta` (docs/BUBBLES.md §6).
 
 
 class Store(Protocol):

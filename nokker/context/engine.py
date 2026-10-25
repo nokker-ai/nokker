@@ -8,7 +8,7 @@ Invariant vérifié par construction (et testé) : le préfixe NE dépend ni du 
 calculé une fois depuis le fichier + les schémas des outils cœur, jamais recalculé par appel. `layer_tokens`
 est une estimation `len(texte) // 4` (documentée partout où elle est utilisée) en attendant un vrai
 tokenizer ; ce n'est pas la mesure qui a produit les chiffres du PLAN (ceux-là viennent du tokenizer réel
-du modèle, cf. note mémoire `nokker-p0` §F4).
+du modèle, cf. notes internes §F4).
 """
 from __future__ import annotations
 
@@ -78,6 +78,10 @@ class ContextEngineV0:
     # Mémoire de projet des sessions locales (lot X1, `context/project_memory.py`) : son noyau court entre dans le
     # message système après le profil. None (défaut, et drapeau `local.project_memory` éteint) : rien ne change.
     project_memory: Any = None
+    # Plan (lot X18, `nokker/plan/service.py`) : consignes héritées de la carte sur laquelle travaille le fil (session
+    # rattachée, ou passage d'un agent listé sur la carte), après la mémoire de projet. None (drapeau `plan` éteint) :
+    # rien ne change.
+    plan: Any = None
 
     def __post_init__(self) -> None:
         self._layers = {"internal": (self._load(self.prefix_path),
@@ -151,6 +155,16 @@ class ContextEngineV0:
             logger.exception("mémoire de projet : noyau indisponible")
             return ""
 
+    def plan_block(self, turn: Turn) -> str:
+        """Consignes héritées du plan pour le fil du tour, ou "" (pas de plan, fil sans carte)."""
+        if self.plan is None:
+            return ""
+        try:
+            return self.plan.block_for_thread(turn.thread_id)
+        except Exception:  # le plan ne casse jamais un assemblage
+            logger.exception("plan : bloc indisponible")
+            return ""
+
     @staticmethod
     def turn_head(turn: Turn, compute: Callable[[], list[str]]) -> str:
         """En-tête du tour, calculé au premier assemblage puis figé sur le tour (`Turn.head`) : les appels suivants
@@ -219,9 +233,12 @@ class ContextEngineV0:
         # change pas : il porte sur `self._prefix_text` seul, pas sur ce message combiné.
         index_block = self.tools_index_block()
         project_text = self.project_block(turn)
+        plan_text = self.plan_block(turn)
         system_parts = self.system_parts(index_block)
         if project_text:
             system_parts.append(project_text)
+        if plan_text:
+            system_parts.append(plan_text)
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
         # Couche 3 — épisodes clos : vide en v0 (aucune frontière d'épisode, cf. docstring). Budget 0.
@@ -236,7 +253,7 @@ class ContextEngineV0:
         # Couche 5 — en-tête du tour (date, rappel CortHeXis, contexte reçu) + message courant, REGROUPÉS DANS LE MÊME
         # message `user` (même raison que ci-dessus : un message `system` qui n'est pas en tête fait échouer l'appel
         # en 502 ; ce tour reste le DERNIER message, rôle `user`, ce que tout amont accepte).
-        # FORMAT = CONTRAT avec l'entraînement de Nina-70B (JUPITER, `infra/sokkan/jupiter/py/nokker_tasks.py::with_recall`) :
+        # FORMAT = CONTRAT avec l'entraînement de Nina-70B (dépôt interne) :
         # `[Rappel mémoire]\n…\n[/Rappel]\n\n<message>` — rappel AVANT le message, balise fermante. Ne pas changer l'un
         # sans l'autre (cf docs/CONTEXT-FORMAT.md). L'index des outils non cœur est dans le message système depuis le
         # 20.10.2026 (option A, cache entre tours) ; l'en-tête est figé par tour et rejoué tel quel par l'historique.
@@ -283,6 +300,8 @@ class ContextEngineV0:
         }
         if self.project_memory is not None:
             layer_tokens["project"] = estimate_tokens(project_text)
+        if plan_text:
+            layer_tokens["plan"] = estimate_tokens(plan_text)
         return Assembled(messages=messages, tools=tools_payload, prefix_sha256=self._prefix_sha256,
                           layer_tokens=layer_tokens)
 
@@ -290,7 +309,7 @@ class ContextEngineV0:
         if len(result.content) <= self.reservoir_char_limit:
             return result
         truncated = result.content[:self.reservoir_char_limit]
-        # `recall_context` retiré de la surface tant que A-1 n'existe pas (décision Nick, P1-S1,
+        # `recall_context` retiré de la surface tant que A-1 n'existe pas (décision produit, P1-S1,
         # 17.10.2026) : ne JAMAIS promettre au modèle un outil qu'il ne peut pas appeler.
         mention = (f"\n[...tronqué à {self.reservoir_char_limit} caractères sur {len(result.content)} — "
                    "le réservoir réel arrive avec le chantier A-1 ; pas de relecture possible pour l'instant]")

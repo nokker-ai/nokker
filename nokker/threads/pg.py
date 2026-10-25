@@ -13,14 +13,18 @@ from nokker.threads.base import BaseThreads
 from nokker.threads.types import Thread
 
 MIGRATION_SQL = (Path(__file__).parent / "migrations" / "0001_threads.sql").read_text(encoding="utf-8")
+# Colonne `origin` des fils de passage d'agent (lot X14) : posée par la 024, rejouée ici (idempotente).
+ENGINE_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "024_agent_engine.sql").read_text(
+    encoding="utf-8")
 
-_COLS = "id, title, owner, members, created_at, updated_at, working, last_snippet"
+_COLS = "id, title, owner, members, created_at, updated_at, working, last_snippet, origin"
 
 
 def _row(row: tuple) -> Thread:
-    tid, title, owner, members, created_at, updated_at, working, last_snippet = row
+    tid, title, owner, members, created_at, updated_at, working, last_snippet, origin = row
     return Thread(id=tid, title=title, owner=owner, members=list(members or []), created_at=created_at,
-                  updated_at=updated_at, working=working, last_snippet=last_snippet or "")
+                  updated_at=updated_at, working=working, last_snippet=last_snippet or "",
+                  origin=dict(origin) if origin else None)
 
 
 @dataclass
@@ -30,7 +34,7 @@ class PgThreads(BaseThreads):
     def __post_init__(self) -> None:
         if not self.dsn:
             raise ValueError("PgThreads requiert un DSN Postgres")
-        migrate(self.dsn, MIGRATION_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
+        migrate(self.dsn, MIGRATION_SQL, ENGINE_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
         self._db = TenantConn(self.dsn)
         self._lock = threading.Lock()
 
@@ -50,11 +54,12 @@ class PgThreads(BaseThreads):
     def _store(self, t: Thread) -> None:
         with self._lock:
             self._conn.execute(
-                f"INSERT INTO nokker_threads ({_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                f"INSERT INTO nokker_threads ({_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, owner = EXCLUDED.owner, "
                 "members = EXCLUDED.members, updated_at = EXCLUDED.updated_at, working = EXCLUDED.working, "
                 "last_snippet = EXCLUDED.last_snippet",
-                (t.id, t.title, t.owner, Jsonb(t.members), t.created_at, t.updated_at, t.working, t.last_snippet))
+                (t.id, t.title, t.owner, Jsonb(t.members), t.created_at, t.updated_at, t.working, t.last_snippet,
+                 Jsonb(t.origin) if t.origin else None))
 
     def _list_all(self) -> list[Thread]:
         with self._lock, self._conn.cursor() as cur:

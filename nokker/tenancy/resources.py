@@ -5,7 +5,7 @@ CHAQUE appel, d'après `current_tenant()`, jamais à la construction. Hors d'un 
 
 - Interne (`tn_ninabot`) : le registre et la mémoire d'avant le multi-locataire, inchangés.
 - Testeur : cœurs + `recall_context` (mémoire de session de SON fil) + web + bulles + SES connecteurs
-  (`ConnectorProvider`). Jamais les MCP partagés (`mcp_tool_servers` : workspace, brosim de Nick) ni sokkan-memory
+  (`ConnectorProvider`). Jamais les MCP partagés (`mcp_tool_servers` : workspace, navigateur partagé de l'opérateur) ni sokkan-memory
   (`memory_search`/`memory_get`, rappel automatique) : un nom absent du jeu répond « outil inconnu », sans exécution.
 """
 from __future__ import annotations
@@ -29,8 +29,9 @@ class TenantRegistry:
     (`self.tools`) et l'exécuteur d'approbations : chacun voit le jeu du locataire du tour en cours.
 
     Un `Registry` par testeur, en cache (son cache de specs est donc stable d'un tour à l'autre, comme le hash du
-    préfixe) ; `forget(tid)` le reconstruit au prochain appel (connecteur ajouté ou retiré), `refresh()` les oublie
-    tous et rafraîchit le registre interne, qui contient toutes les sources partagées."""
+    préfixe) ; `forget(tid)` le reconstruit au prochain appel (connecteur ajouté ou retiré, machine Lokkal liée ou
+    révoquée), `refresh()` les oublie tous et rafraîchit le registre interne, qui contient toutes les sources
+    partagées. Une source qui déclare `available_for(tid)` n'est offerte qu'aux locataires pour qui elle rend vrai."""
 
     def __init__(self, internal: Registry, tester_sources: list[ToolSource],
                  connectors: ConnectorProvider | None = None) -> None:
@@ -48,9 +49,31 @@ class TenantRegistry:
             reg = self._tenants.get(tid)
         if reg is not None:
             return reg
-        reg = Registry(sources=[*self.tester_sources, *self.connectors.sources_for(tid)])
+        sources, sure = self._available(tid)
+        reg = Registry(sources=[*sources, *self.connectors.sources_for(tid)])
+        if not sure:
+            return reg  # disponibilité illisible : rien en cache, on relira au prochain appel
         with self._lock:
             return self._tenants.setdefault(tid, reg)
+
+    def _available(self, tid: str) -> tuple[list[ToolSource], bool]:
+        """Sources du testeur offertes à CE locataire : une source qui déclare `available_for(tid)` n'y est que si elle
+        rend vrai (outils Lokkal : machine liée et non révoquée). Une vérification en échec écarte la source, sans
+        mettre le résultat en cache (`sure` faux)."""
+        out: list[ToolSource] = []
+        sure = True
+        for src in self.tester_sources:
+            check = getattr(src, "available_for", None)
+            if check is None:
+                out.append(src)
+                continue
+            try:
+                if check(tid):
+                    out.append(src)
+            except Exception:  # noqa: BLE001 — base injoignable : l'outil manque à ce tour, il reviendra
+                logger.warning("disponibilité de %s illisible pour %s", type(src).__name__, tid, exc_info=True)
+                sure = False
+        return out, sure
 
     def forget(self, tenant_id: str) -> None:
         with self._lock:
@@ -91,7 +114,7 @@ class TenantRegistry:
 
 class NullMemory:
     """Aucune mémoire longue : pas de rappel, rien de proposé, aucun outil. Celle d'un testeur, et celle de tout le
-    monde quand `memory_mcp_url` est vide (bêta OVH : aucune connexion à la mémoire de Nick)."""
+    monde quand `memory_mcp_url` est vide (bêta OVH : aucune connexion à la mémoire de l'instance interne)."""
 
     def recall(self, query: str, k: int = 5) -> list[Recall]:
         return []
@@ -136,7 +159,7 @@ class TenantMemory:
 
 
 class TenantEscalator:
-    """`core.ports.Escalator` : celui de l'interne (« Je transmets à Nick ») pour `tn_ninabot` ; chez un testeur, aucun
+    """`core.ports.Escalator` : celui de l'interne (« Je transmets à l'équipe ») pour `tn_ninabot` ; chez un testeur, aucun
     destinataire interne nommé — la décision revient à l'utilisateur."""
 
     def __init__(self, internal: Any) -> None:

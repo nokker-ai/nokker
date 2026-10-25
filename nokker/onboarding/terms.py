@@ -1,6 +1,6 @@
 """Conditions de la bêta (terms/fr.md, terms/en.md). Ce que le testeur accepte, c'est le SHA-256 des octets affichés :
 modifier un fichier change la version, donc l'écran d'acceptation périmé est refusé au lieu d'enregistrer un texte
-que la personne n'a pas lu. Ces textes sont un brouillon tant que Nick ne les a pas validés (voir le dépôt interne,
+que la personne n'a pas lu. Ces textes sont un brouillon tant que l'éditeur ne les a pas validés (voir le dépôt interne,
 docs/nokker/conditions-beta-2026-10.md)."""
 from __future__ import annotations
 

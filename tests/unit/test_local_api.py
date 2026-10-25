@@ -221,6 +221,52 @@ def test_cancel_route_and_healthz_versions(server):
     assert body["version"] and body["min_client_version"]
 
 
+def test_local_token_opens_threads_bubbles_events_and_chat(tmp_path):
+    """Le client web local (mode 127.0.0.1) se sert du jeton local comme session : fils, bulles, flux d'événements et
+    chat passent, avec l'identité LOCAL_OWNER. Câblage de `serve` : le hub ne connaît aucun utilisateur de config."""
+    from nokker.api.events import EventBus
+    from nokker.bubbles.hub import BubbleHub
+    from nokker.bubbles.memory import InMemoryBubbles
+    from nokker.threads.memory import InMemoryThreads
+
+    api = _api(tmp_path)
+    bus = EventBus()
+    hub = BubbleHub(threads=InMemoryThreads(), bubbles=InMemoryBubbles(), publish=bus.publish,
+                    known_users=frozenset(), spawn=lambda fn: fn())
+    kernel = make_kernel("ok")
+    kernel.observer, hub.kernel, hub.scrub = hub, kernel, kernel.invariants.scrub_output
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, events=bus, hub=hub,
+                                                               local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        for path in ("/v1/threads", "/v1/bubbles?thread_id=th_inconnu"):
+            assert _req(port, path)[0] == 401, path
+        status, th = _req(port, "/v1/threads", token=api.token, body={"title": "local"})
+        assert status == 201 and th["owner"] == LOCAL_OWNER
+        status, body = _req(port, "/v1/threads", token=api.token)
+        assert status == 200 and [x["id"] for x in body] == [th["id"]]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps({"model": "nokker", "messages": [{"role": "user", "content": "salut"}]}).encode(),
+            headers={"Authorization": f"Bearer {api.token}", "Content-Type": "application/json",
+                     "X-Session-Id": th["id"]})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200 and json.loads(r.read())["choices"][0]["message"]["content"] == "ok"
+        status, body = _req(port, f"/v1/threads/{th['id']}", token=api.token)
+        assert status == 200 and [m["role"] for m in body["messages"]] == ["user", "assistant"]
+        assert _req(port, f"/v1/threads/{th['id']}/bubbles", token=api.token)[0] == 200
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/events",
+                                     headers={"Authorization": f"Bearer {api.token}"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200 and r.headers["Content-Type"].startswith("text/event-stream")
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+
+
 # ─────────────────────────────── décisions locales (§7.4.3) ───────────────────────────────
 
 
@@ -270,7 +316,7 @@ def test_local_decision_routes(tmp_path):
         assert bad[0] == 400  # une règle hors des suggestions est refusée
         status, body = _req(port, f"/v1/local/approvals/{a.id}/decide", token=api.token,
                             body={"decision": "approve", "scope": "session", "rule": "terminal(npm test*)"})
-        assert status == 200 and body["scope"] == "session"
+        assert status == 202 and body["scope"] == "session" and body["continuation"] in ("running", "queued")
         assert kernel.gates.permissions.thread_allow["th_1"][0].pattern == "npm test*"
         b = _card(approvals, "th_1", "npm run build --prod")
         status, body = _req(port, f"/v1/local/approvals/{b.id}/decide", token=api.token,

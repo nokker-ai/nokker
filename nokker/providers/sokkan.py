@@ -8,7 +8,7 @@ le Router** (`qwen/qwen3.8-27b` et `qwen/qwen3.5-397b-a17b`, amont OVH) : c'est 
 coupe vraiment le raisonnement (`reasoning_tokens=0`) sans faire échouer l'appel — `chat_template_kwargs:
 {"enable_thinking": false}` (gabarit vLLM/llama.cpp, ce qu'attendait le PLAN initial) renvoie `HTTP 400
 upstream` sur ces deux modèles OVH, idem pour `reasoning: {"enabled": false}` ; `reasoning_effort: "low"`
-réduit sans éliminer. Cf. `infra/sokkan/openclaw-eval/nokker_bench.py::REASONING_VARIANTS`/D10 (même mesure,
+réduit sans éliminer. Cf. le banc interne `nokker_bench.py::REASONING_VARIANTS`/D10 (même mesure,
 même conclusion). Le point d'injection reste configurable (`reasoning_off_body`) : le llama.cpp partagé de
 Un llama.cpp auto-hébergé (Qwen3.6-35B-A3B) accepte lui `chat_template_kwargs.enable_thinking`, donc un déploiement qui route
 vers lui directement doit surcharger ce champ à la construction du `SokkanProvider`.
@@ -37,6 +37,17 @@ reconstitué en la MÊME réponse que le chemin non-streamé (content, tool_call
 du dernier chunk, modèle, finish_reason) puis passe par le même analyseur → même `Completion`. Réessais :
 mêmes règles et même budget, mais SEULEMENT tant qu'aucun morceau n'a été remis à `on_delta` — après le
 premier, une coupure lève (`StreamInterrupted`) au lieu de rejouer un texte que le client a déjà vu.
+
+Budget de l'appel (revue du train du 2.11, défaut 8) : `call_budget_s` (défaut = `timeout_s`, 180 s) borne le temps
+d'attente TOTAL de l'appel, réessais compris. Un essai de plus (réseau, 5xx, 429, délai d'attente) ne part que s'il
+reste au moins `MIN_RETRY_S` de ce budget, et son délai d'attente est réduit à ce qui reste. Avant, un délai d'attente
+de lecture (180 s) suivi de son essai de plus portait un appel au-delà de 6 min, avec une double facturation possible
+si l'amont finissait la génération abandonnée. Avec les valeurs par défaut, un premier essai qui a attendu tout son
+délai de lecture n'est donc plus rejoué (le tour se dégrade proprement) ; un délai de connexion, court, l'est encore.
+
+Écriture en direct (X22, 25.10.2026) : avec `on_tool_delta(index, call_id, name, morceau)`, chaque morceau BRUT des
+`arguments` d'un appel d'outil est aussi remis dès réception (le noyau en lit le JSON partiel, `core/live_input.py`).
+Un morceau d'arguments remis compte comme un morceau émis : même règle de réessai que pour `on_delta`.
 """
 from __future__ import annotations
 
@@ -56,6 +67,7 @@ from nokker.core.turn import Message, ToolCall, Usage
 logger = logging.getLogger("nokker.providers.sokkan")
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+MIN_RETRY_S = 15.0  # un essai de plus ne part que s'il reste au moins ce temps dans le budget de l'appel
 
 
 class _UpstreamStatus(Exception):
@@ -81,6 +93,12 @@ class SokkanProvider:
     # passer EXACTEMENT le cas mesuré en réel (un 504 à ~60 s + un 2e essai réussi en 8,5-20,9 s) sans
     # laisser un 2e 504 d'affilée lancer un 3e essai (qui pousserait un seul tour à ~180 s).
     total_budget_s: float = 80.0
+    # Délai d'attente (connexion, lecture, écriture) AVANT tout morceau : un essai de plus, même budget total épuisé —
+    # le délai de lecture (180 s) dépasse ce budget, donc le réessai normal ne partait jamais (banc X9 du 25.10, tour
+    # 110 : « échec réseau après 1 tentative(s) : The read operation timed out », tour perdu). Jamais après un morceau.
+    timeout_retries: int = 1
+    # Temps total d'un appel, réessais compris (None = `timeout_s`) : voir la docstring du module.
+    call_budget_s: float | None = None
     max_tokens_default: int = 2048
     extra_headers: dict[str, str] = field(default_factory=dict)
     # 429 « trop de requêtes simultanées pour cette clé » (Router, plafond par clé) : une place se libère quand un
@@ -105,18 +123,32 @@ class SokkanProvider:
         twin._closed = False
         return twin
 
-    def _busy_wait(self, status: int, busy: int, t_budget0: float) -> bool:
+    def _deadline(self) -> float:
+        return time.monotonic() + (self.call_budget_s if self.call_budget_s is not None else self.timeout_s)
+
+    def _room(self, deadline: float, wait: float = 0.0) -> bool:
+        """Reste-t-il de quoi lancer un essai de plus (après `wait` s d'attente) dans le budget de l'appel ?"""
+        return deadline - time.monotonic() - wait >= MIN_RETRY_S
+
+    def _timeout(self, deadline: float) -> float:
+        """Délai d'attente d'un essai : le sien, réduit à ce qui reste du budget de l'appel."""
+        return max(0.001, min(self.timeout_s, deadline - time.monotonic()))
+
+    def _busy_wait(self, status: int, busy: int, t_budget0: float, deadline: float | None = None) -> bool:
         """Vrai (après avoir attendu) si un 429 doit être rejoué sans compter comme un réessai."""
         if status != 429 or not self._budget_left(t_budget0):
             return False
         wait = min(self.busy_backoff_cap_s, self.retry_backoff_s * (2 ** busy))
+        if deadline is not None and not self._room(deadline, wait):
+            return False
         logger.warning("sokkan provider: 429 (clé saturée) %s — attente %.0fs, essai %d", self.model, wait, busy + 1)
         time.sleep(wait)
         return True
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
                  session_key: str, max_tokens: int = 2048,
-                 on_delta: Callable[[str], None] | None = None) -> Completion:
+                 on_delta: Callable[[str], None] | None = None,
+                 on_tool_delta: Callable[[int, str, str, str], None] | None = None) -> Completion:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -136,7 +168,7 @@ class SokkanProvider:
         if on_delta is not None:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
-            data, attempts = self._stream_with_retry(body, headers, on_delta)
+            data, attempts = self._stream_with_retry(body, headers, on_delta, on_tool_delta)
         else:
             data, attempts = self._post_with_retry(body, headers)
         latency_s = time.monotonic() - t0
@@ -154,23 +186,31 @@ class SokkanProvider:
     def _post_with_retry(self, body: dict[str, Any], headers: dict[str, str]) -> tuple[dict[str, Any], int]:
         last_exc: Exception | None = None
         t_budget0 = time.monotonic()
-        attempt, busy = 0, 0
-        while attempt <= self.max_retries:
+        deadline = self._deadline()
+        attempt, busy, timeouts = 0, 0, 0
+        while attempt <= self.max_retries + timeouts:
             self._check_open()
             try:
                 resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=body,
-                                          headers=headers)
+                                          headers=headers, timeout=self._timeout(deadline))
             except httpx.TransportError as e:
                 last_exc = e
                 logger.warning("sokkan provider: erreur réseau (tentative %d/%d) %s: %s",
                                 attempt + 1, self.max_retries + 1, self.model, e)
-                if attempt < self.max_retries and self._budget_left(t_budget0):
-                    time.sleep(self.retry_backoff_s * (attempt + 1))
+                wait = self.retry_backoff_s * (attempt + 1)
+                if attempt < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+                if isinstance(e, httpx.TimeoutException) and timeouts < self.timeout_retries and self._room(deadline):
+                    timeouts += 1
+                    logger.warning("sokkan provider: délai d'attente dépassé %s — un essai de plus, %.0f s restantes "
+                                   "dans le budget de l'appel", self.model, deadline - time.monotonic())
                     attempt += 1
                     continue
                 raise RuntimeError(f"échec réseau après {attempt + 1} tentative(s) : {e}") from e
 
-            if self._busy_wait(resp.status_code, busy, t_budget0):
+            if self._busy_wait(resp.status_code, busy, t_budget0, deadline):
                 busy += 1
                 continue
             if resp.status_code in _RETRYABLE_STATUS and attempt < self.max_retries:
@@ -178,7 +218,7 @@ class SokkanProvider:
                 # 60 s par défaut) sans qu'aucun amont ne réponde (voir docstring du module) : ne réessaie
                 # que s'il reste du budget CÔTÉ NOUS pour un essai de plus, sinon un 2e 504 d'affilée
                 # pousserait ce seul appel à ~180 s (mesure F7 d'origine).
-                if not self._budget_left(t_budget0):
+                if not self._budget_left(t_budget0) or not self._room(deadline, self.retry_backoff_s * (attempt + 1)):
                     logger.warning("sokkan provider: HTTP %d (tentative %d/%d) %s — budget total épuisé "
                                     "(%.1fs), abandon sans réessayer", resp.status_code, attempt + 1,
                                     self.max_retries + 1, self.model, time.monotonic() - t_budget0)
@@ -197,8 +237,9 @@ class SokkanProvider:
             raise RuntimeError(f"échec réseau après {self.max_retries + 1} tentatives") from last_exc
         raise RuntimeError("échec sans réponse (ne devrait pas arriver)")
 
-    def _stream_with_retry(self, body: dict[str, Any], headers: dict[str, str],
-                           on_delta: Callable[[str], None]) -> tuple[dict[str, Any], int]:
+    def _stream_with_retry(self, body: dict[str, Any], headers: dict[str, str], on_delta: Callable[[str], None],
+                           on_tool_delta: Callable[[int, str, str, str], None] | None = None
+                           ) -> tuple[dict[str, Any], int]:
         """Comme `_post_with_retry`, en SSE. `emitted[0]` passe à True au premier morceau remis : dès lors,
         toute erreur lève `StreamInterrupted` (jamais de réessai, le client a déjà vu du texte)."""
         emitted = [False]
@@ -207,19 +248,28 @@ class SokkanProvider:
             emitted[0] = True
             on_delta(piece)
 
+        def _relay_tool(index: int, call_id: str, name: str, piece: str) -> None:
+            emitted[0] = True
+            assert on_tool_delta is not None
+            on_tool_delta(index, call_id, name, piece)
+
         t_budget0 = time.monotonic()
-        attempt, busy = 0, 0
-        while attempt <= self.max_retries:
+        deadline = self._deadline()
+        attempt, busy, timeouts = 0, 0, 0
+        while attempt <= self.max_retries + timeouts:
             self._check_open()
             try:
-                return self._stream_once(body, headers, _relay), attempt + busy + 1
+                return (self._stream_once(body, headers, _relay, _relay_tool if on_tool_delta is not None else None,
+                                          timeout=self._timeout(deadline)),
+                        attempt + busy + 1)
             except _UpstreamStatus as e:
                 # Statut connu avant le moindre octet de corps : rien n'a pu être émis.
-                if self._busy_wait(e.status, busy, t_budget0):
+                if self._busy_wait(e.status, busy, t_budget0, deadline):
                     busy += 1
                     continue
                 if e.status in _RETRYABLE_STATUS and attempt < self.max_retries:
-                    if not self._budget_left(t_budget0):
+                    if not self._budget_left(t_budget0) or not self._room(deadline,
+                                                                          self.retry_backoff_s * (attempt + 1)):
                         raise RuntimeError(f"HTTP {e.status} de {self.base_url} après {attempt + 1} tentative(s) "
                                            f"(budget total {self.total_budget_s}s épuisé, abandon avant un "
                                            "nouvel essai)") from None
@@ -234,20 +284,28 @@ class SokkanProvider:
                     raise StreamInterrupted(f"flux amont interrompu après le premier morceau : {e}") from e
                 logger.warning("sokkan provider: flux en échec avant tout morceau (tentative %d/%d) %s: %s",
                                 attempt + 1, self.max_retries + 1, self.model, e)
-                if attempt < self.max_retries and self._budget_left(t_budget0):
-                    time.sleep(self.retry_backoff_s * (attempt + 1))
+                wait = self.retry_backoff_s * (attempt + 1)
+                if attempt < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+                if isinstance(e, httpx.TimeoutException) and timeouts < self.timeout_retries and self._room(deadline):
+                    timeouts += 1  # rien n'a été émis (vérifié ci-dessus) : un essai de plus, dans le budget de l'appel
+                    logger.warning("sokkan provider: délai d'attente avant tout morceau %s — un essai de plus, %.0f s "
+                                   "restantes", self.model, deadline - time.monotonic())
                     attempt += 1
                     continue
                 raise RuntimeError(f"échec du flux après {attempt + 1} tentative(s) : {e}") from e
         raise RuntimeError("échec sans réponse (ne devrait pas arriver)")
 
-    def _stream_once(self, body: dict[str, Any], headers: dict[str, str],
-                     on_delta: Callable[[str], None]) -> dict[str, Any]:
+    def _stream_once(self, body: dict[str, Any], headers: dict[str, str], on_delta: Callable[[str], None],
+                     on_tool_delta: Callable[[int, str, str, str], None] | None = None,
+                     timeout: float | None = None) -> dict[str, Any]:
         """Un appel SSE, reconstitué en corps non-streamé (`{"model", "choices": [{"message",
         "finish_reason"}], "usage"}`) pour passer par le même analyseur que `_post_with_retry`."""
         acc = _StreamAccumulator(model=self.model)
         with self._client.stream("POST", f"{self.base_url.rstrip('/')}/chat/completions", json=body,
-                                 headers=headers) as resp:
+                                 headers=headers, timeout=timeout if timeout is not None else self.timeout_s) as resp:
             if resp.status_code >= 400:
                 resp.read()
                 raise _UpstreamStatus(resp.status_code, resp.text)
@@ -267,7 +325,7 @@ class SokkanProvider:
                     continue
                 if chunk.get("error"):
                     raise _StreamError(f"erreur amont dans le flux : {str(chunk['error'])[:300]}")
-                piece = acc.add(chunk)
+                piece = acc.add(chunk, on_tool_delta)
                 if piece:
                     on_delta(piece)
         if not acc.done and acc.finish_reason is None:
@@ -301,7 +359,7 @@ class _StreamAccumulator:
     done: bool = False
     tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
 
-    def add(self, chunk: dict[str, Any]) -> str:
+    def add(self, chunk: dict[str, Any], on_tool: Callable[[int, str, str, str], None] | None = None) -> str:
         if chunk.get("model"):
             self.model = chunk["model"]
         if chunk.get("usage"):
@@ -336,7 +394,10 @@ class _StreamAccumulator:
                     slot["function"]["name"] += name
                 if fn.get("arguments"):
                     args = fn["arguments"]
-                    slot["function"]["arguments"] += args if isinstance(args, str) else json.dumps(args)
+                    args = args if isinstance(args, str) else json.dumps(args)
+                    slot["function"]["arguments"] += args
+                    if on_tool is not None and isinstance(idx, int):
+                        on_tool(idx, slot["id"], slot["function"]["name"], args)
         return piece
 
     def as_response(self) -> dict[str, Any]:

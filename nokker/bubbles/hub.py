@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nokker.agents.hub import AgentsHub
-from nokker.agents.types import agent_to_json
+from nokker.agents.types import AgentError, agent_to_json
 from nokker.bubbles.base import BaseBubbles
 from nokker.bubbles.context import render_for_context, render_sent, render_session_message
 from nokker.bubbles.producers import Producers
@@ -34,6 +34,7 @@ from nokker.bubbles.types import (
 )
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import ToolCall, ToolResult, Turn, TurnInput
+from nokker.core.turn_lock import TurnLock, TurnLocks
 from nokker.ledger.prices import load as load_prices
 from nokker.ledger.turn_cost import is_subagent_thread, root_thread, row_from_call, turn_cost
 from nokker.tenancy.context import (
@@ -45,6 +46,8 @@ from nokker.threads.types import Thread, ThreadError, ThreadForbidden, ThreadNot
 logger = logging.getLogger("nokker.bubbles.hub")
 
 NOTIFY_TTL_S = 600.0
+# Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
+KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
@@ -119,8 +122,7 @@ class BubbleHub:
     spawn: Callable[[Callable[[], None]], None] = _spawn_thread
     notify_ttl_s: float = NOTIFY_TTL_S
     clock: Callable[[], float] = time.time
-    _locks: dict[str, threading.RLock] = field(default_factory=dict)
-    _locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    _locks: TurnLocks = field(default_factory=TurnLocks)  # sans noyau branché seulement (sinon ceux du noyau)
     _tool_t0: dict[tuple[str, str], float] = field(default_factory=dict)
     # Une seule bulle `search` par tour (canari 18.10 : 3 web_search d'un même tour = 3 bulles violettes) :
     # les recherches suivantes du tour fusionnent leurs résultats dans la première.
@@ -128,6 +130,13 @@ class BubbleHub:
     # Bulles `artifact` touchées pendant le tour : `working` pendant le tour, `done` à `turn_done` (§10.2).
     _turn_artifacts: dict[str, set[str]] = field(default_factory=dict)
     pages: Any = None  # nokker.pages.store.PageStore du noyau local (None ailleurs)
+    # Relais web → Lokkal (X21, docs/LOKKAL.md §7.16) : nokker.cloud.handoff.HandoffService de nokker.ai (None ailleurs)
+    handoffs: Any = None
+    # Plan (X18, docs/LOKKAL.md §7.18) : nokker.plan.service.Plan (bulles `plan_split` : accepter / refuser) ; None ailleurs
+    plan: Any = None
+    # Écriture en direct (X22, §10.7) : (fil, call_id) → bulles `artifact` passées « en cours d'écriture » par cet appel.
+    _live_writes: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    _live_guard: threading.Lock = field(default_factory=threading.Lock)
     # Coût par tour (X2, docs/LOKKAL.md §7.8) : grille de prix de `turn.cost` ; None = celle du ledger du noyau, sinon
     # la grille versionnée. Les appels des sous-agents d'un fil s'accumulent ici jusqu'à la fin du tour qui les a lancés.
     prices: Any = None
@@ -136,13 +145,11 @@ class BubbleHub:
 
     # ─────────────────────────────── utilitaires ───────────────────────────────
 
-    def thread_lock(self, thread_id: str) -> threading.RLock:
-        """Un tour à la fois par fil (le store attribue l'index du tour au début du tour)."""
-        with self._locks_guard:
-            lock = self._locks.get(thread_id)
-            if lock is None:
-                lock = self._locks[thread_id] = threading.RLock()
-            return lock
+    def thread_lock(self, thread_id: str) -> TurnLock:
+        """Un tour à la fois par fil, dans l'ordre d'arrivée (le store attribue l'index du tour au début du tour) : le
+        verrou du NOYAU (`Kernel.turn_locks`), le même que prend `run_turn`, docs/LOKKAL.md §7.4.9."""
+        locks = getattr(self.kernel, "turn_locks", None) if self.kernel is not None else None
+        return (locks if isinstance(locks, TurnLocks) else self._locks).get(thread_id)
 
     def _scrub(self, text: str) -> str:
         return self.scrub(text) if self.scrub is not None else text
@@ -333,12 +340,32 @@ class BubbleHub:
                       state: dict[str, Any] | None = None, status: str = "idle",
                       actions: list[dict[str, Any]] | None = None) -> Bubble:
         self.require_member(thread_id, user)
-        if kind not in KINDS or kind in ("notify", "episode", "artifact"):
+        if kind not in KINDS or kind in KERNEL_KINDS:
             raise BubbleError(f"kind non créable par un client : {kind}")
         if state is not None and not isinstance(state, dict):
             raise BubbleError("state doit être un objet")
         b = self.bubbles.create(thread_id=thread_id, kind=kind, title=title, state=state, status=status,
                                 actions=actions, created_by=user or "nina")
+        self._emit_bubble("bubble.created", b)
+        return b
+
+    def create_kernel_bubble(self, thread_id: str, *, kind: str, title: str = "", state: dict[str, Any] | None = None,
+                             status: str = "idle", actions: list[dict[str, Any]] | None = None) -> Bubble:
+        """Bulle posée par le noyau (pas par un client) dans un fil existant : `plan_split`, `brief` (X18)."""
+        if kind not in KINDS:
+            raise BubbleError(f"kind inconnu : {kind}")
+        b = self.bubbles.create(thread_id=thread_id, kind=kind, title=title, state=state, status=status,
+                                actions=actions, created_by="nina")
+        self._emit_bubble("bubble.created", b)
+        return b
+
+    def notify_user(self, user: str, *, title: str, text: str, from_thread: str | None = None) -> Bubble:
+        """Notification (`notify`, sans fil, §4) à une identité, venue du noyau (brief du matin, X18)."""
+        src = self.threads.get(from_thread) if from_thread else None
+        b = self.bubbles.create(thread_id=None, kind="notify", title=title[:200], status="done",
+                                state={"from_thread": from_thread, "from_title": src.title if src else title,
+                                       "to_thread": None, "text": self._scrub(text)[:280], "actions": []},
+                                created_by="nina", shared_members=[user])
         self._emit_bubble("bubble.created", b)
         return b
 
@@ -462,19 +489,53 @@ class BubbleHub:
                 self._close(b.id)
                 return {"closed": True, "episode_id": ep_id}
             raise BubbleNotFound(f"action inconnue : {action_id}")
+        if b.kind == "handoff":
+            # Relais web → Lokkal (X21) : `accept` / `refuse` sont la décision de l'UTILISATEUR (membre du fil,
+            # contrôlé par `_writable`, et compte de la demande, contrôlé par le service) ; jamais un tour du modèle.
+            if action_id not in ("accept", "refuse"):
+                raise BubbleNotFound(f"action inconnue : {action_id}")
+            if self.handoffs is None:
+                raise BubbleError("relais vers Lokkal non configuré")
+            from nokker.cloud.handoff import HandoffError, view
+
+            try:
+                tenant = current_tenant_or_none() or tenant_of_thread(b.thread_id or "")
+                h = self.handoffs.decide(tenant, user or "", str((b.state or {}).get("handoff_id") or ""),
+                                         action_id)
+            except HandoffError as e:
+                raise (BubbleNotFound(str(e)) if e.status == 404 else BubbleError(str(e))) from None
+            return {"handoff": view(h)}
+        if b.kind == "plan_split":
+            # Proposition de découpe (X18) : la créer ou la refuser est la décision de l'UTILISATEUR (membre du fil,
+            # contrôlé par `_writable`), jamais un tour du modèle.
+            if action_id not in ("accept", "refuse"):
+                raise BubbleNotFound(f"action inconnue : {action_id}")
+            if self.plan is None:
+                raise BubbleError("plan non configuré")
+            from nokker.plan.types import PlanError
+
+            try:
+                return self.plan.decide(str((b.state or {}).get("proposal_id") or ""), action_id, user or "")
+            except PlanError as e:
+                raise (BubbleNotFound(e.message) if e.status == 404 else BubbleError(e.message)) from None
         if b.kind == "agent_draft":
-            # Seule action : `activate` (§9.4) — crée l'agent (Crew), ferme la bulle, publie
-            # `agent.created`. Jamais en direct ailleurs : pas d'approbation requise ici, un
-            # `agent_draft` armé ne fait rien tout seul (P2 = exécution réelle, hors scope).
+            # Seule action : `activate` (§9.4) — crée l'agent (Crew), ferme la bulle, publie `agent.created`. Pas de
+            # carte ici : armer une règle d'écriture reste un geste à part, avec la carte forte (§9.5).
             if action_id != "activate":
                 raise BubbleNotFound(f"action inconnue : {action_id}")
             if self.agents_hub is None:
                 raise BubbleError("crew (agents) non configuré")
-            s = b.state or {}
-            agent = self.agents_hub.create_agent(
-                name=str(s.get("name") or b.title or ""), role=str(s.get("role") or ""),
-                model=str(s.get("model") or ""), tools=[str(t) for t in (s.get("tools") or [])],
-                created_by=user or b.created_by)
+            s = dict(b.state or {})
+            s["name"] = s.get("name") or b.title or ""
+            # `needs` (X15) : posé par un pack sur sa carte (`gpu` du pack video) ; sans lui, le placement ne voit
+            # jamais le besoin. Validé comme dans POST /v1/agents (noms, `gpu` booléen).
+            body = {k: s.get(k) for k in ("name", "role", "model", "tools", "instructions", "trigger", "secrets",
+                                          "budget", "auto_approve", "placement", "needs", "project") if k in s}
+            # Mêmes règles que POST /v1/agents (§9.5) : manuel sans écriture → armé, sinon au repos (à armer).
+            try:
+                agent = self.agents_hub.create_from_body(body, user or b.created_by)
+            except AgentError as e:
+                raise BubbleError(f"carte d'agent invalide : {e}") from None
             self._close(b.id)
             return {"activated": True, "agent": agent_to_json(agent)}
         action = next((a for a in b.actions if isinstance(a, dict) and a.get("id") == action_id), None)
@@ -614,8 +675,66 @@ class BubbleHub:
                                  "args": args},
                    self.thread_audience(turn.thread_id))
 
+    def tool_input_delta(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Écriture en direct (X22, docs/BUBBLES.md §6 et §10.7) : ce que le modèle est en train d'écrire dans les
+        arguments de `write_file`/`patch`/`page_create`, texte déjà caviardé avec retenue par le noyau
+        (`core/live_input.py`). Rien n'est écrit : le `tool.result` du même `call_id` clôt le bloc. Le fichier d'une
+        page du fil passe sa bulle `artifact` « en cours d'écriture » (`state.writing`), jusqu'au recalage."""
+        tid = _turn_id(turn)
+        event = {"thread_id": turn.thread_id, "turn_id": tid, **data}
+        self._emit("tool.input.delta", event, self.thread_audience(turn.thread_id))
+        call_id = str(data.get("call_id") or "")
+        if not call_id:
+            return
+        if data.get("discarded"):
+            self._clear_live(turn.thread_id, call_id)
+            return
+        path = data.get("path")
+        if self.pages is None or data.get("name") not in ("write_file", "patch") or not path:
+            return
+        try:
+            self._mark_writing(turn, call_id, str(data["name"]), str(path))
+        except Exception:  # noqa: BLE001 — la bulle ne suit pas, le direct du chat continue
+            logger.debug("bulle artifact non passée en écriture", exc_info=True)
+
+    def _mark_writing(self, turn: Turn, call_id: str, name: str, path: str) -> None:
+        from nokker.pages.tools import _relative
+        from nokker.tools.checkpoints import WORKSPACE_MOUNT
+
+        meta = self.pages.by_path(turn.thread_id, _relative(path, WORKSPACE_MOUNT))
+        if meta is None:
+            return
+        for b in self.bubbles.list_thread(turn.thread_id):
+            if (b.kind != "artifact" or b.closed_at is not None or (b.origin or {}).get("mode") == "copy"
+                    or (b.state or {}).get("page_id") != meta.page_id):
+                continue
+            if ((b.state or {}).get("writing") or {}).get("call_id") == call_id:
+                continue  # déjà « en cours d'écriture » pour cet appel : le texte suit par `tool.input.delta`
+            writing = {"call_id": call_id, "turn_id": _turn_id(turn), "name": name, "since": self.clock()}
+            self.update_from_kernel(b.id, state={**(b.state or {}), "writing": writing}, status="working")
+            with self._live_guard:
+                self._live_writes.setdefault((turn.thread_id, call_id), set()).add(b.id)
+            self._turn_artifacts.setdefault(_turn_id(turn), set()).add(b.id)
+
+    def _clear_live(self, thread_id: str, call_id: str) -> None:
+        """Recalage sur la version enregistrée : `writing` retiré si c'est encore CET appel qui écrit (un `write_file`
+        exécuté a déjà remplacé l'état par la nouvelle version ; un refus, une carte ou un abandon le laisse)."""
+        with self._live_guard:
+            ids = self._live_writes.pop((thread_id, call_id), set())
+        for bid in ids:
+            try:
+                b = self.bubbles.get(bid)
+                st = dict(b.state or {}) if b is not None else {}
+                if b is None or (st.get("writing") or {}).get("call_id") != call_id:
+                    continue
+                st.pop("writing", None)
+                self.update_from_kernel(bid, state=st)
+            except Exception:  # noqa: BLE001 — bulle fermée ou retirée entre-temps
+                logger.debug("bulle artifact %s non recalée", bid, exc_info=True)
+
     def tool_result(self, turn: Turn, call: ToolCall, result: ToolResult, ms: int) -> None:
         self._tool_t0.pop((turn.thread_id, call.id), None)
+        self._clear_live(turn.thread_id, call.id)
         self._emit("tool.result", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), "call_id": call.id,
                                    "name": call.name, "ok": not result.is_error, "ms": ms,
                                    "is_error": result.is_error,
@@ -631,6 +750,22 @@ class BubbleHub:
                                    "ok": not is_error, "is_error": is_error, "content": self._scrub(content or ""),
                                    "preview": self._scrub(content or "")[:TOOL_PREVIEW_CHARS]},
                    self.thread_audience(thread_id) or ({owner} if owner else set()))
+
+    def approval_result(self, thread_id: str, turn_index: int, call_id: str | None, approval_id: str, name: str,
+                        content: str, is_error: bool, ms: int | None = None, owner: str | None = None) -> None:
+        """Sortie d'un outil exécuté après sa carte (`ApprovalExecutor`, docs/LOKKAL.md §7.4.9) : `tool.result` du MÊME
+        `call_id` que l'appel resté « en attente » dans le tour qui a posé la carte, avec `approval_id` ; le client le
+        ferme avec la vraie sortie. `turn_id` = ce tour-là. Caviardé et tronqué comme un `tool.result` de la boucle ;
+        même repli d'audience que `direct_result` (fil encore sans tour au hub : le propriétaire qui a décidé)."""
+        data: dict[str, Any] = {"thread_id": thread_id, "turn_id": f"{thread_id}:{turn_index}",
+                                "approval_id": approval_id, "name": name, "ok": not is_error, "is_error": is_error,
+                                "preview": self._scrub(content or "")[:TOOL_PREVIEW_CHARS]}
+        if call_id:
+            data["call_id"] = call_id
+            self._clear_live(thread_id, call_id)
+        if ms is not None:
+            data["ms"] = ms
+        self._emit("tool.result", data, self.thread_audience(thread_id) or ({owner} if owner else set()))
 
     def tool_executed(self, turn: Turn, call: ToolCall, spec: ToolSpec | None, result: ToolResult) -> str | None:
         t0 = self._tool_t0.get((turn.thread_id, call.id))
@@ -677,6 +812,10 @@ class BubbleHub:
         audience = self.thread_audience(turn.thread_id)
         tid = _turn_id(turn)
         self._turn_search.pop(tid, None)
+        with self._live_guard:  # appels jamais exécutés (annulés, abandonnés) : leurs bulles se recalent aussi
+            left = [cid for (th, cid) in self._live_writes if th == turn.thread_id]
+        for cid in left:
+            self._clear_live(turn.thread_id, cid)
         for bid in self._turn_artifacts.pop(tid, set()):  # la page a fini de bouger pour ce tour
             try:
                 self.update_from_kernel(bid, status="done")

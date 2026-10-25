@@ -158,7 +158,7 @@ def test_raises_after_retries_exhausted():
 
 
 def test_tier_enum_has_no_frontier():
-    assert {t.value for t in Tier} == {"local", "ship", "deep"}
+    assert {t.value for t in Tier} == {"local", "small", "ship", "deep"}  # X8 : petit palier, jamais « frontier »
 
 
 def test_attempts_is_one_on_first_try_success():

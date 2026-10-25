@@ -1,0 +1,28 @@
+name: social
+version: 1
+title: Social media
+description: >-
+  Plan and schedule posts through a scheduling MCP server, watch LinkedIn comments and draft replies. Nothing is
+  published without an approval card.
+tools: [skill_view, skill_list, web_search, web_fetch, mcp_server_list, mcp_server_add]
+mcp:
+  scheduler:
+    purpose: Schedule posts on your social accounts and list what is already planned.
+    examples:
+      - Postiz (open source, can be self-hosted; its MCP server exposes the default tool names below)
+      - any other scheduling tool that offers an MCP server (bind its tool names at install)
+    secrets: [SCHEDULER_API_KEY]
+    tools:
+      list_channels: {default: integrationList, effect: read}
+      list_posts: {default: postsListTool, effect: read}
+      schedule_post: {default: integrationSchedulePostTool, effect: send_external}
+  linkedin:
+    purpose: Read your own LinkedIn posts and their comments, and reply or publish when you approve.
+    examples:
+      - an MCP server you run with your own LinkedIn API access (bind its tool names at install)
+    secrets: [LINKEDIN_TOKEN]
+    tools:
+      list_posts: {default: linkedin_list_posts, effect: read}
+      list_comments: {default: linkedin_list_comments, effect: read}
+      reply_comment: {default: linkedin_reply_comment, effect: send_external}
+      publish_post: {default: linkedin_create_post, effect: send_external}

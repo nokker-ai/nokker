@@ -1,6 +1,6 @@
 """Proxy filtrant du socket docker pour le noyau Lokkal (compose Lokkal, service `dockerproxy`).
 
-Le noyau lance un bac à sable par fil (`nokker/tools/code.py`, DockerEnvironment de Hermes, CLI docker). Lui donner
+Le noyau lance un bac à sable par fil (`nokker/tools/code.py`, DockerEnvironment de la bibliothèque amont, CLI docker). Lui donner
 le socket brut, c'est lui donner l'hôte : `docker run --privileged -v /:/host`. Ce proxy est la seule voie du noyau
 vers le démon (DOCKER_HOST=tcp://dockerproxy:2375, sur un réseau interne que seuls eux deux partagent) et n'accepte
 que ce dont le bac à sable a besoin :
@@ -16,7 +16,7 @@ skills (ro), un port publié, un autre réseau que `nokker-sandbox` ou `none`, o
 Le proxy ajoute lui-même HTTP(S)_PROXY vers le proxy de sortie (`egress`) : le réseau `nokker-sandbox` est interne,
 c'est la seule sortie, et elle refuse les plages privées.
 
-Les deux sondes de Hermes (limites cgroup, quota disque) créent un container sans étiquette : acceptées si elles n'ont
+Les deux sondes de la bibliothèque amont (limites cgroup, quota disque) créent un container sans étiquette : acceptées si elles n'ont
 ni montage ni commande autre que `true`, sur une image connue ; le proxy leur pose l'étiquette et le réseau `none`.
 
 Bibliothèque standard seulement. Configuration par l'environnement (voir `Config.from_env`).
@@ -120,7 +120,7 @@ def check_create(body: dict, cfg: Config) -> dict:
     cmd = body.get("Cmd")
     probe = LABEL not in labels
     if probe:
-        # Sondes de Hermes : aucun montage, `true` ou la commande par défaut de l'image, image connue.
+        # Sondes de la bibliothèque amont : aucun montage, `true` ou la commande par défaut de l'image, image connue.
         if hc.get("Binds") or hc.get("Mounts") or body.get("Volumes"):
             raise Refused("container sans étiquette nokker.sandbox avec montage")
         if cmd not in (None, [], ["true"]) or body.get("Entrypoint") not in (None, [], ""):

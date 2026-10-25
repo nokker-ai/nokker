@@ -18,7 +18,7 @@ from typing import Any
 
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
-from nokker.qa.secrets import KnownSecrets, redact
+from nokker.qa.secrets import KnownSecrets, redact, redact_messages
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
 # ─────────────────────────────── drapeaux de domaine ───────────────────────────────
@@ -224,6 +224,7 @@ class DeterministicInvariants:
     allowlist: Allowlist = field(default_factory=Allowlist)
     go_senders: GoAuthorizedSenders = field(default_factory=GoAuthorizedSenders)
     account_tenant: Callable[[str | None], str | None] | None = None
+    _context_cache: dict = field(default_factory=dict, init=False, repr=False)
 
     def go_authorized(self, sender: str | None) -> bool:
         tid = current_tenant_or_none()
@@ -312,6 +313,27 @@ class DeterministicInvariants:
 
     def scrub_output(self, text: str) -> str:
         return redact(text, self.known).text
+
+    def redact_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Filet du fil (`core/loop.py::_wire_messages`, juste avant chaque appel modèle) : coffre + motifs forts sur
+        tout le texte qui part (`qa/secrets.py::redact_messages`). Cache par texte : l'historique repart à chaque
+        appel du tour, seul le nouveau est relu ; vidé quand le coffre change ou passe 4096 entrées."""
+        items = tuple(self.known.items_by_length_desc())
+        sig = hash(items)
+        cache = self._context_cache
+        if cache.get("__sig__") != sig or len(cache) > 4096:
+            cache.clear()
+            cache["__sig__"] = sig
+        known = self.known if items else None
+
+        def scrub(text: str) -> str:
+            got = cache.get(text)
+            if got is None:
+                got = redact(text, known, weak=False, wire=True).text  # le fil : rien de ce que refuse le Router
+                cache[text] = got
+            return got
+
+        return redact_messages(messages, scrub=scrub)
 
 
 __all__ = [

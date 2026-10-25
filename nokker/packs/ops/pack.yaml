@@ -1,0 +1,7 @@
+name: ops
+version: 1
+title: Ops runbooks
+description: >-
+  Runbooks for a full disk, a service that is down and a certificate that expires, run on your hosts by name with
+  the ssh tools. Reads first; every change on a prod host needs a strong approval card.
+tools: [skill_view, skill_list, ssh_hosts, ssh_run, ssh_copy, ssh_trust]

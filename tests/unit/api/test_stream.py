@@ -1,6 +1,6 @@
-"""Streaming de `/v1/chat/completions` (P1, 19.10.2026) — battement, opt-in, reset, contrat gateway Hermes.
+"""Streaming de `/v1/chat/completions` (P1, 19.10.2026) — battement, opt-in, reset, contrat passerelle amont.
 
-Vrai serveur HTTP en boucle locale (mêmes fakes que `test_server.py`). Le lecteur `hermes_read` reproduit
+Vrai serveur HTTP en boucle locale (mêmes fakes que `test_server.py`). Le lecteur `gateway_read` reproduit
 `gateway/run_turn.py::_run_agent_via_proxy` + `_consume_sse_line` (hermes-nokker, `:2827-2880`) : lecture par
 morceaux arbitraires, découpe sur `\\n`, seules les lignes `data: ` comptent, concaténation de TOUT
 `choices[0].delta.content`, arrêt sur `[DONE]`.
@@ -120,7 +120,7 @@ def _writes(body: bytes, piece: int | None) -> list[bytes]:
     return out
 
 
-def hermes_read(body: bytes, piece: int | None = None) -> tuple[str, bool]:
+def gateway_read(body: bytes, piece: int | None = None) -> tuple[str, bool]:
     """`_run_agent_via_proxy` : morceaux → lignes → `_consume_sse_line`."""
     full, saw_done, buffer = "", False, ""
 
@@ -187,7 +187,7 @@ def test_heartbeat_ping_before_reply_and_headers_immediately(fast_ping):
     assert t_headers < 0.3 < total  # en-têtes partis AVANT la fin du tour
     first_data = body.index(b"data: ")
     assert b": ping\n\n" in body[:first_data]
-    assert hermes_read(body) == ("Réponse lente.", True)
+    assert gateway_read(body) == ("Réponse lente.", True)
 
 
 def test_without_opt_in_body_is_exactly_the_old_one_except_pings(fast_ping):
@@ -213,7 +213,7 @@ def test_without_opt_in_body_is_exactly_the_old_one_except_pings(fast_ping):
     assert content["usage"]["prompt_tokens"] == 10
     assert stop["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     assert b"nokker" not in body
-    assert hermes_read(body, piece=3) == ("Bonjour Alice, tout va bien.", True)
+    assert gateway_read(body, piece=3) == ("Bonjour Alice, tout va bien.", True)
 
 
 def test_opt_in_streams_tokens_and_final_chunk_is_authoritative():
@@ -263,7 +263,7 @@ def test_opt_in_tool_call_text_is_reset_for_the_client():
 
 
 def test_gateway_never_sees_partial_text_even_with_a_streaming_provider(fast_ping):
-    """Gateway Hermes (pas d'en-tête opt-in) + provider qui streame + appel en outils : elle ne reçoit QUE la
+    """Passerelle amont (pas d'en-tête opt-in) + provider qui streame + appel en outils : elle ne reçoit QUE la
     réponse finale, une fois (aucun texte de l'appel en outils, aucun reset)."""
     ship = StreamingShip(script=[
         (["Texte intermédiaire qui ne doit jamais atteindre Telegram. " * 3],
@@ -276,7 +276,7 @@ def test_gateway_never_sees_partial_text_even_with_a_streaming_provider(fast_pin
     finally:
         srv.stop()
     assert ship.seen_on_delta == [False, False]
-    assert hermes_read(body) == ("Réponse finale.", True)
+    assert gateway_read(body) == ("Réponse finale.", True)
     assert b"interm" not in body
 
 
@@ -295,4 +295,4 @@ def test_turn_error_after_headers_is_reported_in_stream_without_done(monkeypatch
     data = data_frames(body)
     assert json.loads(data[-1])["error"]["message"] == "panne interne"
     assert "[DONE]" not in data
-    assert hermes_read(body) == ("", False)  # la gateway rapporte « fermé trop tôt », pas un texte vide
+    assert gateway_read(body) == ("", False)  # la gateway rapporte « fermé trop tôt », pas un texte vide

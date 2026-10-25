@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg import sql as sql_lib
 
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
 
@@ -26,6 +28,8 @@ logger = logging.getLogger("nokker.store.conn")
 
 OWNER_DSN_ENV = "NOKKER_PG_OWNER_DSN"
 RLS_MIGRATION = Path(__file__).parent / "migrations" / "006_tenant_rls.sql"
+LOCK_TIMEOUT_ENV = "NOKKER_MIGRATE_LOCK_TIMEOUT"
+_PG_DURATION = re.compile(r"^\d{1,6}\s*(ms|s|min)?$")
 _MIGRATION_LOCK = 727006  # verrou consultatif : deux processus qui migrent en même temps ne se marchent pas dessus
 _SET_TENANT = "SELECT set_config('app.tenant_id', %s, false)"
 
@@ -76,6 +80,14 @@ def migrate(dsn: str, *sqls: str, rls: bool = True, strict: bool = False) -> boo
         sqls = (*sqls, RLS_MIGRATION.read_text(encoding="utf-8"))
     try:
         with connect_admin(owner_dsn(dsn), autocommit=True) as conn:
+            # Job de déploiement sur une base en service : `NOKKER_MIGRATE_LOCK_TIMEOUT` (p. ex. « 5s ») borne l'attente
+            # d'un verrou (ACCESS EXCLUSIVE d'un ALTER) ; dépassé, le job échoue et se relance, au lieu de bloquer
+            # derrière lui toutes les requêtes de la bêta. Vide = attente sans limite (comportement d'avant).
+            lock_timeout = os.environ.get(LOCK_TIMEOUT_ENV, "").strip()
+            if lock_timeout:
+                if not _PG_DURATION.match(lock_timeout):
+                    raise ValueError(f"{LOCK_TIMEOUT_ENV} illisible : {lock_timeout!r} (ex. 5s, 500ms, 1min)")
+                conn.execute(sql_lib.SQL("SET lock_timeout = {}").format(sql_lib.Literal(lock_timeout)))
             conn.execute("SELECT pg_advisory_lock(%s)", (_MIGRATION_LOCK,))
             try:
                 for sql in sqls:

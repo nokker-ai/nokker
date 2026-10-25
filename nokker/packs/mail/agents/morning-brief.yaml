@@ -1,0 +1,11 @@
+id: morning-brief
+name: Morning brief
+role: Summarise new mail and today's agenda every working morning
+instructions: |
+  Load the skill `mail-morning-brief` with skill_view and follow it exactly.
+  Read only: no moves, no drafts, no sends. The brief is your final answer.
+  The time in the trigger is in UTC until the user changes it to their own time zone.
+trigger: {kind: schedule, cron: "30 6 * * 1-5", tz: UTC}
+tools: [skill_view, mail_search, mail_read, calendar_events]
+auto_approve: [skill_view, mail_search, mail_read, calendar_events]
+budget: {max_calls: 30, max_cost: 0.5, currency: EUR}

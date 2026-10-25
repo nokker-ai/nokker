@@ -9,6 +9,8 @@
   injoignable, jeton révoqué : on retente au passage suivant, sans bruit (journal en DEBUG).
 - **Nettoyage** (`clean_load`) : nokker.ai ne garde que les champs connus, bornés ; la machine n'est pas crue sur
   la forme de ce qu'elle envoie.
+- **Inventaire des ressources** (lot X21, `nokker/local/resources.py`) : envoyé dans le même fil, à
+  `POST /v1/gateway/machine/resources`, quand il change et au moins toutes les 10 min ; noms seulement.
 """
 from __future__ import annotations
 
@@ -23,12 +25,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import hashlib
+import json
+import time
+
 import httpx
 
 logger = logging.getLogger("nokker.local.load")
 
 LOAD_VERSION = 1  # forme de la charge (docs/LOKKAL.md §7.2) ; un champ ajouté ne change pas ce numéro
 INTERVAL_S = 60.0
+RESOURCES_EVERY_S = 600.0  # inventaire renvoyé au moins toutes les 10 min, même inchangé (nokker.ai le date)
+DECK_EVERY_S = 300.0  # deck (X15) renvoyé au moins toutes les 5 min, même inchangé ; sinon à chaque changement
 MAX_GPUS = 16
 _GPU_QUERY = ("--query-gpu=name,memory.total,memory.free,utilization.gpu", "--format=csv,noheader,nounits")
 
@@ -201,6 +209,11 @@ class ActiveTurns:
         with self._lock:
             return len(self._by_thread)
 
+    def threads(self) -> set[str]:
+        """Les fils dont un tour est en cours (deck X15 : session « working »)."""
+        with self._lock:
+            return set(self._by_thread)
+
 
 # ─────────────────────────────── envoi ───────────────────────────────
 
@@ -213,6 +226,14 @@ class LoadReporter:
     interval_s: float = INTERVAL_S
     client: Any = None  # httpx.Client injectable (tests)
     last_status: int | None = None  # dernier statut HTTP de nokker.ai (None : rien envoyé)
+    resources: Callable[[], dict[str, Any]] | None = None  # inventaire par noms (X21) ; None = pas d'inventaire
+    resources_every_s: float = RESOURCES_EVERY_S
+    deck: Callable[[], dict[str, Any]] | None = None  # deck de la machine (X15, nokker/local/crew.py) ; None = aucun
+    deck_every_s: float = DECK_EVERY_S
+    _res_sha: str | None = field(default=None, init=False, repr=False)
+    _res_at: float = field(default=0.0, init=False, repr=False)
+    _deck_sha: str | None = field(default=None, init=False, repr=False)
+    _deck_at: float = field(default=0.0, init=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _kick: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
 
@@ -249,6 +270,58 @@ class LoadReporter:
         self.last_status = r.status_code
         if r.status_code != 200:
             logger.debug("charge : refusée par nokker.ai (HTTP %d)", r.status_code)
+        self.send_resources(token)
+        self.send_deck(token)
+        return r.status_code == 200
+
+    def send_resources(self, token: str, force: bool = False) -> bool:
+        """Inventaire des ressources `local` (noms seulement), s'il a changé ou s'il date de plus de 10 min. True si
+        nokker.ai l'a gardé. Jamais d'exception."""
+        if self.resources is None:
+            return False
+        try:
+            inv = self.resources()
+        except Exception:  # noqa: BLE001
+            logger.debug("inventaire : collecte en échec", exc_info=True)
+            return False
+        sha = hashlib.sha256(json.dumps(inv, sort_keys=True).encode()).hexdigest()
+        if not force and sha == self._res_sha and time.monotonic() - self._res_at < self.resources_every_s:
+            return False
+        if self.client is None:
+            self.client = httpx.Client(timeout=10.0)
+        try:
+            r = self.client.post(self.base_url.rstrip("/") + "/v1/gateway/machine/resources", json=inv,
+                                 headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError as e:
+            logger.debug("inventaire : envoi reporté (%s)", type(e).__name__)
+            return False
+        if r.status_code == 200:
+            self._res_sha, self._res_at = sha, time.monotonic()
+        return r.status_code == 200
+
+    def send_deck(self, token: str, force: bool = False) -> bool:
+        """Deck de la machine (X15 : sessions, agents, cartes en attente — noms et états), s'il a changé ou s'il date de
+        plus de 5 min. True si nokker.ai l'a gardé. Jamais d'exception."""
+        if self.deck is None:
+            return False
+        try:
+            deck = self.deck()
+        except Exception:  # noqa: BLE001
+            logger.debug("deck : collecte en échec", exc_info=True)
+            return False
+        sha = hashlib.sha256(json.dumps(deck, sort_keys=True, default=str).encode()).hexdigest()
+        if not force and sha == self._deck_sha and time.monotonic() - self._deck_at < self.deck_every_s:
+            return False
+        if self.client is None:
+            self.client = httpx.Client(timeout=10.0)
+        try:
+            r = self.client.post(self.base_url.rstrip("/") + "/v1/gateway/machine/deck", json=deck,
+                                 headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError as e:
+            logger.debug("deck : envoi reporté (%s)", type(e).__name__)
+            return False
+        if r.status_code == 200:
+            self._deck_sha, self._deck_at = sha, time.monotonic()
         return r.status_code == 200
 
     def _run(self) -> None:

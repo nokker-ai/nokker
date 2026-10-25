@@ -65,7 +65,7 @@ def builtin_core_source() -> StaticToolSource:
     """Les outils cœur qui ne viennent pas de CortHeXis (`memory_search`/`memory_get` sont exposés par
     `nokker.memory.corthexis.CorthexisMemory`, pas ici) — le préfixe de l'instance interne, §Outils cœur.
 
-    `recall_context` RETIRÉ de la surface (décision Nick, P1-S1, 17.10.2026) : tant que le réservoir réel
+    `recall_context` RETIRÉ de la surface (décision produit, P1-S1, 17.10.2026) : tant que le réservoir réel
     (chantier A-1) n'existe pas, cet outil ne pouvait QUE répondre « indisponible » — mesuré en réel : un
     outil qui répond toujours « indisponible » invite le modèle à réessayer (vu jusqu'à 2x sur la même
     tâche), pour rien. Un appel au nom `recall_context` tombera maintenant sur « outil inconnu » (Registry
@@ -104,7 +104,7 @@ class Registry:
                 refresh()
 
     def turn_done(self, thread_id: str) -> None:
-        """Fin de tour : relaie aux sources qui le déclarent (ex. fermeture des onglets brosim)."""
+        """Fin de tour : relaie aux sources qui le déclarent (ex. fermeture des onglets du navigateur partagé)."""
         for src in self.sources:
             hook = getattr(src, "turn_done", None)
             if callable(hook):

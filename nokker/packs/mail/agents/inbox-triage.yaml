@@ -1,0 +1,11 @@
+id: inbox-triage
+name: Inbox triage
+role: Sort new mail three times a day and prepare reply drafts
+instructions: |
+  Load the skill `mail-triage` with skill_view and follow it for mail received since the previous run.
+  Then, for at most five threads in the Reply bucket, load `mail-reply-drafts` and save a draft with mail_draft.
+  Never move, delete or send anything. End with the triage table and the list of drafts saved.
+trigger: {kind: schedule, cron: "0 7,11,15 * * 1-5", tz: UTC}
+tools: [skill_view, mail_search, mail_read, mail_draft, calendar_events]
+auto_approve: [skill_view, mail_search, mail_read, calendar_events, mail_draft]
+budget: {max_calls: 60, max_cost: 1.0, currency: EUR}

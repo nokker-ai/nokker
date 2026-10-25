@@ -130,7 +130,7 @@ def test_text_of_empty_content():
 
 
 def test_close_on_turn_end_closes_only_after_the_last_thread_using_the_server():
-    """Alice 20.10 : les onglets brosim doivent être rendus après usage (2 max par site hostile)."""
+    """Alice 20.10 : les onglets du navigateur partagé doivent être rendus après usage (2 max par site hostile)."""
     from nokker.core.ports import ToolContext
     from nokker.tools.mcp import McpToolSource
 

@@ -1,6 +1,6 @@
 """Seuils automatiser / vérifier / escalader par question (PLAN-P1 §5.3 B-2) + mesures de
-calibration (ECE, Brier). Réglés sur le banc étiqueté B-1 (`infra/sokkan/
-nokker-judge-bench/`), **jamais** sur le banc caché T2 (hors mandat de cette session, pas déchiffré
+calibration (ECE, Brier). Réglés sur le banc étiqueté B-1 (dépôt
+interne), **jamais** sur le banc caché T2 (hors mandat de cette session, pas déchiffré
 ici). Pas d'apprentissage sur le test : les seuils sont choisis par validation croisée (k-fold,
 stratifiée par question), et la précision rapportée (B1) est la moyenne HORS-PLI (out-of-fold) —
 jamais celle obtenue en réévaluant les mêmes lignes qui ont servi à choisir le seuil.
@@ -21,7 +21,7 @@ sinon `1 - confiance` — mêmes deux seuils, même découpage en trois zones.
 
 Température : si au moins 20 questions Noul ont une probabilité mesurée, un scalaire `T` (grid
 search grossier, pas de dépendance scipy) minimise l'ECE en recalant `p' = sigmoid(logit(p) / T)` ;
-sinon `T = 1.0` (pas de recalage) — jamais déduit sans mesure (règle `feedback-verifier-la-chose-ecrite`).
+sinon `T = 1.0` (pas de recalage) — jamais déduit sans mesure.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ class ScoredRow:
     pred: str | None
     probs: dict[str, float] | None
     label_status: str  # "sur" | "ambigu"
-    polarity: str | None  # "fautif" | "juste" | None (L.maic)
+    polarity: str | None  # "fautif" | "juste" | None
     ok: bool | None
 
     @property

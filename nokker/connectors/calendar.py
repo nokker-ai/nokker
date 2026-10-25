@@ -522,8 +522,9 @@ ClientFactory = Callable[[str, int], tuple[Any, httpx.Client]]
 
 class CalendarConnector:
     def __init__(self, settings: dict[str, Any], secret: str, *, client_factory: ClientFactory | None = None,
-                 now: Callable[[], datetime] | None = None) -> None:
+                 now: Callable[[], datetime] | None = None, locality: str | None = None) -> None:
         self._secret = secret
+        self.locality = locality  # docs/LOKKAL.md §6.7 : « cloud » chez nokker.ai, « local » dans Lokkal
         self._factory = client_factory or https_client
         self._now = now or (lambda: datetime.now(UTC))
         mode = settings.get("mode")
@@ -570,7 +571,7 @@ class CalendarConnector:
             parameters={"type": "object", "properties": {
                 "days": {"type": "integer", "description": "nombre de jours à partir de maintenant (1-366, défaut 7)"},
                 "calendar": {"type": "string", "description": "nom de l'agenda, « primary » (défaut) ou « all »"}}},
-            effect=Effect.READ, source=SOURCE)
+            effect=Effect.READ, source=SOURCE, locality=self.locality)
         if self.mode == "ical":
             return [events]
         when = "ISO 8601, ex. 2026-10-27T14:00 (fuseau du compte) ; 2026-10-27 seul = journée entière (fin incluse)"
@@ -584,16 +585,16 @@ class CalendarConnector:
             events,
             ToolSpec(name="calendar_create", description="Crée un événement dans l'agenda du compte. N'envoie aucune invitation.",
                      parameters={"type": "object", "properties": fields, "required": ["summary", "start", "end"]},
-                     effect=Effect.WRITE, source=SOURCE),
+                     effect=Effect.WRITE, source=SOURCE, locality=self.locality),
             ToolSpec(name="calendar_update",
                      description="Modifie un événement existant (id renvoyé par calendar_events) ; seuls les champs donnés changent.",
                      parameters={"type": "object", "properties": {"event_id": {"type": "string"}, **fields},
                                  "required": ["event_id"]},
-                     effect=Effect.WRITE, source=SOURCE),
+                     effect=Effect.WRITE, source=SOURCE, locality=self.locality),
             ToolSpec(name="calendar_delete", description="Supprime un événement (série entière si récurrent). Action destructive.",
                      parameters={"type": "object", "properties": {"event_id": {"type": "string"}, "calendar": cal_param},
                                  "required": ["event_id"]},
-                     effect=Effect.DESTRUCTIVE, source=SOURCE),
+                     effect=Effect.DESTRUCTIVE, source=SOURCE, locality=self.locality),
         ]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:

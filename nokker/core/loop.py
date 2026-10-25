@@ -20,6 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +30,9 @@ from nokker.core.ports import (
     RouteDecision, RouteState, Store, StreamInterrupted, ToolContext, ToolRegistry, ToolSpec, TurnObserver,
     TurnStream, call_effect,
 )
+from nokker.core.live_input import LiveToolInputs
 from nokker.core.stream import ScrubbedDeltas, holdback_for
+from nokker.core.turn_lock import TurnLocks
 from nokker.images.render import materialize
 from nokker.core.turn import (
     Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
@@ -61,6 +64,10 @@ logger = logging.getLogger("nokker.core.loop")
 # Rappel du tour lancé en parallèle de la préparation du contexte (20.10.2026) : mesuré sur le canari, le MCP
 # `sokkan-memory` répond en 1,4-1,5 s à chaud (dont ~1,1 s de reranker), 2,1 s session froide, pics à 8 s.
 _RECALL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="nokker-recall")
+
+
+# Motif d'une conclusion forcée, tel qu'il s'affiche avec les remarques de la relecture (`_final_review`).
+_FORCED_WHY = {"loop:max_calls": "le tour a atteint sa limite d'appels", "loop:stalled": "le tour tournait en rond"}
 
 
 def worst(verdicts: list[Verdict]) -> Decision:
@@ -117,12 +124,12 @@ def reusable_tokens(previous: str | None, current: str, prompt_tokens: int) -> i
     return round(prompt_tokens * n / len(current))
 
 
-def accepts_on_delta(provider: object) -> bool:
-    """Vrai si `provider.complete` DÉCLARE le mot-clé `on_delta` (streaming, `core/ports.py::Provider`).
-    Pas de `**kwargs` accepté comme preuve : un faux provider ou un Mock ne doit pas recevoir un argument
-    qu'il ne comprend pas."""
+def accepts_on_delta(provider: object, keyword: str = "on_delta") -> bool:
+    """Vrai si `provider.complete` DÉCLARE le mot-clé `on_delta` (streaming, `core/ports.py::Provider`), ou `keyword`
+    (`on_tool_delta`, écriture en direct X22). Pas de `**kwargs` accepté comme preuve : un faux provider ou un Mock ne
+    doit pas recevoir un argument qu'il ne comprend pas."""
     try:
-        return "on_delta" in inspect.signature(provider.complete).parameters  # type: ignore[attr-defined]
+        return keyword in inspect.signature(provider.complete).parameters  # type: ignore[attr-defined]
     except (TypeError, ValueError, AttributeError):
         return False
 
@@ -198,8 +205,99 @@ class Kernel:
                 self.note_owner_call(thread_id, name, arguments, result)
             return result
         if decision is Decision.HITL and self.approvals is not None:
-            return self.approvals.request(turn, tc, rule, None).id
+            return self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule)).id
         return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"refusé par le noyau ({why})")
+
+    def _card_advice(self, turn: Turn, tc: ToolCall, rule: Verdict | None) -> str | None:
+        """Avis du juge sur une carte (X8) : seulement si `advisor` est branché et que la carte est forte ; jamais une
+        panne qui bloque la carte."""
+        if self.advisor is None or rule is None:
+            return None
+        try:
+            advice = self.advisor.advise(turn, tc.name, tc.arguments, rule.reason, rule.strength)
+        except Exception:  # noqa: BLE001 — une carte sans avis reste une carte
+            logger.warning("avis de carte en échec", exc_info=True)
+            return None
+        self._record_judge_call(turn, self.advisor, getattr(self.advisor, "last_model", ""),
+                                getattr(self.advisor, "last_usage", None),
+                                getattr(self.advisor, "last_latency_s", 0.0), "juge : avis sur une carte forte")
+        return advice
+
+    def _record_judge_call(self, turn: Turn, role: Any, model: str, usage: dict | None, latency_s: float,
+                           reason: str) -> None:
+        """Les jetons du juge comptent au tour (`turn.cost`, X2) et au ledger, comme un appel modèle : palier
+        `role.tier` (celui dont le modèle sert de juge), motif « juge : … »."""
+        if not usage:
+            return
+        from nokker.providers.sokkan import _parse_usage
+
+        call = LLMCall(tier=getattr(role, "tier", None) or Tier.SHIP, model=model or getattr(role, "model_name", ""),
+                       reasoning=False, prefix_sha256="", layer_tokens={}, usage=_parse_usage(usage),
+                       latency_s=latency_s, route_reason=reason)
+        turn.calls.append(call)
+        try:
+            self.ledger.record(turn.thread_id, turn.index, call)
+        except Exception:  # noqa: BLE001 — un ledger qui tombe ne coûte pas le tour
+            logger.warning("ledger : appel du juge non écrit", exc_info=True)
+
+    def _run_review(self, turn: Turn, final: bool = False):
+        """Une relecture du diff du tour (X8), comptée au tour et tracée (`judge:review`). None : juge en panne ou
+        réponse illisible (rien à relire aussi : `reviewer.review` rend None sans diff)."""
+        try:
+            res = self.reviewer.review(turn)
+        except Exception:  # noqa: BLE001 — un juge qui tombe ne relit pas, le tour finit
+            logger.warning("relecture en échec", exc_info=True)
+            return None
+        if res is None:
+            return None
+        self._record_judge_call(turn, self.reviewer, res.model, res.usage, res.latency_s,
+                                "juge : relecture du diff avant « terminé »" if not final
+                                else "juge : relecture du diff d'une conclusion forcée")
+        verdict = "OK" if res.ok else ("à corriger, non renvoyé à l'auteur (plus d'appel pour corriger), remarques "
+                                       "jointes à la réponse" if final else "à corriger")
+        self._log_verdicts(turn, [Verdict(
+            gate=Gate.SWITCH, decision=Decision.ALLOW if res.ok else Decision.REDO_DEEP, layer=2, rule="judge:review",
+            reason=(f"relecture du diff : {verdict}" + ("" if res.ok else f"\n{res.remarks}"))[:1500],
+            judge_model=res.model, latency_s=res.latency_s, subject="reply")])
+        return res
+
+    def _review(self, turn: Turn, candidate: str, rounds: int, call_index: int) -> str | None:
+        """Relecture du diff avant « terminé » (X8). Rend la note à renvoyer à l'auteur, ou None (rien à relire,
+        relecture OK, juge muet, ou plus de tour de relecture). Plus assez d'appels pour corriger : relecture finale
+        sans renvoi (`_final_review`), faite par l'appelant."""
+        if self.reviewer is None or turn.escalated or rounds >= int(getattr(self.reviewer, "rounds", 1)):
+            return None
+        if call_index + 2 > self.max_calls:
+            return None
+        res = self._run_review(turn)
+        if res is None or res.ok:
+            return None
+        from nokker.qa.review import REVIEW_NOTE
+
+        return REVIEW_NOTE.format(remarks=res.remarks or "(sans détail)")
+
+    def _final_review(self, turn: Turn, reply: str, why: str) -> str:
+        """Relecture d'une réponse qui ne peut plus être corrigée (lot fix-batch-1) : conclusion forcée (plafond
+        d'appels, stagnation) ou réponse au dernier appel. UNE relecture, jamais de renvoi à l'auteur — le plafond est
+        atteint, un renvoi serait une boucle sans budget ; les remarques sont jointes à la réponse, visibles. Juge muet
+        ou en panne sur un tour qui a écrit : la réponse dit que le diff n'a pas été relu. Pas de relecteur, rien
+        d'écrit, tour escaladé : la réponse part telle quelle."""
+        from nokker.qa.review import FINAL_REVIEW_NOTE, NOT_REVIEWED_NOTE, turn_diff
+
+        if self.reviewer is None or turn.escalated or not reply.strip():
+            return reply
+        if not turn_diff(turn, int(getattr(self.reviewer, "max_diff_chars", 24000))):
+            return reply
+        res = self._run_review(turn, final=True)
+        if res is None:
+            self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2,
+                                              rule="judge:review:skipped",
+                                              reason=f"diff non relu ({why}) : relecteur muet ou en panne",
+                                              subject="reply")])
+            return reply + NOT_REVIEWED_NOTE
+        if res.ok:
+            return reply
+        return reply + FINAL_REVIEW_NOTE.format(why=why, remarks=res.remarks or "(sans détail)")
 
     def _take_cancel(self, thread_id: str) -> bool:
         if thread_id in self._cancelled:
@@ -230,10 +328,23 @@ class Kernel:
     # Plafonds des testeurs (docs/TENANCY.md §5, `nokker/tenancy/limits.py::TenantLimits`) : vérifiés AVANT le tour,
     # jamais pour le locataire interne. `None` = aucun plafond (tests, bancs).
     limits: TenantLimits | None = None
+    # Arrêt propre demandé par l'appelant (passage d'un agent Crew, lot X14 : budget d'appels ou de coût atteint) :
+    # appelé avant chaque appel modèle ; un motif (chaîne) termine le tour sur « Arrêté par le noyau : <motif>. »,
+    # `turn.error = "stopped"`, sans nouvel appel. None = jamais.
+    stop_check: Callable[[Turn], str | None] | None = None
+    # Juge allumé (X8, docs/LOKKAL.md §7.17, `nokker/qa/review.py`) : `reviewer` relit le diff du tour avant la réponse
+    # (renvoi à l'auteur avec les remarques, `reviewer.rounds` fois au plus) ; `advisor` met un avis et un niveau de
+    # risque sur les cartes fortes. `None` = éteints (défaut).
+    reviewer: Any = None
+    advisor: Any = None
     # Dernier prompt rendu par fil (`prompt_text`), pour `LLMCall.reusable_tokens` ; borné aux fils récents.
     _last_prompts: OrderedDict = field(default_factory=OrderedDict, repr=False)
     _last_prompts_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     last_prompts_max: int = 256
+    # File par fil (docs/LOKKAL.md §7.4.9) : `run_turn` prend le verrou équitable du fil, quel que soit l'appelant (API,
+    # Telegram, tour de fond, suite d'une décision, CLI, sous-agents). Le hub et l'exécuteur de cartes partagent ces
+    # verrous (`BubbleHub.thread_lock`).
+    turn_locks: TurnLocks = field(default_factory=TurnLocks, repr=False)
 
     def _observe(self, method: str, *args):
         if self.observer is None:
@@ -301,12 +412,25 @@ class Kernel:
         self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0, rule=rule,
                                           reason=reason)])
         reply = self._wrap_up(turn, history, recall, route, thread_id, stream) if not turn.escalated else reply
+        why = _FORCED_WHY.get(rule, rule)
         if not reply:
             turn.error = "max_calls"  # échec : ni conclusion ni escalade motivée
             reply = self.escalator.escalate(turn, "boucle d'outils non terminée")
             turn.escalated = True
+            if self.reviewer is not None and self._wrote(turn):
+                from nokker.qa.review import NOT_REVIEWED_NOTE
+
+                reply += NOT_REVIEWED_NOTE  # l'humain qui reprend sait que le diff n'a pas été relu
+        else:
+            # Conclusion forcée : relue une fois, sans renvoi (lot fix-batch-1 ; banc D1, H03 finissait non relue).
+            reply = self._final_review(turn, reply, why)
         turn.messages.append(Message(role="assistant", content=reply))
         return reply
+
+    def _wrote(self, turn: Turn) -> bool:
+        from nokker.qa.review import turn_diff
+
+        return bool(turn_diff(turn, int(getattr(self.reviewer, "max_diff_chars", 24000))))
 
     def _wrap_up(self, turn: Turn, history: list, recall: list, route: RouteDecision, thread_id: str,
                  stream: TurnStream | None = None, redo_allowed: bool = True) -> str:
@@ -344,7 +468,14 @@ class Kernel:
     def run_turn(self, inp: TurnInput, stream: TurnStream | None = None) -> Turn:
         """Un tour. `stream` (optionnel, P1 19.10.2026) reçoit le texte des appels modèles en direct, caviardé
         avec retenue (`core/stream.py`) — seulement depuis les providers qui savent streamer ; il ne change
-        RIEN au tour lui-même : `Turn.reply` reste la réponse qui fait foi."""
+        RIEN au tour lui-même : `Turn.reply` reste la réponse qui fait foi.
+
+        Un tour à la fois par fil, dans l'ordre d'arrivée (`turn_locks`) : un tour demandé pendant qu'un autre tourne
+        attend sa fin, prend l'index suivant et voit son contexte."""
+        with self.turn_locks.get(inp.thread_id):
+            return self._run_turn(inp, stream)
+
+    def _run_turn(self, inp: TurnInput, stream: TurnStream | None = None) -> Turn:
         # 1. Entrée : caviardage + drapeaux de domaine AVANT tout enregistrement.
         checked = self.invariants.check_input(inp.user_text)
         # 1 bis. Plafond du compte (testeurs seulement) : au-delà, réponse claire, sans rappel ni appel modèle.
@@ -408,6 +539,7 @@ class Kernel:
         # DESTRUCTIVE, SEND_*, SPEND, SECRET) : un doublon là est une DÉCISION du modèle, pas du bruit.
         tool_result_cache: dict[tuple[str, str], ToolResult] = {}
         truncations = 0
+        reviews = 0  # renvois de relecture faits ce tour (X8)
         seen_calls: set[str] = set()  # signatures d'appels (stall_signature) déjà vues ce tour
         stalls = 0
         notice_at = (max(1, int(self.max_calls * self.budget_notice_at))
@@ -423,6 +555,14 @@ class Kernel:
                 if self._take_cancel(inp.thread_id):
                     reply = "Annulé à ta demande."
                     turn.error = "cancelled"
+                    turn.messages.append(Message(role="assistant", content=reply))
+                    break
+                stop = self.stop_check(turn) if self.stop_check is not None else None
+                if stop:
+                    reply = f"Arrêté par le noyau : {stop}."
+                    turn.error = "stopped"
+                    self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
+                                                      rule="loop:stopped", reason=stop)])
                     turn.messages.append(Message(role="assistant", content=reply))
                     break
                 # 3. Palier pour CET appel.
@@ -552,6 +692,20 @@ class Kernel:
                     reason = "; ".join(f"{v.rule}: {v.reason}" for v in verdicts if v.decision is decision)
                     candidate = self.escalator.escalate(turn, reason)
                     turn.escalated = True
+                # X8 : le juge relit le diff du tour avant « terminé » ; à corriger → l'auteur reprend avec les
+                # remarques (la réponse candidate reste dans l'historique : c'est la sienne, il la complète).
+                note = self._review(turn, candidate, reviews, call_index)
+                if note is not None:
+                    reviews += 1
+                    if live is not None:
+                        live.discard()
+                    turn.messages.append(Message(role="assistant", content=candidate))
+                    turn.messages.append(Message(role="user", content=note))
+                    continue
+                if (self.reviewer is not None and call_index + 2 > self.max_calls
+                        and reviews < int(getattr(self.reviewer, "rounds", 1))):
+                    # Dernier appel du tour : plus de place pour un renvoi, la relecture se fait quand même (sans renvoi).
+                    candidate = self._final_review(turn, candidate, "réponse au dernier appel du tour")
                 reply = candidate
                 turn.messages.append(Message(role="assistant", content=reply))
                 break
@@ -698,9 +852,9 @@ class Kernel:
             turn.pending_approvals.append(tc)
             if self.approvals is not None:
                 # P1 (18.10.2026) : carte PROUVÉE (docs/APPROVALS.md), pas seulement une mention dans
-                # `pending_approvals`. `advice` (avis de Nina) pas encore produit par un pilier amont —
-                # None pour l'instant (accompagne, ne bloque rien ; un futur chantier le remplira).
-                approval = self.approvals.request(turn, tc, rule, None)
+                # `pending_approvals`. `advice` : avis du juge sur une carte forte (X8, `advisor`), None sinon
+                # (accompagne, ne bloque rien).
+                approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule))
                 return ToolResult(call_id=tc.id, name=tc.name,
                                   content=f"EN ATTENTE D'APPROBATION HUMAINE ({why}) [approval:{approval.id}]. "
                                           "L'action n'a pas été exécutée. L'utilisateur décide sur la carte : ne "
@@ -736,6 +890,12 @@ class Kernel:
                                                      f"({getattr(provider, 'model', '?')})")])
             if self.observer is not None and hasattr(self.observer, "attachment_skipped"):
                 self._observe("attachment_skipped", turn, skipped, "no_vision")
+        # Filet du fil (lot fix-batch-1) : coffre + motifs forts sur TOUT ce qui part, y compris les blocs qui n'ont pas
+        # de porte à eux (plan, mémoire de projet, profil, arguments d'outils rejoués). Un amont qui refuse un secret
+        # (Router : `400 secret_detected`) casserait le tour entier ; un texte sans secret part à l'identique.
+        redact_context = getattr(self.invariants, "redact_context", None)
+        if callable(redact_context):
+            messages = redact_context(messages)
         return messages
 
     def _complete(self, provider: Provider, assembled, route: RouteDecision, thread_id: str,
@@ -745,24 +905,49 @@ class Kernel:
         sans streaming. Toute autre erreur remonte (repli de palier ou escalade chez l'appelant)."""
         messages = self._wire_messages(provider, assembled, thread_id, turn)
         live = None
+        tools_live: LiveToolInputs | None = None
         kwargs = {}
         if stream is not None and accepts_on_delta(provider):
             live = ScrubbedDeltas(self.invariants.scrub_output, stream, holdback_for(self.invariants))
             kwargs["on_delta"] = live.feed
+            tools_live = self._live_tool_inputs(provider, assembled, turn)
+            if tools_live is not None:
+                kwargs["on_tool_delta"] = tools_live.feed
         budget = {"max_tokens": self.max_tokens} if self.max_tokens else {}
         try:
-            return provider.complete(messages, assembled.tools, reasoning=route.reasoning,
-                                     session_key=thread_id, **budget, **kwargs), live
+            comp = provider.complete(messages, assembled.tools, reasoning=route.reasoning,
+                                     session_key=thread_id, **budget, **kwargs)
         except StreamInterrupted as e:
             logger.warning("flux amont interrompu (%s) : rejeu sans streaming", e)
             if live is not None:
                 live.discard()
+            if tools_live is not None:
+                tools_live.discard()
             return provider.complete(messages, assembled.tools, reasoning=route.reasoning,
                                      session_key=thread_id, **budget), None
         except Exception:
             if live is not None:
                 live.discard()
+            if tools_live is not None:
+                tools_live.discard()
             raise
+        if tools_live is not None:
+            tools_live.finish()  # arguments complets : la retenue du caviardage sort (le texte caviardé en entier)
+        return comp, live
+
+    def _live_tool_inputs(self, provider: Provider, assembled, turn: Turn | None) -> LiveToolInputs | None:
+        """Écriture en direct (X22, docs/BUBBLES.md §6) : seulement pour un tour streamé, un provider qui remet les
+        arguments d'outils au fil de l'eau, un appel qui propose des outils, et un observateur qui publie
+        `tool.input.delta`. Le texte passe par le caviardage avec retenue, comme la réponse."""
+        if (turn is None or self.observer is None or not assembled.tools
+                or not hasattr(self.observer, "tool_input_delta")
+                or not accepts_on_delta(provider, "on_tool_delta")):
+            return None
+
+        def emit(data: dict) -> None:
+            self._observe("tool_input_delta", turn, data)
+
+        return LiveToolInputs(self.invariants.scrub_output, emit, holdback_for(self.invariants))
 
     def _log_verdicts(self, turn: Turn, verdicts: list[Verdict]) -> None:
         for v in verdicts:

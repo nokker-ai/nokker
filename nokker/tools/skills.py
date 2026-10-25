@@ -4,17 +4,17 @@ Une compétence est un dossier `<famille>/<skill>/SKILL.md` (frontmatter `name`,
 au besoin, `references/`, `templates/`, `assets/`, `scripts/`. Le modèle voit un index compact, charge un mode
 d'emploi par `skill_view`, et peut en installer / retirer (carte d'approbation, effet DESTRUCTIVE).
 
-Reprise de Hermes au niveau de ses BRIQUES (règle Nick 16.10), comme `code.py` : `agent.skill_utils.parse_frontmatter`,
+Reprise de la bibliothèque d'agent amont au niveau de ses BRIQUES (règle produit du 16.10), comme `code.py` : `agent.skill_utils.parse_frontmatter`,
 `tools.skills_guard` (scan, politique d'installation), `tools.skills_hub_install` (quarantaine, installation) et
 les sources `GitHubSource` / `UrlSource` / `OptionalSkillSource`. Jamais ses fonctions-outils (`skills_tool` lit sa
 config, installe des dépendances et prétraite les gabarits) : ici JAMAIS de prétraitement de gabarit, JAMAIS de
 shell, JAMAIS d'installation de dépendances.
 
 Garde en ÉCHEC FERMÉ : toute compétence hors des racines de confiance passe par `scan_skill_cached` ; `dangerous` =
-invisible (journalisé), `caution` = visible avec un avertissement. Sans Hermes on ne peut pas scanner : ces
+invisible (journalisé), `caution` = visible avec un avertissement. Sans l'amont on ne peut pas scanner : ces
 compétences sont invisibles et `skill_list` le dit.
 
-Hermes n'est importé qu'à l'usage, dans un try : le module se charge sans lui (CI unitaire). `HERMES_HOME` est posé
+L'amont n'est importé qu'à l'usage, dans un try : le module se charge sans lui (CI unitaire). `HERMES_HOME` est posé
 sur `$NOKKER_HOME` avant tout import.
 """
 from __future__ import annotations
@@ -61,12 +61,12 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
 SKILL_TOOLS = tuple(name for name, *_ in _SPECS)
 
 
-# ─────────────────────────────── Hermes (paresseux) ───────────────────────────────
+# ─────────────────────────────── amont (paresseux) ────────────────────────────────
 
 
 def _guard_module() -> Any | None:
     try:
-        from tools import skills_guard  # Hermes (dépendance épinglée)
+        from tools import skills_guard  # amont (dépendance épinglée)
     except Exception:  # noqa: BLE001 — absent (CI unitaire) : pas de scan possible
         return None
     return skills_guard
@@ -78,7 +78,7 @@ def _clean(text: Any) -> str:
 
 
 def _fallback_frontmatter(content: str) -> tuple[dict[str, Any], str]:
-    """YAML minimal (clé: valeur sur une ligne, listes [a, b]) quand Hermes est absent."""
+    """YAML minimal (clé: valeur sur une ligne, listes [a, b]) quand l'amont est absent."""
     content = content.removeprefix("﻿")
     m = re.search(r"\n---\s*\n", content[3:]) if content.startswith("---") else None
     if not m:
@@ -98,11 +98,11 @@ def _fallback_frontmatter(content: str) -> tuple[dict[str, Any], str]:
 
 def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     try:
-        from agent.skill_utils import parse_frontmatter as hermes_parse
+        from agent.skill_utils import parse_frontmatter as upstream_parse
     except Exception:  # noqa: BLE001
         return _fallback_frontmatter(content)
     try:
-        return hermes_parse(content)
+        return upstream_parse(content)
     except Exception:  # noqa: BLE001
         return _fallback_frontmatter(content)
 
@@ -149,7 +149,7 @@ class SkillToolSource:
 
     def __post_init__(self) -> None:
         self.home = Path(self.home or os.environ.get("NOKKER_HOME") or "~/.nokker").expanduser()
-        os.environ.setdefault("HERMES_HOME", str(self.home))  # AVANT tout import de Hermes
+        os.environ.setdefault("HERMES_HOME", str(self.home))  # AVANT tout import de l'amont
         self.roots = [Path(r).expanduser() for r in self.roots] or [self.user_root]
         self.trusted_roots = [Path(r).expanduser() for r in self.trusted_roots]
         if self.audit is None:
@@ -211,7 +211,7 @@ class SkillToolSource:
         return h.hexdigest()
 
     def _verdict(self, skill_dir: Path, sig: str) -> tuple[str, str]:
-        """(verdict, résumé) — `unscannable` sans Hermes (donc masqué)."""
+        """(verdict, résumé) — `unscannable` sans l'amont (donc masqué)."""
         key = ("verdict", str(skill_dir))
         hit = self._cache.get(key)
         if hit and hit[0] == sig:

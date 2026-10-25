@@ -26,6 +26,7 @@ TOKENS.update({
     "p.nojti.sig": {"tenant": "t_jean", "machine": "m1", "scope": "pages", "iat": _T, "exp": _T + 60},
     "d.deleg.sig": {"tenant": "t_jean", "machine": "m1", "scope": "lokkal:session", "iat": _T, "exp": _T + 60,
                     "jti": "j6"},
+    "d.deleg2.sig": {"tenant": "t_jean", "machine": "m1", "scope": "lokkal:session", "iat": _T, "exp": _T + 300},
 })
 
 
@@ -343,11 +344,12 @@ async def test_pages_jeton_dedie_et_iframe(env):
 
 class FakeCore:
     def __init__(self):
-        self.calls, self.mode = [], "ok"
+        self.calls, self.mode, self.ips = [], "ok", []
         self.n = 0
 
-    async def __call__(self, path, body):
+    async def __call__(self, path, body, client_ip=""):
         self.calls.append((path, body))
+        self.ips.append(client_ip)
         if self.mode == "down":
             return 0, None
         if self.mode == "5xx":
@@ -432,6 +434,7 @@ async def test_gw_garde_fous(gwenv):
              for _ in range(22)]
     assert codes.count(429) == 2 and codes[:20] == [200] * 20
     assert (await c.post("/_gw/token", json=body, headers=G(**{"CF-Connecting-IP": "8.8.8.8"}))).status == 200
+    assert core.ips[-1] == "8.8.8.8"          # l'IP du navigateur suit jusqu'au noyau (limites par IP là-bas aussi)
 
 
 async def test_gw_le_cookie_ne_passe_pas_au_lokkal(gwenv):
@@ -459,3 +462,37 @@ async def test_corps_en_flux_et_plafond_sans_longueur(env, monkeypatch):
     r = await c.post("/v1/threads/x/messages", data=chunked(), headers=H(Authorization="Bearer a.jean.sig"))
     assert r.status == 413
     task.cancel(); await ws.close()
+
+
+async def test_presence_et_delai_de_delegation(monkeypatch):
+    signals = []
+
+    async def presence(tok, online):
+        signals.append((tok, online))
+    relay = R.Relay(S, check_machine, check_token, None, presence)
+    c = TestClient(TestServer(R.make_app(relay)))
+    await c.start_server()
+    try:
+        ws1, t1 = await open_tunnel(c)
+        await asyncio.sleep(0.05)
+        assert signals == [("tok-jean", True)]
+        ws2, t2 = await open_tunnel(c)                 # remplace le premier : pas de « hors ligne » entre les deux
+        await asyncio.sleep(0.1)
+        assert signals == [("tok-jean", True), ("tok-jean", True)]
+        t1.cancel()
+        # délégation : délai long ; accès normal : 60 s (ici réduits)
+        monkeypatch.setattr(R, "RESPONSE_TIMEOUT", 0.2)
+        monkeypatch.setattr(R, "DELEGATION_RESPONSE_TIMEOUT", 1.0)
+        await ws2.close(); t2.cancel()
+        await asyncio.sleep(0.1)
+        assert signals[-1] == ("tok-jean", False)
+
+        async def lent(req, body, ws):
+            await asyncio.sleep(0.5)
+            await default(req, body, ws)
+        ws3, t3 = await open_tunnel(c, handler=lent)
+        assert (await c.post("/v1/chat/completions", headers=H(Authorization="Bearer a.jean.sig"))).status == 504
+        assert (await c.post("/v1/chat/completions", headers=H(Authorization="Bearer d.deleg2.sig"))).status == 200
+        t3.cancel(); await ws3.close()
+    finally:
+        await c.close()

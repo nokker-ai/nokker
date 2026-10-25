@@ -1,7 +1,7 @@
 """nokker/tools/code.py — outils de code de Nokker Lokkal (docs/LOKKAL.md, phase L0) : lire, chercher, écrire,
 patcher, lancer une commande, tenir un plan de travail, dans UN dossier de travail.
 
-Reprise de Hermes (règle Nick 16.10 : on s'appuie sur ce qui marche, on écrit ce qu'il faut) au niveau de ses
+Reprise de la bibliothèque d'agent amont (règle produit du 16.10 : on s'appuie sur ce qui marche, on écrit ce qu'il faut) au niveau de ses
 BRIQUES, appelées en direct :
   - `tools.file_operations.ShellFileOperations` : lecture paginée et numérotée, écriture atomique avec contrôle de
     syntaxe (JSON/YAML/TOML), remplacement tolérant (`patch_replace`), lint après écriture, recherche (rg, sinon
@@ -12,8 +12,8 @@ BRIQUES, appelées en direct :
   - `tools.approval_detection` : classement des commandes (dangereuses, et « hardline » jamais exécutées) ;
   - `tools.todo_tool.TodoStore` : le plan de travail.
 
-Ce qui n'est PAS repris : les fonctions-outils de Hermes (`read_file_tool`, `terminal_tool`…). Elles lisent la
-config Hermes (~/.hermes/config.yaml), tiennent leur propre registre d'environnements par tâche et leur propre
+Ce qui n'est PAS repris : les fonctions-outils de l'amont (`read_file_tool`, `terminal_tool`…). Elles lisent la
+config amont (~/.hermes/config.yaml), tiennent leur propre registre d'environnements par tâche et leur propre
 approbation des commandes ; ici ces trois rôles sont à nous (un `Workspace` par fil, nos portes, notre `Effect`).
 
 Effets (`nokker/tools/effects.py`, PLAN-P1 §2.3 étape 5) : lire, chercher et le plan = READ ; écrire et patcher =
@@ -25,7 +25,7 @@ Commandes en arrière-plan (lot X6, `nokker/tools/processes.py`, drapeau `backgr
 SA commande, classée comme `terminal` (mêmes cartes, mêmes règles, « hardline » jamais) ; `process_list` et
 `process_logs` = READ ; `process_stop` = READ aussi : il n'arrête que ce que le fil a lui-même lancé (sans carte).
 
-Hermes n'est importé qu'à la création d'un dossier de travail : sans lui (CI unitaire), le module se charge, les
+L'amont n'est importé qu'à la création d'un dossier de travail : sans lui (CI unitaire), le module se charge, les
 schémas existent, et `classify_command` retombe sur un classement prudent (jamais READ, DESTRUCTIVE au moindre
 doute).
 """
@@ -61,17 +61,17 @@ _SEGMENTS = re.compile(r"&&|\|\||[;|&\n]")
 # ─────────────────────────────── classement des commandes ───────────────────────────────
 
 
-def _hermes_detection() -> Any | None:
+def _upstream_detection() -> Any | None:
     try:
-        from tools import approval_detection  # Hermes (dépendance épinglée, docs/REPO.md)
+        from tools import approval_detection  # amont (dépendance épinglée, docs/REPO.md)
     except Exception:  # noqa: BLE001 — absent (CI unitaire) : classement prudent
         return None
     return approval_detection
 
 
 def hardline_reason(command: str) -> str | None:
-    """Motif « hardline » de Hermes (jamais exécutable, même approuvée), ou None."""
-    det = _hermes_detection()
+    """Motif « hardline » de l'amont (jamais exécutable, même approuvée), ou None."""
+    det = _upstream_detection()
     if det is None:
         return None
     hit, why = det.detect_hardline_command(command)
@@ -105,9 +105,9 @@ def _read_only(command: str) -> bool:
 
 
 def classify_command(command: str) -> Effect:
-    """Effet d'une commande `terminal`. Sans la détection de Hermes : WRITE si la commande est de lecture pure
+    """Effet d'une commande `terminal`. Sans la détection de l'amont : WRITE si la commande est de lecture pure
     (on ne parie pas sur READ sans la détection), DESTRUCTIVE sinon."""
-    det = _hermes_detection()
+    det = _upstream_detection()
     if det is None:
         return Effect.WRITE if _read_only(command) else Effect.DESTRUCTIVE
     if det.detect_hardline_command(command)[0] or det.detect_dangerous_command(command)[0]:
@@ -207,7 +207,7 @@ _CLASSIFIED = ("terminal", "process_start")  # effet = celui de la commande (`cl
 
 @dataclass
 class Workspace:
-    """Un environnement d'exécution Hermes ouvert sur le dossier, ses opérations de fichiers et son plan."""
+    """Un environnement d'exécution amont ouvert sur le dossier, ses opérations de fichiers et son plan."""
 
     env: Any
     ops: Any
@@ -313,7 +313,7 @@ class CodeToolSource:
             return ws
 
     def _allow_writes_in_workspace(self) -> None:
-        """Hermes refuse toute écriture hors de HERMES_WRITE_SAFE_ROOT quand la variable est posée (l'image nokker
+        """L'amont refuse toute écriture hors de HERMES_WRITE_SAFE_ROOT quand la variable est posée (l'image nokker
         la pose à /opt/data pour la gateway). On y ajoute le dossier de travail, tel que les outils le voient ; on
         n'y touche pas si elle est absente (aucune restriction à élargir)."""
         current = os.environ.get("HERMES_WRITE_SAFE_ROOT")
@@ -334,19 +334,19 @@ class CodeToolSource:
 
             env, cwd = LocalEnvironment(cwd=self._base, timeout=120), self._base
         else:
-            from tools.environments import docker as hermes_docker
+            from tools.environments import docker as upstream_docker
             from tools.environments.docker import DockerEnvironment
 
-            # Hermes monte en lecture seule ses propres dossiers (skills, caches, identifiants de ~/.hermes) dans
+            # L'amont monte en lecture seule ses propres dossiers (skills, caches, identifiants de ~/.hermes) dans
             # chaque container. Lokkal n'en veut aucun : ses skills sont les siens (L3), et ces chemins, pris dans le
             # container du noyau, n'existent pas sur l'hôte (le proxy du socket les refuserait).
-            hermes_docker._readonly_skill_mount_args = lambda: []
-            # /tmp du bac à sable : Hermes le monte sans `exec`, donc noexec et à root. Sous l'uid de l'utilisateur
-            # (run_as_host_user), un venv ou npm y échouent (recette brosim, 23.10) : exécutable et ouvert à tous
+            upstream_docker._readonly_skill_mount_args = lambda: []
+            # /tmp du bac à sable : l'amont le monte sans `exec`, donc noexec et à root. Sous l'uid de l'utilisateur
+            # (run_as_host_user), un venv ou npm y échouent (recette du 23.10) : exécutable et ouvert à tous
             # (sticky), et HOME=/tmp ci-dessous pour les caches de pip et npm.
-            hermes_docker._BASE_SECURITY_ARGS[:] = [
+            upstream_docker._BASE_SECURITY_ARGS[:] = [
                 "/tmp:rw,exec,nosuid,size=1g,mode=1777" if a.startswith("/tmp:") else a
-                for a in hermes_docker._BASE_SECURITY_ARGS]
+                for a in upstream_docker._BASE_SECURITY_ARGS]
 
             safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", thread_id)[:48] or "default"
             # Étiquette `nokker.sandbox` : le proxy du socket docker du compose n'accepte que ces containers-là.
@@ -422,7 +422,7 @@ class CodeToolSource:
         try:
             ws = self.workspace(ctx.thread_id)
             a = arguments
-            # Chemin vérifié AVANT tout appel à Hermes : un refus ne touche jamais l'environnement.
+            # Chemin vérifié AVANT tout appel à l'amont : un refus ne touche jamais l'environnement.
             if name in ("read_file", "search_files"):
                 # Lectures : directement dans le dossier monté quand c'est possible (0-80 ms au lieu de 0,4-2 s par
                 # `docker exec`, mesuré le 23.10) ; elles n'exécutent aucun code du dépôt. Écritures, patchs (et leur
@@ -474,7 +474,7 @@ class CodeToolSource:
             text = str(a.get("patch") or "")
             if not text:
                 return out("mode patch : le contenu du patch est requis", True)
-            # En-têtes réécrits en chemins absolus (vérifiés en local) : Hermes contrôle chaque écriture contre
+            # En-têtes réécrits en chemins absolus (vérifiés en local) : l'amont contrôle chaque écriture contre
             # HERMES_WRITE_SAFE_ROOT, et un chemin relatif s'y lirait depuis le dossier du processus, pas d'ici.
             text = re.sub(r"^(\*\*\* (?:Update|Add|Delete) File: )(.+)$",
                           lambda m: m.group(1) + self._inside(ws, m.group(2).strip()), text, flags=re.MULTILINE)
@@ -487,6 +487,15 @@ class CodeToolSource:
         if r.get("error") and "Could not find" in str(r["error"]):
             r["_hint"] = "passage introuvable : relis le fichier (read_file) ou cherche-le (search_files)"
         return out(r, bool(r.get("error")))
+
+    def workspace_path(self, thread_id: str, path: str) -> str:
+        """Chemin, tel que le bac à sable le voit, d'une destination relative au dossier de travail (`ssh_copy`, lot
+        X11) : borné au dossier (liens symboliques compris en local, au dossier monté en docker)."""
+        ws = self.workspace(thread_id)
+        full = self._inside(ws, path)
+        if self.backend != "local" and full != self.mount and not full.startswith(self.mount + "/"):
+            raise PermissionError(f"{path!r} sort du dossier de travail")
+        return full
 
     def run_hook(self, thread_id: str, command: str, stdin: str, timeout: int) -> tuple[int | None, str]:
         """Une commande de hook (nokker/tools/hooks.py) dans l'environnement du fil : le bac à sable en docker (jamais

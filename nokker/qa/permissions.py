@@ -38,6 +38,8 @@ FILE_EDIT_TOOLS = frozenset({"write_file", "patch", "checkpoint_create"})
 # accept_edits : la mémoire de projet (X1) n'écrit que dans le dossier d'état de Nokker, chaque note est visible
 # (événement `memory.noted`) et un oubli se range à part (rien n'est détruit) — même régime qu'un point de retour.
 MEMORY_EDIT_TOOLS = frozenset({"memory_note", "memory"})
+# Verdict d'un appel à effet d'un connecteur relayé (X20) : une carte par appel, sans règle « session » ni « always ».
+RELAY_CARD_RULE = "permissions:relayed_connector"
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
 
@@ -75,6 +77,11 @@ def _subjects(call: ToolCall) -> list[str]:
     a = call.arguments
     if call.name in ("terminal", "process_start"):
         return [str(a.get("command", "")).strip()]
+    if call.name.startswith("ssh_"):  # outils ops (lot X11) : `hôte:commande`, `hôte:chemin`
+        from nokker.tools.ssh import ssh_subject
+
+        subject = ssh_subject(call.name, a)
+        return [subject] if subject else []
     if call.name == "patch" and str(a.get("mode")) == "patch":
         return [p.strip() for p in re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", str(a.get("patch", "")),
                                               re.MULTILINE)]
@@ -103,6 +110,27 @@ class LocalPermissions:
         mode = Mode(project["mode"]) if project.get("mode") in _STRICTNESS else None
         self.thread_project[thread_id] = (mode, [Rule.parse(r) for r in project.get("ask", [])],
                                           [Rule.parse(r) for r in project.get("deny", [])])
+
+    def restrict_with(self, thread_id: str, rules: dict[str, Any]) -> None:
+        """Règles d'un projet d'équipe (lot X17, nokker/team/) EN PLUS de celles du dépôt, même régime : mode plus
+        strict, `ask`, `deny` ; un `allow` ou un mode plus large ne changent rien. À appeler APRÈS
+        `restrict_for_thread` (qui repart de zéro pour le fil). Une règle illisible est ignorée (nokker.ai les a déjà
+        validées ; l'ouverture de session n'échoue pas)."""
+        cur_mode, cur_ask, cur_deny = self.thread_project.get(thread_id, (None, [], []))
+        mode = Mode(rules["mode"]) if rules.get("mode") in _STRICTNESS else None
+        if mode is None or (cur_mode is not None and _STRICTNESS[cur_mode.value] >= _STRICTNESS[mode.value]):
+            mode = cur_mode
+
+        def parsed(key: str) -> list[Rule]:
+            out = []
+            for r in rules.get(key) or []:
+                try:
+                    out.append(Rule.parse(str(r)))
+                except ValueError:
+                    continue
+            return out
+
+        self.thread_project[thread_id] = (mode, [*cur_ask, *parsed("ask")], [*cur_deny, *parsed("deny")])
 
     def allow_for_thread(self, thread_id: str, rule: Rule) -> None:
         rules = self.thread_allow.setdefault(thread_id, [])
@@ -171,9 +199,21 @@ class PermissionGates:
 
     inner: Any
     permissions: LocalPermissions
+    # Planchers (lot X11, `SshToolSource.floor`) : `(appel, spec, tour) -> Verdict | None`, consultés AVANT les
+    # règles et le mode. Un DENY refuse ; un HITL est une carte qu'aucune règle `allow` (session, « always »), aucun
+    # mode ni GO textuel ne lève — seuls les `deny` et le mode plan refusent encore (plus strict que la carte).
+    floors: list[Any] = field(default_factory=list)
+    # Fil → session de code locale ? Les portes à permissions locales servent `nokker code` (tout le processus est une
+    # session de code : défaut None = vrai pour tout fil) et Lokkal (le registre des sessions de code, posé au
+    # démarrage). Transmis aux portes du noyau : le drapeau de domaine y devient consultatif (qa/gates.py).
+    code_session: Any = None
+
+    def __post_init__(self) -> None:
+        if hasattr(self.inner, "code_session") and getattr(self.inner, "code_session", None) is None:
+            self.inner.code_session = self.code_session if self.code_session is not None else (lambda _tid: True)
 
     def action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> list[Verdict]:
-        if call.name in ("terminal", "process_start"):
+        if call.name in ("terminal", "process_start", "ssh_run"):
             from nokker.tools.code import hardline_reason
 
             why = hardline_reason(str(call.arguments.get("command", "")))
@@ -181,7 +221,30 @@ class PermissionGates:
                 return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:hardline",
                                 reason=why, subject=call.id)]
         effect = call_effect(spec, call.arguments)
+        for floor in self.floors:
+            imposed = floor(call, spec, turn)
+            if imposed is None:
+                continue
+            if imposed.decision is Decision.HITL:
+                decision, why = self.permissions.decide(call, effect, getattr(turn, "thread_id", None))
+                if decision is Decision.DENY:
+                    return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1,
+                                    rule=f"permissions:{self.permissions.mode.value}", reason=why, subject=call.id)]
+            return [imposed]
         decision, why = self.permissions.decide(call, effect, getattr(turn, "thread_id", None))
+        if getattr(spec, "locality", None) == "cloud" and effect is not Effect.READ and decision is not Decision.DENY:
+            # Connecteur relayé (lot X20) : la ressource est au compte nokker.ai, qui exige la preuve d'une carte pour
+            # tout appel à effet. Ni le mode (auto, accept_edits), ni une règle allow, ni un GO écrit n'en dispensent.
+            # Envoi externe et destructif (X20b) : carte FORTE, qui part au téléphone (X10) et dont nokker.ai vérifie
+            # lui-même la signature ; une écriture interne garde une carte standard.
+            v1 = self.inner.invariants.check_action(call, spec, turn)
+            if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
+                return [v1]
+            return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=RELAY_CARD_RULE,
+                            reason="outil d'un compte nokker.ai (connecteur relayé) : chaque appel à effet passe par "
+                                   "une carte", subject=call.id,
+                            strength="strong" if effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL)
+                            else "standard")]
         if decision is None:
             return self.inner.action(call, spec, turn)
         if decision is Decision.ALLOW:
@@ -199,4 +262,5 @@ class PermissionGates:
         return getattr(self.inner, name)
 
 
-__all__ = ["FILE_EDIT_TOOLS", "MEMORY_EDIT_TOOLS", "LocalPermissions", "Mode", "PermissionGates", "Rule"]
+__all__ = ["FILE_EDIT_TOOLS", "MEMORY_EDIT_TOOLS", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
+           "Rule"]

@@ -1,9 +1,9 @@
 """Points de retour (nokker/tools/checkpoints.py, Nokker Lokkal L3).
 
-Partie 1, toujours jouée (sans Hermes) : schémas, effets, enveloppe transparente (faux inner, faux gestionnaire) —
+Partie 1, toujours jouée (sans l'amont) : schémas, effets, enveloppe transparente (faux inner, faux gestionnaire) —
 ordre new_turn → ensure_checkpoint → appel → record_agent_write, rien pour un READ, traduction /workspace, un
 gestionnaire qui lève n'empêche pas l'appel.
-Partie 2, si Hermes est importable (image nokker-lokkal-dev) : vrai CheckpointManager sous un HOME temporaire."""
+Partie 2, si l'amont est importable (image nokker-lokkal-dev) : vrai CheckpointManager sous un HOME temporaire."""
 from __future__ import annotations
 
 import importlib.util
@@ -19,9 +19,9 @@ from nokker.tools import checkpoints as cp
 from nokker.tools.checkpoints import (CHECKPOINT_TOOLS, CheckpointToolSource, CheckpointingToolSource, host_path)
 from nokker.tools.select import FAMILIES, compact_index, relevant_tools
 
-HERMES = importlib.util.find_spec("tools") is not None and \
+UPSTREAM = importlib.util.find_spec("tools") is not None and \
     importlib.util.find_spec("tools.checkpoint_manager") is not None
-needs_hermes = pytest.mark.skipif(not HERMES, reason="Hermes (tools.checkpoint_manager) non importable")
+needs_upstream = pytest.mark.skipif(not UPSTREAM, reason="amont (tools.checkpoint_manager) non importable")
 
 
 def ctx(turn=0, tid="t1"):
@@ -94,7 +94,7 @@ def test_family_in_select():
     assert relevant_tools("bonjour", set(), specs) == []
 
 
-def test_without_hermes_tools_answer_unavailable(tmp_path, monkeypatch):
+def test_without_upstream_tools_answer_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr(cp, "make_manager", lambda home=None, **k: None)
     src = CheckpointToolSource(lambda t: tmp_path)
     for name in CHECKPOINT_TOOLS:
@@ -108,8 +108,8 @@ def test_without_hermes_tools_answer_unavailable(tmp_path, monkeypatch):
     assert log == [("call", "write_file")]  # transparente
 
 
-def test_auto_prune_without_hermes(monkeypatch):
-    monkeypatch.setattr(cp, "_hermes_checkpoints", lambda home=None: None)
+def test_auto_prune_without_upstream(monkeypatch):
+    monkeypatch.setattr(cp, "_upstream_checkpoints", lambda home=None: None)
     r = cp.auto_prune()
     assert r["skipped"] and "indisponibles" in r["error"]
 
@@ -202,7 +202,7 @@ def test_hooks_env_wrapper_appends_config():
     assert cp._no_user_hooks(lambda: {})()["GIT_CONFIG_COUNT"] == "1"
 
 
-# ─────────────────────────────── avec Hermes ───────────────────────────────
+# ─────────────────────────────── avec l'amont ───────────────────────────────
 
 
 @pytest.fixture
@@ -224,7 +224,7 @@ def _j(r):
     return json.loads(r.content)
 
 
-@needs_hermes
+@needs_upstream
 def test_real_create_modify_list_diff_restore(real):
     work, _, tools = real
     c = ctx()
@@ -252,7 +252,7 @@ def test_real_create_modify_list_diff_restore(real):
     assert tools.call("checkpoint_restore", {}, c).is_error
 
 
-@needs_hermes
+@needs_upstream
 def test_real_safe_restore_keeps_user_edits(real):
     work, wrapper, tools = real
     c = ctx()
@@ -266,7 +266,7 @@ def test_real_safe_restore_keeps_user_edits(real):
     assert (work / "b.txt").read_text() == "humain\n" and "b.txt" in res["skipped_user_edits"]
 
 
-@needs_hermes
+@needs_upstream
 def test_real_wrapper_captures_before_write_once_per_turn(real):
     work, wrapper, tools = real
     wrapper.call("write_file", {"path": "a.txt"}, ctx(0))
@@ -279,7 +279,7 @@ def test_real_wrapper_captures_before_write_once_per_turn(real):
     assert len(_j(tools.call("checkpoint_list", {}, ctx()))) == 2
 
 
-@needs_hermes
+@needs_upstream
 def test_real_no_git_dir_written_in_the_users_folder(real):
     work, _, tools = real
     _j(tools.call("checkpoint_create", {}, ctx()))
@@ -289,7 +289,7 @@ def test_real_no_git_dir_written_in_the_users_folder(real):
     assert sorted(p.name for p in work.iterdir()) == ["a.txt", "b.txt"]
 
 
-@needs_hermes
+@needs_upstream
 def test_real_user_repo_hooks_never_run(real, tmp_path):
     work, _, tools = real
     marker = tmp_path / "HOOK-RAN"
@@ -309,7 +309,7 @@ def test_real_user_repo_hooks_never_run(real, tmp_path):
     assert not marker.exists(), marker.read_text() if marker.exists() else ""
 
 
-@needs_hermes
+@needs_upstream
 def test_real_hooks_path_env_is_effective_in_shadow_git(real, tmp_path):
     """Preuve directe : le git du gestionnaire voit core.hooksPath=/dev/null."""
     work, _, tools = real
@@ -320,7 +320,7 @@ def test_real_hooks_path_env_is_effective_in_shadow_git(real, tmp_path):
     assert ok and out == os.devnull, (out, err)
 
 
-@needs_hermes
+@needs_upstream
 def test_real_auto_prune_runs(real):
     r = cp.auto_prune(real[1].manager and None)
     assert "skipped" in r

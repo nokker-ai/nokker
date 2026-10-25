@@ -9,12 +9,20 @@ Modèle : chaque fil a UNE maison (la machine, ou le web). L'autre côté en gar
     les copies `lokkal-*` (une machine ne retire jamais ce qu'elle a poussé).
 Les fichiers du dossier de travail ne passent JAMAIS par ici (§6.3). Effacement propagé : l'effacement du compte efface
 les copies (même locataire) ; une machine efface les siennes (`erase`, route `POST /v1/mirror/erase`), par la fonction
-`nokker_mirror_erase` (migration 015) qui n'atteint que des copies. Les notes CortHeXis suivent dans une version
-suivante (aucun locataire de nokker.ai n'a encore de notes).
+`nokker_mirror_erase` (migration 015) qui n'atteint que des copies.
+
+Notes de mémoire (lot X21, docs/LOKKAL.md §6.7) : la machine pousse le TEXTE de ses notes `both` (notes de
+l'utilisateur, notes d'un projet mis en miroir) ; elles sont gardées par (machine, projet, nom) sous la RLS du
+locataire (`lokkal_mirror_notes`, migration 025). Seconde barrière : une note qui se dit `local` (ou sans localité)
+est refusée ici aussi, même si la machine l'envoie. L'index de recherche côté web se recalcule à partir du texte (pas
+encore branché sur le rappel des sessions web).
 """
 from __future__ import annotations
 
 import dataclasses
+import re
+import threading
+import time
 from typing import Any
 
 from nokker.store.pg import turn_from_dict
@@ -73,4 +81,74 @@ def _parse_cursor(since: str | None) -> tuple[str, str, int]:
     return (created, tid, int(idx))
 
 
-__all__ = ["erase", "mirror_thread", "pull", "push"]
+# ─────────────────────────────── notes (X21) ───────────────────────────────
+
+_NOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
+_PROJECT = re.compile(r"^(u-local|p-[0-9a-f]{16})$")
+MAX_NOTE_TEXT = 4000
+
+
+def _clean_note(raw: Any) -> dict[str, Any] | None:
+    """Note reçue d'une machine, réduite aux champs connus et bornés ; None si elle ne peut pas sortir (localité)
+    ou si sa forme est fausse."""
+    from nokker.core.locality import may_leave
+
+    if not isinstance(raw, dict) or not may_leave(raw.get("locality")):
+        return None
+    project, name = str(raw.get("project") or ""), str(raw.get("name") or "")
+    if not _PROJECT.match(project) or not _NOTE_NAME.match(name):
+        return None
+    scope = "user" if raw.get("scope") == "user" else "project"
+    return {"project": project, "name": name, "kind": str(raw.get("kind") or "")[:20], "scope": scope,
+            "locality": str(raw["locality"]), "title": str(raw.get("title") or "")[:200],
+            "text": str(raw.get("text") or "")[:MAX_NOTE_TEXT], "created": str(raw.get("created") or "")[:40],
+            "derived_from": str(raw.get("derived_from") or "")[:20]}
+
+
+class MemoryMirrorNotes:
+    """Notes en miroir (tests, dev) ; `PgMirrorNotes` (nokker/cloud/pg.py) a la même interface."""
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str, str, str], dict[str, Any]] = {}  # (locataire, machine, projet, nom) → note
+        self.lock = threading.Lock()
+
+    def put(self, tenant: str, machine: str, note: dict[str, Any], at: float) -> None:
+        with self.lock:
+            self.rows[(tenant, machine, note["project"], note["name"])] = {**note, "updated_at": at}
+
+    def forget(self, tenant: str, machine: str, project: str, name: str) -> bool:
+        with self.lock:
+            return self.rows.pop((tenant, machine, project, name), None) is not None
+
+    def of_tenant(self, tenant: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return [{**v, "machine_id": k[1]} for k, v in self.rows.items() if k[0] == tenant]
+
+    def erase(self, tenant: str, machine: str) -> int:
+        with self.lock:
+            keys = [k for k in self.rows if k[0] == tenant and k[1] == machine]
+            for k in keys:
+                del self.rows[k]
+            return len(keys)
+
+
+def push_notes(notes_store: Any, tenant: str, machine: str, body: Any) -> dict[str, int]:
+    """Range les notes poussées par une machine ; rend {accepted, refused, forgotten}."""
+    body = body if isinstance(body, dict) else {}
+    accepted = refused = forgotten = 0
+    now = time.time()
+    for raw in list(body.get("notes") or [])[:MAX_BATCH]:
+        note = _clean_note(raw)
+        if note is None:
+            refused += 1  # `local` ou illisible : rien n'est gardé
+            continue
+        notes_store.put(tenant, machine, note, now)
+        accepted += 1
+    for f in list(body.get("forget") or [])[:MAX_BATCH]:
+        if isinstance(f, dict) and notes_store.forget(tenant, machine, str(f.get("project") or ""),
+                                                      str(f.get("name") or "")):
+            forgotten += 1
+    return {"accepted": accepted, "refused": refused, "forgotten": forgotten}
+
+
+__all__ = ["MemoryMirrorNotes", "erase", "mirror_thread", "pull", "push", "push_notes"]

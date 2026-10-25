@@ -1,4 +1,4 @@
-"""Client du pool de navigateurs de la bêta (contrat : docs/BROWSER-POOL.md, fournisseur : session brosim).
+"""Client du pool de navigateurs de la bêta (contrat : docs/BROWSER-POOL.md, fournisseur : le service du pool).
 
 UNE source d'outils pour tous les testeurs : chaque appel lit le locataire du tour (`current_tenant()`), ouvre ou
 reprend la session navigateur de CE locataire (`POST /sessions {tenant_id}` : 201 nouvelle, 200 la même si elle vit

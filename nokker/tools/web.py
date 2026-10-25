@@ -1,17 +1,17 @@
-"""nokker/tools/web.py — recherche web « sans clé » (P1, décision Nick 18.10.2026).
+"""nokker/tools/web.py — recherche web « sans clé » (P1, décision produit du 18.10.2026).
 
 Contexte : pas de moteur payant (coût incontrôlable à l'échelle), pas d'index maison (trop long,
 trop complexe). On reprend les mêmes offres gratuites et publiques que le mode « sans clé »
-d'Hermes (`hermes-nokker/plugins/web/keyless_mcp.py` + `plugins/web/_common.py`, lu en entier avant
+de la bibliothèque d'agent amont (`hermes-nokker/plugins/web/keyless_mcp.py` + `plugins/web/_common.py`, lu en entier avant
 d'écrire ce module) : Exa (MCP `https://mcp.exa.ai/mcp`), Parallel (MCP
 `https://search.parallel.ai/mcp`), Firecrawl (cloud public `https://api.firecrawl.dev`, sans en-tête
 d'auth — `plugins/web/firecrawl/provider.py::_KeylessFirecrawlClient`) et Keenable
 (`https://api.keenable.ai/v1/search/public`, en-tête `X-Keenable-Title` obligatoire, pas de clé).
 
 **Choix d'implémentation : réimplémentation minimale en `httpx` (déjà une dépendance nokker,
-`providers/sokkan.py`), PAS une enveloppe du module Hermes.** Justification : l'anneau d'Hermes
+`providers/sokkan.py`), PAS une enveloppe du module amont.** Justification : l'anneau amont
 (`search_with_failover`) est construit pour un repli SÉQUENTIEL — un moteur après l'autre, le
-suivant seulement si le précédent est throttled — câblé sur les chokepoints internes d'Hermes
+suivant seulement si le précédent est throttled — câblé sur les chokepoints internes de l'amont
 (`hermes_cli.config`, `tools.web_tools`, `pm.ensure_import`, `tools.interrupt`, son propre anneau
 round-robin par processus). Le contrat demandé ici est différent par nature : les QUATRE moteurs
 lancés EN PARALLÈLE sous un budget global commun, fusion par consensus (une URL vue par plusieurs
@@ -25,7 +25,8 @@ Le code ci-dessous est écrit à neuf : mêmes URLs/formats de requête (ce sont
 œuvre), logique de fan-out/fusion/disjoncteur/cache propre à nokker. Rien n'est copié texte pour
 texte depuis `keyless_mcp.py`/`_common.py`.
 
-**Licence** : hermes-nokker est Apache-2.0 (`LICENSE` de hermes-nokker) ; nokker aussi
+**Licence** : hermes-nokker est un fork en Apache-2.0 (`LICENSE` de hermes-nokker) d'un amont MIT, dont
+l'attribution est dans son `NOTICE` (et `LICENSES/MIT-hermes-agent.txt`) ; nokker aussi est en Apache-2.0
 (`pyproject.toml`, `license = {text = "Apache-2.0"}`) — licences identiques, donc de toute façon
 compatibles même si une ligne de code s'en était trouvée proche par construction (mêmes contraintes
 d'API). Voir `docs/WEB-SEARCH.md` pour le format de résultat et les limites (éditeurs US, paliers
@@ -59,7 +60,7 @@ KEENABLE_API_URL = "https://api.keenable.ai"
 _KEENABLE_TITLE = "nokker"  # X-Keenable-Title : identifie l'appli appelante, jamais un utilisateur
 
 # Parallel (free tier) : corrélation anti-abus demandée par le vendeur, aléatoire par PROCESSUS,
-# jamais persistée ni journalisée — même soin que l'anneau Hermes (_common.py en-tête).
+# jamais persistée ni journalisée — même soin que l'anneau amont (_common.py en-tête).
 _SESSION_ID = uuid.uuid4().hex
 
 _ALL_ENGINES = ("exa", "parallel", "firecrawl", "keenable")
@@ -72,7 +73,7 @@ class WebEngineError(RuntimeError):
 
 # ─────────────────────────────── garde PII ───────────────────────────────
 #
-# Règle Nick : rien d'identifiable chez des éditeurs US (Exa, Parallel, Firecrawl ; Keenable aussi,
+# Règle produit : rien d'identifiable chez des éditeurs US (Exa, Parallel, Firecrawl ; Keenable aussi,
 # tous hors de notre contrôle). Vérifié AVANT tout envoi réseau — un refus ici ne part jamais.
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")

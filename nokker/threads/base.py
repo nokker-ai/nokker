@@ -60,16 +60,16 @@ class BaseThreads:
         return t
 
     def create(self, title: str, owner: str | None, *, thread_id: str | None = None,
-               members: list[str] | None = None) -> Thread:
+               members: list[str] | None = None, origin: dict | None = None) -> Thread:
         now = self.clock()
         t = Thread(id=thread_id or new_thread_id(), title=(title or "").strip()[:200] or "Nouvelle session",
                    owner=owner, members=[m for m in (members or []) if m and m != owner],
-                   created_at=now, updated_at=now)
+                   created_at=now, updated_at=now, origin=dict(origin) if origin else None)
         self._store(t)
         return t
 
     def ensure(self, thread_id: str, owner: str | None, first_text: str) -> tuple[Thread, bool]:
-        """Fil à la volée pour un `X-Session-Id` inconnu (rétrocompatible gateway Hermes) : (fil, créé ?)."""
+        """Fil à la volée pour un `X-Session-Id` inconnu (rétrocompatible passerelle amont) : (fil, créé ?)."""
         t = self._load(thread_id)
         if t is not None:
             return t, False

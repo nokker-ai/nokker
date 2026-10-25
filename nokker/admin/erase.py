@@ -36,6 +36,14 @@ from nokker.tenancy.context import INTERNAL_TENANT
 UNSCOPED_OK = {"operators", "admin_audit", "beta_applications", "used_nonces", "schema_migrations",
                "lokkal_link_requests"}  # flux d'appareil Lokkal : 10 min, aucune donnée de compte
 _LAST = ("accounts", "tenants")  # supprimées après tout le reste, dans cet ordre
+# Équipe (X17, migration 023) : un compte membre d'un projet d'un AUTRE locataire y a des lignes au locataire du projet.
+# Elles partent avec lui : la transaction pose aussi `app.account_id` / `app.account_email`, que les politiques d'équipe
+# ouvrent à ce seul compte (ses adhésions, les invitations qui lui sont adressées) ; le reste du projet ne bouge pas.
+_CROSS_TENANT = {
+    "team_access": ("tenant_id = %s OR account_id = %s", "acc"),
+    "team_members": ("tenant_id = %s OR account_id = %s", "acc"),
+    "team_invites": ("tenant_id = %s OR invitee_account = %s OR (email <> '' AND email = %s)", "acc+mail"),
+}
 
 
 class EraseError(Exception):
@@ -155,12 +163,17 @@ def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: boo
 
         conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant,))  # RLS : ce locataire, cette transaction
         conn.execute("SELECT set_config('nokker.erasing_tenant', %s, true)", (tenant,))  # turns : migration 013
+        conn.execute("SELECT set_config('app.account_id', %s, true), set_config('app.account_email', %s, true)",
+                     (acc, mail))  # équipe : ses adhésions aux projets d'autres locataires (023)
         cols = _columns(conn)
         plan: dict[str, tuple[str, tuple]] = {}
         for t, cs in cols.items():
             if t in _LAST:
                 continue
-            if "tenant_id" in cs:
+            if t in _CROSS_TENANT:
+                where, extra = _CROSS_TENANT[t]
+                plan[t] = (where, (tenant, acc, mail) if extra == "acc+mail" else (tenant, acc))
+            elif "tenant_id" in cs:
                 plan[t] = ("tenant_id = %s", (tenant,))
             elif "account_id" in cs:
                 plan[t] = ("account_id = %s", (acc,))

@@ -52,12 +52,15 @@ class ContextEngineV1(ContextEngineV0):
         memory_text = mgr.memory_block(turn.thread_id)
         index_block = self.tools_index_block()
         project_text = self.project_block(turn)
+        plan_text = self.plan_block(turn)
         # Du plus stable au moins stable (cache de préfixe) : préfixe, index d'outils, profil, mémoire de projet (change
         # quand une consigne du dépôt change ou qu'une règle est notée, au tour suivant), puis la mémoire de session,
         # qui change à la clôture d'un épisode.
         system_parts = self.system_parts(index_block)
         if project_text:
             system_parts.append(project_text)
+        if plan_text:  # consignes héritées du plan (X18) : changent quand la carte ou un ancêtre change
+            system_parts.append(plan_text)
         if memory_text:
             system_parts.append(memory_text)
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
@@ -104,6 +107,8 @@ class ContextEngineV1(ContextEngineV0):
         }
         if self.project_memory is not None:
             layer_tokens["project"] = estimate_tokens(project_text)
+        if plan_text:
+            layer_tokens["plan"] = estimate_tokens(plan_text)
         return Assembled(messages=messages, tools=tools_payload, prefix_sha256=self._prefix_sha256,
                          layer_tokens=layer_tokens)
 

@@ -22,9 +22,9 @@
    `/account/billing`, ou lu par une session qui a le cookie), SOIT `--broker-sqlite` + `--account-id`
    (accès direct, lecture seule, au fichier SQLite du broker — même requête que `usage_daily()`, à
    lancer depuis un hôte qui voit ce fichier, ex. `tokenalp1`).
-2. `mode="catalog"` (compte interne à prix nul, décision Nick 17.10 — Router `356d4d3`) : dès que la
+2. `mode="catalog"` (compte interne à prix nul, décision produit du 17.10 — Router `356d4d3`) : dès que la
    clé de banc devient un compte interne, son `cost_micro` restera à 0 EN CONTINU côté broker (prix
-   nul, cf. note `nokker-p0` « Crédit interne … BLOQUÉ, pas fait » : conçu, pas encore posé, mais c'est
+   nul : le crédit interne est conçu, pas encore posé, mais c'est
    la cible). Il n'y a alors plus de « vraie facture » à comparer : ce mode reprix chaque appel du
    ledger au tarif CATALOGUE public (`prices.py`) et compare ce total à lui-même — un contrôle de
    cohérence interne du ledger, pas un rapprochement externe. Les deux modes partagent le même seuil
@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-total-usd", type=float, default=None)
     parser.add_argument("--broker-sqlite", dest="broker_sqlite_path", default=None)
     parser.add_argument("--account-id", default=None)
-    parser.add_argument("--tenant", default=INTERNAL_TENANT, help="locataire lu (RLS, docs/TENANCY.md §4)")
+    parser.add_argument("--tenant", default=INTERNAL_TENANT, help="locataire lu (RLS)")
     args = parser.parse_args(argv)
 
     from nokker.ledger.costs import PostgresLedger
