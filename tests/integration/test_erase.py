@@ -488,8 +488,8 @@ def test_erase_pending_journal_is_written_before_the_commit(pg, tmp_path):  # no
     acc = tenancy.create_account("journal-moi@recette.test")
     tenancy.suspend_for_deletion(acc.account_id, "ap-journal")
 
-    if os.path.exists("/dev/full"):
-        with ErasureJournal.open("/dev/full") as full:
+    if os.path.exists("/dev/full"):  # fd direct : `open` refuse le dossier /dev, non inscriptible hors root (CI)
+        with ErasureJournal(os.open("/dev/full", os.O_WRONLY | os.O_APPEND)) as full:
             run = erase_pending(pg["app"], apply=True, journal=full)
         assert run.refused >= 1 and acc.account_id in pending_deletions(pg["app"])
         with psycopg.connect(pg["su"]) as conn:

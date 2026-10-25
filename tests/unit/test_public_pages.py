@@ -286,7 +286,7 @@ def test_bubble_follows_publication(hub, rec, tmp_path):  # noqa: F811
 # ─────────────────────────────── miroir : la copie porte sa publication ───────────────────────────────
 
 
-def test_public_copy_served_offline_only_for_the_published_version(cloud):
+def test_public_copy_served_offline_only_for_the_published_version(cloud):  # noqa: F811
     port, mt, machine, store, links, tmp = cloud
     cloud_http._cloud.pages_public_allowed = lambda acc: acc == "us_p"
     pages = PageStore(tmp / "pages")
@@ -331,7 +331,7 @@ def test_public_copy_served_offline_only_for_the_published_version(cloud):
     assert w.push_pages_once() == 0                         # rien à recopier : la marque a suivi le retrait
 
 
-def test_unpublish_purge_waits_and_retries_when_nokker_ai_is_down(cloud, monkeypatch):
+def test_unpublish_purge_waits_and_retries_when_nokker_ai_is_down(cloud, monkeypatch):  # noqa: F811
     import httpx
 
     port, mt, machine, store, _, tmp = cloud
@@ -374,7 +374,7 @@ def test_cloud_refuses_bad_public_and_ignores_it_without_the_right():
     assert not s.clear_public("tn", "mc", "pg_0123456789abcdef")
 
 
-def test_unpublish_route_on_nokker_ai_is_a_right(cloud):
+def test_unpublish_route_on_nokker_ai_is_a_right(cloud):  # noqa: F811
     port, mt, machine, store, _, _ = cloud
     assert _call(port, "DELETE", "/v1/mirror/pages/pg_0123456789abcdef/public")[0] == 401
     assert _call(port, "DELETE", "/v1/mirror/pages/pg_0123456789abcdef/public", token=mt) == (200, {"unpublished": False})
@@ -386,7 +386,7 @@ def test_unpublish_route_on_nokker_ai_is_a_right(cloud):
 # ─────────────────────────────── registre partagé des jetons de pages ───────────────────────────────
 
 
-def test_used_jti_registry_route(cloud):
+def test_used_jti_registry_route(cloud):  # noqa: F811
     port, mt, _, _, _, _ = cloud
     cloud_http._cloud.used_jti = mp.MemoryUsedJti()
     key = {"X-Nokker-Relay-Key": "k" * 32}

@@ -92,7 +92,7 @@ def test_mode_of_the_thread(make):
     assert _decide(gates, svc, t_plan, "write_file", {"path": "a.py", "content": ""})[0].decision is Decision.DENY
     assert _decide(gates, svc, t_plan, "read_file", {"path": "a.py"})[0].decision is Decision.ALLOW
     # destructif : les invariants du noyau décident (carte forte), comme en Lokkal
-    v = _decide(gates, svc, t_edit, "terminal", {"command": "python3 -m pytest"})[0]
+    v = _decide(gates, svc, t_edit, "terminal", {"command": "rm -rf build"})[0]
     assert v.rule == "inner" and inner.seen == ["terminal"]
     # un fil hors session : les portes du noyau seules
     assert _decide(gates, svc, f"{TA}:th_plain", "write_file", {"path": "a", "content": ""})[0].rule == "inner"
@@ -117,7 +117,7 @@ def test_repo_and_team_rules_only_restrict(make):
     assert _decide(gates, svc, t, "write_file", {"path": "secrets/k", "content": ""})[0].decision is Decision.DENY
     # mode « default » de l'équipe (plus strict que accept_edits) ; l'« auto » et l'« allow » du dépôt ignorés
     assert _decide(gates, svc, t, "write_file", {"path": "a.py", "content": ""})[0].decision is Decision.HITL
-    assert _decide(gates, svc, t, "terminal", {"command": "ls"})[0].decision is Decision.HITL
+    assert _decide(gates, svc, t, "terminal", {"command": "python3 -m pytest"})[0].decision is Decision.HITL
 
 
 def test_symlinked_repo_settings_are_ignored(make, tmp_path):

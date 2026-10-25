@@ -18,7 +18,7 @@ from nokker.core.ports import ToolContext
 from nokker.core.turn import Effect
 from nokker.tenancy.context import tenant_scope
 from nokker.tools import skills as sk
-from nokker.tools.packs import PACKS_ROOT, builtin_effects, load_all, load_pack
+from nokker.tools.packs import PACKS_ROOT, builtin_effects, load_all
 from nokker.webpacks.service import WEB_TOOLS, MemoryPackStore, WebPackError, WebPacks, web_split
 from nokker.webpacks.tools import WebPackTools
 from tests.unit.tools.test_packs import safe_guard

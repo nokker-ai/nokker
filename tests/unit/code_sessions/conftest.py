@@ -113,11 +113,28 @@ def fake_upstream(monkeypatch):
     envs.__path__ = []  # type: ignore[attr-defined]
     loc = types.ModuleType("tools.environments.local")
     loc.LocalEnvironment = FakeLocalEnvironment  # type: ignore[attr-defined]
-    for name, mod in (("tools", pkg), ("tools.file_operations", fo), ("tools.todo_tool", td),
-                      ("tools.environments", envs), ("tools.environments.local", loc)):
+    fakes = {"tools": pkg, "tools.file_operations": fo, "tools.todo_tool": td, "tools.environments": envs,
+             "tools.environments.local": loc}
+    # L'amont réel, s'il est installé (CI publique, mode éditable), ne doit plus répondre : ni ses modules déjà chargés
+    # (approval_detection, checkpoint_manager…), ni son chercheur d'import, qui ignore le `__path__` vide du faux paquet.
+    for name in [k for k in sys.modules if k.startswith("tools.") and k not in fakes]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [_NoUpstream(set(fakes)), *sys.meta_path])
+    for name, mod in fakes.items():
         monkeypatch.setitem(sys.modules, name, mod)
-    monkeypatch.delitem(sys.modules, "tools.approval_detection", raising=False)
     yield
+
+
+class _NoUpstream:
+    """Chercheur d'import placé en tête : tout `tools.*` hors des doublures est introuvable."""
+
+    def __init__(self, fakes: set[str]) -> None:
+        self.fakes = fakes
+
+    def find_spec(self, name: str, path: Any = None, target: Any = None) -> None:
+        if name.startswith("tools.") and name not in self.fakes:
+            raise ModuleNotFoundError(f"amont factice : pas de {name}", name=name)
+        return None
 
 
 @dataclass

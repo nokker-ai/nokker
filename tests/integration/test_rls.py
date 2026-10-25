@@ -608,7 +608,7 @@ def test_mail_watch_cursor_roundtrips_and_stays_in_its_tenant(pg, pod_env):
 # Quatre locataires à part (E, F, G, H, I) pour ne pas croiser les tests génériques sur A et B : le propriétaire (E)
 # partage un projet avec un maintainer (F), un membre (G) et un viewer (I) ; H n'est membre de rien.
 
-E, F, G, H, I = "tn_eeeeeeeeeeee", "tn_ffffffffffff", "tn_gggggggggggg", "tn_hhhhhhhhhhhh", "tn_iiiiiiiiiiii"
+E, F, G, H, I = "tn_eeeeeeeeeeee", "tn_ffffffffffff", "tn_gggggggggggg", "tn_hhhhhhhhhhhh", "tn_iiiiiiiiiiii"  # noqa: E741
 
 
 class _Acc:

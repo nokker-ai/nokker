@@ -9,7 +9,6 @@ import json
 
 from nokker.core.ports import ToolContext
 from nokker.core.turn import Effect
-from nokker.tools import checkpoints as cp
 from nokker.tools.checkpoints import CheckpointToolSource, CheckpointingToolSource, TurnLinks, checkpoint_sources
 from tests.unit.tools.test_checkpoints import FakeInner, _j, needs_upstream
 

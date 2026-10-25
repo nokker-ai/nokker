@@ -28,7 +28,7 @@ class Acc:
 P = Acc(TP, "us_payeur00001", "payeur@example.com")
 M = Acc(TM, "us_membre00001", "membre@example.com")
 K = Acc(TK, "us_ado00000001", "ado@example.com")
-O = Acc(TO, "us_voisin00001", "voisin@example.com")
+O = Acc(TO, "us_voisin00001", "voisin@example.com")  # noqa: E741
 Q = Acc(TQ, "us_autre000001", "autre@example.com")
 R = Acc(TR, "us_enfant00001", "enfant@example.com")
 ALL = (P, M, K, O, Q, R)
