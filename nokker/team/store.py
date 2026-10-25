@@ -15,7 +15,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from nokker.team.model import Invite, Member, Note, Project, Skill
+from nokker.team import model as m
+from nokker.team.model import Invite, Member, Note, Project, Skill, TeamError
 
 
 class Actor(Protocol):
@@ -34,6 +35,7 @@ class TeamStore(Protocol):
     def delete_project(self, actor: Actor, project: Project) -> None: ...
     def members(self, actor: Actor, project_id: str) -> list[Member]: ...
     def set_role(self, actor: Actor, project: Project, account_id: str, role: str) -> None: ...
+    def add_member(self, actor: Actor, member: Member) -> None: ...
     def remove_member(self, actor: Actor, project: Project, account_id: str) -> bool: ...
     def create_invite(self, actor: Actor, inv: Invite) -> None: ...
     def invites_of(self, actor: Actor, project_id: str) -> list[Invite]: ...
@@ -50,6 +52,31 @@ class TeamStore(Protocol):
     def put_note(self, actor: Actor, note: Note) -> Note: ...
     def quarantine(self, actor: Actor, note: Note, reason: str, now: float) -> None: ...
     def quarantined(self, actor: Actor, project: Project) -> list[dict[str, Any]]: ...
+    def write_note(self, actor: Actor, project: Project, note: Note, base_sha: str, now: float) -> str: ...
+    def restore_note(self, actor: Actor, project: Project, quarantine_id: int, by: str, now: float) -> Note: ...
+    def audit(self, actor: Actor, project: Project, event: str, detail: dict[str, Any], now: float) -> None: ...
+    def audit_events(self, actor: Actor, project: Project, limit: int) -> list[dict[str, Any]]: ...
+
+
+def _too_many() -> TeamError:
+    return TeamError(409, "too_many", f"{m.MAX_NOTES} notes au plus par projet")
+
+
+def _restored(q: dict[str, Any], project: Project, now: float) -> Note:
+    """La version de la quarantaine `q`, redevenue la version courante (datée de l'horloge de nokker.ai)."""
+    return Note(project_id=project.id, tenant_id=project.tenant_id, name=q["name"], kind=q["kind"], title=q["title"],
+                text=q["text"], sha=m.note_sha(q["kind"], q["title"], q["text"], False), updated_at=now,
+                author_account=q["author_account"], author_machine=q["author_machine"], origin=q.get("origin") or "",
+                derived_from=q.get("derived_from") or "", links=list(q.get("links") or []), deleted=False)
+
+
+def _check_restore(q: dict[str, Any] | None, cur: Note | None, live: int) -> None:
+    if q is None:
+        raise TeamError(404, "not_found", "version inconnue dans la quarantaine de ce projet")
+    if cur is not None and not cur.deleted and cur.sha == m.note_sha(q["kind"], q["title"], q["text"], False):
+        raise TeamError(409, "already_current", "cette version est déjà la version courante")
+    if (cur is None or cur.deleted) and live >= m.MAX_NOTES:
+        raise _too_many()
 
 
 @dataclass
@@ -60,7 +87,9 @@ class MemoryTeamStore:
     skill_rows: dict[tuple[str, str], Skill] = field(default_factory=dict)
     note_rows: dict[tuple[str, str], Note] = field(default_factory=dict)
     quarantine_rows: list[dict[str, Any]] = field(default_factory=list)
+    audit_rows: list[dict[str, Any]] = field(default_factory=list)
     _seq: int = 0
+    _qseq: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def memberships(self, actor: Actor) -> list[Member]:
@@ -100,6 +129,7 @@ class MemoryTeamStore:
             for k in [k for k, v in self.invites.items() if v.project_id == pid]:
                 del self.invites[k]
             self.quarantine_rows[:] = [q for q in self.quarantine_rows if q["project_id"] != pid]
+            self.audit_rows[:] = [a for a in self.audit_rows if a["project_id"] != pid]
 
     def members(self, actor: Actor, project_id: str) -> list[Member]:
         with self._lock:
@@ -109,6 +139,14 @@ class MemoryTeamStore:
     def set_role(self, actor: Actor, project: Project, account_id: str, role: str) -> None:
         with self._lock:
             self.access[(project.id, account_id)].role = role
+
+    def add_member(self, actor: Actor, member: Member) -> None:
+        # Adhésion posée dans le locataire du PROJET sans invitation : seulement le SSO (nokker/sso/service.py), jamais
+        # avec le rôle owner (refusé ici et en base, migration 032).
+        if member.role == "owner":
+            raise ValueError("owner : le créateur du projet seulement")
+        with self._lock:
+            self.access[(member.project_id, member.account_id)] = copy.copy(member)
 
     def remove_member(self, actor: Actor, project: Project, account_id: str) -> bool:
         with self._lock:
@@ -180,17 +218,69 @@ class MemoryTeamStore:
             self.note_rows[(n.project_id, n.name)] = n
             return copy.deepcopy(n)
 
+    def _q_append(self, note: Note, reason: str, now: float) -> None:
+        self._qseq += 1
+        self.quarantine_rows.append({"id": self._qseq, "project_id": note.project_id, "name": note.name,
+                                     "kind": note.kind, "title": note.title, "text": note.text, "sha": note.sha,
+                                     "updated_at": note.updated_at, "author_account": note.author_account,
+                                     "author_machine": note.author_machine, "origin": note.origin,
+                                     "derived_from": note.derived_from, "links": list(note.links), "reason": reason,
+                                     "quarantined_at": now, "restored_at": None, "restored_by": None})
+
     def quarantine(self, actor: Actor, note: Note, reason: str, now: float) -> None:
         with self._lock:
-            self.quarantine_rows.append({"project_id": note.project_id, "name": note.name, "kind": note.kind,
-                                         "title": note.title, "text": note.text, "sha": note.sha,
-                                         "updated_at": note.updated_at, "author_account": note.author_account,
-                                         "author_machine": note.author_machine, "reason": reason,
-                                         "quarantined_at": now})
+            self._q_append(note, reason, now)
 
     def quarantined(self, actor: Actor, project: Project) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(q) for q in self.quarantine_rows if q["project_id"] == project.id]
+            return [copy.deepcopy(q) for q in self.quarantine_rows if q["project_id"] == project.id]
+
+    def restore_note(self, actor: Actor, project: Project, quarantine_id: int, by: str, now: float) -> Note:
+        """Sous le verrou : la version gardée redevient la courante, la courante part en quarantaine (rien n'est
+        effacé), la ligne restaurée est marquée (`restored_at`, `restored_by`)."""
+        with self._lock:
+            q = next((x for x in self.quarantine_rows if x["id"] == quarantine_id and x["project_id"] == project.id),
+                     None)
+            cur = self.note_rows.get((project.id, q["name"])) if q is not None else None
+            live = sum(1 for (p, _), x in self.note_rows.items() if p == project.id and not x.deleted)
+            _check_restore(q, cur, live)
+            if cur is not None and not cur.deleted:
+                self._q_append(cur, m.REASON_RESTORED, now)
+            n = _restored(q, project, now)  # type: ignore[arg-type]
+            self._seq += 1
+            n.seq = self._seq
+            self.note_rows[(project.id, n.name)] = n
+            q["restored_at"], q["restored_by"] = now, by  # type: ignore[index]
+            return copy.deepcopy(n)
+
+    def audit(self, actor: Actor, project: Project, event: str, detail: dict[str, Any], now: float) -> None:
+        with self._lock:
+            self.audit_rows.append({"id": len(self.audit_rows) + 1, "project_id": project.id, "at": now,
+                                    "actor_account": actor.account_id, "event": event, "detail": copy.deepcopy(detail)})
+
+    def audit_events(self, actor: Actor, project: Project, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [copy.deepcopy(a) for a in self.audit_rows if a["project_id"] == project.id]
+        return sorted(rows, key=lambda a: (-a["at"], -a["id"]))[:limit]
+
+    def write_note(self, actor: Actor, project: Project, note: Note, base_sha: str, now: float) -> str:
+        """Lecture, décision (`model.resolve`) et écriture d'un bloc, sous le verrou : deux machines qui écrivent la
+        même note en même temps sont mises l'une après l'autre (la seconde reçue gagne, la première est gardée)."""
+        with self._lock:
+            cur = self.note_rows.get((project.id, note.name))
+            outcome = m.resolve(cur, note, base_sha)
+            if outcome == m.SKIP:
+                return outcome
+            if outcome == m.INSERT and sum(1 for (p, _), x in self.note_rows.items()
+                                           if p == project.id and not x.deleted) >= m.MAX_NOTES:
+                raise _too_many()
+            if cur is not None and not cur.deleted and (outcome == m.CONFLICT or note.deleted):
+                self._q_append(cur, m.REASON_CONFLICT if outcome == m.CONFLICT else m.REASON_FORGOTTEN, now)
+            self._seq += 1
+            n = copy.deepcopy(note)
+            n.seq = self._seq
+            self.note_rows[(n.project_id, n.name)] = n
+            return outcome
 
 
 def _rank(role: str) -> int:
@@ -204,20 +294,23 @@ def _addressed(inv: Invite, actor: Actor) -> bool:
 # ─────────────────────────────── Postgres ───────────────────────────────
 
 _P_COLS = ("project_id, tenant_id, name, description, owner_account, repos, secret_names, budget, rules, mirror, "
-           "created_at, updated_at")
+           "created_at, updated_at, kind, household_policy")
 _M_COLS = "project_id, tenant_id, account_id, role, email, added_by, added_at"
 _I_COLS = ("invite_id, project_id, tenant_id, project_name, email, invitee_account, role, invited_by, state, "
-           "created_at, expires_at, decided_at")
+           "created_at, expires_at, decided_at, kind, profile")
 _S_COLS = "project_id, tenant_id, name, source, description, requires_local, added_by, added_at"
 _N_COLS = ("project_id, tenant_id, name, kind, title, text, sha, updated_at, author_account, author_machine, origin, "
            "derived_from, links, deleted, seq")
+_Q_COLS = ("project_id, tenant_id, name, kind, title, text, sha, updated_at, author_account, author_machine, origin, "
+           "derived_from, links, reason, quarantined_at")
 
 
 def _project(r: dict[str, Any]) -> Project:
     return Project(id=r["project_id"], tenant_id=r["tenant_id"], name=r["name"], description=r["description"],
                    owner_account=r["owner_account"], repos=list(r["repos"] or []),
                    secret_names=list(r["secret_names"] or []), budget=r["budget"], rules=dict(r["rules"] or {}),
-                   mirror=bool(r["mirror"]), created_at=r["created_at"], updated_at=r["updated_at"])
+                   mirror=bool(r["mirror"]), created_at=r["created_at"], updated_at=r["updated_at"],
+                   kind=r.get("kind") or "team", household_policy=dict(r.get("household_policy") or {}))
 
 
 def _member(r: dict[str, Any]) -> Member:
@@ -229,7 +322,8 @@ def _invite(r: dict[str, Any]) -> Invite:
     return Invite(id=r["invite_id"], project_id=r["project_id"], tenant_id=r["tenant_id"],
                   project_name=r["project_name"], email=r["email"], invitee_account=r["invitee_account"],
                   role=r["role"], invited_by=r["invited_by"], state=r["state"], created_at=r["created_at"],
-                  expires_at=r["expires_at"], decided_at=r["decided_at"])
+                  expires_at=r["expires_at"], decided_at=r["decided_at"], kind=r.get("kind") or "team",
+                  profile=r.get("profile") or "adult")
 
 
 def _skill(r: dict[str, Any]) -> Skill:
@@ -261,8 +355,9 @@ class PgTeamStore:
 
             from nokker.store.conn import migrate
 
-            sql = (Path(__file__).parent.parent / "store" / "migrations" / "023_team.sql").read_text(encoding="utf-8")
-            migrate(dsn, sql)
+            mig = Path(__file__).parent.parent / "store" / "migrations"
+            migrate(dsn, *((mig / f).read_text(encoding="utf-8")
+                           for f in ("023_team.sql", "037_team_budget_brief.sql", "039_household.sql")))
 
     def _conn(self, actor: Actor):
         from psycopg.rows import dict_row
@@ -306,9 +401,10 @@ class PgTeamStore:
 
         p = project
         with self._conn(actor) as c:
-            c.execute(f"INSERT INTO team_projects ({_P_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            c.execute(f"INSERT INTO team_projects ({_P_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                       (p.id, p.tenant_id, p.name, p.description, p.owner_account, Jsonb(p.repos),
-                       Jsonb(p.secret_names), Jsonb(p.budget), Jsonb(p.rules), p.mirror, p.created_at, p.updated_at))
+                       Jsonb(p.secret_names), Jsonb(p.budget), Jsonb(p.rules), p.mirror, p.created_at, p.updated_at,
+                       p.kind, Jsonb(p.household_policy)))
             self._insert_member(c, owner)
 
     @staticmethod
@@ -323,14 +419,14 @@ class PgTeamStore:
         p = project
         with self._conn(actor) as c:
             c.execute("UPDATE team_projects SET name=%s, description=%s, repos=%s, secret_names=%s, budget=%s, "
-                      "rules=%s, mirror=%s, updated_at=%s WHERE project_id=%s AND tenant_id=%s",
+                      "rules=%s, mirror=%s, updated_at=%s, household_policy=%s WHERE project_id=%s AND tenant_id=%s",
                       (p.name, p.description, Jsonb(p.repos), Jsonb(p.secret_names), Jsonb(p.budget), Jsonb(p.rules),
-                       p.mirror, p.updated_at, p.id, p.tenant_id))
+                       p.mirror, p.updated_at, Jsonb(p.household_policy), p.id, p.tenant_id))
 
     def delete_project(self, actor: Actor, project: Project) -> None:
         with self._conn(actor) as c:
-            for t in ("team_note_quarantine", "team_notes", "team_skills", "team_invites", "team_members",
-                      "team_access", "team_projects"):
+            for t in ("team_audit", "team_note_quarantine", "team_notes", "team_skills", "team_invites",
+                      "team_members", "team_access", "team_projects"):
                 c.execute(f"DELETE FROM {t} WHERE project_id = %s AND tenant_id = %s", (project.id, project.tenant_id))
 
     def members(self, actor: Actor, project_id: str) -> list[Member]:
@@ -345,6 +441,14 @@ class PgTeamStore:
                 c.execute(f"UPDATE {t} SET role = %s WHERE project_id = %s AND tenant_id = %s AND account_id = %s",
                           (role, project.id, project.tenant_id, account_id))
 
+    def add_member(self, actor: Actor, member: Member) -> None:
+        """Adhésion sans invitation, dans le locataire du projet (le SSO, nokker/sso/service.py) : la politique
+        `tenant_isolation` l'admet, le trigger de 032 refuse toute ligne `owner` qui ne soit pas le créateur."""
+        if member.role == "owner":
+            raise ValueError("owner : le créateur du projet seulement")
+        with self._conn(actor) as c:
+            self._insert_member(c, member)
+
     def remove_member(self, actor: Actor, project: Project, account_id: str) -> bool:
         with self._conn(actor) as c:
             c.execute("DELETE FROM team_members WHERE project_id = %s AND tenant_id = %s AND account_id = %s",
@@ -356,9 +460,9 @@ class PgTeamStore:
     def create_invite(self, actor: Actor, inv: Invite) -> None:
         i = inv
         with self._conn(actor) as c:
-            c.execute(f"INSERT INTO team_invites ({_I_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            c.execute(f"INSERT INTO team_invites ({_I_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                       (i.id, i.project_id, i.tenant_id, i.project_name, i.email, i.invitee_account, i.role,
-                       i.invited_by, i.state, i.created_at, i.expires_at, i.decided_at))
+                       i.invited_by, i.state, i.created_at, i.expires_at, i.decided_at, i.kind, i.profile))
 
     def invites_of(self, actor: Actor, project_id: str) -> list[Invite]:
         with self._conn(actor) as c:
@@ -444,22 +548,105 @@ class PgTeamStore:
                  n.author_machine, n.origin, n.derived_from, Jsonb(n.links), n.deleted)).fetchone()
         return _note(r)
 
+    @staticmethod
+    def _q_insert(c: Any, n: Note, reason: str, now: float) -> None:
+        from psycopg.types.json import Jsonb
+
+        c.execute(f"INSERT INTO team_note_quarantine ({_Q_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                  (n.project_id, n.tenant_id, n.name, n.kind, n.title, n.text, n.sha, n.updated_at, n.author_account,
+                   n.author_machine, n.origin, n.derived_from, Jsonb(list(n.links)), reason, now))
+
     def quarantine(self, actor: Actor, note: Note, reason: str, now: float) -> None:
-        n = note
         with self._conn(actor) as c:
-            c.execute("INSERT INTO team_note_quarantine (project_id, tenant_id, name, kind, title, text, sha, "
-                      "updated_at, author_account, author_machine, reason, quarantined_at) "
-                      "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                      (n.project_id, n.tenant_id, n.name, n.kind, n.title, n.text, n.sha, n.updated_at,
-                       n.author_account, n.author_machine, reason, now))
+            self._q_insert(c, note, reason, now)
 
     def quarantined(self, actor: Actor, project: Project) -> list[dict[str, Any]]:
         with self._conn(actor) as c:
-            rows = c.execute("SELECT project_id, name, kind, title, text, sha, updated_at, author_account, "
-                             "author_machine, reason, quarantined_at FROM team_note_quarantine "
-                             "WHERE project_id = %s AND tenant_id = %s ORDER BY quarantined_at",
-                             (project.id, project.tenant_id)).fetchall()
-        return [dict(r) for r in rows]
+            rows = c.execute("SELECT id, project_id, name, kind, title, text, sha, updated_at, author_account, "
+                             "author_machine, origin, derived_from, links, reason, quarantined_at, restored_at, "
+                             "restored_by FROM team_note_quarantine WHERE project_id = %s AND tenant_id = %s "
+                             "ORDER BY quarantined_at, id", (project.id, project.tenant_id)).fetchall()
+        return [{**dict(r), "links": list(r["links"] or [])} for r in rows]
+
+    def restore_note(self, actor: Actor, project: Project, quarantine_id: int, by: str, now: float) -> Note:
+        """Une transaction, sous le verrou d'écriture des notes du projet (celui de `write_note`)."""
+        with self._conn(actor) as c:
+            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("team_notes:" + project.id,))
+            r = c.execute("SELECT id, name, kind, title, text, sha, author_account, author_machine, origin, "
+                          "derived_from, links FROM team_note_quarantine WHERE id = %s AND project_id = %s "
+                          "AND tenant_id = %s", (quarantine_id, project.id, project.tenant_id)).fetchone()
+            q = dict(r) if r else None
+            cur = None
+            if q is not None:
+                row = c.execute(f"SELECT {_N_COLS} FROM team_notes WHERE project_id = %s AND tenant_id = %s "
+                                "AND name = %s", (project.id, project.tenant_id, q["name"])).fetchone()
+                cur = _note(row) if row else None
+            live = int(c.execute("SELECT count(*) AS n FROM team_notes WHERE project_id = %s AND tenant_id = %s "
+                                 "AND NOT deleted", (project.id, project.tenant_id)).fetchone()["n"])
+            _check_restore(q, cur, live)
+            if cur is not None and not cur.deleted:
+                self._q_insert(c, cur, m.REASON_RESTORED, now)
+            n = _restored(q, project, now)  # type: ignore[arg-type]
+            self._upsert_note(c, n)
+            c.execute("UPDATE team_note_quarantine SET restored_at = %s, restored_by = %s WHERE id = %s "
+                      "AND project_id = %s AND tenant_id = %s", (now, by, quarantine_id, project.id, project.tenant_id))
+            row = c.execute(f"SELECT {_N_COLS} FROM team_notes WHERE project_id = %s AND tenant_id = %s AND name = %s",
+                            (project.id, project.tenant_id, n.name)).fetchone()
+        return _note(row)
+
+    def audit(self, actor: Actor, project: Project, event: str, detail: dict[str, Any], now: float) -> None:
+        from psycopg.types.json import Jsonb
+
+        with self._conn(actor) as c:
+            c.execute("INSERT INTO team_audit (project_id, tenant_id, at, actor_account, event, detail) "
+                      "VALUES (%s,%s,%s,%s,%s,%s)", (project.id, project.tenant_id, now, actor.account_id, event,
+                                                    Jsonb(detail)))
+
+    def audit_events(self, actor: Actor, project: Project, limit: int) -> list[dict[str, Any]]:
+        with self._conn(actor) as c:
+            rows = c.execute("SELECT id, project_id, at, actor_account, event, detail FROM team_audit "
+                             "WHERE project_id = %s AND tenant_id = %s ORDER BY at DESC, id DESC LIMIT %s",
+                             (project.id, project.tenant_id, limit)).fetchall()
+        return [{**dict(r), "detail": dict(r["detail"] or {})} for r in rows]
+
+    @staticmethod
+    def _upsert_note(c: Any, n: Note) -> None:
+        from psycopg.types.json import Jsonb
+
+        cols = _N_COLS.removesuffix(", seq")
+        c.execute(
+            f"INSERT INTO team_notes ({cols}, seq) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+            "nextval('team_notes_seq')) ON CONFLICT (project_id, name) DO UPDATE SET kind = EXCLUDED.kind, "
+            "title = EXCLUDED.title, text = EXCLUDED.text, sha = EXCLUDED.sha, updated_at = EXCLUDED.updated_at, "
+            "author_account = EXCLUDED.author_account, author_machine = EXCLUDED.author_machine, "
+            "origin = EXCLUDED.origin, derived_from = EXCLUDED.derived_from, links = EXCLUDED.links, "
+            "deleted = EXCLUDED.deleted, seq = nextval('team_notes_seq')",
+            (n.project_id, n.tenant_id, n.name, n.kind, n.title, n.text, n.sha, n.updated_at, n.author_account,
+             n.author_machine, n.origin, n.derived_from, Jsonb(n.links), n.deleted))
+
+    def write_note(self, actor: Actor, project: Project, note: Note, base_sha: str, now: float) -> str:
+        """Une transaction : verrou d'écriture DU PROJET (verrou consultatif, relâché au commit), lecture de la version
+        courante, décision (`model.resolve`), quarantaine de la version remplacée, écriture. Le verrou sérialise les
+        écrivains d'un projet : la règle « la dernière reçue gagne » ne perd aucune version, et le compteur `seq`
+        (curseur du tirage) est pris dans l'ordre des commits — un tirage ne saute jamais une écriture encore en
+        cours."""
+        n = note
+        with self._conn(actor) as c:
+            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("team_notes:" + project.id,))
+            r = c.execute(f"SELECT {_N_COLS} FROM team_notes WHERE project_id = %s AND tenant_id = %s AND name = %s",
+                          (project.id, project.tenant_id, n.name)).fetchone()
+            cur = _note(r) if r else None
+            outcome = m.resolve(cur, n, base_sha)
+            if outcome == m.SKIP:
+                return outcome
+            if outcome == m.INSERT and int(c.execute(
+                    "SELECT count(*) AS n FROM team_notes WHERE project_id = %s AND tenant_id = %s AND NOT deleted",
+                    (project.id, project.tenant_id)).fetchone()["n"]) >= m.MAX_NOTES:
+                raise _too_many()
+            if cur is not None and not cur.deleted and (outcome == m.CONFLICT or n.deleted):
+                self._q_insert(c, cur, m.REASON_CONFLICT if outcome == m.CONFLICT else m.REASON_FORGOTTEN, now)
+            self._upsert_note(c, n)
+            return outcome
 
 
 __all__ = ["Actor", "MemoryTeamStore", "PgTeamStore", "TeamStore"]

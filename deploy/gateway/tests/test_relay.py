@@ -181,15 +181,16 @@ async def test_pages(env):
     seen = []
     ws, task = await open_tunnel(c, seen=seen)
     P = "jean--pages.nokker.app"
+    # sans preuve : 404 du relais, la machine n'est pas interrogée (une page publique a son adresse --pub, §7.26)
     r = await c.get("/rapport.html", headers=H(P))
-    assert r.status == 200 and "sandbox" in r.headers["Content-Security-Policy"]
-    assert seen[-1][0]["path"] == "/v1/pages/rapport.html"
-    assert "x-nokker-account" not in {k.lower() for k, _ in seen[-1][0]["headers"]}
+    assert r.status == 404 and seen == []
+    good = R.sign_cookie(S.cookie_secret, "t_jean", "jean", 2**31)
     from yarl import URL
     for raw in ("/x/%2e%2e/y", "/x/../../y", "/.hidden/..", "/a%2f..%2fb"):
-        r = await c.session.get(URL(str(c.make_url("")) + raw, encoded=True), headers=H(P))
+        r = await c.session.get(URL(str(c.make_url("")) + raw, encoded=True),
+                                headers=H(P, Cookie=f"__Host-nk_pg={good}"))
         assert r.status in (404, 400) or seen[-1][0]["path"].count("..") == 0, raw
-    assert (await c.get("/a//b", headers=H(P))).status == 404
+    assert (await c.get("/a//b", headers=H(P, Cookie=f"__Host-nk_pg={good}"))).status == 404
     assert (await c.get("/_auth?token=a.autre.sig&to=/x", headers=H(P), allow_redirects=False)).status == 401
     r = await c.get("/_auth?token=a.jean.sig&to=//evil.com", headers=H(P), allow_redirects=False)
     assert r.status == 302 and r.headers["Location"] == "/"
@@ -197,10 +198,11 @@ async def test_pages(env):
     assert ck["secure"] and ck["httponly"] and not ck["domain"]
     r = await c.get("/rapport.html", headers=H(P, Cookie=f"__Host-nk_pg={ck.value}"))
     assert ("X-Nokker-Account", "t_jean") in [tuple(h) for h in seen[-1][0]["headers"]]
-    # cookie de pages d'un autre nom : ignoré
+    # cookie de pages d'un autre nom : ignoré, donc sans preuve, rien ne part
     other = R.sign_cookie(S.cookie_secret, "t_jean", "autre", 2**31)
-    await c.get("/rapport.html", headers=H(P, Cookie=f"__Host-nk_pg={other}"))
-    assert "x-nokker-account" not in {k.lower() for k, _ in seen[-1][0]["headers"]}
+    n = len(seen)
+    assert (await c.get("/rapport.html", headers=H(P, Cookie=f"__Host-nk_pg={other}"))).status == 404
+    assert len(seen) == n
     assert (await c.post("/rapport.html", headers=H(P))).status == 405
     task.cancel(); await ws.close()
 
@@ -335,10 +337,9 @@ async def test_pages_jeton_dedie_et_iframe(env):
         assert "frame-ancestors" in r.headers["Content-Security-Policy"]
     # chemin de page invalide sous la capacité
     assert (await c.get(f"/_s/{cap}/a//b", headers=H(P))).status == 404
-    # le cookie d'onglet ne vaut pas capacité : sans preuve, le noyau décide (pages publiques)
-    r = await c.get("/rapport.html", headers=H(P))
-    assert "frame-ancestors" in r.headers["Content-Security-Policy"]
-    assert "x-nokker-account" not in {k.lower() for k, _ in seen[-1][0]["headers"]}
+    # sans preuve : 404 du relais, rien ne part vers la machine
+    n = len(seen)
+    assert (await c.get("/rapport.html", headers=H(P))).status == 404 and len(seen) == n
     task.cancel(); await ws.close()
 
 
@@ -496,3 +497,96 @@ async def test_presence_et_delai_de_delegation(monkeypatch):
         t3.cancel(); await ws3.close()
     finally:
         await c.close()
+
+
+# ---- pages servies depuis le miroir, machine éteinte (docs/LOKKAL.md §7.23)
+
+PG = "pg_0123456789abcdef"
+COPY = b"<!doctype html><body><div data-nokker-mirror-banner>Copie du 2027-01-15 08:00 UTC, machine hors ligne</div>" \
+       b"<h1>Bilan</h1></body>"
+
+
+class FakeMirror:
+    """nokker.ai vu du relais : `POST /v1/gateway/mirror/page` (clé du relais), une machine « jean » de t_jean."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, body):
+        self.calls.append(body)
+        if body.get("host") != "jean.nokker.app" or body.get("tenant") != "t_jean" \
+                or body.get("machine") not in (None, "m1"):
+            return 404, {"error": {"message": "not found"}}
+        page = None
+        if body.get("page_id") == PG:
+            page = {"title": "Bilan", "mirrored_at": 1_800_000_000.0, "banner": "Copie du 2027-01-15 08:00 UTC",
+                    "html_b64": base64.b64encode(COPY).decode()}
+        return 200, {"machine_id": "m1", "name": "jean", "page": page}
+
+
+@pytest.fixture
+async def menv():
+    mirror = FakeMirror()
+    relay = R.Relay(S, check_machine, check_token, mirror_page=mirror)
+    client = TestClient(TestServer(R.make_app(relay)))
+    await client.start_server()
+    yield relay, client, mirror
+    await client.close()
+
+
+async def test_pages_miroir_machine_eteinte(menv):
+    relay, c, mirror = menv
+    P = "jean--pages.nokker.app"
+    # sans preuve : rien n'est servi depuis le miroir, nokker.ai n'est même pas interrogé
+    r = await c.get(f"/{PG}", headers=H(P))
+    assert r.status == 502 and "hors ligne" in await r.text() and mirror.calls == []
+    # même lien signé qu'en ligne : jeton de pages à usage unique, puis cookie d'onglet
+    r = await c.get(f"/_auth?token=p.ok1.sig&to=/{PG}", headers=H(P), allow_redirects=False)
+    assert r.status == 302 and "__Host-nk_pg" in r.cookies and r.headers["Location"] == f"/{PG}"
+    assert mirror.calls[-1] == {"host": "jean.nokker.app", "tenant": "t_jean", "machine": "m1"}
+    assert (await c.get(f"/_auth?token=p.ok1.sig&to=/{PG}", headers=H(P), allow_redirects=False)).status == 401
+    for bad in ("p.m9.sig", "p.long.sig", "d.deleg.sig", "inconnu"):
+        assert (await c.get(f"/_auth?token={bad}&to=/{PG}", headers=H(P), allow_redirects=False)).status in (401, 502)
+    cookie = r.cookies["__Host-nk_pg"].value
+    r = await c.get(f"/{PG}", headers=H(P, Cookie=f"__Host-nk_pg={cookie}"))
+    body = await r.read()
+    assert r.status == 200 and body == COPY and b"machine hors ligne" in body
+    csp = r.headers["Content-Security-Policy"]
+    assert csp.startswith("sandbox allow-scripts") and "allow-same-origin" not in csp
+    assert "frame-ancestors https://jean.nokker.app https://nokker.ai https://app.nokker.ai" in csp
+    assert r.headers["X-Content-Type-Options"] == "nosniff" and r.headers["Referrer-Policy"] == "no-referrer"
+    assert r.headers["Cache-Control"] == "no-store" and r.headers["Content-Type"].startswith("text/html")
+    assert r.headers["X-Nokker-Mirror-Copy"].startswith("2027-01-15T08:00")
+    assert "Set-Cookie" not in r.headers
+    assert mirror.calls[-1] == {"host": "jean.nokker.app", "tenant": "t_jean", "page_id": PG}
+    # téléchargement de la copie
+    r = await c.get(f"/{PG}?dl=1", headers=H(P, Cookie=f"__Host-nk_pg={cookie}"))
+    assert r.headers["Content-Disposition"].startswith('attachment; filename="Bilan.html"')
+    # page sans copie (jamais demandée, ou `local`) : la machine est hors ligne, rien d'autre
+    r = await c.get("/pg_ffffffffffffffff", headers=H(P, Cookie=f"__Host-nk_pg={cookie}"))
+    assert r.status == 502
+    # le cookie d'un autre compte sur ce nom : nokker.ai refuse, rien n'est servi
+    other = R.sign_cookie(S.cookie_secret, "t_autre", "jean", 2 ** 31)
+    assert (await c.get(f"/{PG}", headers=H(P, Cookie=f"__Host-nk_pg={other}"))).status == 502
+    # iframe : capacité d'URL, pas de cookie
+    r = await c.get(f"/_auth?token=p.ok2.sig&to=/{PG}&embed=1", headers=H(P), allow_redirects=False)
+    loc = r.headers["Location"]
+    assert loc.startswith("/_s/") and "__Host-nk_pg" not in r.cookies
+    r = await c.get(loc, headers=H(P))
+    assert r.status == 200 and await r.read() == COPY
+    expired = R.sign_cookie(R.cap_key(S.cookie_secret), "t_jean", "jean", 1)
+    r = await c.get(f"/_s/{expired}/{PG}", headers=H(P))
+    assert r.status == 401 and "nokker:pages-expired" in await r.text()
+    # autre chose qu'un id de page, et les écritures
+    assert (await c.get("/../etc", headers=H(P, Cookie=f"__Host-nk_pg={cookie}"))).status == 404
+    assert (await c.post(f"/{PG}", headers=H(P, Cookie=f"__Host-nk_pg={cookie}"))).status == 405
+    # l'interface de pilotage d'une machine éteinte ne passe jamais par le miroir
+    assert (await c.get("/", headers=H("jean.nokker.app"))).status == 502
+
+
+async def test_pages_miroir_seulement_hors_ligne(menv):
+    relay, c, mirror = menv
+    ws, task = await open_tunnel(c)
+    r = await c.get(f"/_auth?token=p.ok3.sig&to=/{PG}", headers=H("jean--pages.nokker.app"), allow_redirects=False)
+    assert r.status == 302 and mirror.calls == []  # en ligne : la machine sert, le miroir n'est pas consulté
+    task.cancel(); await ws.close()

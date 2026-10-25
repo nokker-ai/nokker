@@ -1,0 +1,203 @@
+# Nokker Helm chart — default values (vanilla Kubernetes).
+# Overlay: values-openshift.yaml (restricted / restricted-v2 SCC). Guide: docs/en/kubernetes.md.
+# No secret belongs in this file: generated ones live in the release's Secrets, yours in Secrets you reference.
+
+global:
+  imageRegistry: ""             # prefix for images whose repository has no registry (mirror, air-gapped)
+  imagePullSecrets: []          # [{name: regcred}]
+
+# Pod security of every Nokker pod. Vanilla: fixed non-root uid/gid and fsGroup (volumes writable).
+# OpenShift: values-openshift.yaml sets them to null, the SCC assigns them from the namespace range.
+podSecurity:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+# -- core (API /v1, agent loop, approvals, code sessions) -------------------------------------------------------
+core:
+  image:
+    repository: ghcr.io/nokker-ai/nokker
+    tag: ""                     # default: <appVersion>-lokkal (the image with git and kubectl)
+    pullPolicy: IfNotPresent
+  # ONE replica: the event bus and per-chat locks live in memory (strategy Recreate).
+  replicas: 1
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {cpu: "2", memory: 3Gi}
+  # Public URL of the app (links in notifications, SSO redirect).
+  publicUrl: https://nokker.example.com
+  # Model endpoint (OpenAI-compatible). The key is read from routerKey.existingSecret (key ROUTER_KEY) or generated
+  # empty: set it before the first turn.
+  models:
+    baseUrl: https://router.sokkan.ch/v1
+    ship: qwen/qwen3.5-397b-a17b
+    deep: qwen/qwen3.5-397b-a17b
+    small: ""                   # empty: trivial turns go to ship
+  routerKey:
+    existingSecret: ""          # Secret with key ROUTER_KEY
+  # Teams and single sign-on (OIDC). The identity providers are NOT configured here: the account owner creates them
+  # at runtime (API /v1/sso/connections, web app), the client secret goes write-only to the core's vault.
+  sso:
+    enabled: true
+    # DNS-over-HTTPS resolver (JSON API) used to prove an e-mail domain with a TXT record; empty = proof refused (503).
+    dnsOverHttps: https://dns.google/resolve
+  # Per-tenant turn limits (mode soft counts and warns, hard refuses).
+  tenantLimits: {mode: soft, turns_per_day: 200, turns_per_week: 1000, hard_turns_per_day: 500, deep_per_day: 50}
+  # Extra keys merged into the core config (YAML, top level). Wins over the chart's defaults.
+  extraConfig: {}
+  # Extra environment (plain values) and envFrom (Secrets / ConfigMaps you manage).
+  env: {}
+  extraEnvFrom: []
+  probes:
+    readiness: {initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6}
+    liveness: {initialDelaySeconds: 60, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # The core's state (checkpoints of every tenant's sessions, previews, session notes): persistent, one replica.
+  data:
+    size: 20Gi
+    storageClass: ""
+
+# -- code sessions: one pod per session (nokker/tools/k8s_sandbox.py) --------------------------------------------
+code:
+  enabled: true
+  maxSessionsPerUser: 3
+  idleTtlSeconds: 1800          # the pod goes after this much idle time; the workspace stays on the volume
+  # Forges a session may clone from (https only, exact host[:port] match). Credentials are stored per tenant, by name,
+  # in the core's vault (API /v1/code/credentials), never in values.
+  forgeHosts: []                # [git.example.org, forge.example.net:8443]
+  modes: [default, accept_edits, plan]
+  defaultMode: accept_edits
+  hooks: false                  # repository hooks, after the user trusts them
+  sandbox:
+    image:
+      repository: ghcr.io/nokker-ai/sandbox
+      tag: ""                   # default: <appVersion>
+    resources:
+      limits: {cpu: "2", memory: 4Gi}
+      requests: {cpu: 250m, memory: 512Mi}
+    ephemeralStorage: 2Gi
+    tmpSize: 1Gi
+    execTimeoutSeconds: 600
+    startTimeoutSeconds: 120
+    maxLifetimeSeconds: 86400   # hard cap (activeDeadlineSeconds) if the core dies and never comes back
+    # deny: no network at all. egress: public Internet through the chart's egress proxy only (private ranges refused).
+    network: egress
+    nodeSelector: {}
+    tolerations: []
+  # Workspaces: ONE shared volume, mounted by the core (file tools) and, as a subPath, by each session pod.
+  # ReadWriteMany is required on a multi-node cluster (NFS, CephFS, EFS, Azure Files, OpenShift Data Foundation).
+  # ReadWriteOnce works on a single node only: set colocateWithCore=true (session pods follow the core's node).
+  workspaces:
+    existingClaim: ""
+    accessMode: ReadWriteMany
+    storageClass: ""
+    size: 100Gi
+    colocateWithCore: false
+
+# -- web (static app, nginx, non-root) ---------------------------------------------------------------------------
+web:
+  image:
+    repository: ghcr.io/nokker-ai/nokker-web
+    tag: ""                     # default: <appVersion>
+    pullPolicy: IfNotPresent
+  replicas: 2
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+
+# -- Ingress: / → web, /v1 → core (SSE included). Controller-agnostic: put specifics in annotations.
+ingress:
+  enabled: true
+  className: ""
+  host: nokker.example.com
+  annotations: {}
+  tls:
+    enabled: true
+    secretName: ""              # empty: the controller's default certificate
+
+# -- database -----------------------------------------------------------------------------------------------------
+# Production: your PostgreSQL ≥ 16 with pgvector, two databases (nokker, corthexis), and an admin DSN for the init
+# (roles nokker_owner and nokker_app are created by deploy/postgres/roles.sql; the core runs as nokker_app, under RLS).
+database:
+  # In-chart pgvector for trials and CI only (one pod, no backup, no HA).
+  dev:
+    enabled: true
+    image:
+      repository: pgvector/pgvector
+      tag: pg16
+      digest: sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    size: 20Gi
+    storageClass: ""
+    resources:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits: {cpu: "2", memory: 2Gi}
+  # External database (dev.enabled=false): a Secret with keys NOKKER_PG_HOST, NOKKER_PG_PORT, NOKKER_PG_DATABASE,
+  # NOKKER_CORTHEXIS_DATABASE (both databases created beforehand, pgvector available), PG_ADMIN_USER and
+  # PG_ADMIN_PASSWORD (init containers only: CREATEROLE and owner of both databases). Role passwords are generated.
+  existingSecret: ""
+  sslmode: prefer
+
+# -- memory embeddings (llama.cpp, EmbeddingGemma-300M, CPU) -------------------------------------------------------
+embed:
+  enabled: true
+  image:
+    repository: ghcr.io/ggml-org/llama.cpp
+    tag: server
+    digest: sha256:970168341efef973da5666ea5c362fa428ee66ba0dfa621b0f69bf3feb3320f7   # same image as Lokkal
+  # The model is downloaded from Hugging Face on first start; air-gapped: put the .gguf on the volume yourself.
+  size: 2Gi
+  storageClass: ""
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 1Gi}
+
+# -- egress proxy of the session pods (public Internet only) -------------------------------------------------------
+egress:
+  image:
+    repository: ghcr.io/nokker-ai/sandboxd
+    tag: ""                     # default: <appVersion>
+  resources:
+    requests: {cpu: 50m, memory: 32Mi}
+    limits: {cpu: 500m, memory: 128Mi}
+
+# -- secrets: OpenBao ---------------------------------------------------------------------------------------------
+# enabled: one OpenBao node in the release, initialised by a post-install Job (KV v2 nokker/, AppRole nokker-core,
+# root token revoked). The core only gets role_id and secret_id, as files.
+#   unseal: auto   the unseal key is kept in a Secret of the release; a sidecar unseals after every restart.
+#   unseal: manual the Job prints the key once in its log (read it, store it elsewhere, delete the Job); unseal by
+#                  hand: kubectl exec <release>-openbao-0 -c openbao -- bao operator unseal
+# disabled: the core keeps its secrets in the database, encrypted with a key of the release (file provider).
+openbao:
+  enabled: true
+  unseal: auto
+  image:
+    repository: openbao/openbao
+    tag: "2.4.1"
+  size: 1Gi
+  storageClass: ""
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  # Image with kubectl used by the init Job to store the AppRole (default: the core image).
+  jobImage: {}
+
+# -- network policies ---------------------------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Where the ingress controller runs (vanilla NGINX shown; OpenShift: see values-openshift.yaml).
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ingress-nginx
+  # Ranges no Nokker pod may reach (private networks, cloud metadata, loopback). The database and the model endpoint
+  # are reopened below when they live in such a range.
+  blockedCidrs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8]
+  # The core must reach the Kubernetes API (session pods). Give the API server's address(es) and port(s).
+  apiServer:
+    cidrs: []                   # e.g. [10.96.0.1/32, 192.168.1.10/32]; empty = allow any address on these ports
+    ports: [443, 6443]
+  # Extra CIDRs the core may reach (external database, internal model endpoint, SSO provider or forge on a private
+  # range: the core clones repositories itself, session pods never see the credential).
+  coreExtraEgressCidrs: []

@@ -31,6 +31,7 @@ class TeamRules:
     timeout_s: float = 3.0
     client: Any = None
     clock: Callable[[], float] = field(default=time.time)
+    last_error: Exception | None = field(default=None, init=False, repr=False)  # dernière relecture ratée (réseau)
 
     def projects(self) -> list[dict[str, Any]]:
         cached = self.state.get(STATE_KEY) or {}
@@ -49,7 +50,9 @@ class TeamRules:
                       headers={"Authorization": f"Bearer {token}"}, timeout=self.timeout_s)
         except Exception as e:  # noqa: BLE001 — hors ligne : la dernière liste connue reste
             logger.info("projets d'équipe : nokker.ai injoignable (%s), dernière liste gardée", type(e).__name__)
+            self.last_error = e
             return False
+        self.last_error = None
         if r.status_code in (401, 404):  # machine déliée, ou équipe éteinte chez nokker.ai : plus aucun projet
             self.state[STATE_KEY] = {"at": self.clock(), "projects": []}
             self.save()
@@ -60,7 +63,7 @@ class TeamRules:
             projects = [p for p in (r.json().get("projects") or []) if isinstance(p, dict)]
         except ValueError:
             return False
-        keep = ("id", "name", "role", "repos", "rules", "secret_names", "skills", "mirror")
+        keep = ("id", "name", "role", "repos", "rules", "secret_names", "skills", "mirror", "can_push_notes")
         self.state[STATE_KEY] = {"at": self.clock(), "projects": [{k: p.get(k) for k in keep} for p in projects]}
         self.save()
         return True

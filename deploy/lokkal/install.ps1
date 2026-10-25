@@ -27,7 +27,9 @@ param(
   [switch]$Purge,
   [switch]$NoOpen,
   [switch]$Vault,                   # coffre OpenBao (profil vault), descellé automatiquement
-  [switch]$VaultManual              # idem, part de descellement affichée une fois, redemandée à chaque redémarrage
+  [switch]$VaultManual,             # idem, part de descellement affichée une fois, redemandée à chaque redémarrage
+  [switch]$LocalLlm,                # moteur d'inférence local (Ollama, CPU, profil local-llm), proposé dans /setup
+  [string]$LocalLlmModel = ""       # modèle Ollama à tirer (défaut : qwen3:4b) ; implique -LocalLlm
 )
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -103,6 +105,7 @@ if ($Update)    { $shArgs += "--update" }
 if ($Uninstall) { $shArgs += "--uninstall" }
 if ($Purge)     { $shArgs += "--purge" }
 if ($VaultManual) { $shArgs += "--vault-manual" } elseif ($Vault) { $shArgs += "--vault" }
+if ($LocalLlmModel) { $shArgs += @("--local-llm-model", $LocalLlmModel) } elseif ($LocalLlm) { $shArgs += "--local-llm" }
 $shArgs += "--no-open"
 $quoted = ($shArgs | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join " "
 $envs = ""

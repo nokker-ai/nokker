@@ -1,6 +1,7 @@
 ---
 name: jobs-setup
 description: Connect a job-offers API and record your search profile
+locality: local
 ---
 # Setting up the jobs pack
 

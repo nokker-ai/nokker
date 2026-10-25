@@ -36,13 +36,16 @@ class BillingError(Exception):
 
 class Billing:
     def __init__(self, *, store: BillingStore, stripe: StripeClient, plans: dict[str, Plan], prices: dict[str, str],
-                 webhook_secret: str, app_url: str, clock: Callable[[], float] = time.time) -> None:
+                 webhook_secret: str, app_url: str, clock: Callable[[], float] = time.time, coupon: str = "") -> None:
         if not webhook_secret:
             raise ValueError("secret de webhook requis")
         self.store, self.stripe, self.plans, self.prices = store, stripe, plans, prices
+        # Coupon de bêta (`billing_coupon`, décision du 25.10) : id d'un coupon Stripe posé sur CHAQUE Checkout. Vide =
+        # aucune remise.
+        self.coupon = (coupon or "").strip()
         self._by_price = {v: k for k, v in prices.items()}
         self._secret, self._app_url, self._clock = webhook_secret, app_url.rstrip("/"), clock
-        self._caps: dict[str, tuple[float, dict[str, int] | None]] = {}
+        self._caps: dict[str, tuple[float, str | None, dict[str, int] | None]] = {}
         self._lock = threading.Lock()
 
     # ── état ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -50,19 +53,29 @@ class Billing:
         sub = self.store.subscription(tenant_id)
         return sub if sub and sub["status"] in ACTIVE_STATUSES and sub["plan"] in self.plans else None
 
-    def caps_for(self, tenant_id: str) -> dict[str, int] | None:
-        """Plafonds du palier payé du locataire, ou None (pas d'abonnement actif : plafonds par défaut de la bêta).
-        Appelé à chaque tour : résultat gardé `CAPS_TTL_S` secondes, vidé par le webhook du locataire."""
+    def _tier(self, tenant_id: str) -> tuple[str | None, dict[str, int] | None]:
+        """(palier actif, ses plafonds), ou (None, None). Gardé `CAPS_TTL_S` secondes, vidé par le webhook."""
         now = self._clock()
         with self._lock:
             hit = self._caps.get(tenant_id)
             if hit and now - hit[0] < CAPS_TTL_S:
-                return hit[1]
+                return hit[1], hit[2]
         sub = self._live(tenant_id)
-        caps = dict(self.plans[sub["plan"]].caps) if sub else None
+        plan = sub["plan"] if sub else None
+        caps = dict(self.plans[plan].caps) if plan else None
         with self._lock:
-            self._caps[tenant_id] = (now, caps)
-        return caps
+            self._caps[tenant_id] = (now, plan, caps)
+        return plan, caps
+
+    def caps_for(self, tenant_id: str) -> dict[str, int] | None:
+        """Plafonds du palier payé du locataire, ou None (pas d'abonnement actif : plafonds par défaut de la bêta).
+        Appelé à chaque tour : résultat gardé `CAPS_TTL_S` secondes, vidé par le webhook du locataire."""
+        return self._tier(tenant_id)[1]
+
+    def active_plan(self, tenant_id: str) -> str | None:
+        """Palier ACTIF du locataire (statut dans `ACTIVE_STATUSES` : `past_due` le garde), ou None. Même cache que
+        `caps_for` : le foyer le lit à chaque tour d'un membre (nokker/household/service.py::Household.tier)."""
+        return self._tier(tenant_id)[0]
 
     def status(self, tenant_id: str) -> dict[str, Any]:
         sub = self.store.subscription(tenant_id)
@@ -81,16 +94,39 @@ class Billing:
         created = self.stripe.create_customer(account.email, account.tenant_id, account.account_id)
         return self.store.put_customer(created, account.tenant_id, account.account_id)
 
+    def coupon_for(self, account: Account) -> str | None:
+        """Coupon Stripe à appliquer au Checkout de ce compte, ou None. Bêta : le coupon global `billing_coupon` pour
+        tous. L'ouverture publique demandera un coupon PAR COMPTE éligible (docs/LOKKAL-ROADMAP.md, 25.10) : ce
+        résolveur est le seul endroit à changer."""
+        return self.coupon or None
+
     def checkout(self, account: Account, plan: str) -> str:
         if plan not in self.prices or plan not in self.plans:
             raise BillingError("unknown_plan")
         with tenant_scope(account.tenant_id):
             if self._live(account.tenant_id):
                 raise BillingError("already_subscribed", 409)  # changer de palier = portail Stripe
+        coupon = self.coupon_for(account)
         try:
-            return self.stripe.checkout_session(
-                self._customer(account), self.prices[plan], account.tenant_id, plan,
-                f"{self._app_url}/account?billing=success", f"{self._app_url}/account?billing=cancel", account.lang)
+            customer = self._customer(account)
+
+            def session(with_coupon: str | None) -> str:
+                return self.stripe.checkout_session(
+                    customer, self.prices[plan], account.tenant_id, plan, f"{self._app_url}/account?billing=success",
+                    f"{self._app_url}/account?billing=cancel", account.lang,
+                    **({"coupon": with_coupon} if with_coupon else {}))
+
+            if not coupon:
+                return session(None)
+            try:
+                return session(coupon)
+            except StripeError as e:
+                if not 400 <= e.status < 500:  # Stripe injoignable ou en panne : pas un refus du coupon
+                    raise
+                # Coupon refusé (inconnu, expiré, épuisé…) : l'abonnement passe quand même, sans remise.
+                logger.warning("billing: coupon %r refusé par Stripe (%s, %s) pour %s : Checkout sans remise",
+                               coupon, e.code, e.status, account.tenant_id)
+                return session(None)
         except StripeError:
             raise BillingError("stripe_unavailable", 502) from None
 

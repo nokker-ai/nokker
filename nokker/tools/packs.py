@@ -53,6 +53,7 @@ _AGENT_KEYS = {"id", "name", "role", "model", "instructions", "trigger", "tools"
                "needs"}
 _NEEDS_KEYS = {"gpu"}
 _CONNECTORS = {"mail", "calendar"}
+SKILL_LOCALITIES = {"local", "both"}
 
 # Gravité des effets : un pack peut relever un effet, jamais le baisser.
 RANK: dict[Effect, int] = {Effect.READ: 0, Effect.WRITE: 1, Effect.SECRET: 2, Effect.SPEND: 2,
@@ -72,6 +73,9 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
              "bind": {"type": "object", "description": "facultatif : « rôle.outil » → nom réel de l'outil du "
                                                        "serveur MCP de l'utilisateur ; « secret:NOM » → autre NOM "
                                                        "du coffre"}}}),
+    ("pack_remove", "Retire un pack en un appel : ses compétences et ses cartes d'agents non activées ; pour les "
+     "agents déjà créés depuis le pack, une carte propose de les désarmer ou supprimer (rien en silence). Carte.",
+     Effect.DESTRUCTIVE, {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}),
 )
 PACK_TOOLS = tuple(name for name, *_ in _SPECS)
 
@@ -137,6 +141,9 @@ class Pack:
     skills: list[tuple[str, str, str, Path]]  # (famille, nom, description, dossier)
     agents: list[AgentTemplate]
     path: Path
+    # Compétences qui exigent la machine (frontmatter `locality: local` : fichiers, terminal, ssh, serveurs MCP
+    # ajoutés…) : jamais installées chez nokker.ai (nokker/webpacks/). Les autres valent des deux côtés.
+    local_skills: set[str] = field(default_factory=set)
 
     def summary(self) -> dict[str, Any]:
         return {"name": self.name, "title": self.title, "description": self.description,
@@ -145,7 +152,8 @@ class Pack:
 
     def detail(self) -> dict[str, Any]:
         out = self.summary()
-        out["skills"] = [{"name": n, "family": f, "description": d} for f, n, d, _p in self.skills]
+        out["skills"] = [{"name": n, "family": f, "description": d,
+                          "locality": "local" if n in self.local_skills else "both"} for f, n, d, _p in self.skills]
         out["agents"] = [{"id": a.id, "name": a.fields["name"], "role": a.fields["role"],
                           "trigger": a.fields.get("trigger") or {"kind": "manual"},
                           "auto_approve": list(a.fields.get("auto_approve") or []),
@@ -239,6 +247,8 @@ def _load_skills(pack_dir: Path) -> list[tuple[str, str, str, Path]]:
         desc = _str(fm.get("description"), f"compétence {name}.description", MAX_SKILL_DESC)
         if len(body.strip()) < 200:
             raise PackError(f"compétence {name} : mode d'emploi vide ou trop court")
+        if str(fm.get("locality") or "both") not in SKILL_LOCALITIES:
+            raise PackError(f"compétence {name} : locality ∈ {sorted(SKILL_LOCALITIES)}")
         out.append((rel[0], name, desc, d))
     if not out:
         raise PackError("pack sans compétence")
@@ -246,6 +256,13 @@ def _load_skills(pack_dir: Path) -> list[tuple[str, str, str, Path]]:
     if len(set(names)) != len(names):
         raise PackError("deux compétences du pack portent le même nom")
     return out
+
+
+def _skill_locality(skill_dir: Path) -> str:
+    from nokker.tools.skills import parse_frontmatter
+
+    fm, _ = parse_frontmatter((skill_dir / "SKILL.md").read_text(encoding="utf-8"))
+    return str(fm.get("locality") or "both")
 
 
 def load_pack(pack_dir: Path) -> Pack:
@@ -272,10 +289,11 @@ def load_pack(pack_dir: Path) -> Pack:
         version = 0
     if version < 1:
         raise PackError(f"pack {name} : version entière ≥ 1")
+    skills = _load_skills(pack_dir)
     pack = Pack(name=name, version=version, title=_str(data.get("title"), "title", 60),
                 description=_str(data.get("description"), "description", 240), tools=tools, connectors=connectors,
-                mcp=roles, needs=_needs(data.get("needs"), "pack"), skills=_load_skills(pack_dir), agents=[],
-                path=pack_dir)
+                mcp=roles, needs=_needs(data.get("needs"), "pack"), skills=skills, agents=[], path=pack_dir,
+                local_skills={n for _f, n, _d, p in skills if _skill_locality(p) == "local"})
     seen: set[str] = set()
     for f in sorted((pack_dir / "agents").glob("*.yaml")):
         raw = _read_yaml(f)
@@ -355,7 +373,8 @@ def resolve_agent(pack: Pack, tpl: AgentTemplate, bind: dict[str, str] | None = 
             "name": _str(f.get("name"), f"{where}.name", 80), "role": _str(f.get("role"), f"{where}.role", 200),
             "model": str(f.get("model") or ""), "tools": tools,
             "instructions": str(f.get("instructions") or "").strip(),
-            "trigger": norm_trigger(f.get("trigger")), "secrets": _secret_names(secrets, f"{where}.secrets"),
+            # `mail:<filtre>` : syntaxe vérifiée ici ; la carte et la création refusent sans relève du courrier.
+            "trigger": norm_trigger(f.get("trigger"), mail=True), "secrets": _secret_names(secrets, f"{where}.secrets"),
             "budget": norm_budget(f.get("budget")), "auto_approve": norm_rules(rules)}
     except AgentError as e:
         raise PackError(f"{where} : {e}") from None
@@ -428,6 +447,11 @@ def installed_effect_overrides(home: Path, current: Callable[[str], Effect]) -> 
     return out
 
 
+def installed(record: dict[str, Any] | None) -> bool:
+    """Un registre de pack présent et non retiré."""
+    return bool(record) and not record.get("removed")  # type: ignore[union-attr]
+
+
 def user_home(state_dir: Path | None) -> Path:
     """`$NOKKER_HOME` de Lokkal : le dossier d'état, sinon la même règle que `SkillToolSource`."""
     return Path(state_dir or os.environ.get("NOKKER_HOME") or "~/.nokker").expanduser()
@@ -452,11 +476,14 @@ def with_user_extensions(config: Any, state_dir: Path) -> Any:
 
 
 Proposer = Callable[[dict[str, Any], ToolContext, dict[str, Any]], ToolResult]
+# Suite d'un retrait : (pack, cartes agent_draft posées à l'installation, contexte) → {drafts_closed, agents, card}
+# (`nokker.bubbles.tools.pack_removed`). None : pas de bulles, le résultat dit seulement que les agents créés restent.
+OnRemove = Callable[[str, list[str], ToolContext], dict[str, Any]]
 
 
 @dataclass
 class PackToolSource:
-    """`ToolSource` : `pack_list` (READ) et `pack_install` (DESTRUCTIVE). `home` : `$NOKKER_HOME` (la racine
+    """`ToolSource` : `pack_list` (READ), `pack_install` et `pack_remove` (DESTRUCTIVE). `home` : `$NOKKER_HOME` (la racine
     utilisateur des compétences est `home/skills`, la même que `SkillToolSource`). `propose(args, ctx, extra)` pose
     une bulle `agent_draft` (`nokker.bubbles.tools.propose_agent_draft`) ; None = les cartes sont rendues au modèle,
     qui les propose avec `agent_draft`."""
@@ -466,6 +493,7 @@ class PackToolSource:
     propose: Proposer | None = None
     audit: Callable[[dict[str, Any]], None] | None = None
     core: bool = False
+    on_remove: OnRemove | None = None
     _lock: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -511,6 +539,8 @@ class PackToolSource:
                     return out("bind doit être un objet", True)
                 payload, err = self.install(str(a.get("name") or ""), bind, ctx)
                 return out(payload, err)
+            if name == "pack_remove":
+                return out(self.remove(str(a.get("name") or ""), ctx))
         except PackError as e:
             return out(f"refusé : {e}", True)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
@@ -531,13 +561,13 @@ class PackToolSource:
             pack = self._find(str(name))
             detail = pack.detail()
             rec = self._record(pack.name)
-            detail["installed"] = bool(rec)
+            detail["installed"] = installed(rec)
             return detail
         packs, errors = load_all(self.packs_root)
         items = []
         for p in packs:
             item = p.summary()
-            item["installed"] = bool(self._record(p.name))
+            item["installed"] = installed(self._record(p.name))
             items.append(item)
         result: dict[str, Any] = {"packs": items}
         if errors:
@@ -588,13 +618,17 @@ class PackToolSource:
             self._emit(event="pack_install_refused", pack=pack.name, reason="scan")
             return "installation REFUSÉE par le scanner (rien n'a été installé).\n" + "\n".join(refused), True
         with self._lock:
-            installed = self._copy(pack)
+            prev = self._record(pack.name) or {}
+            copied = self._copy(pack)
+            # Effets relevés par une installation précédente (même retirée) : gardés, jamais baissés.
+            for tool, value in (prev.get("mcp_effects") or {}).items():
+                try:
+                    mcp_effects[tool] = stricter(Effect(mcp_effects.get(tool) or value), Effect(value)).value
+                except ValueError:
+                    continue
             record = {"name": pack.name, "version": pack.version, "installed_at": time.time(),
-                      "skills": installed, "mcp_effects": mcp_effects, "bind": bind}
-            rec_dir = self.user_root / RECORDS_DIR
-            rec_dir.mkdir(parents=True, exist_ok=True)
-            (rec_dir / f"{pack.name}.json").write_text(json.dumps(record, ensure_ascii=False, indent=1),
-                                                     encoding="utf-8")
+                      "skills": copied, "mcp_effects": mcp_effects, "bind": bind, "proposed": []}
+            self._write_record(record)
         proposed, to_propose = [], []
         for tpl, args, extra in drafts:
             if self.propose is None:
@@ -609,10 +643,15 @@ class PackToolSource:
                                    "error": res.content})
                 continue
             proposed.append({"template": tpl.id, "bubble_id": json.loads(res.content).get("bubble_id")})
-        self._emit(event="pack_installed", pack=pack.name, version=pack.version, skills=installed,
+        if proposed:
+            with self._lock:
+                rec = self._record(pack.name) or record
+                rec["proposed"] = [p for p in proposed if p.get("bubble_id")]
+                self._write_record(rec)
+        self._emit(event="pack_installed", pack=pack.name, version=pack.version, skills=copied,
                    proposed=[p["template"] for p in proposed])
         payload: dict[str, Any] = {
-            "installed": pack.name, "skills": installed, "proposed": proposed,
+            "installed": pack.name, "skills": copied, "proposed": proposed,
             "armed": [], "note": "aucun agent n'est créé ni armé : chaque carte s'active par l'utilisateur, et "
                                  "armer une écriture demande sa carte forte"}
         if to_propose:
@@ -630,6 +669,66 @@ class PackToolSource:
         if setup:
             payload["setup"] = setup
         return payload, False
+
+    def _write_record(self, record: dict[str, Any]) -> None:
+        rec_dir = self.user_root / RECORDS_DIR
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        tmp = rec_dir / f".{record['name']}.json.tmp"
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, rec_dir / f"{record['name']}.json")
+
+    def remove(self, name: str, ctx: ToolContext) -> dict[str, Any]:
+        """Retrait en un appel, idempotent : les compétences que CE pack a copiées (registre), ses cartes d'agents non
+        activées, puis `on_remove` pour les agents déjà créés (carte, jamais de suppression silencieuse). Le registre
+        reste, marqué retiré, avec les effets MCP relevés : retirer un pack ne baisse jamais un effet (un agent créé
+        depuis le pack peut encore appeler ces outils)."""
+        if not _NAME.match(name or ""):
+            raise PackError(f"nom de pack invalide : {name!r}")
+        rec = self._record(name)
+        if rec is None and not (Path(self.packs_root) / name / "pack.yaml").is_file():
+            known = ", ".join(p.name for p in pack_dirs(self.packs_root)) or "aucun"
+            raise PackError(f"pack inconnu : {name!r} (packs : {known})")
+        removed: list[str] = []
+        already = not installed(rec)
+        bubbles: list[str] = []
+        with self._lock:
+            if rec is not None and not already:
+                root = os.path.realpath(self.user_root)
+                for rel in rec.get("skills") or []:
+                    target = self.user_root / str(rel)
+                    real = os.path.realpath(target)
+                    if target.is_symlink() or not real.startswith(root + os.sep) or str(rel).count("/") != 1:
+                        log.warning("pack %s : %s ignoré au retrait (hors de la racine ou lien)", name, rel)
+                        continue
+                    if target.is_dir():
+                        shutil.rmtree(real)
+                        removed.append(str(rel))
+                    fam = target.parent
+                    if fam.is_dir() and not any(fam.iterdir()):
+                        fam.rmdir()
+            if rec is not None:
+                bubbles = [str(p.get("bubble_id")) for p in rec.get("proposed") or [] if p.get("bubble_id")]
+                self._write_record({**rec, "skills": [], "proposed": [], "removed": True, "removed_at": time.time()})
+        follow: dict[str, Any] | None = None
+        if self.on_remove is not None:
+            try:
+                follow = self.on_remove(name, bubbles, ctx)
+            except Exception as e:  # noqa: BLE001 — le retrait des compétences est fait ; on le dit
+                log.exception("pack %s : suite du retrait en échec", name)
+                follow = {"drafts_closed": [], "agents": None, "card": None, "error": f"{type(e).__name__}: {e}"}
+        self._emit(event="pack_removed", pack=name, skills=removed, already=already)
+        payload: dict[str, Any] = {"removed": name, "skills": removed, "already_removed": already,
+                                   "drafts_closed": (follow or {}).get("drafts_closed", []),
+                                   "agents": (follow or {}).get("agents"), "card": (follow or {}).get("card")}
+        if follow and follow.get("error"):
+            payload["error"] = follow["error"]
+        if payload["agents"]:
+            payload["note"] = ("les agents créés depuis ce pack sont gardés tels quels : la carte propose de les "
+                               "désarmer ou de les supprimer, l'utilisateur choisit")
+        elif payload["agents"] is None:
+            payload["note"] = ("les agents déjà créés depuis ce pack ne sont pas touchés : retire-les depuis Crew si "
+                               "l'utilisateur le demande")
+        return payload
 
     def _copy(self, pack: Pack) -> list[str]:
         """Copie les compétences dans la racine utilisateur. Refuse AVANT toute copie si un dossier existe déjà sans

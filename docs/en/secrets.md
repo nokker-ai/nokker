@@ -56,6 +56,7 @@ mcp_tool_servers:
 |---|---|
 | MCP servers (`token`, `headers`) | resolved each time a session to the server opens: a changed value is picked up without a restart |
 | connectors (mail, calendar): the stored credential can be `secret:NAME` | resolved when the connector is built and when it is tested |
+| the mailbox of the machine (`/v1/local/connectors/mail`, below) | ALWAYS a name: resolved at each mail tool call and each check of a `mail:` trigger |
 | ssh hosts (`hosts.yaml`, `key: secret:NAME`) | read at each call, handed to the sandbox on stdin, never in the model's context ([ops.md](ops.md)) |
 | [agents](agents.md) (`secrets: [NAME]`) | resolved before each run; a missing name skips the run. During a run, only the names the agent declares resolve; any other reference fails |
 | environment of a process the core starts (stdio MCP) | the resolver is ready; injecting values into a sandbox environment is **planned** |
@@ -131,3 +132,44 @@ Both scopes are copied, each value is read back and compared. Running it again c
 exists in OpenBao with another value is reported (`divergent`) and **not** overwritten unless you pass
 `--overwrite`. The source is never modified. Then set `NOKKER_SECRETS_PROVIDER=openbao` and restart the core; delete
 `vault.bin` yourself once you have checked. The reverse (`--from openbao --to file`) works the same way.
+
+## Your mailbox on the machine
+
+The owner of a Lokkal install can link one IMAP/SMTP mailbox **on the machine**. The password goes in the vault; the
+connector keeps only its name. It never leaves the machine: not to nokker.ai, not through the gateway, not in the
+mirror.
+
+```bash
+# 1. the password (an app password), in the vault
+nokker secret set MAIL_PASSWORD
+# 2. the mailbox, with the local token (the gateway gets 403 on these routes)
+curl -X PUT http://127.0.0.1:8742/v1/local/connectors/mail -H "Authorization: Bearer $(cat ~/.nokker/state/local-token)" \
+  -d '{"settings": {"preset": "custom", "address": "me@example.com", "imap_host": "imap.example.com",
+                    "imap_port": 993, "smtp_host": "smtp.example.com", "smtp_port": 465},
+       "secret": "MAIL_PASSWORD"}'
+```
+
+```
+GET    /v1/local/connectors              {connectors: [{kind: "mail", state, settings, secret: "NAME", locality: "local"}], presets}
+PUT    /v1/local/connectors/mail         {settings, secret: "NAME" | "secret:NAME"}   tested (IMAP and SMTP) before it is kept
+POST   /v1/local/connectors/mail/test    {ok, message, code}
+DELETE /v1/local/connectors/mail         {revoked}
+```
+
+- `secret` is a **name** in the vault. A value, a name that is not in the vault, or a `password` field is refused
+  (400), and what you sent is not repeated in the answer. Presets: `gmail`, `icloud`, `infomaniak`, `fastmail`, or
+  `custom` with hosts and ports. Mail only for now.
+- The settings live in `connectors.json` under the core state folder (mode 0600), with `secret:NAME` and nothing else
+  secret.
+- Sessions of the owner get the mail tools (`mail_search`, `mail_read`, `mail_draft`, `mail_move`, `mail_trash`,
+  `mail_send`), with locality `local`. `mail_send` and `mail_trash` are **always a strong card**, whatever the
+  permission mode or `allow` rules; no agent rule lifts it.
+- During an [agent](agents.md) run, only the names the agent declares resolve: an agent that reads this mailbox lists
+  the password name in its `secrets`.
+- A `mail:<filter>` trigger of the owner's agents watches this mailbox.
+- If the machine also has the relayed mailbox of your nokker.ai account (connectors relayed, see the Lokkal docs), the
+  mailbox of the machine wins: its tools take the `mail_*` names, and `mail:` triggers watch it, never the relayed one.
+  Remove it (`DELETE`) to use the relayed one again.
+- Mirror: a turn that used this mailbox, and every turn of a run started by `mail:`, stays on the machine (the mirror
+  skips it). The machine tells nokker.ai only that it has a `mail` connector (for agent placement), never the address,
+  the host or the name of the secret.

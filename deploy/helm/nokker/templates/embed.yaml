@@ -1,0 +1,85 @@
+{{- if .Values.embed.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+# Memory embeddings: llama.cpp on CPU, EmbeddingGemma-300M Q8_0 (same model as nokker.ai and Lokkal: compatible
+# indexes). Downloaded from Hugging Face on first start into the volume (~330 MB), then served offline.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fn }}-embed
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: embed
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.embed.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.embed.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-embed
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: embed
+spec:
+  selector:
+    {{- include "nokker.selector" (dict "root" . "component" "embed") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-embed
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: embed
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # RWO model volume
+  selector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "embed") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: embed
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      containers:
+        - name: embed
+          image: {{ include "nokker.image" (dict "root" . "image" .Values.embed.image "default" "server") }}
+          env:
+            - {name: LLAMA_CACHE, value: /models}
+            - {name: HOME, value: /tmp}
+          args: ["--hf-repo", "ggml-org/embeddinggemma-300M-GGUF", "--hf-file", "embeddinggemma-300M-Q8_0.gguf",
+                 "--embedding", "--pooling", "mean", "-t", "2", "-c", "1024", "-np", "1", "-b", "512", "-ub", "512",
+                 "--cache-ram", "0", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+            failureThreshold: 40   # first start downloads the model
+          resources:
+            {{- toYaml .Values.embed.resources | nindent 12 }}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: {{ $fn }}-embed}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+{{- end }}

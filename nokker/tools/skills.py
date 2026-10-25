@@ -14,6 +14,14 @@ Garde en ÉCHEC FERMÉ : toute compétence hors des racines de confiance passe p
 invisible (journalisé), `caution` = visible avec un avertissement. Sans l'amont on ne peut pas scanner : ces
 compétences sont invisibles et `skill_list` le dit.
 
+Skills du DÉPÔT (`<dépôt>/.nokker/skills`, `ProjectSkills`, drapeau `local.project_skills`) : ils viennent avec le
+code, donc d'un tiers possible — même règle que les hooks du dépôt (nokker/tools/hooks.py). Invisibles tant que
+l'utilisateur n'a pas déclaré de confiance CE dossier et CETTE empreinte de l'arbre (`trusted_project_skills: [{root,
+sha256}]` dans SES réglages, jamais dans ceux du dépôt) ; empreinte recalculée à chaque lecture du catalogue (un skill
+réécrit pendant la session, par le modèle en `accept_edits` par exemple, redevient invisible jusqu'à une nouvelle
+confiance) ; jamais en mode plan ; puis le garde habituel (ils ne sont jamais dans une racine de confiance). Portée :
+le fil de la session ouverte dans ce dépôt (cwd sous sa racine git) et ses sous-agents `<fil>/sa-<id>`.
+
 L'amont n'est importé qu'à l'usage, dans un try : le module se charge sans lui (CI unitaire). `HERMES_HOME` est posé
 sur `$NOKKER_HOME` avant tout import.
 """
@@ -41,6 +49,11 @@ MAX_LINKED_FILES = 200
 SUPPORT_DIRS = ("references", "templates", "assets", "scripts")
 _EXCLUDED_DIRS = {".git", ".github", ".hub", ".scan-cache", "node_modules", "__pycache__"}
 _PLATFORMS = {"macos": "darwin", "linux": "linux", "windows": "win32"}
+PROJECT_SKILLS_DIR = (".nokker", "skills")
+PROJECT_TRUST_KEY = "trusted_project_skills"
+MAX_PROJECT_FILES = 500  # au-delà, l'arbre des skills du dépôt est ignoré en entier (empreinte non calculée)
+MAX_PROJECT_BYTES = 4 * 1024 * 1024
+SUBAGENT_MARK = "/sa-"  # fil d'un sous-agent : `<fil parent>/sa-<id>` (nokker/tools/delegate.py)
 
 _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
     ("skill_list", "Liste les compétences disponibles (nom, famille, description), filtrables par famille.",
@@ -116,6 +129,184 @@ def _platform_ok(fm: dict[str, Any]) -> bool:
                for p in plats)
 
 
+# ─────────────────────────────── skills du dépôt ───────────────────────────────
+
+
+def project_skills_sha256(skills_dir: Path) -> tuple[str | None, int, str | None]:
+    """(empreinte, nombre de skills, raison du refus) de l'arbre `skills_dir`. L'empreinte couvre TOUT l'arbre
+    (chemins relatifs et contenus ; un lien symbolique compte par sa cible, sans être suivi) : un fichier lié changé,
+    ajouté ou retiré change l'empreinte. Arbre trop gros (`MAX_PROJECT_FILES`, `MAX_PROJECT_BYTES`) : refusé."""
+    h = hashlib.sha256()
+    files = size = 0
+    for cur, dirs, names in os.walk(skills_dir):  # sans suivre les liens
+        dirs.sort()
+        rel_cur = Path(cur).relative_to(skills_dir)
+        for n in sorted(names) + [d for d in dirs if os.path.islink(os.path.join(cur, d))]:
+            full = os.path.join(cur, n)
+            rel = (rel_cur / n).as_posix()
+            files += 1
+            if files > MAX_PROJECT_FILES:
+                return None, 0, f"trop de fichiers (plus de {MAX_PROJECT_FILES})"
+            if os.path.islink(full):
+                h.update(b"L\0" + rel.encode() + b"\0" + os.readlink(full).encode() + b"\n")
+                continue
+            try:
+                data = Path(full).read_bytes()
+            except OSError as e:
+                return None, 0, f"fichier illisible {rel} : {e.strerror or e}"
+            size += len(data)
+            if size > MAX_PROJECT_BYTES:
+                return None, 0, f"trop volumineux (plus de {MAX_PROJECT_BYTES // (1024 * 1024)} Mio)"
+            h.update(b"F\0" + rel.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    return h.hexdigest(), len(SkillToolSource._skill_dirs(skills_dir)), None
+
+
+@dataclass
+class _ProjectState:
+    root: str  # racine du dépôt (chemin réel)
+    dir: Path  # <root>/.nokker/skills
+    project: str = "absent"  # absent | trusted | untrusted | invalid
+    sha256: str | None = None  # empreinte lue (à l'ouverture, ou au dernier changement constaté)
+    count: int = 0
+    notice: str | None = None
+
+
+@dataclass
+class ProjectSkills:
+    """Les skills du dépôt de chaque fil de session. `user_settings` : réglages de l'utilisateur (où la confiance
+    s'écrit) ; `mode_of(thread_id)` : mode de permission du fil (plan → aucun skill du dépôt ; illisible → aucun) ;
+    `emit(nom, données)` publie `skill.untrusted`."""
+
+    user_settings: Path | None = None
+    mode_of: Callable[[str], Any] | None = None
+    emit: Callable[[str, dict[str, Any]], Any] | None = None
+    _threads: dict[str, _ProjectState] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    @staticmethod
+    def repo_root(cwd: str | Path, mount_root: str | Path | None) -> str:
+        """Racine git de `cwd` sans dépasser la racine montée (comme les fichiers d'instructions, lot X1), sinon cwd."""
+        from nokker.context.project_memory import find_git_root
+
+        found = find_git_root(cwd, mount_root or cwd)
+        return os.path.realpath(found if found is not None else cwd)
+
+    def _user(self) -> dict[str, Any]:
+        from nokker.tools.hooks import read_settings
+
+        try:
+            return read_settings(self.user_settings)
+        except ValueError:
+            return {}
+
+    def open_session(self, thread_id: str, cwd: str | Path, mount_root: str | Path | None = None) -> dict[str, Any]:
+        """Lit l'arbre `.nokker/skills` du dépôt du fil et l'état de confiance ; rend `skills` de la réponse
+        d'ouverture."""
+        from nokker.tools.hooks import is_trusted
+
+        root = self.repo_root(cwd, mount_root)
+        st = _ProjectState(root=root, dir=Path(root, *PROJECT_SKILLS_DIR))
+        parent = st.dir.parent
+        if parent.is_symlink() or st.dir.is_symlink():
+            st.project, st.notice = "invalid", ("skills du dépôt ignorés : .nokker/skills est un lien symbolique "
+                                                "(il pourrait sortir du dépôt)")
+        elif st.dir.is_dir():
+            sha, count, why = project_skills_sha256(st.dir)
+            if why:
+                st.project, st.notice = "invalid", f"skills du dépôt ignorés (.nokker/skills) : {why}"
+            elif count:
+                st.sha256, st.count = sha, count
+                if is_trusted(self._user(), root, sha, PROJECT_TRUST_KEY):  # type: ignore[arg-type]
+                    st.project = "trusted"
+                else:
+                    st.project, st.notice = "untrusted", self._untrusted_notice(st, changed=False)
+        with self._lock:
+            self._threads[thread_id] = st
+        if st.project == "untrusted":
+            self._emit_untrusted(thread_id, st)
+        return self.status(thread_id) or {}
+
+    @staticmethod
+    def _untrusted_notice(st: _ProjectState, changed: bool) -> str:
+        what = ("Les skills de ce dépôt ont été modifiés depuis la confiance" if changed else
+                f"Ce dépôt déclare {st.count} skill(s) dans .nokker/skills")
+        return (f"{what} (empreinte {(st.sha256 or '')[:12]}…) : ils sont IGNORÉS tant que tu ne leur fais pas "
+                "confiance. Relis-les, puis POST /v1/local/skills/trust {thread_id, sha256} (jeton local), ou "
+                f"`python -m nokker.cli skills trust --sha256 {st.sha256}` dans le dossier. Un arbre modifié devra "
+                "être de nouveau accepté.")
+
+    def _emit_untrusted(self, thread_id: str, st: _ProjectState) -> None:
+        if self.emit is None:
+            return
+        try:
+            self.emit("skill.untrusted", {"thread_id": thread_id, "root": st.root, "sha256": st.sha256,
+                                          "count": st.count, "notice": st.notice})
+        except Exception:  # noqa: BLE001 — un événement manqué ne casse jamais un appel
+            log.debug("emit skill.untrusted a levé", exc_info=True)
+
+    def status(self, thread_id: str) -> dict[str, Any] | None:
+        st = self._threads.get(thread_id)
+        if st is None:
+            return None
+        return {"enabled": True, "project": st.project, "root": st.root, "sha256": st.sha256, "count": st.count,
+                "notice": st.notice}
+
+    def trust(self, thread_id: str, sha256: str) -> tuple[int, dict[str, Any]]:
+        """Le propriétaire fait confiance aux skills du dépôt de CE fil, tels qu'il les a relus (`sha256` = celle
+        rendue à l'ouverture ou par le dernier avis de changement)."""
+        from nokker.tools.hooks import trust_project_hooks
+
+        st = self._threads.get(thread_id)
+        if st is None or st.project not in ("untrusted", "trusted"):
+            return 404, {"error": {"message": "pas de skills de dépôt sur ce fil"}}
+        if sha256 != st.sha256:
+            return 409, {"error": {"message": "empreinte différente de celle lue : relis les skills du dépôt"}}
+        if self.user_settings is None:
+            return 503, {"error": {"message": "pas de réglages de l'utilisateur où écrire la confiance"}}
+        trust_project_hooks(self.user_settings, st.root, sha256, key=PROJECT_TRUST_KEY)
+        with self._lock:
+            st.project, st.notice = "trusted", None
+        return 200, {"thread_id": thread_id, "root": st.root, "sha256": sha256, "trusted": True}
+
+    def close(self, thread_id: str) -> None:
+        with self._lock:
+            self._threads.pop(thread_id, None)
+
+    def visible_dir(self, thread_id: str | None) -> Path | None:
+        """Le dossier des skills du dépôt à charger pour CE fil, ou None : fil inconnu, pas de confiance, mode plan
+        (ou illisible), ou arbre changé depuis la confiance (il redevient non fiable, avec un avis)."""
+        if not thread_id:
+            return None
+        base = thread_id.split(SUBAGENT_MARK, 1)[0]
+        st = self._threads.get(base)
+        if st is None or st.project != "trusted":
+            return None
+        if self.mode_of is not None:
+            from nokker.qa.permissions import Mode
+
+            try:
+                if self.mode_of(base) is Mode.PLAN:
+                    return None
+            except Exception:  # noqa: BLE001 — mode illisible : échec fermé
+                return None
+        if st.dir.is_symlink() or st.dir.parent.is_symlink() or not st.dir.is_dir():
+            return None
+        sha, count, why = project_skills_sha256(st.dir)
+        if sha == st.sha256:
+            return st.dir
+        with self._lock:
+            if st.project != "trusted":
+                return None
+            if why:
+                st.project, st.sha256, st.notice = "invalid", None, f"skills du dépôt ignorés (.nokker/skills) : {why}"
+            else:
+                st.sha256, st.count = sha, count
+                st.project, st.notice = "untrusted", self._untrusted_notice(st, changed=True)
+        if st.project == "untrusted":
+            self._emit_untrusted(base, st)
+        return None
+
+
 # ─────────────────────────────── catalogue ───────────────────────────────
 
 
@@ -137,13 +328,15 @@ class SkillToolSource:
 
     roots : racines par précédence (projet > utilisateur > fournies). trusted_roots : racines exemptées du scan
     (compétences fournies). home : `$NOKKER_HOME`, défaut `~/.nokker` ; la racine utilisateur est `home/skills`
-    (seule où l'on installe et retire). audit : reçoit un dict par install / refus / retrait / compétence masquée."""
+    (seule où l'on installe et retire). audit : reçoit un dict par install / refus / retrait / compétence masquée.
+    project : skills des dépôts par fil (`ProjectSkills`), en tête de la précédence, jamais de confiance d'office."""
 
     roots: list[Path] = field(default_factory=list)
     trusted_roots: list[Path] = field(default_factory=list)
     home: Path | None = None
     audit: Callable[[dict[str, Any]], None] | None = None
     core: bool = False
+    project: ProjectSkills | None = None
     _cache: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -230,12 +423,26 @@ class SkillToolSource:
         self._cache[key] = (sig, out)
         return out
 
-    def _catalog(self) -> tuple[list[_Entry], dict[str, list[_Entry]], dict[str, Any]]:
+    def _roots_for(self, thread_id: str | None) -> list[Path]:
+        """Racines du fil : celle des skills de son dépôt si elle est visible maintenant (confiance, empreinte, mode),
+        puis les racines fixes."""
+        proj = self.project.visible_dir(thread_id) if self.project is not None else None
+        return ([proj] if proj is not None else []) + list(self.roots)
+
+    def _project_ok(self, entry: _Entry, thread_id: str | None) -> bool:
+        """Un skill du dépôt lu : l'arbre a-t-il encore l'empreinte de confiance APRÈS la lecture ?"""
+        if self.project is None or entry.source != "project":
+            return True
+        d = self.project.visible_dir(thread_id)
+        return d is not None and self._same(d, entry.root)
+
+    def _catalog(self, thread_id: str | None = None) -> tuple[list[_Entry], dict[str, list[_Entry]], dict[str, Any]]:
         """(entrées visibles dédoublonnées par précédence, collisions nom → entrées masquées, infos)."""
+        roots = self._roots_for(thread_id)
         with self._lock:
             entries: list[_Entry] = []
             info = {"unscannable": 0, "dangerous": 0}
-            for root in self.roots:
+            for root in roots:
                 trusted, label = self._is_trusted(root), self._label(root)
                 for d in self._skill_dirs(root):
                     try:
@@ -282,10 +489,11 @@ class SkillToolSource:
             return out(f"outil inconnu : {name}", True)
         try:
             a = arguments or {}
+            tid = getattr(ctx, "thread_id", None)
             if name == "skill_list":
-                return out(self.list_skills(a.get("category")))
+                return out(self.list_skills(a.get("category"), tid))
             if name == "skill_view":
-                payload, err = self.view(str(a["name"]), a.get("file"))
+                payload, err = self.view(str(a["name"]), a.get("file"), tid)
                 return out(payload, err)
             if name == "skill_install":
                 payload, err = self.install(str(a["source"]), a.get("category"))
@@ -297,8 +505,8 @@ class SkillToolSource:
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
             return out(_clean(f"{type(e).__name__}: {e}"), True)
 
-    def list_skills(self, category: str | None = None) -> dict[str, Any]:
-        entries, _, info = self._catalog()
+    def list_skills(self, category: str | None = None, thread_id: str | None = None) -> dict[str, Any]:
+        entries, _, info = self._catalog(thread_id)
         if category:
             entries = [e for e in entries if e.category == category]
         skills = []
@@ -314,8 +522,8 @@ class SkillToolSource:
                               "sécurité n'est pas disponible, elles ne sont pas affichées par prudence.")
         return result
 
-    def _find(self, name: str) -> tuple[_Entry | None, list[_Entry]]:
-        entries, shadowed, _ = self._catalog()
+    def _find(self, name: str, thread_id: str | None = None) -> tuple[_Entry | None, list[_Entry]]:
+        entries, shadowed, _ = self._catalog(thread_id)
         name = name.strip()
         for e in entries:
             if e.name == name or (e.category and f"{e.category}/{e.name}" == name):
@@ -342,13 +550,18 @@ class SkillToolSource:
                         return files
         return files
 
-    def view(self, name: str, file: str | None = None) -> tuple[Any, bool]:
-        entry, hidden = self._find(name)
+    def view(self, name: str, file: str | None = None, thread_id: str | None = None) -> tuple[Any, bool]:
+        entry, hidden = self._find(name, thread_id)
         if entry is None:
             return f"compétence introuvable : {name!r} (skill_list pour voir les noms)", True
+        changed = (("REFUSÉ : les skills du dépôt ont changé pendant la lecture ; ils sont de nouveau ignorés "
+                    "jusqu'à une nouvelle confiance de l'utilisateur"), True)
         if file:
-            return self._read_linked(entry, str(file))
+            payload, err = self._read_linked(entry, str(file))
+            return changed if not err and not self._project_ok(entry, thread_id) else (payload, err)
         text = (entry.path / "SKILL.md").read_text(encoding="utf-8-sig", errors="replace")
+        if not self._project_ok(entry, thread_id):
+            return changed
         _, body = parse_frontmatter(text)
         payload: dict[str, Any] = {"name": entry.name, "category": entry.category, "source": entry.source,
                                    "description": entry.description, "content": body.lstrip("\n"),
@@ -493,9 +706,9 @@ class SkillToolSource:
         return out
 
     # ── index pour le bloc du tour ──
-    def index_block(self, limit_per_family: int = 4, desc_chars: int = 60) -> str:
+    def index_block(self, limit_per_family: int = 4, desc_chars: int = 60, thread_id: str | None = None) -> str:
         """Une ligne par famille : `- famille : nom — description ; …`. Stable (trié), compact."""
-        entries, _, _ = self._catalog()
+        entries, _, _ = self._catalog(thread_id)
         if not entries:
             return ""
         fams: dict[str, list[_Entry]] = {}
@@ -512,4 +725,5 @@ class SkillToolSource:
                 "liste une famille]\n" + "\n".join(lines) + "\n[/Compétences]")
 
 
-__all__ = ["SKILL_TOOLS", "SkillToolSource", "parse_frontmatter"]
+__all__ = ["PROJECT_TRUST_KEY", "SKILL_TOOLS", "ProjectSkills", "SkillToolSource", "parse_frontmatter",
+           "project_skills_sha256"]

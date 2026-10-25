@@ -46,11 +46,130 @@ _MONTANT = re.compile(
 
 DOMAIN_PATTERNS: dict[str, re.Pattern[str]] = {"fiscal": _FISCAL, "juridique": _JURIDIQUE, "montant": _MONTANT}
 
+# ─────────────── engagement et simple mention (rc.7, docs/INVARIANTS.md §1.2) ───────────────
+#
+# Le drapeau dit seulement que le domaine est NOMMÉ. L'escalade forcée (qa/gates.py::domain_verdict) vise la demande de
+# DÉCIDER ou d'ENGAGER dans ce domaine. Ces motifs servent à une restriction précise : trois familles de « simple
+# mention » (arnaque, lecture d'un document reçu, rappel ou relance) lèvent l'escalade, SAUF si le message porte un
+# marqueur d'engagement. Tout ce qui n'est dans aucune famille escalade comme avant ; dans le doute, on escalade.
+
+# Ordre en tête de proposition (« Vire 3 000 CHF », « puis paie-la », « Please pay … »). Ancré pour ne pas prendre
+# « ma fiche de paie » ou « la règle fiscale » pour un ordre.
+_CLAUSE = (r"(?:^|[.!?;:\n,(«\"]\s*|\b(?:stp|svp|allez|ok|bon|maintenant|ensuite|puis|et|please|pls|now|then|and|"
+           r"just|go ahead and|can you|could you|would you|bitte|dann|und|jetzt)\s+)")
+_MONEY_VERBS = (r"(?:paie|paye|payez|vire|virez|verse|versez|transf[èe]re|transf[ée]rez|"
+                r"pay(?!\s+attention)|wire|transfer|send (?:the )?(?:money|payment|funds)|"
+                r"[üu]berweise|[üu]berweis|bezahle|bezahl|zahle|begleiche)\b")
+_MONEY_ORDER = re.compile(r"(?i)" + _CLAUSE + _MONEY_VERBS)
+# Même ordre suivi d'un montant (« Vire 3 000 CHF », « Wire CHF 3,000 ») : seul cas où il POSE le drapeau `montant`
+# (« transfer the files », « vire ce fichier » ne sont pas de l'argent).
+_AMOUNT = (r"(?:\d[\d'’  .,]*\s*(?:chf|eur|€|usd|\$|gbp|£|fr\.?|francs?|euros?|dollars?)(?![a-z])|"
+           r"(?:chf|eur|€|usd|\$|gbp|£)\s*\d)")
+_MONEY_ORDER_AMOUNT = re.compile(r"(?i)" + _CLAUSE + _MONEY_VERBS + r"[^.?!\n]{0,40}?" + _AMOUNT)
+_COMMIT_ORDER = re.compile(
+    r"(?i)" + _CLAUSE + r"(?:r[èe]gle|r[ée]glez|signe|signez|r[ée]silie|r[ée]siliez|d[ée]clare|d[ée]clarez|d[ée]duis|"
+    r"d[ée]duisez|conteste|contestez|accepte|acceptez|ordonne|"
+    r"sign|terminate|cancel|file|declare|deduct|settle|dispute|"
+    r"k[üu]ndige|k[üu]ndig|unterschreibe|unterschreib|unterzeichne|deklariere|widersprich)\b")
+_MODAL_ORDER = re.compile(
+    r"(?i)\b(?:peux-tu|pourrais-tu|tu peux|tu pourrais|merci de|il faut|il faudrait|je veux|je voudrais|j'aimerais|"
+    r"on doit|veuillez|kannst du|k[öo]nntest du|w[üu]rdest du|bitte)\b[^.?!\n]{0,60}?\b"
+    r"(?:payer|r[ée]gler|virer|verser|signer|r[ée]silier|d[ée]clarer|d[ée]duire|contester|accepter|transf[ée]rer|"
+    r"[üu]berweisen|bezahlen|zahlen|k[üu]ndigen|unterschreiben|ausf[üu]hren|deklarieren|absetzen|begleichen)\b")
+_PAYMENT_ORDER = re.compile(
+    r"(?i)\b(?:fais|faites|effectue|effectuez|lance|lancez|relance|relancez|ex[ée]cute|ex[ée]cutez|programme|programmez|"
+    r"valide|validez|approuve|approuvez|faire|effectuer|lancer|relancer|ex[ée]cuter|programmer|valider|approuver|"
+    r"make|send|execute|approve|schedule|retry)\s+(?:le|la|un|une|ce|cette|les|mon|ma|mes|the|a|this|my)\s+"
+    r"(?:virement|paiement|versement|transfert|r[èe]glement|ordre|payment|transfer|wire)")
+_FIX_AMOUNT = re.compile(
+    r"(?i)\b(?:fixe[rz]?|d[ée]termine[rz]?|set|decide)\s+(?:le|la|un|une|ce|the|a)\s+(?:montant|prix|tarif|taux|acompte|"
+    r"amount|price|rate|fee)\b|\b(?:lege|setze)\s+den\s+(?:betrag|preis|satz)\b")
+# Avis qui engage : « dois-je », « puis-je », « quel taux », « should I », « muss ich »… (dont le banc `escalade-fiscal`).
+_ADVICE = re.compile(
+    r"(?i)\b(?:dois[- ]je|doit[- ]on|je dois|faut[- ]il|puis[- ]je|peux[- ]je|est[- ]ce que (?:je|j'|on) (?:dois|peux|doit)|"
+    r"est[- ]ce (?:l[ée]gal|obligatoire|d[ée]ductible|valable)|est[- ]il (?:l[ée]gal|obligatoire|d[ée]ductible|valable)|"
+    r"ai[- ]je (?:le droit|int[ée]r[êe]t)|a[- ]t[- ]on le droit|suis[- ]je (?:oblig[ée]e?|tenue?)|vaut[- ]il mieux|"
+    r"que (?:dois|faut)[- ](?:je|il)|quel(?:le)? (?:est le )?taux|combien (?:d'imp[ôo]ts?|dois[- ]je|vais[- ]je|je dois|"
+    r"je vais|facturer|payer|demander)|quel (?:montant|prix) (?:facturer|payer|demander)|"
+    r"can i|could i|should i|must i|do i (?:have|need)|am i (?:required|allowed|liable)|"
+    r"is (?:it|this|that) (?:legal|deductible|allowed|valid|binding|enforceable)|how much (?:tax|vat|do i|should i|will i)|"
+    r"what (?:tax |vat )?rate|which (?:tax |vat )?rate|"
+    r"muss ich|darf ich|soll ich|sollte ich|kann ich|wie (?:hoch|viel)|welche[rsn]? (?:steuer)?satz|"
+    r"ist (?:das|es|sie|er) (?:legal|erlaubt|absetzbar|g[üu]ltig|zul[äa]ssig|rechtens)|absetzbar)")
+# Juger un montant ou un calcul : « la TVA est-elle juste ? », « vérifie la TVA », « is the amount correct? ».
+_JUDGE_AMOUNT = re.compile(
+    r"(?i)\b(?:est|sont|para[îi]t|semble)(?:[- ](?:elle|il|ils|elles))?\s+(?:vraiment\s+)?(?:juste|correct|exact|faux|"
+    r"fausse|erron[ée]|bon|bonne)\w*|"
+    r"\b(?:v[ée]rifie\w*|contr[ôo]le\w*|recalcule\w*|check\w*|verify|double-check|pr[üu]f\w*|[üu]berpr[üu]f\w*|"
+    r"nachrechn\w*)\s+(?:(?:si|le|la|les|l'|mon|ma|mes|the|my|this|if|die|den|das|ob)\s*)?(?:tva|taxe\w*|imp[ôo]t\w*|"
+    r"montant\w*|calcul\w*|total|vat|tax\w*|amount\w*|steuer\w*|mwst|betrag\w*|summe\w*)\b|"
+    r"\bis (?:it|this|that|the \w+) (?:correct|right|accurate|wrong)\b|\b(?:stimmt|richtig|korrekt|falsch)\w*")
+_ENGAGEMENT_PATTERNS = (_MONEY_ORDER, _COMMIT_ORDER, _MODAL_ORDER, _PAYMENT_ORDER, _FIX_AMOUNT, _ADVICE, _JUDGE_AMOUNT)
+
+# Familles de simple mention, chacune avec les drapeaux qu'elle peut lever. Une lecture ou une relance ne lève jamais
+# `juridique` (un contrat lu, une clause citée : on escalade).
+_SCAM = re.compile(
+    r"(?i)\b(?:arnaque\w*|escroqu\w*|hame[çc]onnage|phishing|frauduleu\w*|fraudes?|fausses? factures?|faux (?:mail|"
+    r"courriel|message|sms|avocat|huissier|fournisseur)|suspect\w*|"
+    r"scams?|scammer\w*|fraud\w*|fake (?:invoice|bill|email|e-mail|lawyer)s?|suspicious|spoof\w*|"
+    r"betrug\w*|betr[üu]g\w*|gef[äa]lscht\w*|fake-rechnung\w*|verd[äa]chtig\w*)")
+_REMIND_ME = re.compile(
+    r"(?i)\b(?:rappelle[sz]?[- ]moi (?:de |d['’])|(?:mets|cr[ée]e|ajoute|programme|note)[sz]?(?:[- ]moi)? un rappel|"
+    r"remind me to|(?:set|add|create) (?:me )?an? reminder|erinnere mich)")
+_FOLLOW_UP = re.compile(
+    r"(?i)\b(?:relance\w*|rappel de paiement|lettre de rappel|payment reminder|follow[- ]up|chase (?:the |a |my )?"
+    r"(?:client|customer|invoice|payment)|dunning|zahlungserinnerung\w*|mahnung\w*|nachfass\w*)")
+_READ = re.compile(
+    r"(?i)\b(?:explique[sz]?(?:[- ]moi)?|que (?:veut dire|signifie)|qu'est-ce que (?:veut dire|signifie)|"
+    r"[àa] quoi correspond|r[ée]sume[sz]?(?:[- ]moi)?|lis(?:[- ]moi)?|relis|d[ée]chiffre|traduis|"
+    r"explain|what does\b.{1,60}\bmean|summari[sz]e|read (?:me|this|the)|walk me through|translate|"
+    r"erkl[äa]r\w*|was (?:bedeutet|hei[ßs]t)|fasse?\b.{0,40}\bzusammen|lies|[üu]bersetze?)\b")
+_RECEIVED_DOC = re.compile(
+    r"(?i)\b(?:factures?|d[ée]comptes?|relev[ée]s?|bulletins?|quittances?|re[çc]us?|"
+    r"invoices?|bills?|statements?|receipts?|"
+    r"rechnung\w*|abrechnung\w*|beleg\w*|quittung\w*|kontoauszug\w*)\b")
+_ALL_FLAGS = frozenset({"fiscal", "juridique", "montant"})
+_MONEY_FLAGS = frozenset({"fiscal", "montant"})
+
+
+def domain_engagement(text: str) -> bool:
+    """Le message demande-t-il au système de DÉCIDER ou d'ENGAGER (payer, virer, signer, résilier, déclarer, déduire,
+    fixer un montant, donner un avis qui engage, juger un montant) ? Vrai dès qu'un motif répond."""
+    return any(p.search(text or "") for p in _ENGAGEMENT_PATTERNS)
+
+
+def domain_mention(text: str, flags: set[str] | frozenset[str]) -> str | None:
+    """Famille de simple mention qui lève TOUS les `flags` (« arnaque », « rappel », « lecture », « relance »), ou None.
+    None dès qu'un marqueur d'engagement est présent, qu'aucune famille ne s'applique, ou qu'un drapeau reste (ex.
+    `juridique` dans une lecture) : l'escalade forcée s'applique alors comme avant."""
+    text = text or ""
+    if not flags or domain_engagement(text):
+        return None
+    families: list[tuple[str, frozenset[str]]] = []
+    if _SCAM.search(text):
+        families.append(("arnaque", _ALL_FLAGS))
+    if _REMIND_ME.search(text):
+        families.append(("rappel", _ALL_FLAGS))
+    if _READ.search(text) and _RECEIVED_DOC.search(text):
+        families.append(("lecture", _MONEY_FLAGS))
+    if _FOLLOW_UP.search(text):
+        families.append(("relance", _MONEY_FLAGS))
+    lifted = frozenset().union(*(f for _, f in families))
+    if not families or not set(flags) <= lifted:
+        return None
+    return families[0][0]
+
 
 def domain_flags(text: str) -> set[str]:
     """Drapeaux de domaine sur le texte BRUT (avant caviardage : les mots-clés eux-mêmes ne
-    sont jamais des secrets, donc l'ordre caviardage/drapeaux n'a pas d'incidence ici)."""
-    return {name for name, pattern in DOMAIN_PATTERNS.items() if pattern.search(text)}
+    sont jamais des secrets, donc l'ordre caviardage/drapeaux n'a pas d'incidence ici).
+
+    Un ordre de mouvement d'argent sans mot-clé (« Vire 3 000 CHF à … », « Wire 3,000 CHF », « Überweise … ») pose
+    aussi `montant` (rc.7 : il ne l'était que s'il nommait le virement ou la facture)."""
+    flags = {name for name, pattern in DOMAIN_PATTERNS.items() if pattern.search(text)}
+    if _MONEY_ORDER_AMOUNT.search(text):
+        flags.add("montant")
+    return flags
 
 
 # ─────────────────────────────── GO explicite (invariant 4) ───────────────────────────────

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from nokker.images.render import IMAGE_PART
+from nokker.images.render import IMAGE_PART, shed_line
 from nokker.tools.select import compact_index
 from nokker.core.ports import Assembled, Recall, ToolRegistry, ToolSpec
 from nokker.core.turn import Tier, ToolResult, Turn
@@ -82,6 +82,10 @@ class ContextEngineV0:
     # rattachée, ou passage d'un agent listé sur la carte), après la mémoire de projet. None (drapeau `plan` éteint) :
     # rien ne change.
     plan: Any = None
+    # Profil mineur d'un foyer (lot X23, `nokker/household/guard.py::young_prefix`) : locataire courant → `teen` |
+    # `child` | None. Posé (drapeau `household_minors`) : le préfixe produit d'un profil mineur reçoit l'addendum
+    # `prompts/prefix-young.md` et sa tranche d'âge. None (défaut) : rien ne change.
+    young_profile: Any = None
 
     def __post_init__(self) -> None:
         self._layers = {"internal": (self._load(self.prefix_path),
@@ -95,10 +99,31 @@ class ContextEngineV0:
         if self.product_prefix_path is None:
             self._sha_by_tenant[""] = _compute_prefix_sha256(self._prefix_text, self.tools.core())
 
+    def _young(self) -> str | None:
+        if self.young_profile is None or self.product_prefix_path is None:
+            return None
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT:
+            return None
+        try:
+            return self.young_profile(tid)
+        except Exception:  # noqa: BLE001 — profil illisible : le préfixe le plus prudent (moins de 13 ans)
+            logger.warning("profil mineur de %s illisible", tid, exc_info=True)
+            return "child"
+
     def _layer(self) -> tuple[str, str]:
         """(préfixe, profil) du locataire courant."""
         if self.product_prefix_path is None or current_tenant() == INTERNAL_TENANT:
             return self._layers["internal"]
+        young = self._young()
+        if young:
+            key = f"young:{young}"
+            if key not in self._layers:
+                from nokker.household.guard import young_prefix
+
+                base = self._layers["product"][0]
+                self._layers[key] = (f"{base.rstrip()}\n\n{young_prefix(young)}", "")
+            return self._layers[key]
         return self._layers["product"]
 
     @property
@@ -111,7 +136,7 @@ class ContextEngineV0:
 
     @property
     def _prefix_sha256(self) -> str:
-        key = "" if self.product_prefix_path is None else current_tenant()
+        key = "" if self.product_prefix_path is None else f"{current_tenant()}|{self._young() or ''}"
         sha = self._sha_by_tenant.get(key)
         if sha is None:
             sha = _compute_prefix_sha256(self._prefix_text, self.tools.core())
@@ -196,12 +221,12 @@ class ContextEngineV0:
         parts: list[dict] = [{"type": "text", "text": text}] if text else []
         for img in t.images:
             if (t.index, img.sha256) in kept:
+                # `turn` et `size` : sur un palier sans vision, une image d'un tour précédent devient la ligne de
+                # délestage (nokker/images/render.py), seule celle du tour courant est signalée non lue.
                 parts.append({"type": IMAGE_PART, "sha256": img.sha256, "media_type": img.media_type,
-                              "name": img.name})
+                              "name": img.name, "turn": t.index, "size": img.size})
             else:
-                label = f"{img.name} " if img.name else ""
-                parts.append({"type": "text", "text": f"[image délestée : {label}({img.media_type}, "
-                                                      f"{max(1, img.size // 1024)} Ko), jointe au tour {t.index}]"})
+                parts.append({"type": "text", "text": shed_line(img.name, img.media_type, img.size, t.index)})
         return {"role": "user", "content": parts}
 
     @staticmethod

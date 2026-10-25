@@ -9,6 +9,8 @@ Règle de bascule propre à `GatesV0` (au-delà de ce que l'invariant d'entrée 
 de domaine (fiscal/juridique/montant) sur `turn.input.domain_flags`, si le tour n'est pas déjà escaladé,
 force ESCALATE — "escalade humaine" de l'invariant 5 du préfixe, appliquée par le noyau et pas seulement
 par la bonne volonté du modèle.
+Restriction rc.7 (docs/INVARIANTS.md §1.2) : un domaine seulement MENTIONNÉ (arnaque, lecture d'un document reçu,
+rappel ou relance) sans aucune demande de décider ou d'engager garde la réponse (`qa/invariants.py::domain_mention`).
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from typing import Callable
 from nokker.core.ports import Judge, JudgeAnswer, ToolSpec, call_effect
 from nokker.core.turn import Decision, Effect, Gate, Tier, ToolCall, Turn, Verdict
 from nokker.qa.calibrate import DEFAULT_THRESHOLDS, Thresholds
+from nokker.qa.invariants import domain_mention
 from nokker.qa.questions import QUESTIONS, Primitive, action_prompt, switch_prompt
 
 logger = logging.getLogger("nokker.qa.gates")
@@ -62,6 +65,12 @@ def domain_verdict(turn: Turn, allowed: frozenset[str] = DEFAULT_DOMAIN_FLAGS,
         return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:session-code",
                        reason="session de code locale : drapeau consultatif, réponse gardée"
                               + (" (demande de conseil fiscal ou juridique : à faire vérifier)" if advice else ""))
+    # Restriction rc.7 (docs/INVARIANTS.md §1.2) : domaine seulement MENTIONNÉ (arnaque, lecture d'un document reçu,
+    # rappel ou relance), sans aucun marqueur d'engagement — la réponse reste, le modèle garde `escalate_to_human`.
+    family = domain_mention(turn.input.text or "", flags)
+    if family is not None:
+        return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:mention:{family}",
+                       reason=f"domaine seulement mentionné ({family}), aucune demande de décider ou d'engager")
     return Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=1, rule=rule,
                    reason="drapeau de domaine sans escalade explicite du modèle")
 

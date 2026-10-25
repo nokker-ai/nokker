@@ -45,12 +45,32 @@ CONTENT_TABLES = [
     "nokker_plan_briefs",
     "lokkal_machine_deck",  # deck de chaque machine (028, X15) : machine authentifiée ou compte du deck
     "subscriptions",  # abonnements Stripe (010) : sous RLS
+    "nokker_mail_watch",  # curseurs de la relève du déclencheur mail: (031) : écrits dans le locataire de l'agent
+    "lokkal_mirror_pages",  # pages copiées, servies machine éteinte (033, §7.23) : machine authentifiée ou relais
+    # SSO OIDC des équipes (032) : locataire de la connexion ; lecture du lien par les membres dans test_sso_rls.py
+    "sso_connections", "sso_domains", "sso_bindings", "sso_managed", "sso_audit",
+    # équipe, suite (037) : journal du projet (locataire du projet ; owner et maintainer d'autres locataires plus bas),
+    # choix de livraison du brief du matin (locataire de la personne)
+    "team_audit", "nokker_brief_delivery",
+    # foyer (039, X23) : locataire du FOYER (le payeur) ; politiques des membres dans test_household_rls.py
+    "household_members", "parental_consents",
+    "nokker_code_sessions",  # sessions de code multi-utilisateur (038, §7.28) : écrites dans le locataire du compte
+    "nokker_pack_installs",  # packs installés par un compte chez nokker.ai (036) : locataire du compte
 ]
 OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
               "lokkal_machines", "lokkal_link_requests",  # lien Lokkal (014) : cherchées par empreinte de jeton ou par code
               "lokkal_gateway_codes", "lokkal_gateway_refresh",  # connexion passerelle (019), idem, par empreinte
-              "billing_customers", "billing_events"}  # webhook Stripe (010) : lus avant de connaître le locataire
+              "billing_customers", "billing_events",  # webhook Stripe (010) : lus avant de connaître le locataire
+              "lokkal_relay_used_jti",  # jti des jetons de pages présentés au relais (035) : par empreinte, sans locataire
+              # SSO (032) : connexion → locataire, domaine prouvé → connexion, connexions en cours, (issuer, sub)
+              "sso_routes", "sso_domain_claims", "sso_flows", "sso_identities",
+              # foyer (039) : « ce compte est un profil mineur », lu avant le locataire (SSO, consentements)
+              "account_minors",
+              # modération des pages publiques (040) : registre lu par le relais avant le locataire, et par
+              # l'opérateur pour tous les locataires ; audit en ajout seul
+              "lokkal_public_pages", "lokkal_page_moderation",
+              "account_deletions"}  # file d'effacement (017) : lue par l'outil d'opérateur pour tous les locataires
 
 
 @pytest.fixture(scope="module")
@@ -112,7 +132,7 @@ def _dummy_row(conn, table: str) -> tuple[list[str], list]:
 
     vals = {"text": lambda: uuid.uuid4().hex, "integer": lambda: secrets.randbelow(10**6),
             "bigint": lambda: secrets.randbelow(10**9), "double precision": lambda: 1.0,
-            "boolean": lambda: False, "jsonb": lambda: Jsonb({}),
+            "boolean": lambda: False, "jsonb": lambda: Jsonb({}), "bytea": lambda: b"<p>x</p>",
             "timestamp with time zone": lambda: datetime.now(timezone.utc)}
     return [c for c, _ in rows], [vals[t]() for _, t in rows]
 
@@ -123,6 +143,8 @@ def _insert(conn, table: str, tenant: str | None = None) -> None:
         th = uuid.uuid4().hex
         conn.execute("INSERT INTO threads (thread_id) VALUES (%s)", (th,))
         vals[cols.index("thread_id")] = th
+    if table == "parental_consents":  # foyer (039) : une attestation est attestée, pour un profil mineur
+        vals[cols.index("attested")], vals[cols.index("profile")] = True, "teen"
     if tenant is not None:
         cols, vals = [*cols, "tenant_id"], [*vals, tenant]
     names = ", ".join(f'"{c}"' for c in cols)
@@ -543,3 +565,274 @@ def test_billing_pg_store_isolation_idempotence_and_stale_events(pg, pod_env):
 
     with psycopg.connect(pg["app"]) as conn:  # hors scope : la RLS ne rend rien
         assert conn.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 0
+
+
+@requires_pg
+def test_mail_watch_cursor_roundtrips_and_stays_in_its_tenant(pg, pod_env):
+    """Déclencheur `mail:` (031) : le curseur d'un agent survit à Postgres (redémarrage : pas de rejeu), et un
+    locataire ne voit ni n'efface celui d'un autre."""
+    from nokker.agents.mailwatch import PgWatchStore, WatchState
+    from nokker.store.pg import apply_migrations
+    from nokker.tenancy.context import tenant_scope
+
+    assert apply_migrations(pg["owner"], strict=True)  # 031 rejouée : aucune erreur
+    store = PgWatchStore(pg["app"])
+    try:
+        with tenant_scope(A):
+            st = WatchState(agent_id="ag_aaaaaaaaaaaa", filter="from:billing@example.com", uidvalidity=41, last_uid=7,
+                            last_poll_at=1.5, last_ok_at=1.5, next_poll_at=121.5, errors=0, pending=2,
+                            held="un passage est en cours", updated_at=1.5)
+            store.save(st)
+            st.last_uid, st.pending = 9, 0
+            st.inflight_run_id, st.inflight_uid = "ar_0123456789abcdef", 12  # curseur « en vol » (p2/mail-local)
+            store.save(st)  # mise à jour en place
+        with tenant_scope(B):
+            assert store.get("ag_aaaaaaaaaaaa") is None and "ag_aaaaaaaaaaaa" not in store.ids()
+            store.delete("ag_aaaaaaaaaaaa")  # sans effet hors de son locataire
+        store2 = PgWatchStore(pg["app"])  # « redémarrage »
+        try:
+            with tenant_scope(A):
+                got = store2.get("ag_aaaaaaaaaaaa")
+                assert (got.uidvalidity, got.last_uid, got.pending, got.filter) == (41, 9, 0, "from:billing@example.com")
+                assert (got.inflight_run_id, got.inflight_uid) == ("ar_0123456789abcdef", 12)
+                assert "ag_aaaaaaaaaaaa" in store2.ids()
+                store2.delete("ag_aaaaaaaaaaaa")
+                assert store2.get("ag_aaaaaaaaaaaa") is None
+        finally:
+            store2.close()
+    finally:
+        store.close()
+
+
+# ─────────────── équipe, suite (037) : dépenses d'un projet, journal, restauration, livraison du brief ───────────────
+# Quatre locataires à part (E, F, G, H, I) pour ne pas croiser les tests génériques sur A et B : le propriétaire (E)
+# partage un projet avec un maintainer (F), un membre (G) et un viewer (I) ; H n'est membre de rien.
+
+E, F, G, H, I = "tn_eeeeeeeeeeee", "tn_ffffffffffff", "tn_gggggggggggg", "tn_hhhhhhhhhhhh", "tn_iiiiiiiiiiii"
+
+
+class _Acc:
+    def __init__(self, tenant_id: str, account_id: str, email: str) -> None:
+        self.tenant_id, self.account_id, self.email, self.status = tenant_id, account_id, email, "active"
+
+
+OWN = _Acc(E, "us_owner037001", "owner037@example.org")
+MAINT = _Acc(F, "us_maint037001", "maint037@example.org")
+MEM = _Acc(G, "us_member37001", "mem037@example.org")
+OUT = _Acc(H, "us_outsider371", "out037@example.org")
+VIEW = _Acc(I, "us_viewer37001", "view037@example.org")
+
+
+class _Accounts:
+    def __init__(self, *accs: _Acc) -> None:
+        self.by_id = {a.account_id: a for a in accs}
+
+    def account(self, account_id):
+        return self.by_id.get(account_id)
+
+    def account_by_email(self, email):
+        return next((a for a in self.by_id.values() if a.email == email), None)
+
+
+@pytest.fixture(scope="module")
+def team037(pg):
+    from nokker.team.service import Team
+    from nokker.team.store import PgTeamStore
+    from nokker.tenancy.context import tenant_scope
+
+    team = Team(store=PgTeamStore(pg["app"], migrate_now=False), tenancy=_Accounts(OWN, MAINT, MEM, OUT, VIEW),
+                mirror_allowed=lambda acc: True)
+    with tenant_scope(E):
+        pid = team.create(OWN, {"name": "Plateforme"})["id"]
+        team.patch(OWN, pid, {"mirror": True})
+        invites = {who.account_id: team.invite(OWN, pid, {"email": who.email, "role": role})["id"]
+                   for who, role in ((MAINT, "maintainer"), (MEM, "member"), (VIEW, "viewer"))}
+    for who in (MAINT, MEM, VIEW):
+        with tenant_scope(who.tenant_id):
+            team.accept(who, invites[who.account_id])
+    return {"team": team, "pid": pid}
+
+
+def _raw037(dsn, actor, sql, params=()):
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute("SELECT set_config('app.tenant_id', %s, false), set_config('app.account_id', %s, false)",
+                     (actor.tenant_id, actor.account_id))
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall() if cur.description else cur.rowcount
+        conn.commit()
+        return rows
+
+
+@requires_pg
+def test_project_spending_is_read_across_tenants_by_members_only(pg, pod_env, team037):
+    """Le budget se lit dans le ledger : les lignes attribuées au projet, de tous les locataires, pour un membre du
+    projet ; jamais une ligne hors projet d'un autre locataire, jamais rien pour un non-membre ; et personne
+    n'attribue au projet une dépense qu'il n'a pas le droit d'y mettre."""
+    from datetime import UTC, datetime, timedelta
+
+    import psycopg
+
+    from nokker.ledger.attribution import SpendTag, spend_tag
+    from nokker.ledger.costs import PostgresLedger
+    from nokker.ledger.prices import load_from_yaml
+    from nokker.team.budget import ProjectBudget
+    from nokker.tenancy.context import tenant_scope
+    from tests.unit.team.test_budget import call
+
+    team, pid = team037["team"], team037["pid"]
+    ledger = PostgresLedger(pg["app"], prices=load_from_yaml(), migrate=False)
+    since = datetime.now(UTC) - timedelta(days=1)
+    with tenant_scope(G):
+        with spend_tag(SpendTag(pid, E, MEM.account_id)):
+            ledger.record("th_g_proj", 0, call(60))
+        ledger.record("th_g_free", 0, call(500))  # hors projet : reste chez G
+    with tenant_scope(F), spend_tag(SpendTag(pid, E, MAINT.account_id)):
+        ledger.record("th_f_proj", 0, call(30))
+    with tenant_scope(E):
+        rows = ledger.fetch_project_calls(pid, E, since=since, actor=OWN.account_id)
+        assert sorted((r.thread_id, r.account) for r in rows) == [("th_f_proj", MAINT.account_id),
+                                                                  ("th_g_proj", MEM.account_id)]
+        assert ledger.fetch_calls(thread_id="th_g_proj") == []  # sans compte posé : rien d'un autre locataire
+    with tenant_scope(H):
+        assert ledger.fetch_project_calls(pid, E, since=since, actor=OUT.account_id) == []
+    # SQL brut au nom du membre : ses lignes, celles du projet ; jamais la ligne hors projet de F
+    seen = {r[0] for r in _raw037(pg["app"], MAINT, "SELECT thread_id FROM ledger_entries")}
+    assert {"th_g_proj", "th_f_proj"} <= seen and "th_g_free" not in seen
+    assert {r[0] for r in _raw037(pg["app"], OUT, "SELECT thread_id FROM ledger_entries")} == set()
+    # attribuer au projet : un non-membre, un viewer, ou au nom d'un autre compte → refusé en base
+    for who, acc in ((OUT, OUT.account_id), (VIEW, VIEW.account_id), (MEM, MAINT.account_id)):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _raw037(pg["app"], who, "INSERT INTO ledger_entries (thread_id, turn_index, tier, model, project_id, "
+                                    "project_tenant, account) VALUES ('th_x', 0, 'ship', 'm', %s, %s, %s)",
+                    (pid, E, acc))
+    with tenant_scope(H), spend_tag(SpendTag(pid, E, OUT.account_id)), \
+            pytest.raises(psycopg.errors.InsufficientPrivilege):
+        ledger.record("th_h", 0, call(10))
+    # la vue du budget sur Postgres : total du projet, lignes par membre pour l'owner, la sienne pour un membre
+    budget = ProjectBudget(team=team, ledger=ledger, prices=ledger.prices)
+    with tenant_scope(E):
+        team.put_budget(OWN, pid, {"daily": 100})
+        v = budget.view(OWN, pid)
+    assert v["today"]["spent"] == pytest.approx(0.9)
+    assert {m["account_id"]: m["today"] for m in v["members"] if m["today"]} == {
+        MEM.account_id: pytest.approx(0.6), MAINT.account_id: pytest.approx(0.3)}
+    with tenant_scope(G):
+        mine = budget.view(MEM, pid)
+        assert [m["account_id"] for m in mine["members"]] == [MEM.account_id]
+        assert budget.check_project(pid, MEM.account_id).verdict is None
+
+
+@requires_pg
+def test_project_journal_and_quarantine_restore_across_tenants(pg, pod_env, team037):
+    """Journal du projet : écrit et lu par owner et maintainer seulement (même d'un autre locataire) ; la restauration
+    d'une version de la quarantaine par un maintainer d'un autre locataire passe, un membre ne touche à rien."""
+    from nokker.tenancy.context import tenant_scope
+
+    team, pid = team037["team"], team037["pid"]
+    note = {"name": "fact-ci", "kind": "fact", "title": "CI", "locality": "both"}
+    with tenant_scope(G):
+        team.push_notes(MEM, pid, "mc_g", [{**note, "text": "La CI tourne sur la forge."}])
+    with tenant_scope(F):
+        team.push_notes(MAINT, pid, "mc_f", [{**note, "text": "La CI tourne ailleurs."}])
+        [q] = [x for x in team.quarantined(MAINT, pid)["quarantine"] if x["name"] == "fact-ci"]
+        got = team.restore_note(MAINT, pid, q["id"])["note"]
+        assert got["text"] == "La CI tourne sur la forge."
+        rows = team.quarantined(MAINT, pid)["quarantine"]
+        assert [r["restored_by"] for r in rows if r["id"] == q["id"]] == [MAINT.account_id]
+        events = [e["event"] for e in team.audit(MAINT, pid)["events"]]
+        assert "note_restored" in events
+    # le membre : ni lecture du journal, ni écriture, ni marque sur la quarantaine
+    assert _raw037(pg["app"], MEM, "SELECT * FROM team_audit") == []
+    assert _raw037(pg["app"], MEM, "UPDATE team_note_quarantine SET restored_by = 'x'") == 0
+    import psycopg
+
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        _raw037(pg["app"], MEM, "INSERT INTO team_audit (project_id, tenant_id, at, actor_account, event) "
+                                "VALUES (%s, %s, 1, %s, 'budget_set')", (pid, E, MEM.account_id))
+    # le maintainer n'écrit pas au nom d'un autre
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        _raw037(pg["app"], MAINT, "INSERT INTO team_audit (project_id, tenant_id, at, actor_account, event) "
+                                  "VALUES (%s, %s, 1, %s, 'budget_set')", (pid, E, OWN.account_id))
+    assert _raw037(pg["app"], OUT, "SELECT * FROM team_audit") == []
+
+
+@requires_pg
+def test_brief_delivery_choice_roundtrips_and_stays_in_its_tenant(pg, pod_env):
+    from nokker.plan.store import PgPlan
+    from nokker.tenancy.context import tenant_scope
+
+    store = PgPlan(dsn=pg["app"], migrate_now=False)
+    try:
+        with tenant_scope(A):
+            store.put_delivery("us_aaaa", {"telegram": True, "email": "a@example.com", "email_armed": "f" * 64,
+                                           "arm_approval_id": None, "armed_by": "us_aaaa", "armed_at": 1.0,
+                                           "last": {"at": "2026-10-26T06:30:00Z", "telegram": "sent", "email": "sent"},
+                                           "updated_at": 2.0})
+            store.put_delivery("us_aaaa", {**store.get_delivery("us_aaaa"), "telegram": False, "updated_at": 3.0})
+            got = store.get_delivery("us_aaaa")
+            assert got["telegram"] is False and got["email_armed"] == "f" * 64 and got["last"]["email"] == "sent"
+        with tenant_scope(B):
+            assert store.get_delivery("us_aaaa") is None
+    finally:
+        store.close()
+
+
+@requires_pg
+def test_mail_watch_031_adds_the_inflight_columns_to_an_older_table(pg):
+    """031 de la première version (sans curseur « en vol ») déjà appliquée : rejouée, elle ajoute les deux colonnes,
+    et une seconde fois ne touche à rien."""
+    import psycopg
+
+    from nokker.agents.mailwatch import MIGRATION
+    from nokker.store.conn import migrate
+
+    with psycopg.connect(pg["owner"], autocommit=True) as c:
+        c.execute("ALTER TABLE nokker_mail_watch DROP COLUMN IF EXISTS inflight_run_id, "
+                  "DROP COLUMN IF EXISTS inflight_uid")
+    sql = MIGRATION.read_text(encoding="utf-8")
+    assert migrate(pg["owner"], sql, rls=False, strict=True)
+    assert migrate(pg["owner"], sql, rls=False, strict=True)
+    with psycopg.connect(pg["owner"]) as c:
+        cols = {r[0] for r in c.execute("SELECT column_name FROM information_schema.columns "
+                                        "WHERE table_name = 'nokker_mail_watch'").fetchall()}
+    assert {"inflight_run_id", "inflight_uid"} <= cols
+
+
+@requires_pg
+def test_web_packs_and_agent_origin_roundtrip_under_rls(pg, pod_env):
+    """Migration 036 : les packs d'un compte (`PgPackStore`) restent dans son locataire, l'origine d'un agent créé
+    depuis la carte d'un pack survit à Postgres, et la migration se rejoue sans danger."""
+    from nokker.agents.pg import PgAgents
+    from nokker.store.pg import apply_migrations
+    from nokker.tenancy.context import tenant_scope
+    from nokker.webpacks.pg import PgPackStore
+    from nokker.webpacks.service import PackInstall
+
+    assert apply_migrations(pg["owner"], strict=True)
+    store = PgPackStore(pg["app"])
+    rec = PackInstall(account="us_aaaa", pack="mail", version=1,
+                      skills=[{"family": "mail", "name": "mail-triage", "sha256": "ab" * 32}],
+                      templates=["inbox-triage"], machine={"skills": [], "agents": []}, bind={"secret:X": "Y"},
+                      proposed=[{"template": "inbox-triage", "bubble_id": "bu_1"}], installed_at=1.5)
+    store.put(A, rec)
+    rec.version = 2
+    store.put(A, rec)  # même (compte, pack) : mis à jour, pas dupliqué
+    got = store.get(A, "us_aaaa", "mail")
+    assert got == rec and [r.pack for r in store.list(A, "us_aaaa")] == ["mail"]
+    assert store.get(B, "us_aaaa", "mail") is None and store.list(B, "us_aaaa") == []
+    assert store.delete(B, "us_aaaa", "mail") is False and store.get(A, "us_aaaa", "mail") is not None
+    assert store.delete(A, "us_aaaa", "mail") is True and store.get(A, "us_aaaa", "mail") is None
+    agents = PgAgents(dsn=pg["app"])
+    try:
+        with tenant_scope(A):
+            a = agents.create(name="Tri", role="r", model="", tools=["mail_search"], created_by="us_aaaa",
+                              origin={"pack": "mail", "template": "inbox-triage"})
+            assert agents.get(a.id).origin == {"pack": "mail", "template": "inbox-triage"}
+            b = agents.create(name="Libre", role="r", model="", tools=[], created_by="us_aaaa")
+            assert agents.get(b.id).origin is None
+        with tenant_scope(B):
+            assert agents.get(a.id) is None
+    finally:
+        agents.close()

@@ -27,11 +27,16 @@ SPEC = ToolSpec(name="ssh_run", description="", parameters={}, effect=Effect.DES
 CALL = ToolCall(id="c1", name="ssh_run", arguments={"host": "web", "command": "systemctl restart app"})
 
 
-def test_floor_rules_are_the_ssh_ones():
-    assert eng._FLOOR_RULES == {PROD_RULE, TRUST_RULE}
+def test_floor_rules_are_the_ssh_ones_and_the_local_mailbox_send():
+    from nokker.qa.permissions import LOCAL_STRONG_RULE
+
+    from nokker.household.model import GUARDIAN_RULE
+
+    assert eng._FLOOR_RULES == {PROD_RULE, TRUST_RULE, LOCAL_STRONG_RULE, GUARDIAN_RULE}
 
 
-@pytest.mark.parametrize("rule", [PROD_RULE, TRUST_RULE])
+@pytest.mark.parametrize("rule", [PROD_RULE, TRUST_RULE, "permissions:local_connector_strong",
+                                  "household:guardian"])
 def test_agent_rule_never_lifts_a_floor_card(rule):
     gates = AgentRunGates(inner=Inner(rule), rules=[Rule.parse("ssh_run"), Rule.parse("ssh_trust")])
     out = gates.action(CALL, SPEC, SimpleNamespace(thread_id="th_x"))

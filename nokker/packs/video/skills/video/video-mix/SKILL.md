@@ -1,6 +1,7 @@
 ---
 name: video-mix
 description: Mix voice and music, set loudness, encode the final file
+locality: local
 ---
 # Audio mix and final encode
 

@@ -81,7 +81,10 @@ def turn(reply="fait", **kw):
 
 class FakeKernel:
     def __init__(self, replies, factory):
-        self.replies, self.factory, self.inputs = replies, factory, []
+        self.replies, self.factory, self.inputs, self.cancelled = replies, factory, [], []
+
+    def cancel(self, thread_id):  # Kernel.cancel : arrêt du tour en cours du fil
+        self.cancelled.append(thread_id)
 
     def run_turn(self, inp, stream=None):
         self.inputs.append(inp)

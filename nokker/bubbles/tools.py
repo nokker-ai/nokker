@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nokker.bubbles.hub import SESSION_CHANNEL, BubbleHub
-from nokker.bubbles.types import BubbleError
+from nokker.bubbles.types import BubbleError, BubbleNotFound
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.threads.types import ThreadError
@@ -36,6 +36,13 @@ _SESSION_SEND_PARAMS = {
     "required": ["to_thread", "text"],
 }
 
+_TRIGGER_DESC = ("{kind: manual} | {kind: schedule, cron: \"0 7 * * 1-5\", tz: \"Europe/Zurich\"} | {kind: once, at: "
+                 "ISO 8601} | {kind: event, event: \"webhook:<id>\" | \"alert:<nom>\"}")
+# Relève du courrier branchée (moteur + connecteurs, `nokker/agents/mailwatch.py`) : `mail:<filtre>` est offert.
+_TRIGGER_DESC_MAIL = (_TRIGGER_DESC[:-1] + " | \"mail:<filtre>\"} — filtre : from:, to:, cc:, subject:, is:unread|read|"
+                      "starred, mots libres, -terme pour exclure, * = tout nouveau message de la boîte de réception ; "
+                      "tous les termes doivent correspondre ; le passage reçoit l'id, l'expéditeur, le sujet et la date, "
+                      "et lit le message avec mail_read")
 _AGENT_DRAFT_PARAMS = {
     "type": "object",
     "properties": {
@@ -45,9 +52,7 @@ _AGENT_DRAFT_PARAMS = {
         "tools": {"type": "array", "items": {"type": "string"}, "description": "outils prévus"},
         "fill": {"type": "number", "description": "0..1, avancement du brouillon (défaut 1)"},
         "instructions": {"type": "string", "description": "la mission, message de chaque passage"},
-        "trigger": {"type": "object", "description": "{kind: manual} | {kind: schedule, cron: \"0 7 * * 1-5\", "
-                    "tz: \"Europe/Zurich\"} | {kind: once, at: ISO 8601} | {kind: event, event: "
-                    "\"webhook:<id>\" | \"alert:<nom>\"}",
+        "trigger": {"type": "object", "description": _TRIGGER_DESC,
                     "properties": {"kind": {"type": "string", "enum": ["manual", "schedule", "once", "event"]}}},
         "secrets": {"type": "array", "items": {"type": "string"}, "description": "NOMS de secrets du coffre "
                     "(jamais une valeur)"},
@@ -70,6 +75,11 @@ _AGENT_DRAFT_PARAMS_NO_ENGINE = {
     },
     "required": ["name", "role"],
 }
+_AGENT_DRAFT_PARAMS_MAIL = {
+    **_AGENT_DRAFT_PARAMS,
+    "properties": {**_AGENT_DRAFT_PARAMS["properties"],
+                   "trigger": {**_AGENT_DRAFT_PARAMS["properties"]["trigger"], "description": _TRIGGER_DESC_MAIL}},
+}
 _AGENT_DRAFT_DESC = ("Propose une carte de création d'agent (Crew) dans le fil courant ; l'utilisateur l'active ensuite "
                      "(ne crée AUCUN agent par lui-même).")
 _AGENT_DRAFT_DESC_NO_ENGINE = (_AGENT_DRAFT_DESC + " Cette instance n'a pas de moteur d'agents : déclencheur manuel "
@@ -87,6 +97,13 @@ def agents_engine(hub: BubbleHub) -> bool:
     return agents is not None and getattr(agents, "engine", None) is not None
 
 
+def agents_mail(hub: BubbleHub) -> Any:
+    """La relève du courrier (déclencheur `mail:<filtre>`), ou None : même condition que `AgentsHub._check_mail`."""
+    agents = getattr(hub, "agents_hub", None)
+    engine = getattr(agents, "engine", None) if agents is not None else None
+    return getattr(engine, "mail_watch", None) if engine is not None else None
+
+
 _BUBBLE_SHOW_PARAMS = {
     "type": "object",
     "properties": {
@@ -102,12 +119,15 @@ _AGENT_DRAFT_ACTIONS = [{"id": "activate", "label": "Activer", "primary": True}]
 
 
 def propose_agent_draft(hub: BubbleHub, ctx: ToolContext, arguments: dict[str, Any],
-                        extra_state: dict[str, Any] | None = None, *, scheduled: bool = True) -> ToolResult:
+                        extra_state: dict[str, Any] | None = None, *, scheduled: bool = True,
+                        mail: Any = None) -> ToolResult:
     """Pose une bulle `agent_draft` dans le fil du tour (§9.4/§9.5) : ne crée AUCUN agent. `extra_state` : champs
     de la carte venus d'un pack — `pack` et `template` (information, ignorés à l'activation) et `needs` (X15), que
     l'activation passe à l'agent pour le placement. Partagé par l'outil `agent_draft` et par `pack_install` (lot
     X16). `scheduled` faux (pas de moteur) :
-    un déclencheur autre que `manual` est refusé tout de suite, avec la consigne pour le modèle."""
+    un déclencheur autre que `manual` est refusé tout de suite, avec la consigne pour le modèle. `mail` : la relève du
+    courrier (défaut : celle du moteur de `hub`) ; sans elle, `mail:<filtre>` est refusé (`NO_MAIL_TRIGGER`), avec
+    elle, une boîte non reliée l'est aussi."""
     try:
         fill = float(arguments.get("fill", 1.0))
     except (TypeError, ValueError):
@@ -121,9 +141,10 @@ def propose_agent_draft(hub: BubbleHub, ctx: ToolContext, arguments: dict[str, A
     from nokker.agents.spec import norm_budget, norm_rules, norm_secrets, norm_trigger
     from nokker.agents.types import AgentError
 
+    watch = mail if mail is not None else agents_mail(hub)
     try:
         state.update({"instructions": str(arguments.get("instructions") or "")[:20_000],
-                      "trigger": norm_trigger(arguments.get("trigger")),
+                      "trigger": norm_trigger(arguments.get("trigger"), mail=watch is not None),
                       "secrets": norm_secrets(arguments.get("secrets")),
                       "budget": norm_budget(arguments.get("budget")),
                       "auto_approve": norm_rules(arguments.get("auto_approve"))})
@@ -131,11 +152,56 @@ def propose_agent_draft(hub: BubbleHub, ctx: ToolContext, arguments: dict[str, A
         return ToolResult(call_id="", name="agent_draft", content=f"carte refusée : {e}", is_error=True)
     if not scheduled and state["trigger"].get("kind") != "manual":
         return ToolResult(call_id="", name="agent_draft", content=NO_ENGINE_DRAFT, is_error=True)
+    if watch is not None and str(state["trigger"].get("event") or "").startswith("mail:"):
+        why = watch.unavailable()  # pas de carte « Activer » vouée au 400 : aucune boîte reliée
+        if why:
+            return ToolResult(call_id="", name="agent_draft", content=f"carte refusée : {why}", is_error=True)
     for key, value in (extra_state or {}).items():
         state.setdefault(key, value)  # jamais par-dessus un champ d'agent
     b = hub.create_bubble(ctx.thread_id, ctx.sender, kind="agent_draft", title=state["name"] or "Nouvel agent",
                           state=state, actions=list(_AGENT_DRAFT_ACTIONS))
     return ToolResult(call_id="", name="agent_draft", content=json.dumps({"bubble_id": b.id}, ensure_ascii=False))
+
+
+PACK_AGENTS_ACTIONS = ({"id": "disarm", "label": "Désarmer"}, {"id": "delete", "label": "Supprimer"},
+                       {"id": "keep", "label": "Garder", "primary": True})
+
+
+def pack_removed(hub: BubbleHub, ctx: ToolContext, pack: str, bubble_ids: list[str] | None, *,
+                 owner: str | None = None) -> dict[str, Any]:
+    """Suite d'un retrait de pack (`pack_remove`, local et web) dans le fil du tour : ferme les cartes `agent_draft` de
+    ce pack encore ouvertes (`bubble_ids`, celles que l'installation a posées), et si des agents ont été CRÉÉS depuis
+    ce pack, pose (ou remet à jour) UNE carte `pack_agents` qui propose de les désarmer ou de les supprimer. Aucun agent
+    n'est touché ici : seule l'action de l'utilisateur sur la carte le fait (§9.6). `owner` (nokker.ai) : seulement les
+    agents créés par ce compte."""
+    closed: list[str] = []
+    for bid in bubble_ids or []:
+        try:
+            b = hub.bubbles.require(str(bid))
+        except BubbleNotFound:
+            continue
+        if b.kind != "agent_draft" or (b.state or {}).get("pack") != pack or b.closed_at is not None:
+            continue
+        hub._close(b.id)
+        closed.append(b.id)
+    agents_hub = getattr(hub, "agents_hub", None)
+    created = [a for a in (agents_hub.from_pack(pack) if agents_hub is not None else [])
+               if owner is None or a.created_by == owner]
+    listed = [{"id": a.id, "name": a.name, "status": a.status, "armed": a.armed} for a in created]
+    card = None
+    if listed and ctx.thread_id:
+        state = {"pack": pack, "agents": listed, **({"owner": owner} if owner else {}),
+                 "note": "le pack est retiré ; ces agents en viennent et restent tels quels tant que tu ne choisis pas"}
+        existing = next((b for b in hub.bubbles.list_thread(ctx.thread_id)
+                         if b.kind == "pack_agents" and (b.state or {}).get("pack") == pack), None)
+        if existing is not None:
+            b = hub.bubbles.update(existing.id, state=state)
+            hub._emit_bubble("bubble.updated", b)
+        else:
+            b = hub.create_kernel_bubble(ctx.thread_id, kind="pack_agents", title=f"Agents du pack « {pack} »",
+                                         state=state, actions=[dict(a) for a in PACK_AGENTS_ACTIONS])
+        card = b.id
+    return {"drafts_closed": closed, "agents": listed, "card": card}
 
 
 @dataclass
@@ -147,6 +213,8 @@ class BubbleToolSource:
 
     def specs(self) -> list[ToolSpec]:
         engine = agents_engine(self.hub)
+        params = (_AGENT_DRAFT_PARAMS_MAIL if agents_mail(self.hub) is not None else _AGENT_DRAFT_PARAMS) if engine \
+            else _AGENT_DRAFT_PARAMS_NO_ENGINE
         return [
             ToolSpec(name="bubble_show", description="MONTRE une page à l'utilisateur dans une nouvelle bulle (carte "
                      "d'aperçu cliquable : image, titre, description) : profil Instagram/LinkedIn, article, site. À "
@@ -162,7 +230,7 @@ class BubbleToolSource:
                      source="builtin"),
             # Schéma et description selon l'instance (moteur d'agents ou non), relus à chaque `specs()`.
             ToolSpec(name="agent_draft", description=_AGENT_DRAFT_DESC if engine else _AGENT_DRAFT_DESC_NO_ENGINE,
-                     parameters=_AGENT_DRAFT_PARAMS if engine else _AGENT_DRAFT_PARAMS_NO_ENGINE, effect=Effect.READ,
+                     parameters=params, effect=Effect.READ,
                      source="builtin"),
         ]
 
@@ -230,4 +298,5 @@ class BubbleToolSource:
             ensure_ascii=False))
 
 
-__all__ = ["NO_ENGINE_DRAFT", "BubbleToolSource", "agents_engine", "propose_agent_draft"]
+__all__ = ["NO_ENGINE_DRAFT", "PACK_AGENTS_ACTIONS", "BubbleToolSource", "agents_engine", "pack_removed",
+           "propose_agent_draft"]

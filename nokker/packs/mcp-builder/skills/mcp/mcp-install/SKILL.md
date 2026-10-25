@@ -1,6 +1,7 @@
 ---
 name: mcp-install
 description: Add a tested MCP server to the config, secrets by name
+locality: local
 ---
 # Installing an MCP server
 

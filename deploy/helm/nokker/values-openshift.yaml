@@ -1,0 +1,32 @@
+# OpenShift overlay (restricted-v2 SCC): helm install … -f values-openshift.yaml
+# - no fixed uid / gid / fsGroup: the SCC assigns them from the namespace range; every Nokker pod runs under an
+#   arbitrary uid (HOME and caches on emptyDir, group-0 writable paths not needed);
+# - no privileged pod, no host namespaces, capabilities dropped, RuntimeDefault seccomp (the chart's defaults);
+# - session pods: same rules (k8s_sandbox.py omits runAsUser and fsGroup when they are null);
+# - exposure through a standard Ingress, turned into a Route by the OpenShift router.
+podSecurity:
+  runAsUser: null
+  runAsGroup: null
+  fsGroup: null
+
+ingress:
+  className: ""
+  annotations:
+    route.openshift.io/termination: edge
+    haproxy.router.openshift.io/timeout: 3600s
+  tls:
+    enabled: true
+    secretName: ""
+
+networkPolicy:
+  ingressNamespaceSelector:
+    matchLabels:
+      network.openshift.io/policy-group: ingress
+  apiServer:
+    ports: [443, 6443]
+
+# Workspaces: ReadWriteMany from OpenShift Data Foundation (CephFS) or your NFS provisioner.
+code:
+  workspaces:
+    accessMode: ReadWriteMany
+    storageClass: ocs-storagecluster-cephfs

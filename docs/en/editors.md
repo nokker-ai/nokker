@@ -41,6 +41,16 @@ Use an absolute path (`~/.nokker/bin/nokker`) if `nokker` is not on Zed's `PATH`
 `"--server", "http://127.0.0.1:<port>"` to `args` if your kernel does not listen on the port written by the installer.
 Start a thread with New Thread → Nokker. Logs: `dev: open acp logs` in Zed, `nokker logs --component cli` for Nokker.
 
+## Session routes (for integrations)
+
+Both integrations use the same local routes as the terminal client (local token required):
+
+- `POST /v1/local/sessions {cwd}` opens a session; add `thread_id` (or its alias `resume`) to reopen an existing
+  thread. Giving both with different values is refused (400).
+- `GET /v1/local/sessions` lists open sessions. Each entry has `thread_id`, `cwd`, `title` (null before the first
+  turn), `last_turn_at` (ISO 8601, end of the last recorded turn, or null), `working` (a turn is running or queued on
+  the thread) and `pending_approvals` (cards waiting on the thread and its sub-agents).
+
 ## VS Code extension
 
 A chat panel on the coding session of the open folder:

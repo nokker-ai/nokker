@@ -136,3 +136,67 @@ def test_previous_turn_class_is_remembered_per_thread():
     assert p.choose(state("corrige le bug dans app.py", thread="m", index=0)).tier is Tier.DEEP
     assert p.choose(state("et les tests ?", thread="m", index=1)).tier is Tier.DEEP
     assert p.choose(state("et les tests ?", thread="other", index=0)).tier is Tier.SHIP
+
+
+# ── images (X7) : un tour avec image ne part jamais sur un palier sans vision ──
+
+def image_state(text, thread, **kw):
+    from nokker.core.turn import ImageRef
+
+    s = state(text, thread=thread, **kw)
+    s.turn.images = [ImageRef(sha256="ab" * 32, media_type="image/png", size=68, name="capture.png")]
+    return s
+
+
+def vision_policy(vision=(Tier.SHIP, Tier.DEEP), **kw):
+    return policy(vision=lambda: vision, **kw)
+
+
+def test_trivial_turn_with_an_image_goes_to_a_tier_with_vision():
+    # La bêta : petit palier 35B sans vision, Ship et Deep (397B) avec. « merci ! » + capture : jamais le 35B.
+    p = vision_policy()
+    s = image_state("merci !", thread="i1")
+    d = p.choose(s)
+    assert d.tier is Tier.SHIP and "image" in d.reason
+    assert p.choose(RouteState(turn=s.turn, call_index=1)).tier is Tier.SHIP  # la suite du tour aussi
+
+
+def test_text_turns_keep_their_tier_and_their_cost():
+    p = vision_policy()
+    assert p.choose(state("merci !", thread="t1")).tier is Tier.SMALL  # sans image : petit palier, comme avant
+    assert p.choose(state("résume ce mail", thread="t2")).tier is Tier.SHIP
+    assert p.choose(state("corrige le bug dans app.py", thread="t3")).tier is Tier.DEEP
+
+
+def test_image_turn_on_a_tier_without_vision_moves_to_the_nearest_one_with_it():
+    only_deep = vision_policy(vision=(Tier.DEEP,))
+    assert only_deep.choose(image_state("merci !", thread="v1")).tier is Tier.DEEP
+    assert only_deep.choose(image_state("que vois-tu sur cette capture ?", thread="v2")).tier is Tier.DEEP
+    # Déjà sur un palier avec vision : rien ne change (code → Deep, conversation → Ship).
+    p = vision_policy()
+    assert p.choose(image_state("corrige le bug visible sur la capture dans app.py", thread="v3")).tier is Tier.DEEP
+    assert p.choose(image_state("que vois-tu sur cette capture ?", thread="v4")).tier is Tier.SHIP
+
+
+def test_no_tier_with_vision_keeps_the_routing():
+    # Aucun palier ne lit les images (clé de l'utilisateur, modèle local) : le routage ne change pas, l'image est
+    # signalée non lue par le noyau (`attachment.skipped`), comme avant.
+    p = vision_policy(vision=())
+    assert p.choose(image_state("merci !", thread="n1")).tier is Tier.SMALL
+    assert policy().choose(image_state("merci !", thread="n2")).tier is Tier.SMALL  # vision inconnue : inchangé
+
+
+def test_build_policy_reads_the_vision_of_the_served_tiers():
+    """`build_policy` : la vision lue sur les fournisseurs servis À CHAQUE tour (un palier retiré à chaud compris)."""
+    from types import SimpleNamespace
+
+    from nokker.api.server import build_policy
+    from nokker.config import NokkerConfig
+
+    providers = {Tier.SMALL: SimpleNamespace(vision=False), Tier.SHIP: SimpleNamespace(vision=True),
+                 Tier.DEEP: SimpleNamespace(vision=True)}
+    p = build_policy(NokkerConfig(route={"policy": "v1"}), providers)
+    assert p.choose(image_state("merci !", thread="b1")).tier is Tier.SHIP
+    assert p.choose(state("merci !", thread="b2")).tier is Tier.SMALL
+    providers.pop(Tier.SHIP)
+    assert p.choose(image_state("merci !", thread="b3")).tier is Tier.DEEP

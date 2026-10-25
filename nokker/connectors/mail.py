@@ -40,6 +40,7 @@ MAX_RESULTS = 25
 MAX_BODY_CHARS = 20_000
 MAX_FETCH_BYTES = 2_000_000
 MAX_RECIPIENTS = 10
+WATCH_FOLDER = "INBOX"  # relève du déclencheur mail: (v1 : la boîte de réception seulement)
 _ADDR_RE = re.compile(r"^[^@\s<>\"',;]+@[^@\s<>\"',;]+\.[A-Za-z]{2,}$")
 _ROLE_FLAGS = {"drafts": "\\Drafts", "trash": "\\Trash", "spam": "\\Junk", "sent": "\\Sent"}
 _ROLE_NAMES = {
@@ -630,6 +631,51 @@ class MailConnector:
                 return {"moved": False, "reason": "déjà dans la corbeille"}
             return self._relocate(m, uid, src, roles["trash"])
 
+    # ── relève de fond (déclencheur mail:<filtre>, nokker/agents/mailwatch.py) ──
+
+    def watch(self, criteria: list[str], *, last_uid: int | None, validity: int | None, fetch: int) -> dict[str, Any]:
+        """Une relève de la boîte de réception, en LECTURE SEULE (EXAMINE, BODY.PEEK : rien n'est marqué lu) :
+        `{validity, top, baseline: True}` quand il n'y a pas encore de curseur ou que l'UIDVALIDITY a changé (le dossier
+        a été reconstruit : on repart du plus grand UID, sans rien rejouer) ; sinon `{validity, top, uids, messages}` —
+        les UID > `last_uid` qui passent `criteria` (critères IMAP SEARCH déjà construits, croissants), et les
+        métadonnées (id, expéditeur, sujet, date ; jamais le corps) des `fetch` plus récents. Lève `ConnectorError`
+        (sans secret)."""
+        with self._imap() as m:
+            actual = self._select(m, WATCH_FOLDER, readonly=True)
+            top = self._top_uid(m)
+            if last_uid is None or validity is None or actual != validity:
+                return {"validity": actual, "top": top, "baseline": True}
+            m._encoding = "utf-8"  # noqa: SLF001 — critères non ASCII (SEARCH CHARSET UTF-8)
+            typ, data = m.uid("SEARCH", "CHARSET", "UTF-8", "UID", f"{last_uid + 1}:*", *criteria)
+            if typ != "OK":
+                raise ConnectorError("protocol_error", "SEARCH refusé par le serveur")
+            # « n:* » désigne toujours au moins le dernier message (RFC 3501) : on ne garde que ce qui est après le curseur.
+            uids = sorted({int(u) for u in (data[0] or b"").split() if u.isdigit() and int(u) > last_uid})
+            listed = uids[-fetch:] if fetch > 0 else []
+            messages = [x for x in (self._watch_meta(m, WATCH_FOLDER, actual, str(u)) for u in listed) if x]
+        return {"validity": actual, "top": max([top, *uids]), "uids": uids, "messages": messages}
+
+    @staticmethod
+    def _top_uid(m: Any) -> int:
+        """Plus grand UID du dossier sélectionné : UIDNEXT − 1 (réponse du SELECT), sinon le plus grand UID trouvé."""
+        typ, data = m.response("UIDNEXT")
+        try:
+            return max(0, int(data[0]) - 1)
+        except (TypeError, ValueError, IndexError):
+            pass
+        typ, data = m.uid("SEARCH", "ALL")
+        uids = [int(u) for u in (data[0] or b"").split() if u.isdigit()] if typ == "OK" and data else []
+        return max(uids, default=0)
+
+    def _watch_meta(self, m: Any, folder: str, validity: int, uid: str) -> dict[str, Any] | None:
+        typ, data = m.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        raw = next((p[1] for p in (data or []) if isinstance(p, tuple)), None) if typ == "OK" else None
+        if raw is None:
+            return None
+        h = email.message_from_bytes(raw, policy=email.policy.default)
+        return {"id": self._mid(folder, validity, uid), "from": _clean(_header_text(h, "From"), 200),
+                "subject": _clean(_header_text(h, "Subject"), 200), "date": _clean(_header_text(h, "Date"), 80)}
+
     # ── test de connexion ──
 
     def test(self) -> str:
@@ -649,4 +695,5 @@ class MailConnector:
         return f"IMAP et SMTP ok ({count} messages dans la boîte de réception)"
 
 
-__all__ = ["MailConnector", "PRESETS", "connect_imap", "connect_smtp", "normalize_settings", "translate_query"]
+__all__ = ["MailConnector", "PRESETS", "WATCH_FOLDER", "connect_imap", "connect_smtp", "normalize_settings",
+           "translate_query"]

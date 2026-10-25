@@ -4,6 +4,7 @@ depuis l'environnement, jamais depuis le fichier.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,9 @@ class TierConfig:
     # Le modèle lit-il les images jointes (X7, docs/LOKKAL.md §7.6) ? Sans vision, l'image n'est pas envoyée : le modèle
     # reçoit une note texte et l'utilisateur l'événement `attachment.skipped`. Mesuré avant de passer à `true`.
     vision: bool = False
+    # `vision: auto` dans la config : `vision` reste faux et une sonde unique tranche au premier tour avec image
+    # (nokker/providers/vision_probe.py).
+    vision_auto: bool = False
 
     def api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")
@@ -202,6 +206,12 @@ class NokkerConfig:
     #            openbao: {address, mount, prefix, auth, role_id_file, secret_id_file, token_file, ca_file}}}
     # (coffre local, lot X4 : nokker/secrets/, docs/en/secrets.md)
     local: dict[str, Any] | None = None
+    # Sessions de code multi-utilisateur (docs/LOKKAL.md §7.28, nokker/code_sessions/) : None ou `enabled: false`
+    # (défaut) = aucune route /v1/code/*, aucun outil de code pour les comptes. {enabled, backend: docker|kubernetes,
+    # workspace_root, layout: tenant/user/session, max_sessions_per_user, idle_ttl_s, instance, modes, default_mode,
+    # forge: {allowed_hosts}, secrets: {provider, file, openbao}, hooks, state_dir, docker: {image, network,
+    # network_name, host_root}, kubernetes: {…, transmis au module du bac à sable}}. Refusé dans Lokkal (local.code).
+    code: dict[str, Any] | None = None
     # nokker.ai, côté cloud du lien Lokkal (docs/LOKKAL.md §7.2 révisé, §7.5, nokker/cloud/) : None (défaut) = aucune
     # route /v1/link/*, /v1/gateway/*, /v1/inference/*. {signing_key_env, base_url, gateway_domain}
     cloud_link: dict[str, Any] | None = None
@@ -209,6 +219,31 @@ class NokkerConfig:
     # catalogue de skills, règles qui restreignent, noms de secrets, notes de projet en miroir. Éteint par défaut :
     # aucune route /v1/projects*, aucun champ `project` sur les agents, comportement inchangé.
     team: bool = False
+    # Réglages de l'équipe : {budget_rates: {CHF: <EUR pour 1 CHF>, USD: <EUR pour 1 USD>}} — taux de conversion des
+    # dépenses vers la devise d'un budget de projet (nokker/team/budget.py) ; USD ↔ CHF vient du catalogue de prix.
+    # Absent : une dépense dans une devise sans taux rend le budget invérifiable (tour refusé par prudence).
+    team_settings: dict[str, Any] | None = None
+    # Foyer (lot X23, docs/LOKKAL.md §7.29, nokker/household/) : un projet d'équipe de type `household` (demande `team`),
+    # quota commun du payeur compté dans le ledger, mémoire du foyer commune. Éteint par défaut : aucune route
+    # /v1/household*, aucun tour attribué, comportement inchangé. `household_minors` (éteint) : profils teen/child,
+    # attestation du représentant légal, garde-fous (carte forte du représentant, liste blanche, préfixe adapté).
+    # household_settings : {plan: famille, turns_per_day: 110, turns_per_week: 550, member_turns_per_day: 40,
+    # max_members: 6 (au plus), mode: hard|soft} — le palier `plan` de `billing_plans`, s'il existe, donne le quota.
+    household: bool = False
+    household_minors: bool = False
+    household_settings: dict[str, Any] | None = None
+    # SSO OIDC des équipes (docs/LOKKAL.md §7.24, nokker/sso/) : connexion par le fournisseur d'une organisation,
+    # groupes → rôles des projets, « SSO obligatoire ». Demande `team`. Éteint par défaut : aucune route /v1/sso*,
+    # /v1/auth/oidc/*, /v1/projects/{id}/sso, aucun contrôle de plus sur l'équipe.
+    # sso_settings : {redirect_uri (https, la page du client web qui renvoie code et state), secrets: {provider: file|
+    # openbao, file: {...}, openbao: {...}} (secrets des clients, portée system), state_dir, dns_over_https (URL DoH
+    # JSON pour prouver un domaine)}
+    sso: bool = False
+    sso_settings: dict[str, Any] | None = None
+    # Packs d'agents chez nokker.ai (docs/LOKKAL.md §7.30, nokker/webpacks/) : un compte installe dans SON périmètre les
+    # compétences et les modèles d'agents d'un pack livré avec le noyau qui tournent au web (jamais les serveurs MCP ni
+    # ce qui demande une machine). Éteint par défaut : aucune route /v1/packs*, aucun outil de pack pour les testeurs.
+    packs_web: bool = False
     # Plan et incidents (lot X18, docs/LOKKAL.md §7.18). `plan` : cartes hiérarchiques, consignes héritées injectées,
     # avancement calculé, propositions de découpe, brief du matin (routes /v1/plan*, outils plan_*). `operate` : alertes
     # signées → incidents → agents `alert:<nom>` (routes /v1/alerts*, /v1/incidents*). Éteints par défaut : 404 comme
@@ -266,6 +301,9 @@ class NokkerConfig:
     billing_webhook_secret_env: str = "NOKKER_STRIPE_WEBHOOK_SECRET"
     billing_prices: dict[str, str] = field(default_factory=dict)  # {palier: price_id Stripe}
     billing_plans: dict[str, dict[str, int]] = field(default_factory=dict)  # plafonds qui remplacent DEFAULT_PLANS
+    # Id d'un coupon Stripe appliqué à CHAQUE Checkout (`discounts`), créé chez Stripe à part (bêta : 100 % pendant 3
+    # mois, `duration: repeating`). Vide = aucune remise. Pas un secret. Coupon refusé par Stripe : Checkout sans remise.
+    billing_coupon: str = ""
 
     def images_root(self) -> str:
         """Dossier du magasin d'images : `images_dir`, sinon `<local.state_dir>/images` (Lokkal), sinon vide (aucune)."""
@@ -282,6 +320,25 @@ class NokkerConfig:
             return (m or "").rsplit("/", 1)[-1].strip().lower()
 
         return any(t.vision and bare(t.model) == bare(model) for t in self.tiers.values()) if model else False
+
+    def vision_mode_for_model(self, model: str) -> str:
+        """« true » | « auto » | « false » pour un modèle choisi à l'onboarding : la vision déclarée d'un palier de la
+        config qui sert le même modèle, sinon `local.vision` (le réglage des paliers servis par ce modèle), sinon non."""
+        if self.vision_for_model(model):
+            return "true"
+
+        def bare(m: str) -> str:
+            return (m or "").rsplit("/", 1)[-1].strip().lower()
+
+        if model and any(t.vision_auto and bare(t.model) == bare(model) for t in self.tiers.values()):
+            return "auto"
+        return vision_mode((self.local or {}).get("vision", False))
+
+    def vision_probe_path(self) -> Path | None:
+        """Résultats des sondes de vision : dans l'état local de la machine ; None hors Lokkal (gardés en mémoire)."""
+        if self.local is None:
+            return None
+        return Path(self.local.get("state_dir") or "~/.config/nokker").expanduser() / "vision-probes.json"
 
     def known_users(self) -> frozenset[str]:
         """Utilisateurs connus (partage de bulle, membres de fil) : identités des clés d'API + Telegram."""
@@ -336,6 +393,17 @@ class NokkerConfig:
         return frozenset(GoAuthorizedSenders().senders | {s.lower() for s in extra})
 
 
+def vision_mode(raw: Any) -> str:
+    """`vision` d'un palier : `true` | `false` | `auto` (booléen YAML ou chaîne). Une valeur inconnue = texte seul."""
+    if raw is True or (isinstance(raw, str) and raw.strip().lower() in ("true", "yes", "on")):
+        return "true"
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return "auto"
+    if raw not in (False, None) and not (isinstance(raw, str) and raw.strip().lower() in ("false", "no", "off", "")):
+        logging.getLogger("nokker.config").warning("vision : valeur inconnue %r, texte seul (true|false|auto)", raw)
+    return "false"
+
+
 def load_config(path: str | None = None) -> NokkerConfig:
     path = path or DEFAULT_CONFIG_PATH
     p = Path(path)
@@ -346,7 +414,8 @@ def load_config(path: str | None = None) -> NokkerConfig:
         name: TierConfig(base_url=t["base_url"], model=t["model"], api_key_env=t.get("api_key_env", "ROUTER_KEY"),
                          reasoning_off_body=t.get("reasoning_off_body"),
                          fallback_model=t.get("fallback_model", ""), hedge_after_s=float(t.get("hedge_after_s", 8.0)),
-                         cache=str(t.get("cache", "none")), vision=bool(t.get("vision", False)))
+                         cache=str(t.get("cache", "none")), vision=vision_mode(t.get("vision")) == "true",
+                         vision_auto=vision_mode(t.get("vision")) == "auto")
         for name, t in (raw.get("tiers") or {}).items()
     } or None
     # `api_keys: []` explicite = AUCUNE clé (bêta OVH), pas une clé par défaut ; absente = défaut.

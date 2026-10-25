@@ -286,6 +286,10 @@ class MemoryLinkStore:
         with self.lock:
             self.machines[machine_id].revoked = True
 
+    def by_host(self, host: str) -> Machine | None:
+        with self.lock:
+            return next((m for m in self.machines.values() if m.host == host and not m.revoked), None)
+
     def of_account(self, account: str) -> list[Machine]:
         with self.lock:
             return [m for m in self.machines.values() if m.account == account and not m.revoked]
@@ -461,6 +465,14 @@ class LinkService:
     def machine_of(self, account: str, machine_id: str) -> Machine | None:
         """La machine non révoquée de CE compte, sinon None (sans dire si elle existe ailleurs)."""
         return next((m for m in self.store.of_account(account) if m.id == machine_id), None)
+
+    def machine_by_host(self, host: str) -> Machine | None:
+        """La machine NON révoquée qui porte ce nom de passerelle (`<nom>.nokker.app`), sinon None. Pour le relais
+        seulement (pages servies depuis le miroir, machine éteinte) : l'appelant vérifie ensuite le locataire."""
+        if not host:
+            return None
+        m = self.store.by_host(host.lower())
+        return m if m is not None and not m.revoked else None
 
     def report_load(self, machine: Machine, raw: Any) -> dict[str, Any] | None:
         """Charge envoyée par la machine (`POST /v1/gateway/machine/load`), nettoyée puis gardée (une ligne courante

@@ -1,0 +1,55 @@
+{{- if and .Values.code.enabled (eq .Values.code.sandbox.network "egress") }}
+{{- $fn := include "nokker.fullname" . -}}
+# The session pods' only way out (code.sandbox.network=egress): an HTTP(S) CONNECT proxy that resolves the name and
+# refuses private ranges (cluster, LAN, cloud metadata) before connecting (deploy/lokkal/sandboxd/egress.py, the same
+# proxy as Lokkal). The NetworkPolicy lets session pods reach this proxy and nothing else.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-egress
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress
+spec:
+  selector:
+    {{- include "nokker.selector" (dict "root" . "component" "egress") | nindent 4 }}
+  ports:
+    - {name: proxy, port: 3128, targetPort: 3128}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-egress
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "egress") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: egress
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      containers:
+        - name: egress
+          image: {{ include "nokker.image" (dict "root" . "image" .Values.egress.image "default" .Chart.AppVersion) }}
+          command: ["python3", "egress.py"]
+          ports:
+            - {name: proxy, containerPort: 3128}
+          readinessProbe:
+            tcpSocket: {port: proxy}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.egress.resources | nindent 12 }}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+{{- end }}

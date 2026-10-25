@@ -44,11 +44,30 @@ protocol).
 
 ## 3. A model on your machine
 
-- **Ollama** is detected automatically, on `host.docker.internal:11434` or `127.0.0.1:11434`, and its models are
-  listed. Choosing one sets the default to `local:<url>|<model>`, served through `<url>/v1`.
+- **Ollama** is detected automatically and its models are listed. Choosing one sets the default to
+  `local:<url>|<model>`, served through `<url>/v1`. Lokkal looks for the Ollama of the `local-llm` profile below, then
+  for one on your machine (`host.docker.internal:11434`, `127.0.0.1:11434`); `NOKKER_OLLAMA_URLS` in `~/.nokker/.env`
+  replaces that list (comma-separated).
+- **The `local-llm` profile** starts Ollama for you, next to the core, with no port published:
+  `install.sh --local-llm` (or `install.ps1 -LocalLlm`). It pulls `qwen3:4b` by default, about 2.5 GB, in the
+  background; `--local-llm-model <name>` picks another Ollama model. It runs on the CPU and is capped at 8 GB of
+  memory (`NOKKER_LOCAL_LLM_MEM`). On a 36-core CPU, a turn with `qwen3:4b` took about 50 s once the model was loaded,
+  and close to 3 min for the first one: good enough to try Lokkal offline, slow for daily coding.
+- **A GPU** for that Ollama: add a `docker-compose.override.yml` next to `~/.nokker/docker-compose.yml`, then
+  `docker compose -p nokker up -d`:
+
+  ```yaml
+  services:
+    ollama:
+      gpus: all
+      environment:
+        NVIDIA_VISIBLE_DEVICES: all
+  ```
+
+  It needs the NVIDIA Container Toolkit on the host. Without the override, the profile keeps
+  `NVIDIA_VISIBLE_DEVICES=void`, so it also starts on hosts where the toolkit is installed but no driver is loaded.
 - **llama.cpp, vLLM and others** work the same way as a custom endpoint (case 2). There is no automatic detection for
   them.
-- An optional compose profile that starts a local inference runtime for you is **planned**.
 
 Coding quality depends on the model you pick. Small local models are fine for trying Lokkal; the agent loop, sandbox and
 approvals do not depend on the model.
@@ -101,7 +120,15 @@ Whether the model reads them depends on the model:
 - the default Router model reads images;
 - a model that cannot read images never receives them: it gets a short note saying an image was attached but not
   read, and the client tells you so (event `attachment.skipped`, reason `no_vision`);
-- your own endpoint and local models are treated as text-only for now.
+- your own endpoint and local models are text-only unless you say otherwise. Each tier takes `vision: true`, `false`
+  (the default) or `auto` in the core config (`tiers.<tier>.vision`); for the model picked in onboarding, set
+  `local.vision`. With `auto`, Lokkal checks **once**, at the first turn that carries an image: it sends the model a
+  tiny square of a random colour and asks which colour it is. The model reads images only if it names that colour
+  (and no other). The answer is kept in the state folder (`vision-probes.json`, per endpoint and model, never the
+  key), so it is not asked again, even after a restart. The check never runs in the background or on a turn without
+  an image. If the endpoint refuses the image, the model reads images "no"; if the check gets no answer (network, a
+  server error), the turn goes text-only and the check is tried again ten minutes later at the earliest. A tier with a
+  slow-answer fallback model (`fallback_model`) stays text-only with `auto`.
 
 Only the most recent images of a conversation are sent in full (the current message's, then the latest ones, up to 4);
 older ones are replaced by a one-line mention, like long tool results.
@@ -122,4 +149,7 @@ only: Lokkal does not guess what your provider charges. Qwen3.5-397B-A17B on OVH
 Memory runs on your machine, in the install's database, with a small embedding service that downloads its model on first
 start (about 330 MB, then works offline). Nothing about your memory leaves the machine unless you turn on the
 subscriber mirror (`local.mirror`, off in the install, **rolling out**), which copies your threads and your `user`
-notes, never your project notes by default and never your work folder.
+notes, the project notes of the projects you put in the mirror yourself (shared with a team: [teams.md](teams.md)),
+and the pages you choose to keep online ([gateway.md](gateway.md#pages-when-your-machine-is-off)); never your work
+folder. Its state, per channel (last send, delay, last error, next try), is `GET /v1/local/mirror`; a full
+resynchronisation is `POST /v1/local/mirror/resync`.

@@ -498,6 +498,52 @@ class ProjectMemory:
                             links=list(f.get("links") or []), mirrored=mirrored))
         return out
 
+    # ── notes d'équipe tirées du miroir (X17, nokker/local/team_notes.py) ──
+
+    def put_synced(self, project: str, note: dict[str, Any]) -> Note | None:
+        """Écrit (ou remplace) une note de projet reçue de l'équipe par le miroir, au format des notes apprises : elle
+        entre dans le noyau et le rappel comme une note écrite ici. Rend la note telle que relue (None : refusée —
+        projet, nom ou type hors des formes permises, jamais un chemin)."""
+        name, kind = str(note.get("name") or ""), str(note.get("kind") or "")
+        if not re.fullmatch(r"p-[0-9a-f]{16}", project) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,159}", name) \
+                or name.startswith(SOURCE_PREFIX) or kind not in KINDS:
+            return None
+        title = " ".join(str(note.get("title") or "").split())[:MAX_TITLE]
+        text = str(note.get("text") or "").strip()[:MAX_TEXT]
+        links = [str(x) for x in (note.get("links") or []) if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,159}", str(x))]
+        body = f"# {title}\n\n{text}"
+        if links:
+            body += "\n\nVoir aussi : " + ", ".join(f"[[{x}]]" for x in links)
+        body += f"\n\n_Origine : note d'équipe ({note.get('team_project') or 'projet partagé'}), reçue par le miroir._"
+        created = str(note.get("created") or self.now_fn().isoformat(timespec="seconds"))
+        with self._lock:
+            _atomic_write(self._dir(project) / file_name(name), render(
+                name, title, kind, body, {"scope": "project", "derived_from": str(note.get("derived_from") or "agent"),
+                                          "origin": str(note.get("origin") or "")[:200], "created": created,
+                                          "links": links, "team": str(note.get("team_project") or ""),
+                                          "modified": created[:10]}))
+            got = next((n for n in self.learned(project) if n.name == name), None)
+        self._enqueue(project)
+        self._publish("memory.noted", {"name": name, "kind": kind, "scope": "project", "title": title,
+                                       "derived_from": "team"})
+        return got
+
+    def forget_synced(self, project: str, name: str) -> bool:
+        """Oubli reçu de l'équipe : la note passe dans `.forgotten` du projet (hors de l'index, rien n'est détruit),
+        comme un oubli local. False si elle n'est pas là."""
+        if not re.fullmatch(r"p-[0-9a-f]{16}", project) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,159}", name):
+            return False
+        with self._lock:
+            src = self.root / project / file_name(name)
+            if not src.is_file():
+                return False
+            trash = self._dir(project) / FORGOTTEN
+            trash.mkdir(exist_ok=True)
+            src.replace(trash / src.name)
+        self._enqueue(project)
+        self._publish("memory.forgotten", {"name": name, "scope": "project", "derived_from": "team"})
+        return True
+
     def _all_learned(self, st: _Session | None) -> list[Note]:
         """Notes de portée user, plus celles du projet de la session (un fil sans session de code : user seules)."""
         return self.learned(USER_PROJECT) + (self.learned(st.project) if st is not None else [])

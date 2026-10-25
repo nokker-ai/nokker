@@ -15,6 +15,7 @@ Sessions de code : `POST /v1/local/sessions {cwd}` ouvre un fil `th_…` dont le
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import secrets
 import threading
@@ -33,6 +34,26 @@ from nokker.secrets.vault import Vault
 from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, CodeToolSource
 
 LOCAL_OWNER = "local-owner"
+logger = logging.getLogger("nokker.local.api")
+# Champs ajoutés à chaque ligne de `GET /v1/local/sessions` (§7.4.1), avec leur valeur quand rien n'est connu.
+SESSION_DEFAULTS: dict[str, Any] = {"title": None, "last_turn_at": None, "working": False, "pending_approvals": 0}
+
+
+def _chosen_thread(body: Any) -> tuple[str | None, str | None]:
+    """Fil demandé à l'ouverture : `thread_id`, ou son alias `resume` (forme du SDK et du mock). (fil, erreur)."""
+    if not isinstance(body, dict):
+        return None, None
+    values = []
+    for key in ("thread_id", "resume"):
+        v = body.get(key)
+        if v in (None, ""):
+            continue
+        if not isinstance(v, str):
+            return None, f"{key} : chaîne attendue"
+        values.append(v)
+    if len(set(values)) > 1:
+        return None, "thread_id et resume désignent deux fils différents : n'en donner qu'un"
+    return (values[0] if values else None), None
 
 
 def _instance_id(state_dir: Path) -> str:
@@ -56,6 +77,15 @@ def ensure_token(path: str | Path) -> str:
         f.write(tok + "\n")
     os.chmod(p, 0o600)
     return tok
+
+
+def _project_skills(local: dict[str, Any], state_dir: Path) -> Any:
+    """`ProjectSkills` si `local.project_skills` est allumé (confiance écrite dans les réglages de l'utilisateur)."""
+    if not local.get("project_skills", False):
+        return None
+    from nokker.tools.skills import ProjectSkills
+
+    return ProjectSkills(user_settings=Path(local.get("settings_path") or state_dir / "settings.json").expanduser())
 
 
 @dataclass
@@ -177,6 +207,12 @@ class LocalApi:
     # HookRunner posé par serve quand le drapeau est allumé.
     hooks_enabled: bool = False
     hooks: Any = None
+    # Skills du dépôt (`<dépôt>/.nokker/skills`, nokker/tools/skills.py `ProjectSkills`) : drapeau
+    # `local.project_skills`, éteint par défaut ; confiance par empreinte comme les hooks du dépôt.
+    project_skills: Any = None
+    # Sous-agents (nokker.tools.delegate.DelegateToolSource), posé par serve : l'annulation d'un fil arrête ses enfants,
+    # `delegate_status` est appelable hors tour.
+    subagents: Any = None
     # Connecteurs relayés (lot X20, docs/LOKKAL.md §7.12) : drapeau `local.relayed_connectors`, éteint par défaut ;
     # `relayed` est la source posée par serve (nokker/local/relayed.py) quand il est allumé.
     relayed_enabled: bool = False
@@ -192,8 +228,13 @@ class LocalApi:
     pages_enabled: bool = False
     # Coffre (X4, nokker/secrets/) : portée `user` derrière /v1/local/secrets, portée `system` sous `setup.vault`.
     vault: Vault | None = None
+    # Packs d'agents (lot X16) : la `PackToolSource` du noyau et « ce fil existe-t-il ? », posés par serve.
+    packs: Any = None
+    packs_thread: Any = None
     _pages: Any = None
     _preview: Any = None
+    # Bulles `artifact` d'une page changée hors d'un tour (`BubbleHub.page_changed`), posé par le serveur.
+    page_changed: Any = None
 
     @property
     def preview_signer(self) -> Any:
@@ -215,6 +256,18 @@ class LocalApi:
     # Agents du deck multi-machines (lot X15, docs/LOKKAL.md §7.19) : passages demandés par nokker.ai, déménagements,
     # deck publié (nokker.local.crew.LocalCrew) ; None = moteur des agents éteint ou machine sans Crew.
     crew: Any = None
+    # Boîte mail posée dans Lokkal pour le propriétaire local (docs/LOKKAL.md §7.25, nokker.local.connectors) :
+    # `/v1/local/connectors*`, outils mail des tours, relève du déclencheur mail: ; mot de passe par NOM du coffre.
+    connectors: Any = None
+    # (thread_id) -> {title, last_turn_at, working, pending_approvals} : posé par `make_handler`, qui a le hub, les
+    # verrous de tour et les cartes ; None = valeurs par défaut dans `GET /v1/local/sessions`.
+    describe_session: Any = None
+    # Bus d'événements (`EventBus.publish`), posé par serve : `checkpoint.created` des points de retour (§7.4.7).
+    emit: Any = None
+
+    def _emit(self, name: str, payload: dict[str, Any]) -> None:
+        if self.emit is not None:
+            self.emit(name, payload)
 
     @property
     def pages(self) -> Any:
@@ -274,6 +327,7 @@ class LocalApi:
                    token=ensure_token(local.get("token_path") or state_dir / "local-token"), roots=roots, setup=setup,
                    state_dir=state_dir, vault=vault, link=link, pages_enabled=bool(local.get("pages", False)),
                    hooks_enabled=bool(local.get("hooks", False)),
+                   project_skills=_project_skills(local, state_dir),
                    relayed_enabled=bool(local.get("relayed_connectors", False)),
                    settings_path=Path(local.get("settings_path") or state_dir / "settings.json").expanduser(),
                    allowed_hosts=frozenset(h.lower() for h in hosts),
@@ -285,6 +339,9 @@ class LocalApi:
                                          state_dir=str(state_dir)))
         if local.get("ops"):
             api.enable_ops(local)
+        from nokker.local.connectors import FILE_NAME, LocalConnectors
+
+        api.connectors = LocalConnectors(state_dir / FILE_NAME, vault)
         return api
 
     def enable_ops(self, local: dict[str, Any]) -> None:
@@ -322,7 +379,7 @@ class LocalApi:
 
         from nokker.pages.tools import PageToolSource, PagingToolSource
 
-        wrapper, checkpoints = checkpoint_sources(self.code, root_of, home)
+        wrapper, checkpoints = checkpoint_sources(self.code, root_of, home, emit=self._emit)
         auto_prune(home)
         memory = []
         if self.project_memory is not None:
@@ -333,20 +390,27 @@ class LocalApi:
             # Ops (X11), hors de l'enveloppe des points de retour : seul `ssh_copy` avec `local_path` écrit dans le
             # dossier, sans photo avant (limite connue) ; il passe au journal d'audit comme tout appel à effet.
             memory.append(self.ssh)
+        skills = SkillToolSource(home=home, project=self.project_skills)
         if not self.pages_enabled:
-            return [wrapper, checkpoints, SkillToolSource(home=home), *memory]
+            return [wrapper, checkpoints, skills, *memory]
         # Pages (§10) : l'enveloppe des pages autour de celle des points de retour (photo avant, version de page après).
         return [PagingToolSource(wrapper, self.pages, root_of), checkpoints, PageToolSource(self.pages, root_of),
-                SkillToolSource(home=home), *memory]
+                skills, *memory]
 
     def host_ok(self, host: str | None) -> bool:
+        """Hôtes acceptés : ceux de la configuration, et, tunnel ouvert, `<nom>.nokker.app` et ses deux origines de pages
+        (`<nom>--pages.nokker.app`, pages privées ; `<nom>--pub.nokker.app`, pages publiques, §7.26) que le relais pose
+        sur les requêtes qu'il fait passer."""
         h = (host or "").strip().lower()
         if not h:
             return False
         if h in self.allowed_hosts:
             return True
-        return bool(self.relay_host) and h == self.relay_host.lower() and self.tunnel is not None \
-            and self.tunnel.state == "up"
+        if not (self.relay_host and self.tunnel is not None and self.tunnel.state == "up"):
+            return False
+        rh = self.relay_host.lower()
+        name, dot, domain = rh.partition(".")
+        return h == rh or (bool(dot) and h in (f"{name}--pages.{domain}", f"{name}--pub.{domain}"))
 
     def is_owner(self, authorization: str | None) -> bool:
         auth = authorization or ""
@@ -389,6 +453,20 @@ class LocalApi:
             return True
         return self.delegated is not None and self.delegated.allows(method, path, session_id, claims)
 
+    def _session_row(self, thread_id: str, cwd: str) -> dict[str, Any]:
+        """Une ligne de `GET /v1/local/sessions` (§7.4.1) : `{thread_id, cwd}` d'origine, plus `title`, `last_turn_at`,
+        `working`, `pending_approvals` donnés par `describe_session` (posé par `make_handler`) ; sans lui, ou s'il lève,
+        les valeurs par défaut (aucun tour connu)."""
+        row: dict[str, Any] = {"thread_id": thread_id, "cwd": cwd, **SESSION_DEFAULTS}
+        if self.describe_session is not None:
+            try:
+                extra = self.describe_session(thread_id) or {}
+            except Exception:  # noqa: BLE001 — la liste des sessions ne tombe jamais pour un détail
+                logger.warning("description de la session %s impossible", thread_id, exc_info=True)
+                extra = {}
+            row.update({k: v for k, v in extra.items() if k in SESSION_DEFAULTS})
+        return row
+
     def _root_of(self, cwd: str) -> str | None:
         full = os.path.realpath(os.path.expanduser(cwd))
         for r in self.roots:
@@ -424,7 +502,10 @@ class LocalApi:
             root = self._root_of(cwd) if cwd else None
             if root is None or not os.path.isdir(cwd):
                 return 403, {"error": {"message": "dossier hors des racines déclarées"}}
-            thread_id = str(body.get("thread_id") or f"th_{uuid.uuid4().hex[:16]}")
+            chosen, err = _chosen_thread(body)
+            if err:
+                return 400, {"error": {"message": err}}
+            thread_id = chosen or f"th_{uuid.uuid4().hex[:16]}"
             if claims is not None:
                 if self.delegated is None:
                     return 403, {"error": {"message": "délégation non prise en charge sur cette machine"}}
@@ -434,6 +515,9 @@ class LocalApi:
             extra = self.on_session_open(thread_id, os.path.realpath(cwd)) if self.on_session_open is not None else None
             if self.project_memory is not None:  # consignes du dépôt importées, clé de projet posée (ne lève pas)
                 self.project_memory.open_session(thread_id, os.path.realpath(cwd), root)
+            if self.project_skills is not None:  # skills du dépôt : empreinte et confiance, pour ce fil
+                extra = {**(extra if isinstance(extra, dict) else {}),
+                         "skills": self.project_skills.open_session(thread_id, os.path.realpath(cwd), root)}
             if self.ssh is not None:  # inventaire des hôtes lu UNE fois, pour ce fil (lot X11)
                 extra = {**(extra if isinstance(extra, dict) else {}), "ops": self.ssh.open_session(thread_id)}
             return 201, {**(extra if isinstance(extra, dict) else {}), "thread_id": thread_id,
@@ -445,8 +529,25 @@ class LocalApi:
             if self.hooks is None:
                 return 404, {"error": {"message": "hooks désactivés (local.hooks)"}}
             return self.hooks.trust(str(body.get("thread_id") or ""), str(body.get("sha256") or ""))
+        if path == "/v1/local/skills/trust" and method == "POST":
+            # Même règle que les hooks : la confiance dans le contenu d'un dépôt se donne sur la machine seulement.
+            if relayed:
+                return 403, {"error": {"message": "confiance des skills : sur la machine seulement (jeton local)"}}
+            if self.project_skills is None:
+                return 404, {"error": {"message": "skills du dépôt désactivés (local.project_skills)"}}
+            return self.project_skills.trust(str(body.get("thread_id") or ""), str(body.get("sha256") or ""))
+        if method == "GET" and path.startswith("/v1/local/sessions/") and path.endswith("/skills"):
+            # État de confiance des skills du dépôt d'une session déjà ouverte (reprise d'une session, §7.21.3) ;
+            # lecture seule : rouvrir la session remplacerait sa source de code.
+            thread_id = path[len("/v1/local/sessions/"):-len("/skills")]
+            if self.project_skills is None:
+                return 404, {"error": {"message": "skills du dépôt désactivés (local.project_skills)"}}
+            st = self.project_skills.status(thread_id) if thread_id in self.code.sessions() else None
+            if st is None:
+                return 404, {"error": {"message": "pas de session locale sur ce fil"}}
+            return 200, {"thread_id": thread_id, "skills": st}
         if path == "/v1/local/sessions" and method == "GET":
-            return 200, {"sessions": [{"thread_id": t, "cwd": c} for t, c in self.code.sessions().items()]}
+            return 200, {"sessions": [self._session_row(t, c) for t, c in self.code.sessions().items()]}
         if path.startswith("/v1/local/setup") and self.setup is not None:
             return self._setup(method, path, body)
         if path == "/v1/local/machine" and method == "GET":
@@ -462,13 +563,97 @@ class LocalApi:
         if path == "/v1/local/mirror/projects" or path.startswith("/v1/local/mirror/projects/"):
             return self._mirror_projects(method, path, body)
         if path == "/v1/local/mirror" or path.startswith("/v1/local/mirror/"):
-            return self._mirror(method, path)
+            return self._mirror(method, path, body)
         if path == "/v1/local/resources" and method == "GET":
             # Ce que la machine publie à nokker.ai (X21) : noms seulement, comme envoyé.
             return 200, self.inventory.collect() if self.inventory is not None else {"v": 1}
         if path == "/v1/local/secrets" or path.startswith("/v1/local/secrets/"):
             return self._secrets(method, path, body, relayed)
+        if path == "/v1/local/mcp-servers" or path.startswith("/v1/local/mcp-servers/"):
+            return self._mcp_servers(method, path, body, relayed)
+        if path == "/v1/local/packs" or path.startswith("/v1/local/packs/"):
+            return self._packs(method, path, body, relayed)
+        if path.split("?", 1)[0].rstrip("/") == "/v1/local/connectors" or path.startswith("/v1/local/connectors/"):
+            if self.connectors is None:
+                return 404, {"error": {"message": "connecteurs locaux non pris en charge sur cette machine"}}
+            return self.connectors.handle(method, path, body, relayed)
         return None
+
+    def _packs(self, method: str, path: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]] | None:
+        """Packs d'agents (lot X16, LOKKAL §7.30) : `GET` → la liste (`pack_list`) ; `POST /{nom}/remove {thread_id?}` →
+        le même retrait que l'outil `pack_remove` (compétences, cartes non activées ; carte `pack_agents` dans le fil
+        pour les agents créés depuis le pack, jamais de suppression silencieuse). Le geste est celui du propriétaire
+        (jeton local) : pas de carte d'approbation en plus ; par la passerelle, refusé."""
+        from nokker.core.ports import ToolContext
+        from nokker.tools.packs import PackError
+
+        if self.packs is None:
+            return 404, {"error": {"message": "packs non pris en charge sur cette machine"}}
+        if path == "/v1/local/packs" and method == "GET":
+            return 200, self.packs.list_packs()
+        rest = path[len("/v1/local/packs/"):]
+        if method != "POST" or not rest.endswith("/remove") or rest.count("/") != 1:
+            return None
+        if relayed:
+            return 403, {"error": {"message": "retirer un pack : sur la machine seulement (jeton local)"}}
+        thread = body.get("thread_id") if isinstance(body, dict) else None
+        if thread is not None and not isinstance(thread, str):
+            return 400, {"error": {"message": "thread_id : identifiant de fil (texte)", "code": "bad_body"}}
+        if thread and (self.packs_thread is None or not self.packs_thread(thread)):
+            return 404, {"error": {"message": "fil inconnu", "code": "unknown_thread"}}
+        ctx = ToolContext(thread_id=thread or "", turn_index=0, channel="api", sender=LOCAL_OWNER)
+        try:
+            return 200, self.packs.remove(rest[:-len("/remove")], ctx)
+        except PackError as e:
+            return 404, {"error": {"message": str(e), "code": "unknown_pack"}}
+
+    def _mcp_servers(self, method: str, path: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]] | None:
+        """Serveurs MCP ajoutés depuis une session (lot X16) : `GET` → la liste (noms de secrets, outils déclarés en
+        lecture) ; `PUT /{nom}/read-tools {read_tools}` → remplace les outils en lecture (actif au prochain démarrage).
+        Un nom d'écriture évidente n'est jamais déclaré par ici (409) : il passe par l'outil `mcp_server_read_tools`
+        et sa carte forte. Écrire par la passerelle : refusé (la config de la machine se règle sur la machine)."""
+        from urllib.parse import unquote
+
+        from nokker.tools.mcp_config import (
+            FILE_NAME, McpConfigError, check_read_tools, load_user_servers, secret_names, set_read_tools, write_words,
+        )
+        from nokker.tools.packs import user_home
+
+        file = user_home(self.state_dir) / FILE_NAME
+        if path == "/v1/local/mcp-servers" and method == "GET":
+            items = []
+            for s in load_user_servers(file):
+                item = {"name": s["name"], "url": s["url"], "secrets": secret_names(s)}
+                for key in ("purpose", "read_tools", "confirmed_writes"):
+                    if s.get(key):
+                        item[key] = s[key]
+                items.append(item)
+            return 200, {"servers": items}
+        rest = path[len("/v1/local/mcp-servers/"):]
+        if method != "PUT" or not rest.endswith("/read-tools"):
+            return None
+        if relayed:
+            return 403, {"error": {"message": "les serveurs MCP se règlent sur la machine (jeton local)"}}
+        name = unquote(rest[:-len("/read-tools")])
+        reads = body.get("read_tools") if isinstance(body, dict) else None
+        if not isinstance(reads, list):
+            return 400, {"error": {"message": "corps {read_tools: [noms d'outils]} requis", "code": "bad_body"}}
+        writes = [str(t) for t in reads if write_words(str(t))]
+        if writes:
+            return 409, {"error": {"code": "needs_strong_card", "message": (
+                f"{', '.join(writes)} : nom d'écriture évidente ; le déclarer en lecture demande une carte forte : "
+                "demande-le dans une session (outil mcp_server_read_tools avec confirm_writes)")}}
+        try:
+            check_read_tools(reads)
+            if not any(s["name"] == name for s in load_user_servers(file)):
+                return 404, {"error": {"message": f"serveur ajouté inconnu : {name[:40]}", "code": "not_found"}}
+            entry = set_read_tools(file, name, reads)
+        except McpConfigError as e:
+            return 400, {"error": {"message": str(e), "code": "bad_body"}}
+        except OSError as e:
+            return 500, {"error": {"message": f"écriture impossible : {type(e).__name__}"}}
+        return 200, {"server": name, "read_tools": entry.get("read_tools") or [],
+                     "active": "au prochain redémarrage du noyau"}
 
     def _secrets(self, method: str, path: str, body: dict[str, Any],
                  relayed: bool) -> tuple[int, dict[str, Any]] | None:
@@ -519,9 +704,10 @@ class LocalApi:
             return 404, {"error": {"message": "projet inconnu"}}
         return 200, {"project": project, "mirror": body["mirror"]}
 
-    def _mirror(self, method: str, path: str) -> tuple[int, dict[str, Any]] | None:
-        """Miroir web ⇄ machine (L5) : état, effacement des copies de la machine chez nokker.ai (envoi en pause),
-        reprise (tout est renvoyé)."""
+    def _mirror(self, method: str, path: str, body: Any = None) -> tuple[int, dict[str, Any]] | None:
+        """Miroir web ⇄ machine (L5, §7.23) : état (`GET`), effacement des copies de la machine chez nokker.ai (envoi en
+        pause), reprise (tout est renvoyé), resynchronisation complète (`POST /resync` → 202 ; 409 en pause), choix des
+        pages copiées (`GET /pages`, `PUT /pages/{page_id} {mirror: bool}` : 400 corps, 404 page inconnue)."""
         if self.mirror is None:
             if path == "/v1/local/mirror" and method == "GET":
                 return 200, {"enabled": False}
@@ -536,7 +722,36 @@ class LocalApi:
         if path == "/v1/local/mirror/resume" and method == "POST":
             self.mirror.resume()
             return 200, self.mirror.status()
+        if path == "/v1/local/mirror/resync" and method == "POST":
+            if not self.mirror.request_resync():
+                return 409, {"error": {"message": "miroir en pause (copies effacées) : reprendre d'abord"}}
+            return 202, self.mirror.status()
+        if path == "/v1/local/mirror/pages" and method == "GET":
+            return 200, self.mirror.pages_view()
+        if path.startswith("/v1/local/mirror/pages/") and method == "PUT":
+            page_id = path[len("/v1/local/mirror/pages/"):]
+            if not isinstance(body, dict) or not isinstance(body.get("mirror"), bool):
+                return 400, {"error": {"message": "corps {mirror: true|false} requis"}}
+            try:
+                if not self.mirror.set_page_mirror(page_id, body["mirror"]):
+                    return 404, {"error": {"message": "page inconnue"}}
+            except ValueError as e:  # page épinglée `local` (§7.26)
+                return 409, {"error": {"code": "local_page", "message": str(e)}}
+            return 200, {"page_id": page_id, "mirror": body["mirror"]}
         return None
+
+    def sync_moderation(self) -> list[Any]:
+        """Applique aux pages de la machine ce que nokker.ai a dit de leur modération (`LocalLink.moderation`, lu avec
+        le droit de publier, §7.26 point 6) : dépublier et marquer les pages retirées, démarquer celles que l'opérateur
+        a rendues ; les bulles suivent. Rien sans liste connue."""
+        moderation = getattr(self.link, "moderation", None) if self.link is not None else None
+        if not isinstance(moderation, dict) or (not self.pages_enabled and self._pages is None):
+            return []
+        changed = self.pages.apply_moderation(moderation)
+        for meta in changed:
+            if self.page_changed is not None:
+                self.page_changed(meta)
+        return changed
 
     def _link(self, method: str, path: str) -> tuple[int, dict[str, Any]] | None:
         if self.link is None:
@@ -547,7 +762,11 @@ class LocalApi:
             if path == "/v1/local/link/start" and method == "POST":
                 return 200, self.link.start(socket.gethostname())
             if path == "/v1/local/link/status" and method == "GET":
-                return 200, self.link.status()
+                st = self.link.status()
+                if isinstance(st, dict) and st.get("state") == "approved" and hasattr(self.link, "pages_public"):
+                    st = {**st, "pages_public": bool(self.link.pages_public())}  # droit de publier (§7.26), caché 5 min
+                    self.sync_moderation()  # lue dans la même réponse de nokker.ai (§7.26 point 6)
+                return 200, st
             if path == "/v1/local/link" and method == "DELETE":
                 return 200, self.link.unlink()
         except VaultError as e:
@@ -581,4 +800,4 @@ class LocalApi:
         return None
 
 
-__all__ = ["LOCAL_OWNER", "LocalApi", "SessionCodeTools", "ensure_token"]
+__all__ = ["LOCAL_OWNER", "SESSION_DEFAULTS", "LocalApi", "SessionCodeTools", "ensure_token"]

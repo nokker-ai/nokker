@@ -18,7 +18,15 @@ class Plan:
 DEFAULT_PLANS: dict[str, Plan] = {
     "essentiel": Plan("essentiel", {"turns_per_day": 50, "deep_per_day": 5}),
     "solo": Plan("solo", {"turns_per_day": 150, "deep_per_day": 20}),
+    # Paliers de foyer (X23, LOKKAL §7.29 ; décision produit du 25.10 : Famille 49, Large 99 CHF/€ par mois, 6 membres au
+    # plus, payeur compris, le tour moins cher que Solo). Quota COMMUN du foyer, lu par `household.Settings` ;
+    # `household_members` = sièges, payeur compris (ignoré par les plafonds du locataire).
+    "famille": Plan("famille", {"turns_per_day": 110, "turns_per_week": 550, "household_members": 6}),
+    "large": Plan("large", {"turns_per_day": 230, "turns_per_week": 1150, "household_members": 6}),
 }
+
+# Paliers dont l'abonnement porte un foyer (quota partagé entre ses membres).
+HOUSEHOLD_PLANS = frozenset({"famille", "large"})
 
 # `past_due` garde les plafonds du palier : Stripe relance le paiement quelques jours avant de résilier.
 ACTIVE_STATUSES = frozenset({"active", "trialing", "past_due"})

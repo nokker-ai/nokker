@@ -41,6 +41,16 @@ _hits: dict[str, deque[float]] = defaultdict(deque)
 _lock = threading.Lock()
 
 
+# Profil mineur d'un foyer (lot X23, `Household.is_minor`) : jamais de consentement d'entraînement, refusé ici (403
+# `minor_training_refused`) comme en base (trigger de la migration 039). None (défaut, drapeau éteint) : aucun contrôle.
+_is_minor: Any = None
+
+
+def configure_minors(is_minor: Any) -> None:
+    global _is_minor
+    _is_minor = is_minor
+
+
 def configure(onboarding: Onboarding | None, codes: EmailCodes | None = None) -> None:
     global _onboarding, _codes
     _onboarding, _codes = onboarding, codes
@@ -137,11 +147,12 @@ def account_route(handler: Any, method: str, path: str, account: Any) -> bool:
         accepted = ob.acceptances.for_account(account.account_id) if ob is not None else []
         last = accepted[-1] if accepted else None
         training = bool(ob is not None and ob.consents is not None and ob.consents.current(account.account_id, "training"))
+        minor = bool(_is_minor is not None and _is_minor(account.account_id))
         handler._json(200, {
             "email": account.email, "lang": account.lang, "created_at": _iso(account.created_at),
             "status": account.status,
             "terms": {"version": last["terms_version_sha256"], "accepted_at": _iso(last["accepted_at"])} if last else None,
-            "consents": {"training": training}})
+            "consents": {"training": training, **({"training_locked": "minor"} if minor else {})}})
         return True
     if path == "/v1/account/consent" and method == "PUT":
         if ob is None or ob.consents is None:
@@ -151,6 +162,9 @@ def account_route(handler: Any, method: str, path: str, account: Any) -> bool:
         scope, granted = body.get("scope"), body.get("granted")
         if scope not in SCOPES or not isinstance(granted, bool):
             handler._json(400, {"error": "invalid"})
+            return True
+        if granted and scope == "training" and _is_minor is not None and _is_minor(account.account_id):
+            handler._json(403, {"error": "minor_training_refused"})
             return True
         if ob.consents.current(account.account_id, scope) != granted:
             accepted = ob.acceptances.for_account(account.account_id)

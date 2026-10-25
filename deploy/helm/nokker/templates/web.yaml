@@ -1,0 +1,102 @@
+{{- $fn := include "nokker.fullname" . -}}
+# Web app: the static files of the nokker-web image, served by its nginx as a NON-ROOT process (main config
+# replaced: no `user`, pid and temp files under /tmp), so it runs under the restricted SCC. /v1 goes to the core
+# through the Ingress (same origin), not through this nginx.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-web
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+data:
+  nginx.conf: |
+    worker_processes auto;
+    pid /tmp/nginx.pid;
+    error_log /dev/stderr warn;
+    events { worker_connections 1024; }
+    http {
+      include /etc/nginx/mime.types;
+      default_type application/octet-stream;
+      access_log off;
+      sendfile on;
+      server_tokens off;
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path       /tmp/proxy_temp;
+      fastcgi_temp_path     /tmp/fastcgi_temp;
+      uwsgi_temp_path       /tmp/uwsgi_temp;
+      scgi_temp_path        /tmp/scgi_temp;
+      server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        location = /healthz { default_type text/plain; return 200 "ok\n"; }
+        location /assets/ { add_header Cache-Control "public, max-age=31536000, immutable"; try_files $uri =404; }
+        location = /sw.js { add_header Cache-Control "no-cache"; try_files $uri =404; }
+        location = /manifest.webmanifest {
+          add_header Cache-Control "no-cache";
+          default_type application/manifest+json;
+          try_files $uri =404;
+        }
+        location / { add_header Cache-Control "no-cache"; try_files $uri /index.html; }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-web
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  selector:
+    {{- include "nokker.selector" (dict "root" . "component" "web") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-web
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      containers:
+        - name: web
+          image: {{ include "nokker.image" (dict "root" . "image" .Values.web.image "default" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.web.image.pullPolicy }}
+          command: ["nginx", "-g", "daemon off;", "-c", "/etc/nokker-web/nginx.conf"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nokker-web, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: conf
+          configMap: {name: {{ $fn }}-web}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}

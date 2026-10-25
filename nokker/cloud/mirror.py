@@ -124,6 +124,11 @@ class MemoryMirrorNotes:
         with self.lock:
             return [{**v, "machine_id": k[1]} for k, v in self.rows.items() if k[0] == tenant]
 
+    def keys(self, tenant: str, machine: str) -> list[tuple[str, str]]:
+        """(projet, nom) des notes gardées pour cette machine (resynchronisation complète)."""
+        with self.lock:
+            return sorted((k[2], k[3]) for k in self.rows if k[0] == tenant and k[1] == machine)
+
     def erase(self, tenant: str, machine: str) -> int:
         with self.lock:
             keys = [k for k in self.rows if k[0] == tenant and k[1] == machine]

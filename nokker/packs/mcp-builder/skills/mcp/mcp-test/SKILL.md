@@ -1,6 +1,7 @@
 ---
 name: mcp-test
 description: Run an MCP server in the sandbox and test it end to end
+locality: local
 ---
 # Testing an MCP server in the sandbox
 

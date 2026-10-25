@@ -111,14 +111,18 @@ class StripeClient:
         return str(r["id"])
 
     def checkout_session(self, customer: str, price_id: str, tenant_id: str, plan: str, success_url: str,
-                         cancel_url: str, lang: str) -> str:
-        r = self._call("POST", "checkout/sessions", {
+                         cancel_url: str, lang: str, coupon: str | None = None) -> str:
+        """Session Checkout d'abonnement. `coupon` (id d'un coupon Stripe) : remise appliquée d'office par
+        `discounts` ; Stripe refuse `discounts` avec `allow_promotion_codes`, qui n'est donc jamais envoyé."""
+        params: dict[str, Any] = {
             "mode": "subscription", "customer": customer, "client_reference_id": tenant_id,
             "line_items": [{"price": price_id, "quantity": 1}],
             "success_url": success_url, "cancel_url": cancel_url, "locale": "fr" if lang == "fr" else "en",
             "subscription_data": {"metadata": {"tenant_id": tenant_id, "plan": plan}},
-        })
-        return str(r["url"])
+        }
+        if coupon:
+            params["discounts"] = [{"coupon": coupon}]
+        return str(self._call("POST", "checkout/sessions", params)["url"])
 
     def portal_session(self, customer: str, return_url: str) -> str:
         return str(self._call("POST", "billing_portal/sessions", {"customer": customer, "return_url": return_url})["url"])

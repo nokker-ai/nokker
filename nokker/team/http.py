@@ -18,7 +18,10 @@ Session du compte (`us_…`) :
     GET    /v1/projects/{id}/rules                    PUT {mode?, ask, deny}
     GET    /v1/projects/{id}/secrets                  PUT|DELETE /v1/projects/{id}/secrets/{NOM}   (noms seulement)
     GET    /v1/projects/{id}/notes?since=             GET /v1/projects/{id}/notes/quarantine
-    GET    /v1/projects/{id}/agents
+    POST   /v1/projects/{id}/notes/quarantine/{q}/restore                   (maintainer)
+    GET    /v1/projects/{id}/agents                   POST /v1/projects/{id}/agents/{ag}/disarm
+    GET    /v1/projects/{id}/budget                   PUT {daily?, monthly?, currency?} | DELETE  (maintainer)
+    GET    /v1/projects/{id}/audit?limit=                                   (maintainer)
 Jeton de machine (Lokkal lié) :
     GET    /v1/mirror/projects                        GET|POST /v1/mirror/projects/{id}/notes
 Erreurs : `{"error": {"code", "message"}}` ; 404 identique pour un projet inconnu et un projet dont on n'est pas membre.
@@ -31,7 +34,6 @@ from collections import defaultdict, deque
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from nokker.agents.types import agent_to_json
 from nokker.team.model import TeamError
 from nokker.team.service import Team
 
@@ -75,7 +77,7 @@ def _rate_ok(key: str) -> bool:
 
 
 def _error(h: Any, e: TeamError) -> None:
-    h._json(e.status, {"error": {"code": e.code, "message": e.message}})
+    h._json(e.status, {"error": {**getattr(e, "extra", {}), "code": e.code, "message": e.message}})
 
 
 def _body(h: Any) -> dict[str, Any]:
@@ -170,9 +172,24 @@ def _dispatch(t: Team, h: Any, method: str, parts: list[str], a: Any) -> tuple[i
             return 200, t.notes(a, pid, since)
         if n == 3 and parts[2] == "quarantine" and method == "GET":
             return 200, t.quarantined(a, pid)
+        if n == 5 and parts[2] == "quarantine" and parts[4] == "restore" and method == "POST":
+            return 200, t.restore_note(a, pid, parts[3])
     elif sub == "agents":
         if n == 2 and method == "GET":
-            return 200, {"agents": [agent_to_json(x) for x in t.project_agents(a, pid)]}
+            return 200, {"agents": t.project_agents(a, pid)}
+        if n == 4 and parts[3] == "disarm" and method == "POST":
+            return 200, {"agent": t.disarm_agent(a, pid, parts[2])}
+    elif sub == "budget":
+        if n == 2 and method == "GET":
+            return 200, t.budget_view(a, pid)
+        if n == 2 and method == "PUT":
+            return 200, t.put_budget(a, pid, _body(h))
+        if n == 2 and method == "DELETE":
+            return 200, t.delete_budget(a, pid)
+    elif sub == "audit":
+        if n == 2 and method == "GET":
+            raw = (parse_qs(urlsplit(h.path).query).get("limit") or ["100"])[0]
+            return 200, t.audit(a, pid, limit=int(raw) if raw.isdigit() else 100)
     # Chemin inconnu SOUS un projet : la même réponse qu'un projet inconnu, après le contrôle d'accès (un
     # non-membre ne distingue pas un projet existant d'un chemin inexistant).
     t.get(a, pid)

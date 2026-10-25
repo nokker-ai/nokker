@@ -222,19 +222,24 @@ class TenantLimits:
         return self.turns_per_week if self.mode == "hard" else None
 
     # ── tour ──────────────────────────────────────────────────────────────────────────────────────────────────────
-    def check_turn(self, sender: str | None) -> Verdict | None:
+    def check_turn(self, sender: str | None, *, shared: bool = False) -> Verdict | None:
+        """None : le tour passe (et il est compté). Sinon le verdict à journaliser ; le tour répond `reply(verdict)`.
+
+        `shared` : le compte est membre d'un foyer (lot X23) ; son quota est celui du foyer (nokker/household/quota.py),
+        compté à part. Le tour reste compté ici, et seule la garde de coût `hard_turns_per_day` coupe."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.check_turn(sender)
-        """None : le tour passe (et il est compté). Sinon le verdict à journaliser ; le tour répond `reply(verdict)`."""
+            return eff.check_turn(sender, shared=shared)
         tid = current_tenant()  # hors scope : NoTenant, jamais un tour sans quota par défaut
         if tid == INTERNAL_TENANT:
             return None
         who = sender or ""
         (day, _), (week, _) = self._keys()
         day_cap, week_cap = self._day_cap(), self._week_cap()
+        if shared:
+            day_cap, week_cap = self.hard_turns_per_day, None
         if not self.counter.take(tid, who, day.date(), "turns", UNBOUNDED if day_cap is None else day_cap):
-            soft = self.mode == "soft"
+            soft = self.mode == "soft" or shared
             return Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0,
                            rule="limits:hard_turns_per_day" if soft else "limits:turns_per_day",
                            reason=f"{day_cap} tours par jour atteints pour {sender or '(compte inconnu)'}",
@@ -253,16 +258,19 @@ class TenantLimits:
         (_, day_end), (_, week_end) = self._keys()
         if verdict is not None and verdict.rule == "limits:turns_per_week":
             return LIMIT_REPLY_WEEK.format(n=self.turns_per_week, at=_swiss_hour(week_end))
+        if verdict is not None and verdict.rule == "limits:hard_turns_per_day":
+            return LIMIT_REPLY_DAY.format(n=self.hard_turns_per_day, at=_swiss_hour(day_end))
         return LIMIT_REPLY_DAY.format(n=self._day_cap(), at=_swiss_hour(day_end))
 
-    def notice(self, sender: str | None) -> str | None:
+    def notice(self, sender: str | None, *, shared: bool = False) -> str | None:
+        """Mode soft : avertissement à ajouter à la réponse du tour qui vient de DÉPASSER le quota du jour ou de la
+        semaine (une seule fois par fenêtre : le tour n° cap + 1). None sinon, et toujours None en mode hard ou pour un
+        membre d'un foyer (`shared` : son quota est celui du foyer)."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.notice(sender)
-        """Mode soft : avertissement à ajouter à la réponse du tour qui vient de DÉPASSER le quota du jour ou de la
-        semaine (une seule fois par fenêtre : le tour n° cap + 1). None sinon, et toujours None en mode hard."""
+            return eff.notice(sender, shared=shared)
         tid = current_tenant()
-        if self.mode != "soft" or tid == INTERNAL_TENANT:
+        if self.mode != "soft" or shared or tid == INTERNAL_TENANT:
             return None
         who = sender or ""
         (day, day_end), (week, week_end) = self._keys()

@@ -59,6 +59,9 @@ RECALL_SCORE_THRESHOLD = 0.40   # = SEUIL
 RECALL_SEUIL_RERANK = 0.25      # = SEUIL_RERANK
 RECALL_RERANK_OK = 0.5          # = RERANK_OK
 _MIN_SEG_LEN = 4
+# Démarrage : nouvel essai du contrôle de la mémoire longue directe (installation neuve : embed qui télécharge son modèle).
+STARTUP_RETRY_S = 600
+STARTUP_RETRY_EVERY_S = 15
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
@@ -405,14 +408,23 @@ class DirectCorthexisMemory:
         """Contrôle de démarrage en arrière-plan (le noyau ne l'attend pas) : une base ou un embed injoignable se voit
         dans le journal en ERREUR, et dans `status()` — jamais une mémoire vide silencieuse."""
         def _go() -> None:
-            st = self.status(max_age_s=0.0)
-            if st.get("ok"):
-                store = st.get("store") or {}
-                logger.info("mémoire longue CortHeXis (direct) prête : %s note(s), projets %s, embed %s ms",
-                            store.get("notes"), st.get("projects") or "tous", (st.get("embed") or {}).get("ms"))
-            else:
-                logger.error("mémoire longue CortHeXis (direct) INDISPONIBLE au démarrage : %s — rappel vide tant "
-                             "que ce n'est pas réparé (état : GET /v1/local/memory, /healthz)", st.get("error"))
+            # Installation neuve : l'embed télécharge encore son modèle quelques minutes. Avertissement et nouvel essai
+            # pendant STARTUP_RETRY_S ; ERREUR seulement si la mémoire est toujours injoignable ensuite.
+            deadline = time.monotonic() + STARTUP_RETRY_S
+            while True:
+                st = self.status(max_age_s=0.0)
+                if st.get("ok"):
+                    store = st.get("store") or {}
+                    logger.info("mémoire longue CortHeXis (direct) prête : %s note(s), projets %s, embed %s ms",
+                                store.get("notes"), st.get("projects") or "tous", (st.get("embed") or {}).get("ms"))
+                    return
+                if time.monotonic() >= deadline:
+                    logger.error("mémoire longue CortHeXis (direct) INDISPONIBLE au démarrage : %s — rappel vide tant "
+                                 "que ce n'est pas réparé (état : GET /v1/local/memory, /healthz)", st.get("error"))
+                    return
+                logger.warning("mémoire longue CortHeXis (direct) pas encore prête : %s — nouvel essai dans %d s",
+                               st.get("error"), STARTUP_RETRY_EVERY_S)
+                time.sleep(STARTUP_RETRY_EVERY_S)
         threading.Thread(target=_go, name="memory-check", daemon=True).start()
 
     def propose(self, thread_id: str, facts: list[str]) -> None:

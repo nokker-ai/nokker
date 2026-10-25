@@ -1,6 +1,7 @@
 ---
 name: video-shots
 description: Render each storyboard shot with ffmpeg in the sandbox
+locality: local
 ---
 # Rendering shots
 

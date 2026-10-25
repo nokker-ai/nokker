@@ -67,6 +67,7 @@ include = ["nokker*"]
 nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*.sql", "bubbles/migrations/*.sql",
           "approvals/migrations/*.sql", "store/migrations/*.sql", "agents/migrations/*.sql",
           "api/miniapp/*.html", "api/miniapp/*.js", "api/miniapp/*.css", "prompts/*.md", "onboarding/terms/*.md",
+          "household/consent/*.md",
           "tools/browser_pool_tools.json",
           "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*",
           "admin/ui/*.html"]

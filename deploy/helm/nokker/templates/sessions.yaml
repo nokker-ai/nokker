@@ -1,0 +1,75 @@
+{{- if .Values.code.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+# Code sessions: the core creates one pod per session in ITS namespace (nokker/tools/k8s_sandbox.py), nothing else.
+# No secrets, no PVC creation, no access outside the namespace. Session pods run as <release>-sandbox: no rights and
+# no token mounted (also set on each pod).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fn }}-sandbox
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fn }}-core-sessions
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    resourceNames: [{{ include "nokker.workspacesClaim" . | quote }}]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fn }}-core-sessions
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fn }}-core-sessions
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fn }}-core
+    namespace: {{ .Release.Namespace }}
+{{- if not .Values.code.workspaces.existingClaim }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nokker.workspacesClaim" . }}
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspaces
+  annotations:
+    helm.sh/resource-policy: keep   # the users' work: never removed by helm uninstall
+spec:
+  accessModes: [{{ .Values.code.workspaces.accessMode }}]
+  {{- with .Values.code.workspaces.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.code.workspaces.size }}
+{{- end }}
+{{- if and (eq .Values.code.workspaces.accessMode "ReadWriteOnce") (not .Values.code.workspaces.colocateWithCore) }}
+{{- fail "code.workspaces.accessMode=ReadWriteOnce needs code.workspaces.colocateWithCore=true (single node)" }}
+{{- end }}
+{{- end }}

@@ -146,7 +146,7 @@ def test_member_writes_notes_but_cannot_promote_or_join_elsewhere(world):
     a, now = OWNER.tenant_id, time.time()
     with tenant_scope(MEM.tenant_id):
         r = t.push_notes(MEM, pid, "mc_mem", [{"name": "fact-ci", "kind": "fact", "title": "CI", "text": "Forgejo",
-                                               "updated_at": now}])
+                                               "updated_at": now, "locality": "both"}])
     assert r["accepted"] == 1
     with tenant_scope(VIEW.tenant_id):
         assert [n["name"] for n in t.notes(VIEW, pid, None)["notes"]] == ["fact-ci"]

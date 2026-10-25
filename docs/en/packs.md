@@ -4,9 +4,10 @@ A pack bundles [skills](skills.md) for one kind of work with ready-made **agent 
 its skills in your skills folder and *proposes* its agents as cards in the conversation. Nothing is created, armed
 or run until you act on a card.
 
-Status: available in the Lokkal install. The packs ship with Nokker; they contain no account, address or key: you
-connect your own services and keep credentials in the [vault](secrets.md). Their agents run on the agent engine
-([agents.md](agents.md)).
+Status: available in the Lokkal install. In the web app (nokker.ai): **rolling out**, behind a server flag, with the
+limits described in [Packs in the web app](#packs-in-the-web-app). The packs ship with Nokker; they contain no
+account, address or key: you connect your own services and keep credentials in the [vault](secrets.md). Their agents
+run on the agent engine ([agents.md](agents.md)). Nokker never downloads a third-party pack.
 
 ## The packs
 
@@ -29,8 +30,10 @@ it is there.
 |---|---|---|
 | `pack_list(name?)` | READ | The packs, or one pack in detail: skills, agent templates, MCP roles with their tools, effects and secret names |
 | `pack_install(name, bind?)` | DESTRUCTIVE | Installs the skills (scanned) and proposes the agents. Asks for a card. |
-| `mcp_server_list()` | READ | MCP servers added from a session, the secret names they use, the names missing from the vault |
-| `mcp_server_add(name, url, token?, headers?, purpose?)` | DESTRUCTIVE | Adds an MCP server to the configuration. Asks for a card. |
+| `pack_remove(name)` | DESTRUCTIVE | Removes a pack in one call (below). Asks for a card. |
+| `mcp_server_list()` | READ | MCP servers added from a session, the secret names they use, the names missing from the vault, the tools declared read-only |
+| `mcp_server_add(name, url, token?, headers?, purpose?, read_tools?, confirm_writes?)` | DESTRUCTIVE | Adds an MCP server to the configuration. Asks for a card. |
+| `mcp_server_read_tools(name, read_tools, confirm_writes?)` | DESTRUCTIVE | Declares which tools of an added server only read (below). Asks for a card. |
 | `mcp_server_remove(name)` | DESTRUCTIVE | Removes a server added from a session. Asks for a card. |
 
 ## Installing
@@ -57,6 +60,23 @@ pack_install {name: "social", bind: {"scheduler.schedule_post": "create_post",
 ```
 
 Binding a secret to an empty name drops it from the proposed agents (for a server that needs no key).
+
+## Removing a pack
+
+`pack_remove {name: "mail"}` undoes an install in one call:
+
+- the skills this pack copied are removed (a skill of yours in the same folder stays);
+- the agent cards of the pack that you have not activated are closed;
+- agents you **already created** from the pack are never disarmed or deleted silently. They are listed in the result
+  and a `pack_agents` card offers **Disarm**, **Delete** or **Keep** for all of them; only your click acts, and only on
+  agents that still exist and still come from that pack. Each agent created from a pack card remembers where it came
+  from (`origin: {pack, template}` in [agents.md](agents.md)), which is how the removal finds it;
+- effects the pack raised for MCP tools stay raised: removing a pack never lowers an effect (an agent you kept may
+  still call those tools).
+
+Removing again, or removing a pack that is not installed, does nothing and says so (`already_removed: true`). From the
+machine, `POST /v1/local/packs/{name}/remove {thread_id?}` (local token) does the same removal and posts the same card
+in that thread; `GET /v1/local/packs` lists the packs.
 
 ## What every pack guarantees
 
@@ -90,7 +110,31 @@ mcp_server_add {name: "tracker", url: "https://mcp.example.com/mcp", token: "sec
 - The address is `https://`, or `http://` to the loopback or a local service name without a dot. Credentials in the
   URL are refused.
 - A server already named in `config.yaml` wins over one added from a session.
-- Every tool of an added server is treated as a write (it asks) unless a pack declares a stricter effect.
+- Every tool of an added server is treated as a write (it asks) unless a pack declares a stricter effect, or you
+  declare it read-only (below).
+
+### Declaring read tools without a pack
+
+If a server has tools that only read (list, search, fetch), name them so they stop asking:
+
+```
+mcp_server_add {name: "tracker", url: "https://mcp.example.com/mcp", token: "secret:TRACKER_TOKEN",
+                read_tools: ["list_issues", "get_issue"]}
+mcp_server_read_tools {name: "tracker", read_tools: ["list_issues", "get_issue", "search_issues"]}
+```
+
+The same list can be set from the machine with `PUT /v1/local/mcp-servers/{name}/read-tools {read_tools: [...]}`
+(local token; `GET /v1/local/mcp-servers` lists the servers). An empty list makes every tool a write again. It
+applies at the next start of the core, and:
+
+- by default nothing changes: every tool stays a write;
+- a declaration only lifts a tool the core knows nothing about. A tool the core, your `config.yaml` or a pack already
+  classifies keeps that effect (a declaration never lowers one);
+- a tool whose **name** reads like a write (send, delete, write, create, update, post, push, rm, remove, move,
+  schedule, pay…) is refused unless you also name it in `confirm_writes`; the call then asks for a **strong card**
+  that no mode, no `allow` rule and no written go-ahead lifts. The local route never accepts such a name;
+- a tool whose **description**, as the server gives it, announces a write stays a write unless its name was
+  confirmed that way.
 
 ## Writing a pack
 
@@ -105,12 +149,41 @@ An MCP role declares its purpose, examples, secret names, and each tool with a d
 (`read`, `write`, `send_external`, `spend`, `destructive`). A template refers to a role's tool as
 `<role>.<tool>`. A budget is required.
 
+## Packs in the web app
+
+Status: **rolling out** with the nokker.ai launch (server flag `packs_web`, off by default).
+
+From the web app, an account installs a pack into **its own scope**. The content is the one shipped with Nokker,
+passed through the same skills guard (fails closed without the scanner). What can live on the web is installed, the
+rest is left for a machine:
+
+| Part of a pack | On the web |
+|---|---|
+| Skills that only need text and the web | installed for the account; `skill_list` / `skill_view` read them |
+| Skills marked `locality: local` (files, terminal, ssh hosts, added MCP servers, project memory, ffmpeg) | never |
+| Agent templates whose every tool exists on the web (skills, web search, the account's mail and calendar connectors) | proposed as cards, like in Lokkal |
+| Agent templates that call an MCP role, the sandbox or your hosts, or need a GPU | never |
+
+So `mail` installs entirely, `social`, `jobs`, `brand`, `video` and `ops` install in part, and `mcp-builder` does not
+install on the web (409 `machine_only`). A partial install says so (`partial: true`, `machine: {skills, agents, linked,
+handoff, next}`). If one of your linked machines declares a resource the rest needs (an MCP server with the role's
+name, a host), the install can propose to hand the rest over to that machine (`handoff: true`: a
+hand-over card, and nothing runs before you accept; the machine then runs `pack_install` with its own cards). Without a linked machine, the result tells you to install Lokkal and run `pack_install` there.
+
+Nothing is copied: the account keeps the names and a fingerprint of each skill taken when it was scanned. If the
+shipped content changes later (a Nokker update), the skill is hidden until you install the pack again, which scans it
+again. Removing a pack on the web works as in Lokkal (cards for the agents you created). One account never sees,
+installs into or removes from another account.
+
+The web app talks to `/v1/packs` (list, detail, `POST /v1/packs/{name}/install`, `POST /v1/packs/{name}/propose`,
+`DELETE /v1/packs/{name}`).
+
 ## Not there yet
 
 - Agent runs do not open a code session yet: templates that need the sandbox or your hosts (`video`, `ops`)
   prepare the work and a session does it. Placing a run on a machine with a GPU (`needs.gpu`) is part of the
   multi-machine placement: **rolling out** ([agents.md](agents.md#several-machines)). The card's `needs` reach the
   agent when you activate it.
-- Packs in the web app: **planned**. Today `pack_install` and `mcp_server_add` are local-edition tools.
-- Removing a whole pack in one call: **planned**; remove its skills with `skill_remove`.
-- Declaring read tools of a server added with `mcp_server_add` without a pack: **planned**.
+- Packs in the web app: **rolling out** (above). MCP servers are never added from the web: `mcp_server_add` stays a
+  local-edition tool.
+- The web install cannot bind MCP tool names (no MCP part runs there); secret names can be bound.

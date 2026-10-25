@@ -174,12 +174,27 @@ def test_routes_serve_private_pages_with_sandbox_headers(tmp_path):
         assert _get(port, link["url"].replace("&sig=", "&dl=1&sig="))[0] == 404
         assert "Content-Disposition" not in _get(port, link["url"])[1]
         assert "public_url" not in link  # privée : pas de lien à copier
-        api.pages.update(meta.page_id, public=True)
-        assert _get(port, f"/v1/pages/{meta.page_id}")[0] == 200
+        import hashlib
+
+        published = api.pages.publish(meta.page_id, 1, hashlib.sha256(HTML).hexdigest())  # après la carte (§7.26)
+        assert _get(port, f"/v1/pages/{meta.page_id}")[0] == 404  # publique : jamais par son page_id sans preuve
         api.setup.state["relay_host"] = "atelier.nokker.app"
         pub = _req(port, f"/v1/pages/{meta.page_id}/link", token=api.token, body={})[1]
-        assert pub["public_url"] == f"https://atelier--pages.nokker.app/{meta.page_id}"
+        assert pub["public_url"] == f"https://atelier--pub.nokker.app/{published.public_id}"
         assert _get(port, "/v1/pages/pg_zzzz")[0] == 404
+
+        def delete(token=None):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/pages/{meta.page_id}", method="DELETE",
+                                         headers={"Authorization": f"Bearer {token}"} if token else {})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        assert delete() == 401  # supprimer : le propriétaire local seulement
+        assert delete(api.token) == 200 and api.pages.get(meta.page_id) is None
+        assert _get(port, f"/v1/pages/{meta.page_id}", api.token)[0] == 404 and delete(api.token) == 404
     finally:
         httpd.shutdown()
 

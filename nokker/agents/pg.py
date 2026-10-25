@@ -20,11 +20,12 @@ ENGINE_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "024_agent
     encoding="utf-8")
 PLACEMENT_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "028_deck_placement.sql").read_text(
     encoding="utf-8")
+PACKS_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "036_packs_web.sql").read_text(encoding="utf-8")
 
 _COLS = ("id, name, role, model, tools, status, created_by, created_at, updated_at, instructions, trigger, "
          "next_run_at, last_run, secrets, budget, auto_approve, placement, project, armed, approved_rules, "
-         "arm_approval_id, webhook_key, needs")
-_JSON_AGENT = {"tools", "trigger", "last_run", "secrets", "budget", "auto_approve", "placement", "needs"}
+         "arm_approval_id, webhook_key, needs, origin")
+_JSON_AGENT = {"tools", "trigger", "last_run", "secrets", "budget", "auto_approve", "placement", "needs", "origin"}
 _RUN_COLS = ("id, agent_id, trigger, status, scheduled_for, started_at, ended_at, thread_id, cost, summary, "
              "catch_up, event, input, approvals, created_at, machine_id, guest")
 _JSON_RUN = {"cost", "approvals", "guest"}
@@ -72,7 +73,7 @@ class PgAgents(BaseAgents):
         if not self.dsn:
             raise ValueError("PgAgents requiert un DSN Postgres")
         # en propriétaire, puis la RLS (nokker/store/conn.py)
-        migrate(self.dsn, MIGRATION_SQL, PROJECT_SQL, ENGINE_SQL, PLACEMENT_SQL)
+        migrate(self.dsn, MIGRATION_SQL, PROJECT_SQL, ENGINE_SQL, PLACEMENT_SQL, PACKS_SQL)
         self._db = TenantConn(self.dsn)
         self._lock = threading.Lock()
 

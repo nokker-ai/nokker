@@ -1,6 +1,7 @@
 ---
 name: cover-letter-drafts
 description: Cover letters from the CV and the offer, saved as drafts
+locality: local
 ---
 # Cover letter drafts
 

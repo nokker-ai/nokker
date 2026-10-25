@@ -14,8 +14,8 @@ La bêta est proposée par **Ninabot Sàrl**, c/o Openest coworking SA, Chemin d
   Vous pouvez arrêter quand vous voulez.
 
 ## 3. Ce que nous vous demandons
-- Utiliser Nokker réellement pendant la bêta et nous faire part de vos retours, notamment par un **court questionnaire
-  chaque dimanche soir** (2 minutes ; le lundi, c'est encore bon).
+- Utiliser Nokker réellement pendant la bêta et nous faire part de vos retours, notamment par un
+  **court questionnaire chaque dimanche soir** (2 minutes ; le lundi, c'est encore bon).
 - **Ne pas confier de données sensibles** : données de santé, secrets professionnels ou bancaires, mots de passe
   principaux, données de tiers que vous n'avez pas le droit de partager.
 - Ne pas utiliser Nokker à des fins illégales, ni pour nuire à autrui.

@@ -27,7 +27,7 @@ from typing import Any
 
 from nokker.agents.base import BaseAgents
 from nokker.agents.cron import next_run
-from nokker.agents.spec import norm_fields, norm_placement, parse_when
+from nokker.agents.spec import NO_MAIL_TRIGGER, norm_fields, norm_placement, parse_when
 from nokker.agents.types import (
     Agent, AgentConflict, AgentError, AgentNotFound, AgentRun, agent_to_json, run_to_json,
 )
@@ -46,6 +46,17 @@ class EngineUnavailable(AgentError):
 NO_ENGINE_SCHEDULED = "les agents programmés ne sont pas disponibles sur cette instance (pas de moteur)"
 NO_ENGINE_WRITE = ("pas de moteur d'agents sur cette instance : un agent qui lève une écriture (auto_approve) ne peut "
                    "pas y être armé")
+
+
+def clean_origin(origin: Any) -> dict[str, str] | None:
+    """{pack, template} d'une carte de pack (noms courts), sinon None."""
+    import re
+
+    if not isinstance(origin, dict):
+        return None
+    pack, template = str(origin.get("pack") or ""), str(origin.get("template") or "")
+    name = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+    return {"pack": pack, "template": template} if name.match(pack) and name.match(template) else None
 
 
 def rules_fingerprint(rules: list[str]) -> str:
@@ -140,6 +151,27 @@ class AgentsHub:
         if self.engine is None and (trigger or {}).get("kind", "manual") != "manual":
             raise AgentError(NO_ENGINE_SCHEDULED)
 
+    def mail_watch(self) -> Any:
+        """La relève du courrier du moteur (`nokker/agents/mailwatch.py`), ou None : sans elle, `mail:<filtre>` est
+        refusé (aucun producteur, l'agent ne tournerait jamais)."""
+        return getattr(self.engine, "mail_watch", None) if self.engine is not None else None
+
+    def _check_mail(self, trigger: dict) -> None:
+        """`mail:<filtre>` : il faut la relève (moteur + connecteurs) ET une boîte reliée au locataire courant."""
+        if not str((trigger or {}).get("event") or "").startswith("mail:") or trigger.get("kind") != "event":
+            return
+        watch = self.mail_watch()
+        if watch is None:
+            raise AgentError(NO_MAIL_TRIGGER, code="no_mail_trigger")
+        why = watch.unavailable()
+        if why:
+            raise AgentError(why, code="mailbox_unlinked")
+
+    def _forget_mail(self, agent_id: str) -> None:
+        watch = self.mail_watch()
+        if watch is not None:
+            watch.forget(agent_id)
+
     def _cancel_arm_card(self, a: Agent, why: str) -> None:
         if a.arm_approval_id and self.engine is not None:
             self.engine.drop_card(a.arm_approval_id, why)
@@ -167,6 +199,7 @@ class AgentsHub:
         trigger = fields.get("trigger") or {"kind": "manual"}
         rules = fields.get("auto_approve") or []
         self._check_engine(trigger)
+        self._check_mail(trigger)
         self._check_event_writes(trigger, rules)
         # Placé sur une machine (X15) : ses portes à elle, aucune règle levée — rien à signer pour l'armer.
         remote = self.is_remote(Agent(id="", name="", role="", model="", placement=fields.get("placement")))
@@ -176,21 +209,29 @@ class AgentsHub:
         self._emit("agent.created", {"agent": agent_to_json(a)})
         return a
 
-    def create_from_body(self, body: dict[str, Any], created_by: str) -> Agent:
+    def create_from_body(self, body: dict[str, Any], created_by: str, origin: dict[str, Any] | None = None) -> Agent:
+        """`origin` : posé par le noyau seulement (activation de la carte d'un pack, {pack, template}), jamais lu du
+        corps d'un client."""
         f = norm_fields(body, partial=False, local_machine=self._machine(), policy=self.placement_policy,
-                        owner=created_by)
-        return self.create_agent(created_by=created_by, **f)
+                        owner=created_by, mail=self.mail_watch() is not None)
+        return self.create_agent(created_by=created_by, origin=clean_origin(origin), **f)
+
+    def from_pack(self, pack: str) -> list[Agent]:
+        """Agents du locataire courant créés depuis une carte du pack `pack` (champ `origin`)."""
+        return [a for a in self.store.list_all() if (a.origin or {}).get("pack") == pack]
 
     def patch_agent(self, agent_id: str, body: dict[str, Any], by: str) -> Agent:
         a = self.store.require(agent_id)
         self._not_moved(a)
         f = norm_fields(body, partial=True, local_machine=self._machine(), policy=self.placement_policy,
-                        owner=a.created_by)
+                        owner=a.created_by, mail=self.mail_watch() is not None)
         if self.mover is not None and "placement" in f and f["placement"] != a.placement:
             # Changer de maison = un déménagement contrôlé (LOKKAL §6.7, X15) : la destination est vérifiée là-bas.
             raise AgentError("placement : un changement de machine passe par POST /v1/agents/{id}/move (il vérifie "
                              "ce que la destination offre)")
         self._check_engine(f.get("trigger", a.trigger))
+        if "trigger" in f:
+            self._check_mail(f["trigger"])
         self._check_event_writes(f.get("trigger", a.trigger), f.get("auto_approve", a.auto_approve))
         changed = [k for k in DISARMING_FIELDS if k in f and f[k] != getattr(a, k)]
         for k, v in f.items():
@@ -200,6 +241,8 @@ class AgentsHub:
             if a.armed:
                 a.armed = False  # §9.5 : ce que l'humain a armé n'est plus ce qui tournerait
                 a.next_run_at = None
+            if "trigger" in changed:
+                self._forget_mail(a.id)  # un nouveau filtre repart d'une nouvelle ligne de base
         return self.refresh(a)
 
     # ─────────────────────────────── armer, désarmer ───────────────────────────────
@@ -211,6 +254,7 @@ class AgentsHub:
         self._not_moved(a)
         self.check_placement(a)
         self._check_engine(a.trigger)  # agent programmé d'avant ce contrôle : il ne s'arme plus sans moteur
+        self._check_mail(a.trigger)  # `mail:` d'avant la relève, ou boîte retirée depuis : il ne s'arme pas
         now = self.clock()
         if a.trigger.get("kind") == "once" and parse_when(a.trigger["at"]) <= now:
             raise AgentConflict("trigger once : échéance passée, choisir une nouvelle date (PATCH)")
@@ -230,7 +274,11 @@ class AgentsHub:
         a.armed = True
         a.arm_approval_id = None
         a.next_run_at = self.next_occurrence(a, now)
-        return self.refresh(a)
+        a = self.refresh(a)
+        watch = self.mail_watch()
+        if watch is not None and str(a.trigger.get("event") or "").startswith("mail:"):
+            watch.kick()  # ligne de base au plus tôt : ce qui arrive après l'armement déclenche
+        return a
 
     def arm_decided(self, agent_id: str, approved: bool, fingerprint: str, by: str | None) -> str:
         """Décision de la carte forte d'armement (exécuteur d'approbation, toutes origines : local, téléphone)."""
@@ -253,6 +301,7 @@ class AgentsHub:
         self._cancel_arm_card(a, f"désarmé par {by}")
         a.armed = False
         a.next_run_at = None
+        self._forget_mail(a.id)  # la relève s'arrête ; réarmé, il repart d'une nouvelle ligne de base
         return self.refresh(a)
 
     # ─────────────────────────────── passages ───────────────────────────────
@@ -317,6 +366,7 @@ class AgentsHub:
         if live is not None and self.engine is not None:
             self.engine.cancel(live, by)
         self._cancel_arm_card(a, f"agent supprimé par {by}")
+        self._forget_mail(agent_id)
         self.store.delete(agent_id)
         self._emit("agent.deleted", {"id": agent_id})
 
@@ -335,5 +385,5 @@ class AgentsHub:
         return key, event.split(":", 1)[1]
 
 
-__all__ = ["DISARMING_FIELDS", "NO_ENGINE_SCHEDULED", "NO_ENGINE_WRITE", "AgentsHub", "EngineUnavailable",
+__all__ = ["DISARMING_FIELDS", "clean_origin", "NO_ENGINE_SCHEDULED", "NO_ENGINE_WRITE", "AgentsHub", "EngineUnavailable",
            "rules_fingerprint"]

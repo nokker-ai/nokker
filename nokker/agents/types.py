@@ -14,7 +14,12 @@ FINAL_RUN = RUN_STATUSES - LIVE_RUN
 
 
 class AgentError(Exception):
-    """Requête invalide (400)."""
+    """Requête invalide (400). `code` : identifiant stable pour les écrans (`{"error": {"message", "code"}}`), facultatif ;
+    le message reste la raison en clair."""
+
+    def __init__(self, *args: object, code: str | None = None) -> None:
+        super().__init__(*args)
+        self.code = code
 
 
 class AgentNotFound(AgentError):
@@ -56,6 +61,7 @@ class Agent:
     placement: dict[str, Any] | None = None  # X15 : {machine: auto | mc_… | web} ; None = la machine qui porte le noyau
     needs: dict[str, Any] | None = None  # X15 : {repos, hosts, connectors, mcp: [noms], gpu} exigés de la machine
     project: str | None = None  # X17 : champ seulement
+    origin: dict[str, Any] | None = None  # créé depuis la carte d'un pack : {pack, template} (pack_remove le retrouve)
     # Internes (jamais servis tels quels) :
     armed: bool = True  # l'humain a armé l'agent (échéances et événements actifs) ; `status` en découle
     approved_rules: str | None = None  # empreinte des règles d'écriture approuvées par une carte forte
@@ -106,7 +112,7 @@ def agent_to_json(a: Agent) -> dict[str, Any]:
             "last_run": last_run_json(a.last_run), "secrets": list(a.secrets),
             "budget": dict(a.budget) if a.budget else None, "auto_approve": list(a.auto_approve),
             "placement": dict(a.placement) if a.placement else None, "needs": dict(a.needs) if a.needs else None,
-            "project": a.project,
+            "project": a.project, "origin": dict(a.origin) if a.origin else None,
             "arm_approval_id": a.arm_approval_id}
 
 

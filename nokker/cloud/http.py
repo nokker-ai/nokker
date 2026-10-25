@@ -35,6 +35,23 @@ Délégation web → Lokkal par besoin (lot X21, docs/LOKKAL.md §7.16, nokker/c
     GET  /v1/handoffs?thread_id= | GET /v1/handoffs/{handoff_id} (session du compte) → demandes du compte
     POST /v1/handoffs/{handoff_id}/accept | /refuse (session du compte) → la demande (l'acceptation lance la session)
     POST /v1/mirror/notes {notes, forget} (jeton de machine, abonnés) → {accepted, refused, forgotten} (notes `both`)
+    GET  /v1/mirror/notes (jeton de machine) → {notes: [{project, name}]} : ce que nokker.ai garde de cette machine
+Pages servies depuis le miroir, machine éteinte (docs/LOKKAL.md §7.23, nokker/cloud/mirror_pages.py) :
+    GET    /v1/mirror/pages (jeton de machine) → {pages: [{page_id, title, version, size, sha256, …}], used, quota}
+    PUT    /v1/mirror/pages/{page_id} {title, version, sha256, locality, html_b64} (jeton de machine, abonnés)
+    DELETE /v1/mirror/pages/{page_id} (jeton de machine ; un droit, abonnement échu compris) → {deleted}
+    POST   /v1/gateway/mirror/page {host, tenant, machine?, page_id?} (clé du relais, X-Nokker-Relay-Key) → copie
+Pages publiques (docs/LOKKAL.md §7.26) :
+    GET    /v1/gateway/machine → … + pages_public (le compte peut publier : abonné ou compte vérifié)
+    PUT    /v1/mirror/pages/{page_id} … + public: {id_sha256, index, version} | null
+    DELETE /v1/mirror/pages/{page_id}/public (jeton de machine ; un droit) → {unpublished}
+    POST   /v1/gateway/mirror/public-page {host, public_id} (clé du relais) → {page} : copie publique, machine éteinte
+    POST   /v1/gateway/pages-jti {jti, exp} (clé du relais) → 200 {first: true} | 409 : jetons de pages, toutes répliques
+Modération des pages publiques (§7.26, point 6 ; nokker/cloud/moderation.py, migration 040) :
+    POST   /v1/gateway/public-page/check {host, public_id, page_id?, size?} (clé du relais) → 200 {allowed} | 410
+           moderated | 404 : demandé par le relais AVANT de servir une page publique ; la vue est inscrite au registre
+    GET    /v1/gateway/machine → … + moderated_pages, moderated_public : pages de cette machine retirées par l'opérateur
+    POST   /v1/gateway/mirror/public-page → 410 moderated pour une copie publique retirée
 Deck multi-machines et agents placés (lot X15, docs/LOKKAL.md §7.19, nokker/cloud/crew.py) :
     GET  /v1/link/deck (session du compte) → toutes les machines du compte, leurs sessions, leurs agents, leurs cartes
     POST /v1/gateway/machine/deck {sessions, agents, pending_approvals} (jeton de machine) → {stored, at}
@@ -104,6 +121,19 @@ class CloudLink:
     # Délégation web → Lokkal (lot X21) : demandes de relais ; None = routes /v1/handoffs absentes (404).
     handoffs: Any = None
     mirror_notes: Any = None  # notes en miroir (MemoryMirrorNotes / PgMirrorNotes, migration 025)
+    # Pages copiées pour être servies machine éteinte (MemoryMirrorPages / PgMirrorPages, migration 033) ; None = routes
+    # absentes (404). Plafond par compte, toutes machines ; clé que le relais présente pour lire une copie ("" = route
+    # du relais fermée : sans clé, rien n'est servi depuis le miroir).
+    mirror_pages: Any = None
+    mirror_pages_quota: int = 50 * 1024 * 1024
+    relay_key: str = ""
+    # Pages publiques (§7.26) : compte → peut publier (abonné ou compte vérifié) ; None = personne. Registre des jti
+    # des jetons de pages pour un relais à plusieurs répliques (MemoryUsedJti / PgUsedJti, migration 035).
+    pages_public_allowed: Callable[[str], bool] | None = None
+    used_jti: Any = None
+    # Registre de modération des pages publiques (§7.26, point 6 : MemoryPublicPages / PgPublicPages, migration 040) ;
+    # None = route du relais fermée (404) : le relais ne sert alors aucune page publique (échec fermé).
+    public_pages: Any = None
     # Deck multi-machines et agents placés (lot X15) : nokker.cloud.crew.CloudCrew ; None = routes absentes (404).
     crew: Any = None
     agents: Any = None  # AgentsHub de nokker.ai (agents du deck), posé par serve
@@ -115,6 +145,9 @@ class CloudLink:
     default_model: str = ""
     inference_rate_max: int = 60  # appels par minute et par machine (une session de code enchaîne vite)
     inference_calls_per_day: int = 2000  # appels par jour de quota et par compte, suites de tour comprises
+    # Quota commun du foyer (X23, nokker/household/quota.py::HouseholdQuota, posé par configure_household) : un appel
+    # relayé qui ouvre un tour passe par le même contrôle qu'un tour du noyau ; None = foyer éteint.
+    household: Any = None
     gateway_rate_max: int = GATEWAY_RATE_MAX  # `token|refresh|revoke` par minute et par IP du navigateur (§7.3)
     _hits: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque), init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -155,6 +188,7 @@ _RE_MACHINE_RESULT = re.compile(r"^/v1/gateway/approvals/([A-Za-z0-9_-]{1,64})/r
 _RE_HANDOFF = re.compile(r"^/v1/handoffs(?:/(ho_[0-9a-f]{16})(?:/(accept|refuse))?)?$")
 _RE_HANDOFF_RESULT = re.compile(r"^/v1/gateway/handoffs/(ho_[0-9a-f]{16})/result$")
 _RE_AGENT_RUN_RESULT = re.compile(r"^/v1/gateway/agent-runs/(ar_[0-9a-f]{16})/result$")
+_RE_MIRROR_PAGE = re.compile(r"^/v1/mirror/pages(?:/([^/]+)(/public)?)?$")
 MAX_DECK_BYTES = 64 * 1024  # deck d'une machine : 100 sessions et 200 agents, noms et états
 
 
@@ -296,6 +330,10 @@ def handle(h: Any, method: str, path: str) -> bool:
     if path == "/v1/link/machines" or m:
         _account_machines(h, c, method, path, m)
         return True
+    if path in ("/v1/gateway/mirror/page", "/v1/gateway/mirror/public-page", "/v1/gateway/pages-jti",
+                "/v1/gateway/public-page/check"):
+        _relay_mirror_page(h, c, method, path)
+        return True
     machine = c.links.machine_for_token(_bearer(h))
     if machine is None:
         h._json(401, {"error": {"message": "jeton de machine requis"}})
@@ -307,6 +345,7 @@ def handle(h: Any, method: str, path: str) -> bool:
         return True
     if path == "/v1/link/revoke" and method == "POST":
         c.links.revoke(_bearer(h))
+        _purge_pages(c, machine.tenant, machine.id)  # machine déliée : ses pages copiées partent avec le lien
         h._json(200, {"revoked": True})
         return True
     if path == "/v1/gateway/machine/load" and method == "POST":
@@ -341,8 +380,16 @@ def handle(h: Any, method: str, path: str) -> bool:
                 seen(machine.id, time.time())  # « vue à » de l'écran « mes machines »
             except Exception:  # noqa: BLE001 — le contrôle du relais ne dépend pas de cette date
                 pass
-        h._json(200, {"machine_id": machine.id, "name": machine.name, "tenant": machine.tenant, "host": machine.host,
-                      "inference": True})  # l'inférence passe par nous dès que la machine est liée (§7.2 révisé)
+        out = {"machine_id": machine.id, "name": machine.name, "tenant": machine.tenant, "host": machine.host,
+               "inference": True,  # l'inférence passe par nous dès que la machine est liée (§7.2 révisé)
+               "pages_public": _pages_public(c, machine.account)}  # §7.26 : relais et machine le lisent
+        if c.public_pages is not None:
+            try:  # §7.26 point 6 : la machine dépublie et marque ses pages retirées par l'opérateur
+                mod = c.public_pages.moderated_of(machine.id)
+                out.update(moderated_pages=mod["page_ids"], moderated_public=mod["public_sha256"])
+            except Exception:  # noqa: BLE001 — sans la liste, la machine garde ce qu'elle savait ; le relais bloque
+                logger.exception("registre de modération illisible (machine %s)", machine.id)
+        h._json(200, out)
         return True
     if path == "/v1/mirror/erase" and method == "POST":
         from nokker.cloud import mirror
@@ -352,7 +399,17 @@ def handle(h: Any, method: str, path: str) -> bool:
             h._json(404, {"error": {"message": "miroir non configuré"}})
             return True
         notes = c.mirror_notes.erase(machine.tenant, machine.id) if c.mirror_notes is not None else 0
-        h._json(200, {"erased_turns": mirror.erase(c.store, machine.tenant, machine.id), "erased_notes": notes})
+        h._json(200, {"erased_turns": mirror.erase(c.store, machine.tenant, machine.id), "erased_notes": notes,
+                      "erased_pages": _purge_pages(c, machine.tenant, machine.id)})
+        return True
+    if path == "/v1/mirror/notes" and method == "GET":
+        # Resynchronisation complète (machine) : les clés gardées ici, pour oublier ce que la machine n'a plus.
+        keys = c.mirror_notes.keys(machine.tenant, machine.id) if c.mirror_notes is not None else []
+        h._json(200, {"notes": [{"project": p, "name": n} for p, n in keys]})
+        return True
+    mpg = _RE_MIRROR_PAGE.match(path)
+    if mpg:
+        _machine_mirror_pages(h, c, machine, method, mpg.group(1), public=bool(mpg.group(2)))
         return True
     if path == "/v1/mirror/notes" and method == "POST":
         from nokker.cloud import mirror
@@ -469,6 +526,7 @@ def _account_machines(h: Any, c: CloudLink, method: str, path: str, m: Any) -> N
         return
     if action == "revoke":
         if c.links.revoke_machine(account, machine_id):
+            _purge_pages(c, tenant, machine_id)
             h._json(200, {"revoked": True})
         else:
             h._json(404, {"error": {"message": "not found"}})
@@ -814,6 +872,114 @@ def _pages_link(h: Any, c: CloudLink, machine: Any, account: str, tenant: str, b
     h._json(200, {"url": url + ("&embed=1" if body.get("embed") else ""), "expires_at": int(time.time()) + 60})
 
 
+def _purge_pages(c: CloudLink, tenant: str, machine_id: str) -> int:
+    """Copies des pages d'une machine effacées (effacement des copies, révocation, déliaison) ; 0 sans miroir des pages."""
+    if c.mirror_pages is None:
+        return 0
+    from nokker.tenancy.context import tenant_scope
+
+    try:
+        with tenant_scope(tenant):
+            return int(c.mirror_pages.erase(tenant, machine_id))
+    except Exception:  # la révocation est faite ; la purge est rejouée par `nokker erase` au pire
+        logger.exception("purge des pages copiées de %s en échec", machine_id)
+        return 0
+
+
+def _pages_public(c: CloudLink, account: str) -> bool:
+    try:
+        return c.pages_public_allowed is not None and bool(c.pages_public_allowed(account))
+    except Exception:  # noqa: BLE001 — une règle en panne ne publie rien
+        logger.exception("droit de publier illisible pour %s", account)
+        return False
+
+
+def _machine_mirror_pages(h: Any, c: CloudLink, machine: Any, method: str, page_id: str | None,
+                          public: bool = False) -> None:
+    """`GET /v1/mirror/pages` (liste, resynchronisation), `PUT|DELETE /v1/mirror/pages/{page_id}` (jeton de machine),
+    `DELETE /v1/mirror/pages/{page_id}/public` (dépublier, §7.26). Copier exige le miroir (abonnés) ; retirer une copie
+    ou sa publication est un droit, abonnement échu compris."""
+    from nokker.cloud import mirror_pages as mp
+    from nokker.tenancy.context import tenant_scope
+
+    if c.mirror_pages is None:
+        h._json(404, {"error": {"message": "pages en miroir non configurées"}})
+        return
+    with tenant_scope(machine.tenant):
+        if page_id is None and method == "GET":
+            h._json(200, {"pages": c.mirror_pages.of_machine(machine.tenant, machine.id),
+                          "used": c.mirror_pages.used(machine.tenant), "quota": c.mirror_pages_quota})
+            return
+        if page_id is None or not mp.is_page_id(page_id):
+            h._json(404, {"error": {"message": "not found"}})
+            return
+        if public:
+            if method != "DELETE":
+                h._json(404, {"error": {"message": "not found"}})
+                return
+            h._json(200, {"unpublished": bool(c.mirror_pages.clear_public(machine.tenant, machine.id, page_id))})
+            return
+        if method == "DELETE":
+            h._json(200, {"deleted": bool(c.mirror_pages.delete(machine.tenant, machine.id, page_id))})
+            return
+        if method != "PUT":
+            h._json(404, {"error": {"message": "not found"}})
+            return
+        if c.mirror_allowed is None or not c.mirror_allowed(machine.account):
+            h._json(403, {"error": {"code": "mirror_subscription", "message": "miroir réservé aux abonnés"}})
+            return
+        if int(h.headers.get("Content-Length") or 0) > mp.MAX_PUT_BYTES:
+            h._json(413, {"error": {"code": "too_big", "message": "copie trop grande"}})
+            return
+        if not c.rate_ok(f"mirror-pages:{machine.id}", 120):
+            h._json(429, {"error": "rate", "retry_after_s": int(RATE_WINDOW_S)})
+            return
+        h._json(*mp.push_page(c.mirror_pages, machine.tenant, machine.id, page_id, h._read_json_body(),
+                              c.mirror_pages_quota, time.time(), public_allowed=_pages_public(c, machine.account)))
+
+
+def _relay_mirror_page(h: Any, c: CloudLink, method: str, path: str = "/v1/gateway/mirror/page") -> None:
+    """Le RELAIS, avec sa clé : copie d'une page machine éteinte (docs/LOKKAL.md §7.23 : il a vérifié la preuve du
+    navigateur et en donne le locataire, et la machine du jeton) ; copie PUBLIQUE (§7.26 : `{host, public_id}`) ;
+    registre des jti des jetons de pages (`{jti, exp}`, plusieurs répliques). Sans la clé du relais, ou sans le magasin
+    voulu : 404, comme une route que personne ne sert."""
+    import hmac as _hmac
+
+    from nokker.cloud import mirror_pages as mp
+
+    key = h.headers.get("X-Nokker-Relay-Key") or ""
+    store = {"/v1/gateway/pages-jti": c.used_jti, "/v1/gateway/public-page/check": c.public_pages}.get(
+        path, c.mirror_pages)
+    if method != "POST" or store is None or len(c.relay_key) < 32 \
+            or not _hmac.compare_digest(key.encode(), c.relay_key.encode()):
+        h._json(404, {"error": {"message": "not found"}})
+        return
+    body = h._read_json_body()
+    if path == "/v1/gateway/pages-jti":
+        h._json(*mp.use_jti(store, body, time.time()))
+        return
+    if path == "/v1/gateway/public-page/check":
+        from nokker.cloud.moderation import check_view
+
+        h._json(*check_view(store, c.links, c.pages_public_allowed, body, time.time()))
+        return
+    if path == "/v1/gateway/mirror/public-page":
+        got = mp.public_copy_for_relay(c.mirror_pages, c.links, c.mirror_allowed, c.pages_public_allowed,
+                                       host=str(body.get("host") or ""), public_id=str(body.get("public_id") or ""),
+                                       moderation=c.public_pages)
+        if got is not None and got.get("moderated"):
+            from nokker.cloud.moderation import REMOVED
+
+            h._json(410, {"error": {"code": "moderated", "message": f"page {REMOVED}"}})
+            return
+        h._json(200, got) if got is not None else h._json(404, {"error": {"message": "not found"}})
+        return
+    got = mp.copy_for_relay(c.mirror_pages, c.links, c.mirror_allowed, host=str(body.get("host") or ""),
+                            tenant=str(body.get("tenant") or ""), machine=str(body.get("machine") or "") or None,
+                            page_id=str(body.get("page_id") or "") or None)
+    h._json(200, got) if got is not None else h._json(404, {"error": {"message": "not found"}})
+
+
 def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
     """Relaie un appel compatible OpenAI au Router, avec la clé de nokker.ai ; l'usage est compté au locataire de la
     machine. Flux SSE relayé tel quel quand `stream` est demandé.
@@ -821,7 +987,10 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
     Gardes (revue du train du 2.11, décision 1), dans cet ordre, avant tout appel au Router : taille (413), débit par
     machine (429), modèle de la config du noyau (400, absent = celui de la config), plafonds du compte (403
     `quota_exceeded`) : appels par jour, et un appel qui OUVRE un tour (dernier message `user`) compte comme un tour du
-    web (`TenantLimits.check_turn`, mêmes plafonds, ceux de l'abonnement s'il y en a un)."""
+    web : quota commun du foyer pour un membre actif (`HouseholdQuota.check`), puis `TenantLimits.check_turn` (mêmes
+    plafonds, ceux de l'abonnement s'il y en a un ; `shared` pour un membre de foyer). L'usage est rangé au ledger avec
+    l'étiquette du foyer (`SpendTag.household_id`), un indice par tour (`_turn_index`). Budget de projet d'équipe : non
+    appliqué, rien dans l'appel ne relie la session Lokkal à un projet (docs/LOKKAL.md §7.27, reste ouvert)."""
     from nokker.tenancy.context import tenant_scope
 
     length = int(h.headers.get("Content-Length") or 0)
@@ -850,10 +1019,11 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
     if model and body.get("model") != model:
         body["model"] = model
         raw = json.dumps(body).encode()
+    session = str(h.headers.get("X-Session-Id") or "")[:128]  # fil de la session Lokkal (affinité du Router)
     with tenant_scope(machine.tenant):
-        refused = _inference_quota(c, machine, body)
-    if refused is not None:
-        h._json(403, {"error": {"code": "quota_exceeded", "message": refused}})
+        ticket = _inference_quota(c, machine, body, session)
+    if ticket.refused is not None:
+        h._json(403, {"error": {"code": "quota_exceeded", "message": ticket.refused}})
         return
     t0 = time.monotonic()
     url = c.router_base.rstrip("/") + "/chat/completions"
@@ -890,9 +1060,13 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
         return
     if c.record_usage is not None:
         try:
-            # Dans le locataire de la machine : le ledger Postgres (RLS) lève NoTenant sans lui.
-            with tenant_scope(machine.tenant):
-                c.record_usage(machine.tenant, machine.id, usage, time.monotonic() - t0, model)
+            # Dans le locataire de la machine : le ledger Postgres (RLS) lève NoTenant sans lui. Membre actif d'un
+            # foyer : la ligne porte l'étiquette du foyer (quota commun, §7.29.3), sous la politique RESTRICTIVE
+            # `household_spend_tag` (ce compte, membre de CE foyer).
+            from nokker.ledger.attribution import spend_tag
+
+            with tenant_scope(machine.tenant), spend_tag(ticket.tag):
+                c.record_usage(machine.tenant, machine.id, usage, time.monotonic() - t0, model, ticket.turn_index)
         except Exception:  # noqa: BLE001 — la réponse est déjà partie : on ne la casse pas, on le dit fort
             logger.error("comptage de l'inférence relayée en échec (machine %s, locataire %s) : appel NON compté",
                          machine.id, machine.tenant, exc_info=True)
@@ -905,27 +1079,112 @@ def _opens_turn(body: dict[str, Any]) -> bool:
     return not msgs or msgs[-1].get("role") == "user"
 
 
-def _inference_quota(c: CloudLink, machine: Any, body: dict[str, Any]) -> str | None:
-    """None : l'appel passe (et il est compté). Sinon le message du refus. Appelé dans `tenant_scope(machine.tenant)`.
-    Le locataire interne n'a pas de plafond (comme ses tours)."""
+# Indice de tour d'un appel relayé au ledger (fil `lokkal-<machine>`) : le quota du foyer compte des TOURS, une paire
+# (fil, indice) par tour. Un appel qui ouvre un tour prend un indice neuf, croissant (secondes depuis cette origine,
+# jamais en dessous du dernier + 1 : unique dans le processus, et après un redémarrage dès que l'horloge a dépassé le
+# dernier indice donné) ; une suite reprend celui du tour ouvert par la même session (`X-Session-Id` du Lokkal), sinon
+# l'indice 0 (« hors tour » : une suite dont on a perdu le tour, après un redémarrage, ne fait pas un tour de plus).
+_TURN_EPOCH = 1_767_225_600  # 2026-01-01T00:00:00Z ; l'indice tient dans un INTEGER Postgres jusqu'en 2094
+_TURN_SESSIONS_MAX = 4096
+
+
+@dataclass
+class _InferenceTicket:
+    """Ce que garde un appel relayé admis : l'étiquette du ledger (foyer) et l'indice de tour où le ranger."""
+    refused: str | None = None
+    tag: Any = None  # nokker.ledger.attribution.SpendTag | None
+    turn_index: int = 0
+
+
+_turns_lock = threading.Lock()
+_turn_last: dict[str, int] = {}  # machine → dernier indice donné
+_turn_of_session: dict[tuple[str, str], int] = {}  # (machine, session Lokkal) → indice du tour en cours
+
+
+def _turn_index(machine_id: str, session: str, opens: bool) -> int:
+    with _turns_lock:
+        if not opens:
+            return _turn_of_session.get((machine_id, session), 0) if session else 0
+        idx = max(int(time.time()) - _TURN_EPOCH, _turn_last.get(machine_id, 0) + 1)
+        _turn_last[machine_id] = idx
+        if session:
+            _turn_of_session.pop((machine_id, session), None)
+            _turn_of_session[(machine_id, session)] = idx
+            while len(_turn_of_session) > _TURN_SESSIONS_MAX:  # les plus anciennes sessions d'abord (ordre d'insertion)
+                _turn_of_session.pop(next(iter(_turn_of_session)))
+        return idx
+
+
+def _household_tag(c: CloudLink, machine: Any, opens: bool) -> tuple[Any, str | None]:
+    """(étiquette du foyer | None, refus | None). Un appel qui ouvre un tour passe par `HouseholdQuota.check`, comme un
+    tour du noyau (`Kernel.run_turn`, 0 bis) ; une suite de tour est seulement étiquetée (un tour commencé finit)."""
+    q = c.household
+    if q is None:
+        return None, None
+    if not opens:
+        return q.tag(machine.account), None
+    ticket = q.check(f"lokkal-{machine.id}", machine.account)
+    if ticket is None:
+        return None, None
+    if ticket.verdict is not None:
+        logger.info("inférence relayée refusée (%s) : %s", ticket.verdict.rule, ticket.verdict.reason)
+        return None, ticket.reply
+    return ticket.tag, None
+
+
+def _inference_quota(c: CloudLink, machine: Any, body: dict[str, Any], session: str = "") -> _InferenceTicket:
+    """`refused` None : l'appel passe (et il est compté) ; sinon le message du refus. Appelé dans
+    `tenant_scope(machine.tenant)`. Le locataire interne n'a pas de plafond (comme ses tours).
+
+    Ordre (celui de `Kernel.run_turn`) : appels par jour et par compte, foyer (quota commun, plafond du membre), puis
+    plafonds du compte, `shared` pour un membre actif d'un foyer (seule la garde de coût du compte coupe alors)."""
     from nokker.tenancy.context import INTERNAL_TENANT
     from nokker.tenancy.limits import day_window
 
+    opens = _opens_turn(body)
     lim = c.limits
-    if lim is None or machine.tenant == INTERNAL_TENANT:
-        return None
-    day = day_window(lim.clock())[0].date()
+    if machine.tenant == INTERNAL_TENANT:
+        return _InferenceTicket(turn_index=_turn_index(machine.id, session, opens))
     calls_key = f"{machine.account}#inference"  # compteur à part, même table : jamais mêlé aux tours du compte
-    if not lim.counter.take(machine.tenant, calls_key, day, "turns", c.inference_calls_per_day):
-        return (f"Limite du jour atteinte pour l'inférence de Nokker Lokkal : {c.inference_calls_per_day} appels par "
-                "jour et par compte. Elle repart avec le compteur du jour.")
-    if _opens_turn(body):
-        verdict = lim.check_turn(machine.account)
-        if verdict is not None:
+    day = day_window(lim.clock())[0].date() if lim is not None else None
+    if lim is not None and not lim.counter.take(machine.tenant, calls_key, day, "turns", c.inference_calls_per_day):
+        return _InferenceTicket(
+            refused=(f"Limite du jour atteinte pour l'inférence de Nokker Lokkal : {c.inference_calls_per_day} appels "
+                     "par jour et par compte. Elle repart avec le compteur du jour."))
+
+    def give_back() -> None:
+        if lim is not None:
             lim.counter.give_back(machine.tenant, calls_key, day, "turns")
+
+    tag, refused = _household_tag(c, machine, opens)
+    if refused is not None:
+        give_back()
+        return _InferenceTicket(refused=refused)
+    if opens and lim is not None:
+        verdict = lim.check_turn(machine.account, shared=tag is not None)
+        if verdict is not None:
+            give_back()
             logger.info("inférence relayée refusée (%s) : %s", verdict.rule, verdict.reason)
-            return lim.reply(verdict)
-    return None
+            return _InferenceTicket(refused=lim.reply(verdict))
+    return _InferenceTicket(tag=tag, turn_index=_turn_index(machine.id, session, opens))
+
+
+def ledger_usage_recorder(ledger: Any, default_model: str) -> Callable[..., None]:
+    """`CloudLink.record_usage` sur le ledger du noyau : une ligne par appel relayé, fil `lokkal-<machine>` du
+    locataire de la machine, au tour `turn_index`. L'étiquette courante (`spend_tag`, foyer) est lue par le ledger."""
+    from nokker.core.turn import LLMCall, Tier, Usage
+    from nokker.tenancy.context import scoped_thread_id
+
+    def record(tenant: str, machine: str, usage: dict[str, Any], seconds: float, model: str = "",
+               turn_index: int = 0) -> None:
+        # Appelé dans tenant_scope(tenant) : le ledger Postgres est sous RLS.
+        call = LLMCall(tier=Tier.DEEP, model=model or default_model, reasoning=False, prefix_sha256="",
+                       layer_tokens={}, usage=Usage(prompt=int(usage.get("prompt_tokens") or 0),
+                                                    completion=int(usage.get("completion_tokens") or 0)),
+                       latency_s=seconds, route_reason=f"lokkal:{machine}")
+        ledger.record(scoped_thread_id(tenant, f"lokkal-{machine}"), turn_index, call)
+
+    return record
 
 
 def _last_usage(chunk: bytes) -> dict[str, Any] | None:

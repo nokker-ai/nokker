@@ -126,7 +126,7 @@ def test_install_refused_when_a_skill_is_flagged(monkeypatch, tmp_path):
 
 def test_pack_tools_effects():
     specs = {s.name: s.effect for s in PackToolSource(home=Path("/nonexistent-home")).specs()}
-    assert specs == {"pack_list": Effect.READ, "pack_install": Effect.DESTRUCTIVE}
+    assert specs == {"pack_list": Effect.READ, "pack_install": Effect.DESTRUCTIVE, "pack_remove": Effect.DESTRUCTIVE}
 
 
 # ─────────────────────────────── contenu neutre ───────────────────────────────
@@ -156,7 +156,8 @@ _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _HOME = re.compile(r"(?i)(?:/root\b|/home/|/Users/|[A-Z]:\\|~/[A-Za-z])")
 _ABS = re.compile(r"(?<![\w.:/~<>{}-])/[A-Za-z][\w.-]*(?:/[\w.<>-]+)*")
-ALLOWED_ABS = ("/var/log", "/var/cache", "/var/lib/docker", "/etc/letsencrypt", "/dev/null", "/mcp")
+# `/v1/…` : routes publiques de l'API du noyau (contrat documenté), pas un chemin de machine.
+ALLOWED_ABS = ("/var/log", "/var/cache", "/var/lib/docker", "/etc/letsencrypt", "/dev/null", "/mcp", "/v1/")
 _URL = re.compile(r"https?://([^\s\"'`)]+)")
 _KEYLIKE = re.compile(r"(?i)\b(?:sk-[a-z0-9]{8,}|ghp_[a-z0-9]{8,}|xox[bap]-|akia[0-9a-z]{12,}|whsec_[a-z0-9]{6,}|"
                       r"-----BEGIN [A-Z ]*PRIVATE KEY)")
@@ -288,11 +289,23 @@ def _with_template(name: str, **changes):
     ("mail", {"tools": ["calendar_delete"]}, "non déclaré"),
     ("mail", {"budget": None}, "budget requis"),
     ("mail", {"secrets": ["sk-abcdefabcdefabcdefabcdef"]}, "valeur"),
+    ("mail", {"trigger": {"kind": "event", "event": "mail:is:unread"}, "tools": ["mail_draft"],
+              "auto_approve": ["mail_draft"]}, "événement"),
+    ("mail", {"trigger": {"kind": "event", "event": "mail:after:2026/01/01"}}, "after:"),
 ])
 def test_imprudent_templates_are_refused(pack, changes, needle):
     p, t = _with_template(pack, **changes)
     with pytest.raises(PackError, match=re.escape(needle)):
         resolve_agent(p, t)
+
+
+def test_a_mail_trigger_template_is_checked_here_and_gated_at_the_card():
+    """Un modèle `mail:<filtre>` : la syntaxe du filtre est vérifiée ici (le pack ne sait pas si l'instance a la relève
+    du courrier) ; c'est la carte `agent_draft` et la création qui refusent quand la relève n'est pas branchée."""
+    p, t = _with_template("mail", trigger={"kind": "event", "event": "mail:from:billing@example.com   is:unread"},
+                          auto_approve=[])
+    args, _ = resolve_agent(p, t)
+    assert args["trigger"] == {"kind": "event", "event": "mail:from:billing@example.com is:unread"}
 
 
 def test_binding_cannot_lower_an_effect():

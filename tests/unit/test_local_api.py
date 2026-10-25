@@ -181,6 +181,8 @@ def test_account_link_device_flow_keeps_the_key_in_the_vault(tmp_path, monkeypat
             polls.append(1)
             return httpx.Response(200, json={"state": "pending"} if len(polls) == 1 else
                                   {"state": "approved", "api_key": "rk-secret", "account": "us_abc"})
+        if req.url.path == "/v1/gateway/machine":
+            return httpx.Response(200, json={"pages_public": True})
         return httpx.Response(200, json={})
 
     api = _api(tmp_path)
@@ -191,7 +193,10 @@ def test_account_link_device_flow_keeps_the_key_in_the_vault(tmp_path, monkeypat
     assert status == 200 and body["user_code"] == "ABCD-1234" and "device_code" not in body
     assert api.handle("GET", "/v1/local/link/status", auth, {})[1] == {"state": "pending"}
     status, body = api.handle("GET", "/v1/local/link/status", auth, {})
-    assert body == {"state": "approved", "account": "us_abc"} and "rk-secret" not in json.dumps(body)
+    # sans jeton de machine, pas de droit de publier lu (pages publiques, §7.26)
+    assert body == {"state": "approved", "account": "us_abc", "pages_public": False} and "rk-secret" not in json.dumps(body)
+    api.setup.vault.put("machine_token", "mt-x")
+    assert api.handle("GET", "/v1/local/link/status", auth, {})[1]["pages_public"] is True
     assert api.setup.vault.get("router") == "rk-secret" and api.setup.state["default"] == "router"
     assert api.handle("DELETE", "/v1/local/link", auth, {})[1] == {"state": "unlinked"}
     assert api.setup.vault.get("router") is None and api.setup.state["default"] is None

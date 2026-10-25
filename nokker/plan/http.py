@@ -13,6 +13,7 @@ Identité vérifiée du locataire (comme /v1/agents) :
     POST   /v1/plan/cards/<id>/threads {thread_id}  DELETE /v1/plan/cards/<id>/threads/<thread_id>
     GET    /v1/plan/proposals?card_id=&state=       POST /v1/plan/proposals/<pp_…>/accept | /refuse
     GET    /v1/plan/brief                           POST /v1/plan/brief {cron?, tz?, model?}   DELETE /v1/plan/brief
+    GET    /v1/plan/brief/delivery                  PUT {telegram?: bool, email?: adresse | null}
 Erreurs : `{"error": {"code", "message"}}` ; une carte d'un autre locataire n'existe pas (404).
 """
 from __future__ import annotations
@@ -54,7 +55,7 @@ def handle(h: Any, method: str, path: str) -> bool:
     plan = _plan
     if plan is None or not is_path(path):
         return False
-    body = h._read_json_body() if method in ("POST", "PATCH") else {}
+    body = h._read_json_body() if method in ("POST", "PATCH", "PUT") else {}
     body = body if isinstance(body, dict) else {}
     sender = h._resolve_identity(body)
     if sender is None:
@@ -123,6 +124,14 @@ def _dispatch(plan: Plan, h: Any, method: str, path: str, body: dict[str, Any], 
     m = _RE_PROPOSAL.match(path)
     if m and method == "POST":
         return 200, plan.decide(m.group(1), m.group(2), sender)
+    if path == "/v1/plan/brief/delivery":
+        if plan.delivery is None:
+            return None
+        if method == "GET":
+            return 200, plan.delivery.get(sender)
+        if method == "PUT":
+            return 200, plan.delivery.put(sender, body)
+        return None
     if path == "/v1/plan/brief":
         if method == "GET":
             a = plan.get_brief(sender)

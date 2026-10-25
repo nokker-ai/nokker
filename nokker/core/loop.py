@@ -33,10 +33,11 @@ from nokker.core.ports import (
 from nokker.core.live_input import LiveToolInputs
 from nokker.core.stream import ScrubbedDeltas, holdback_for
 from nokker.core.turn_lock import TurnLocks
-from nokker.images.render import materialize
+from nokker.images.render import has_images, materialize
 from nokker.core.turn import (
     Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
 )
+from nokker.ledger.attribution import merge_tags, spend_tag
 from nokker.tenancy.context import submit_in_context
 
 if TYPE_CHECKING:
@@ -328,6 +329,14 @@ class Kernel:
     # Plafonds des testeurs (docs/TENANCY.md §5, `nokker/tenancy/limits.py::TenantLimits`) : vérifiés AVANT le tour,
     # jamais pour le locataire interne. `None` = aucun plafond (tests, bancs).
     limits: TenantLimits | None = None
+    # Budget des projets d'équipe (docs/LOKKAL.md §7.15, `nokker/team/budget.py::ProjectBudget`) : un tour rattaché à un
+    # projet porte son étiquette au ledger ; au-delà du plafond du projet, refusé AVANT tout appel modèle (comme
+    # `limits`). `None` = équipe éteinte, rien n'est attribué.
+    project_budget: Any = None
+    # Quota commun du foyer (lot X23, `nokker/household/quota.py::HouseholdQuota`) : un tour d'un membre porte
+    # l'étiquette du foyer au ledger (même mécanisme que le budget) ; au-delà d'un plafond du foyer ou du membre, refusé
+    # AVANT tout appel modèle. `None` = foyer éteint, rien n'est attribué.
+    household: Any = None
     # Arrêt propre demandé par l'appelant (passage d'un agent Crew, lot X14 : budget d'appels ou de coût atteint) :
     # appelé avant chaque appel modèle ; un motif (chaîne) termine le tour sur « Arrêté par le noyau : <motif>. »,
     # `turn.error = "stopped"`, sans nouvel appel. None = jamais.
@@ -473,13 +482,30 @@ class Kernel:
         Un tour à la fois par fil, dans l'ordre d'arrivée (`turn_locks`) : un tour demandé pendant qu'un autre tourne
         attend sa fin, prend l'index suivant et voit son contexte."""
         with self.turn_locks.get(inp.thread_id):
-            return self._run_turn(inp, stream)
+            # 0. Projet d'équipe : le budget est relu avant le tour ; refusé, le tour s'arrête là (rien n'est compté
+            # au plafond du compte). Attribué, chaque appel du tour porte le projet au ledger (`spend_tag`).
+            # 0 bis. Foyer (X23) : quota commun et plafond du membre, comptés en tours dans le ledger ; un tour d'un
+            # membre porte l'étiquette du foyer, en plus de celle d'un projet d'équipe s'il y en a une.
+            house = self.household.check(inp.thread_id, inp.sender) if self.household is not None else None
+            if house is not None and house.verdict is not None:
+                return self._limited_turn(inp, self.invariants.check_input(inp.user_text), house.verdict,
+                                          reply=house.reply)
+            ticket = self.project_budget.check(inp.thread_id, inp.sender) if self.project_budget is not None else None
+            if ticket is not None and ticket.verdict is not None:
+                return self._limited_turn(inp, self.invariants.check_input(inp.user_text), ticket.verdict,
+                                          reply=ticket.reply)
+            with spend_tag(merge_tags(ticket.tag if ticket is not None else None,
+                                      house.tag if house is not None else None)):
+                return self._run_turn(inp, stream, ticket, house)
 
-    def _run_turn(self, inp: TurnInput, stream: TurnStream | None = None) -> Turn:
+    def _run_turn(self, inp: TurnInput, stream: TurnStream | None = None, budget_ticket: Any = None,
+                  household_ticket: Any = None) -> Turn:
         # 1. Entrée : caviardage + drapeaux de domaine AVANT tout enregistrement.
         checked = self.invariants.check_input(inp.user_text)
-        # 1 bis. Plafond du compte (testeurs seulement) : au-delà, réponse claire, sans rappel ni appel modèle.
-        over = self.limits.check_turn(inp.sender) if self.limits is not None else None
+        # 1 bis. Plafond du compte (testeurs seulement) : au-delà, réponse claire, sans rappel ni appel modèle. Membre
+        # d'un foyer : le quota est celui du foyer (0 bis), seule la garde de coût du compte reste (`shared`).
+        shared = household_ticket is not None
+        over = self.limits.check_turn(inp.sender, shared=shared) if self.limits is not None else None
         if over is not None:
             return self._limited_turn(inp, checked, over)
         # 2 (lancé tôt). Rappel du tour : part maintenant, en parallèle de la préparation du contexte ci-dessous,
@@ -722,12 +748,23 @@ class Kernel:
         # 8 bis. Quota dépassé en mode soft : l'avertissement suit la réponse (une fois par fenêtre). Hors de
         # `messages` : le modèle ne le relit pas au tour suivant. Le chunk final du flux porte `turn.reply`.
         try:
-            notice = self.limits.notice(inp.sender) if self.limits is not None else None
+            notice = self.limits.notice(inp.sender, shared=shared) if self.limits is not None else None
+            if household_ticket is not None and notice is None:
+                notice = self.household.notice(household_ticket)  # foyer en mode soft : quota passé, une fois
         except Exception:  # noqa: BLE001 — un avertissement manqué ne casse jamais le tour
             logger.warning("avertissement de quota en échec", exc_info=True)
             notice = None
         if notice:
             turn.reply = f"{turn.reply}\n\n{notice}"
+        # 8 ter. Budget du projet : avertissement quand CE tour fait passer 80 % du plafond (une fois).
+        if budget_ticket is not None:
+            try:
+                project_notice = self.project_budget.notice(budget_ticket, turn.calls)
+            except Exception:  # noqa: BLE001 — un avertissement manqué ne casse jamais le tour
+                logger.warning("avertissement du budget de projet en échec", exc_info=True)
+                project_notice = None
+            if project_notice:
+                turn.reply = f"{turn.reply}\n\n{project_notice}"
         # 9. Fin de tour : append-only. L'extraction de faits → quarantaine arrive avec A-3 (memory.propose).
         self.store.append(turn)
         self._after_turn(turn)
@@ -749,13 +786,16 @@ class Kernel:
                 logger.warning("hooks turn_end en échec", exc_info=True)
         return turn
 
-    def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict) -> Turn:
-        """Tour refusé par le plafond du jour : gardé dans l'historique avec son verdict, sans appel modèle."""
+    def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict, *, reply: str | None = None) -> Turn:
+        """Tour refusé par un plafond (compte, ou budget du projet : `reply` donné) : gardé dans l'historique avec son
+        verdict, sans appel modèle."""
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender)
         self._observe("turn_started", turn)
         self._log_verdicts(turn, [verdict])
-        turn.reply = self.limits.reply(verdict) if self.limits is not None else ""
+        if reply is None:
+            reply = self.limits.reply(verdict) if self.limits is not None else ""
+        turn.reply = reply
         turn.messages.append(Message(role="assistant", content=turn.reply))
         self.store.append(turn)
         self._after_turn(turn)
@@ -879,10 +919,22 @@ class Kernel:
 
     def _wire_messages(self, provider: Provider, assembled, thread_id: str, turn: Turn | None) -> list[dict]:
         """Messages tels qu'ils partent (X7) : parties `nokker_image` du Context Engine changées en `image_url` (palier
-        avec vision) ou en note texte (sans vision). Des images non lues : verdict `images:not_read` au ledger et
-        événement `attachment.skipped` à l'utilisateur, une fois par tour."""
+        avec vision) ou en note texte (sans vision). Des images du tour courant non lues : verdict `images:not_read` au
+        ledger et événement `attachment.skipped` à l'utilisateur, une fois par tour ; celles des tours précédents,
+        sans vision, deviennent leur ligne de délestage, sans rien signaler."""
         vision = bool(getattr(provider, "vision", False))
-        messages, skipped = materialize(assembled.messages, vision=vision, blobs=self.images, thread_id=thread_id)
+        probe = getattr(provider, "vision_probe", None)
+        if not vision and probe is not None and has_images(assembled.messages):
+            # Vision `auto` (§7.6) : UNE sonde, ici seulement (un tour qui porte une image), jamais en fond.
+            vision, fresh = probe.check(provider)
+            if fresh and turn is not None:
+                self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
+                                                  rule="images:vision_probe",
+                                                  reason=f"sonde de vision {getattr(provider, 'model', '?')} : "
+                                                         f"{'oui' if vision else 'non'} ({probe.last_reason})")])
+        # Images non lues signalées pour CE tour seulement ; celles des tours d'avant sont délestées en une ligne.
+        messages, skipped = materialize(assembled.messages, vision=vision, blobs=self.images, thread_id=thread_id,
+                                        current_turn=turn.index if turn is not None else None)
         if skipped and turn is not None and not any(v.rule == "images:not_read" for v in turn.verdicts):
             self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
                                               rule="images:not_read",

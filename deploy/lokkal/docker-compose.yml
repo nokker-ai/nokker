@@ -13,13 +13,17 @@
 #   openbao, vault-unseal    profil `vault` (install.sh --vault, COMPOSE_PROFILES=vault dans .env) : coffre OpenBao
 #               des secrets du noyau, et son compagnon qui le descelle (mode auto) ; vault-init (profil vault-init,
 #               lancé une fois par l'installeur) l'initialise. La part et le root token n'entrent jamais dans `core`.
+#   ollama, local-llm-pull   profil `local-llm` (install.sh --local-llm, COMPOSE_PROFILES=local-llm) : moteur
+#               d'inférence local (Ollama, CPU) et le job qui tire le modèle NOKKER_LOCAL_LLM_MODEL ; le noyau le
+#               détecte (NOKKER_OLLAMA_URLS) et /setup le propose comme modèle local. Aucun port publié.
 #
 # Réseaux (aucun port publié hors 127.0.0.1) :
-#   internal    core, web, postgres, embed, init, openbao — interne : pas d'Internet
+#   internal    core, web, postgres, embed, init, openbao, ollama — interne : pas d'Internet
 #   dockerapi   core ↔ dockerproxy seulement — interne
 #   sandbox     `nokker-sandbox` : bacs à sable ↔ egress seulement — interne ; nom fixe, le noyau le passe à docker
 #   front       web seul : publie 127.0.0.1:${NOKKER_PORT} (docker ne publie pas depuis un réseau interne)
-#   outbound    core (modèles : Router Nokker ou fournisseur choisi), egress, embed (téléchargement du modèle)
+#   outbound    core (modèles : Router Nokker ou fournisseur choisi), egress, embed et ollama (téléchargement des
+#               modèles)
 name: nokker
 
 x-hardening: &hardening
@@ -60,6 +64,9 @@ services:
       NOKKER_SANDBOX_IMAGE: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
       APPROVALS_ENC_KEY: ${NOKKER_APPROVALS_KEY:?}
       ROUTER_KEY: ${NOKKER_ROUTER_KEY:-}
+      # Modèle local (setup.py, détection Ollama, premier qui répond) : le service `ollama` du profil local-llm, puis
+      # un Ollama de l'hôte (les deux candidats d'avant). La variable remplace la liste entière.
+      NOKKER_OLLAMA_URLS: ${NOKKER_OLLAMA_URLS:-http://ollama:11434,http://host.docker.internal:11434,http://127.0.0.1:11434}
       # Coffre (LOKKAL §7 X4) : `file` (vault.bin, NOKKER_LOCAL_SECRET_KEY) sans le profil vault ; `openbao` avec. Le
       # noyau ne reçoit que role_id et secret_id de l'AppRole nokker-core, en fichiers (rien dans l'environnement).
       NOKKER_SECRETS_PROVIDER: ${NOKKER_SECRETS_PROVIDER:-file}
@@ -281,10 +288,52 @@ services:
       - ./vault/approle:/vault/approle
     networks: [internal]
 
+  # ---- profil local-llm -----------------------------------------------------------------------------------
+  ollama:
+    <<: *hardening
+    profiles: [local-llm]
+    # Ollama 0.40.2 (index multi-arch). CPU : un GPU se donne par un docker-compose.override.yml (docs/en/models.md).
+    image: ${NOKKER_OLLAMA_IMAGE:-ollama/ollama@sha256:b86366bb528bbf7f1424435d165028497a5b69bf6ddb4fa5a87102e2b79f44fb}
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${NOKKER_LOCAL_LLM_KEEP_ALIVE:-15m}
+      # L'image pose NVIDIA_VISIBLE_DEVICES=all : sur un hôte où le runtime NVIDIA est installé sans pilote chargé, le
+      # conteneur ne démarre même pas (NVML). CPU par défaut ; l'override GPU remet `all` (docs/en/models.md).
+      NVIDIA_VISIBLE_DEVICES: ${NOKKER_LOCAL_LLM_NVIDIA:-void}
+    read_only: true
+    tmpfs: [/tmp]
+    volumes: [llm:/root/.ollama]   # modèles et clé d'identité d'Ollama ; survivent à une mise à jour
+    networks: [internal, outbound]
+    mem_limit: ${NOKKER_LOCAL_LLM_MEM:-8g}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  local-llm-pull:
+    <<: *hardening
+    profiles: [local-llm]
+    restart: "no"
+    image: ${NOKKER_OLLAMA_IMAGE:-ollama/ollama@sha256:b86366bb528bbf7f1424435d165028497a5b69bf6ddb4fa5a87102e2b79f44fb}
+    # Le serveur télécharge (réseau outbound du service ollama) ; le job ne fait que le demander, puis s'arrête.
+    # Déjà présent : rien à télécharger, le job sort tout de suite.
+    entrypoint: ["ollama", "pull", "${NOKKER_LOCAL_LLM_MODEL:-qwen3:4b}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      NVIDIA_VISIBLE_DEVICES: void   # même image : même blocage NVML sans pilote (voir ollama)
+    depends_on:
+      ollama: {condition: service_healthy}
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [internal]
+
 volumes:
   postgres:
   models:
   vault:
+  llm:
 
 networks:
   internal: {internal: true}

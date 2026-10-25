@@ -119,13 +119,170 @@ def _upstream_checkpoints(home: Path | None = None) -> Any | None:
         return _cm_module or None
 
 
+_manager_cls: Any = None
+
+
+def _manager_class(cm: Any) -> Any:
+    """Le gestionnaire amont, plus deux gestes à nous : `tip` (hash du dernier point d'un dossier) et
+    `restore_created` (revenir, pour UN fichier, à un point où il n'existait pas : le supprimer)."""
+    global _manager_cls
+    if _manager_cls is not None and _manager_cls.__mro__[1] is cm.CheckpointManager:
+        return _manager_cls
+
+    class Manager(cm.CheckpointManager):  # type: ignore[misc, name-defined]
+        def tip(self, working_dir: str) -> str | None:
+            abs_dir = str(cm._normalize_path(working_dir))
+            store = cm._store_path()
+            if not (store / "HEAD").exists():
+                return None
+            return cm._ref_tip(store, abs_dir, cm._ref_name(cm._project_hash(abs_dir)))
+
+        def restore_created(self, working_dir: str, commit_hash: str, file_path: str) -> dict | None:
+            from tools.checkpoint_pruning import PruneError, store_lock
+
+            try:
+                with store_lock(cm._resolve_checkpoint_base()):
+                    return self._restore_created(working_dir, commit_hash, file_path)
+            except (PruneError, OSError) as exc:
+                return {"success": False, "error": str(exc)}
+
+        def _restore_created(self, working_dir: str, commit_hash: str, file_path: str) -> dict | None:
+            """None : le fichier existe dans le point (restauration habituelle). Sinon le supprime, mais seulement
+            après une photo « avant retour » qui en contient EXACTEMENT le contenu actuel : jamais la seule copie."""
+            err = cm._validate_commit_hash(commit_hash) or cm._validate_file_path(file_path, working_dir)
+            if err:
+                return {"success": False, "error": err}
+            abs_dir = str(cm._normalize_path(working_dir))
+            store = cm._store_path()
+            if not (store / "HEAD").exists():
+                return {"success": False, "error": "No checkpoints exist for this directory"}
+            ok, _, _ = cm._run_git(["cat-file", "-t", commit_hash], store, abs_dir, allowed_returncodes={1, 128})
+            if not ok:
+                return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
+            rel = os.path.normpath(file_path).replace(os.sep, "/")
+            ok, _, _ = cm._run_git(["cat-file", "-e", f"{commit_hash}:{rel}"], store, abs_dir,
+                                   allowed_returncodes={1, 128})
+            if ok:
+                return None
+            target = Path(abs_dir) / rel
+            _, subject, _ = cm._run_git(["log", "--format=%s", "-1", commit_hash], store, abs_dir)
+            done = {"success": True, "restored_to": commit_hash[:8], "reason": subject or "unknown",
+                    "directory": abs_dir, "file": rel}
+            if not target.exists() and not target.is_symlink():
+                return {**done, "deleted": False, "message": "absent au point et déjà absent : rien à faire"}
+            if target.is_symlink() or not target.is_file():
+                return {"success": False, "error": f"{rel} n'est pas un fichier ordinaire (dossier ou lien) : "
+                                                   "restaure le dossier entier"}
+            if self._exceeds_size_cap(target):
+                return {"success": False, "error": f"{rel} non capturé par les points de retour (trop gros) : "
+                                                   "pas supprimé, ce serait la seule copie"}
+            self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})", prune=False)
+            snap = self.tip(abs_dir)
+            ok_blob, in_snap, _ = cm._run_git(["rev-parse", "--verify", "-q", f"{snap}:{rel}"], store, abs_dir,
+                                              allowed_returncodes={1, 128}) if snap else (False, "", "")
+            ok_now, now, _ = cm._run_git(["hash-object", f"--path={rel}", str(target)], store, abs_dir)
+            if not (ok_blob and ok_now and in_snap.strip() and in_snap.strip() == now.strip()):
+                return {"success": False, "error": f"{rel} non capturé par les points de retour (exclu ou ignoré) : "
+                                                   "pas supprimé, ce serait la seule copie"}
+            try:
+                target.unlink()
+            except OSError as exc:
+                return {"success": False, "error": f"suppression de {rel} impossible : {exc}"}
+            self._prune(store, abs_dir, cm._ref_name(cm._project_hash(abs_dir)))
+            return {**done, "deleted": True, "snapshot": snap}
+
+    _manager_cls = Manager
+    return Manager
+
+
 def make_manager(home: Path | None = None, *, max_snapshots: int = 20, max_total_size_mb: int = 500,
                  max_file_size_mb: int = 10) -> Any | None:
     cm = _upstream_checkpoints(home)
     if cm is None:
         return None
-    return cm.CheckpointManager(enabled=True, max_snapshots=max_snapshots, max_total_size_mb=max_total_size_mb,
-                                max_file_size_mb=max_file_size_mb)
+    return _manager_class(cm)(enabled=True, max_snapshots=max_snapshots, max_total_size_mb=max_total_size_mb,
+                              max_file_size_mb=max_file_size_mb)
+
+
+# ─────────────────────────────── points ↔ tours ───────────────────────────────
+
+LINKS_FILE = "turn-links.json"
+MAX_LINKS = 2000
+
+
+def links_path(home: Path | None = None) -> Path:
+    """`<état>/checkpoints/turn-links.json` : à côté du magasin des points, dans l'état local de la machine."""
+    base = Path(home) if home is not None else Path(os.environ.get("HERMES_HOME") or nokker_home())
+    return base / "checkpoints" / LINKS_FILE
+
+
+class TurnLinks:
+    """Hash d'un point → `{thread_id, turn_index, tool}` du tour qui l'a pris (outil avant lequel la photo a été prise).
+    Fichier JSON réécrit atomiquement, borné aux `cap` derniers points ; illisible = aucun lien, jamais d'erreur."""
+
+    def __init__(self, path: Path, cap: int = MAX_LINKS) -> None:
+        self.path, self.cap = Path(path), max(1, cap)
+        self._mu = threading.Lock()
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def add(self, commit: str, thread_id: str, turn_index: int, tool: str) -> None:
+        if not commit:
+            return
+        with self._mu:
+            data = self._load()
+            data.pop(commit, None)
+            data[commit] = {"thread_id": thread_id, "turn_index": turn_index, "tool": tool}
+            for old in list(data)[:max(0, len(data) - self.cap)]:
+                data.pop(old, None)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, self.path)
+            except OSError:
+                logger.warning("liens des points de retour non écrits (%s)", self.path, exc_info=True)
+
+    def get(self, commit: str) -> dict[str, Any] | None:
+        if not commit:
+            return None
+        with self._mu:
+            found = self._load().get(commit)
+        return dict(found) if isinstance(found, dict) else None
+
+    def annotate(self, entries: list[dict]) -> list[dict]:
+        with self._mu:
+            data = self._load()
+        return [{**e, **data[e["hash"]]} if isinstance(data.get(e.get("hash")), dict) else e for e in entries]
+
+
+def _tip(manager: Any, root: Path) -> str | None:
+    fn = getattr(manager, "tip", None)
+    try:
+        return fn(str(root)) if callable(fn) else None
+    except Exception:  # noqa: BLE001 — le lien est un plus, jamais une panne
+        logger.warning("dernier point de %s illisible", root, exc_info=True)
+        return None
+
+
+def _announce(links: TurnLinks | None, emit: Callable[[str, dict[str, Any]], Any] | None, commit: str | None,
+              ctx: ToolContext, tool: str) -> None:
+    """Point nouveau : lien au tour (état local) et `checkpoint.created {thread_id, turn_index, hash, tool}`."""
+    if not commit:
+        return
+    if links is not None:
+        links.add(commit, ctx.thread_id, ctx.turn_index, tool)
+    if emit is not None:
+        try:
+            emit("checkpoint.created", {"thread_id": ctx.thread_id, "turn_index": ctx.turn_index, "hash": commit,
+                                        "tool": tool})
+        except Exception:  # noqa: BLE001 — un abonné en panne ne casse jamais un outil
+            logger.debug("emit checkpoint.created a levé", exc_info=True)
 
 
 def auto_prune(home: Path | None = None) -> dict[str, Any]:
@@ -181,10 +338,13 @@ class CheckpointingToolSource:
     n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente."""
 
     def __init__(self, inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None,
-                 manager: Any | None = None) -> None:
+                 manager: Any | None = None, links: TurnLinks | None = None,
+                 emit: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
         self.inner = inner
         self.root_of = root_of
         self.manager = manager if manager is not None else make_manager(home)
+        self.links = links
+        self.emit = emit  # `checkpoint.created` (posé par le serveur local)
         self._turns: dict[str, int] = {}
         self._mu = threading.Lock()
 
@@ -213,8 +373,9 @@ class CheckpointingToolSource:
                 if self._turns.get(ctx.thread_id) != ctx.turn_index:
                     self._turns[ctx.thread_id] = ctx.turn_index
                     self.manager.new_turn()
-            if call_effect(self._spec(name), args) is not Effect.READ:
-                self.manager.ensure_checkpoint(str(root), f"avant {name}")
+            if call_effect(self._spec(name), args) is not Effect.READ \
+                    and self.manager.ensure_checkpoint(str(root), f"avant {name}"):
+                _announce(self.links, self.emit, _tip(self.manager, root), ctx, name)
         except Exception:  # noqa: BLE001 — la capture ne fait jamais échouer l'outil
             logger.warning("capture avant %s en échec", name, exc_info=True)
         return root
@@ -257,10 +418,13 @@ class CheckpointToolSource:
     """`ToolSource` des quatre outils de points de retour, sur le dossier hôte que donne `root_of(thread_id)`."""
 
     def __init__(self, root_of: Callable[[str], Path | None], home: Path | None = None, manager: Any | None = None,
-                 core: bool = False) -> None:
+                 core: bool = False, links: TurnLinks | None = None,
+                 emit: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
         self.root_of = root_of
         self.manager = manager if manager is not None else make_manager(home)
         self.core = core
+        self.links = links
+        self.emit = emit
 
     def specs(self) -> list[ToolSpec]:
         return [ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core, source=SOURCE)
@@ -287,10 +451,11 @@ class CheckpointToolSource:
                 m.ensure_checkpoint(root_s, reason)
                 new = _fr_entries([c for c in m.list_checkpoints(root_s) if c["hash"] not in before])
                 if new:
-                    return out({"created": True, **new[0]})
+                    _announce(self.links, self.emit, new[0]["hash"], ctx, name)
+                    return out({"created": True, **self._linked([new[0]])[0]})
                 return out({"created": False, "message": "aucun changement depuis le dernier point de retour"})
             if name == "checkpoint_list":
-                return out(_fr_entries(m.list_checkpoints(root_s)))
+                return out(self._linked(_fr_entries(m.list_checkpoints(root_s))))
             if name == "checkpoint_diff":
                 h = str(a.get("hash") or "").strip()
                 r = m.diff(root_s, h) if h else m.session_diff(root_s)
@@ -303,12 +468,26 @@ class CheckpointToolSource:
             # checkpoint_restore
             if not a.get("hash"):
                 return out("argument manquant : hash", True)
-            r = m.restore(root_s, str(a["hash"]), a.get("file") or None, safe=bool(a.get("safe", True)))
+            before_tip = _tip(m, root)
+            r = None
+            created = getattr(m, "restore_created", None)
+            if a.get("file") and callable(created):
+                # Fichier absent au point (créé depuis) : le revenir à ce point = le supprimer (photo avant).
+                r = created(root_s, str(a["hash"]), str(a["file"]))
+            if r is None:
+                r = m.restore(root_s, str(a["hash"]), a.get("file") or None, safe=bool(a.get("safe", True)))
+            after_tip = _tip(m, root)
+            if after_tip and after_tip != before_tip:  # le point « avant retour » pris par la restauration
+                _announce(self.links, self.emit, after_tip, ctx, name)
             if isinstance(r, dict) and r.get("reason"):
                 r = {**r, "reason": fr_reason(str(r["reason"]))}
             return out(r, not r.get("success"))
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle
             return out(f"{type(e).__name__}: {e}", True)
+
+
+    def _linked(self, entries: list[dict]) -> list[dict]:
+        return self.links.annotate(entries) if self.links is not None else entries
 
 
 _REASON_PRE_ROLLBACK = re.compile(r"^pre-rollback snapshot \(restoring to ([0-9a-f]{7,40})\)$")
@@ -327,12 +506,16 @@ def _fr_entries(entries: list[dict]) -> list[dict]:
     return [{**c, "reason": fr_reason(str(c.get("reason", "")))} for c in entries]
 
 
-def checkpoint_sources(inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None
+def checkpoint_sources(inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None,
+                       emit: Callable[[str, dict[str, Any]], Any] | None = None
                        ) -> tuple[CheckpointingToolSource, CheckpointToolSource]:
-    """Enveloppe + outils, sur le MÊME gestionnaire : `Registry(sources=[wrapper, tools, …])`."""
+    """Enveloppe + outils, sur le MÊME gestionnaire et les MÊMES liens point ↔ tour : `Registry(sources=[wrapper,
+    tools, …])`. `emit(nom, données)` publie `checkpoint.created`."""
     manager = make_manager(home)
-    return (CheckpointingToolSource(inner, root_of, home, manager), CheckpointToolSource(root_of, home, manager))
+    links = TurnLinks(links_path(home))
+    return (CheckpointingToolSource(inner, root_of, home, manager, links=links, emit=emit),
+            CheckpointToolSource(root_of, home, manager, links=links, emit=emit))
 
 
-__all__ = ["CHECKPOINT_TOOLS", "CheckpointToolSource", "CheckpointingToolSource", "auto_prune",
-           "checkpoint_sources", "code_root_of", "host_path", "make_manager", "nokker_home"]
+__all__ = ["CHECKPOINT_TOOLS", "CheckpointToolSource", "CheckpointingToolSource", "TurnLinks", "auto_prune",
+           "checkpoint_sources", "code_root_of", "host_path", "links_path", "make_manager", "nokker_home"]

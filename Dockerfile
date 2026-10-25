@@ -119,6 +119,19 @@ RUN set -eu; \
     echo "$sum  /tmp/docker.tgz" | sha256sum -c -; \
     tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
     rm /tmp/docker.tgz; docker --version
+# kubectl : bac à sable Kubernetes (X19, nokker/tools/k8s_sandbox.py, chart deploy/helm/nokker) — pods de session créés
+# et pilotés (apply, wait, exec, delete) avec le compte de service du pod du noyau. Binaire officiel épinglé par sha256 ;
+# 1.36 couvre les API 1.35 à 1.37, et les verbes utilisés (Pod v1, exec) sont stables bien en deçà.
+ARG KUBECTL_VERSION=v1.36.5
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) sum=33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e ;; \
+      arm64) sum=88fc1aca8fd0c1b44fe379f67c39bd6858bdfc50241dc55775f84d0f5b31da3a ;; \
+      *) echo "architecture non prise en charge : $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl"; \
+    echo "$sum  /usr/local/bin/kubectl" | sha256sum -c -; \
+    chmod 755 /usr/local/bin/kubectl; kubectl version --client
 # git : `nokker review` (X13, action GitHub/Forgejo) lit le diff de la PR dans cette image ; pas dans l'image bêta.
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* && git --version

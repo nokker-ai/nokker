@@ -84,7 +84,15 @@ def _cmd_code(args: argparse.Namespace) -> int:
             parent["k"], observer=observer, tools=hooks["r"].wrap(registry) if "r" in hooks else registry),
         source)
     memory_tools = [ProjectMemoryTools(project_memory)] if project_memory is not None else []
-    kernel = build_kernel(config, extra_sources=[wrapper, checkpoints, delegate, *memory_tools])
+    skill_tools = []
+    if getattr(args, "project_skills", False) or local.get("project_skills", False):
+        # Skills (§7.21) : ceux de l'utilisateur et ceux du dépôt, ces derniers seulement avec la confiance de
+        # l'utilisateur pour CE dossier et CETTE empreinte (lue dans SES réglages), jamais en mode plan.
+        from nokker.tools.skills import ProjectSkills, SkillToolSource
+
+        skill_tools = [SkillToolSource(home=Path(local["state_dir"]).expanduser() if local.get("state_dir") else None,
+                                       project=ProjectSkills(user_settings=_user_settings_path(local)))]
+    kernel = build_kernel(config, extra_sources=[wrapper, checkpoints, delegate, *skill_tools, *memory_tools])
     parent["k"] = kernel
     delegate.bind(getattr(kernel.tools, "internal", kernel.tools))
     kernel.max_calls = args.max_calls
@@ -117,6 +125,12 @@ def _cmd_code(args: argparse.Namespace) -> int:
         state = hooks["r"].open_session(thread_id, args.workspace)
         if state.get("notice"):
             print(f"[hooks] {state['notice']}", file=sys.stderr)
+    if skill_tools:
+        project = skill_tools[0].project
+        project.mode_of = perms.mode_for  # mode du fil, dépôt compris : plan → aucun skill du dépôt
+        state = project.open_session(thread_id, args.workspace, args.workspace)  # jamais au-dessus du dossier monté
+        if state.get("notice"):
+            print(f"[skills] {state['notice']}", file=sys.stderr)
     if project_memory is not None:
         install(kernel, project_memory)
         project_memory.open_session(thread_id, args.workspace, args.workspace)
@@ -151,6 +165,18 @@ def _cmd_code(args: argparse.Namespace) -> int:
             print(f"[erreur: {turn.error}]", file=sys.stderr)
         print(turn.reply)
     return 1 if turn.error else 0
+
+
+def _user_settings_path(local: dict | None = None):
+    """Réglages de l'UTILISATEUR, là où `nokker skills trust` écrit la confiance : `local.settings_path`, sinon
+    `$NOKKER_HOME/settings.json`, sinon `~/.config/nokker/settings.json`. Jamais un fichier du dépôt."""
+    import os
+    from pathlib import Path
+
+    if local and local.get("settings_path"):
+        return Path(local["settings_path"]).expanduser()
+    home = os.environ.get("NOKKER_HOME")
+    return Path(home) / "settings.json" if home else Path.home() / ".config" / "nokker" / "settings.json"
 
 
 def _code_turn_cost(kernel, thread_id: str, turn, started) -> dict:
@@ -204,6 +230,49 @@ def _cmd_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_skills(args: argparse.Namespace) -> int:
+    """`nokker skills show|trust` : les skills du `.nokker/skills` d'un dépôt ne sont chargés qu'une fois déclarés de
+    confiance par l'utilisateur pour CE dossier et CETTE empreinte de l'arbre (nokker/tools/skills.py). `trust` exige
+    l'empreinte recopiée, comme `nokker hooks trust`."""
+    import json
+    import os
+    from pathlib import Path
+
+    from nokker.tools.hooks import is_trusted, read_settings, trust_project_hooks
+    from nokker.tools.skills import (
+        PROJECT_SKILLS_DIR, PROJECT_TRUST_KEY, ProjectSkills, SkillToolSource, parse_frontmatter, project_skills_sha256,
+    )
+
+    settings = Path(args.settings).expanduser() if args.settings else _user_settings_path()
+    root = ProjectSkills.repo_root(args.workspace, os.path.abspath(os.sep))
+    folder = Path(root, *PROJECT_SKILLS_DIR)
+    if folder.is_symlink() or folder.parent.is_symlink():
+        print(f"{folder} est un lien symbolique : ignoré", file=sys.stderr)
+        return 2
+    sha, count, why = project_skills_sha256(folder) if folder.is_dir() else (None, 0, None)
+    if why:
+        print(f"skills du dépôt ignorés : {why}", file=sys.stderr)
+        return 2
+    if not count:
+        print(f"aucun skill dans {folder}")
+        return 0 if args.skills_command == "show" else 1
+    if args.skills_command == "show":
+        names = []
+        for d in SkillToolSource._skill_dirs(folder):
+            fm, _ = parse_frontmatter((d / "SKILL.md").read_text(encoding="utf-8-sig", errors="replace"))
+            names.append(str(fm.get("name") or d.name).strip())
+        trusted = is_trusted(read_settings(settings), root, sha, PROJECT_TRUST_KEY)  # type: ignore[arg-type]
+        print(json.dumps({"root": root, "sha256": sha, "trusted": trusted, "skills": sorted(names)},
+                         ensure_ascii=False, indent=1))
+        return 0
+    if args.sha256 != sha:
+        print(f"empreinte différente : l'arbre actuel est {sha} (relis-le avec `nokker skills show`)", file=sys.stderr)
+        return 1
+    trust_project_hooks(settings, root, sha, key=PROJECT_TRUST_KEY)  # type: ignore[arg-type]
+    print(f"confiance enregistrée dans {settings} : {root} ({sha[:12]}…)")
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """`nokker review` (lot X13) : relecture d'un diff ou d'une PR par le juge (nokker/review/cli.py)."""
     from nokker.review.cli import run
@@ -249,14 +318,56 @@ def _admin_dsn(args: argparse.Namespace) -> str | None:
 
 
 def _cmd_erase(args: argparse.Namespace) -> int:
-    from nokker.admin.erase import EraseError, erase_account
+    from nokker.admin.erase import EraseError, erase_account, erase_scope
 
+    if args.journal and not args.pending:
+        print("[erreur: --journal ne vaut que pour --pending]", file=sys.stderr)
+        return 2
+    if args.pending:
+        # Suppressions accordées par les personnes elles-mêmes (carte forte) : l'accord vaut confirmation. Même portée
+        # que l'effacement sur demande (images, sessions de code, index de session), sous verrou consultatif.
+        from contextlib import nullcontext
+
+        from nokker.admin import erase as erase_mod
+
+        # Journal de rejeu (--journal) vérifié et ouvert AVANT tout : dossier absent ou non inscriptible → code 2.
+        try:
+            if args.journal and args.apply:
+                journal_cm = erase_mod.ErasureJournal.open(args.journal)
+            else:
+                if args.journal:
+                    erase_mod.ErasureJournal.check(args.journal)
+                journal_cm = nullcontext(None)
+        except erase_mod.JournalUnusable as e:
+            print(f"[erreur: {e} — rien n'est fait]", file=sys.stderr)
+            return 2
+        with journal_cm as journal:
+            dsn = _admin_dsn(args)
+            if not dsn:
+                return 1
+            if args.apply and journal is None:
+                print("[avertissement : sans journal (--journal PATH), cet effacement n'est pas rejouable après "
+                      "restauration d'une sauvegarde]", file=sys.stderr)
+            # Sortie : avec --apply, UNE ligne par passage sur stdout (date et nombres, rien d'autre) — c'est elle qui
+            # part dans les journaux du pod. Jamais l'adresse, le compte, le locataire ni le compte rendu par table ;
+            # le locataire va seulement au fichier --journal (rejeu après restauration).
+            run = erase_mod.erase_pending(dsn, apply=args.apply, scope=erase_scope(load_config(args.config)),
+                                          journal=journal)
+        if run.locked:
+            print("[erase --pending : un autre passage est déjà en cours, rien n'est fait]", file=sys.stderr)
+            return 0
+        if run.applied:
+            print(run.journal_line())
+        print(f"[erase --pending : {run.erased} compte(s) {'effacé(s)' if run.applied else 'à blanc'}, "
+              f"{run.refused} refus, {run.gone} déjà sorti(s) de la file]", file=sys.stderr)
+        return 1 if run.refused else 0
     dsn = _admin_dsn(args)
     if not dsn:
         return 1
     try:
+        cfg = load_config(args.config)  # images, sessions de code, index de session : ce qui vit hors de la base
         report = erase_account(dsn, email=args.email, account_id=args.account, apply=args.apply, confirm=args.confirm,
-                               images_root=load_config(args.config).images_root() or None)
+                               **erase_scope(cfg))
     except EraseError as e:
         print(f"[erreur: {e}]", file=sys.stderr)
         return 1
@@ -275,6 +386,46 @@ def _cmd_devices_remove(args: argparse.Namespace) -> int:
     except EraseError as e:
         print(f"[erreur: {e}]", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_pages(args: argparse.Namespace) -> int:
+    """Modération des pages publiques (docs/LOKKAL.md §7.26, point 6). Sorties : jamais le contenu d'une page, jamais
+    l'adresse ni l'identifiant d'un compte (le locataire et le nom public suffisent à l'opérateur)."""
+    import json
+
+    from nokker.cloud import moderation as md
+
+    try:
+        service = md.open_operator(load_config(args.config))
+        if args.pages_command == "list":
+            moderated = bool(args.moderated)
+            rows = service.list_pages(moderated=moderated)
+            print("page\tnom public\tlocataire\t" + ("retirée le" if moderated else "vue depuis") + "\ttaille (octets)")
+            for r in rows:
+                print(f"{r['page']}\t{r['public_name']}\t{r['tenant']}\t{r['date']}\t{r['size']}")
+            print(f"[{len(rows)} page(s) {'retirée(s)' if moderated else 'publique(s)'}]", file=sys.stderr)
+            return 0
+        action = "unpublish" if args.pages_command == "unpublish" else "restore"
+        out = service.change(args.target, args.reason, action=action, apply=args.apply)
+    except md.ModerationError as e:
+        print(f"[erreur: {e}]", file=sys.stderr)
+        return 1
+    t = out["target"]
+    where = f"page {t.label} sur {service.public_name(t.machine_id)} (locataire {t.tenant_id})"
+    if out["already"]:
+        print(f"RIEN À FAIRE — {where} : {'déjà retirée' if action == 'unpublish' else 'pas retirée'}")
+        return 0
+    if not out["applied"]:
+        verb = "serait retirée de l'accès public" if action == "unpublish" else "serait rendue à son auteur"
+        print(f"À BLANC (rien n'est fait ; --apply pour agir) — {where} {verb} ; motif : {out['reason']}")
+        return 0
+    if action == "unpublish":
+        print(f"RETIRÉE — {where} : le relais répond 410, la machine la dépublie à sa prochaine synchronisation "
+              f"(copie publique du miroir effacée : {out['mirror_cleared']})")
+    else:
+        print(f"RENDUE — {where} : son auteur pourra la republier (nouvelle carte, nouvelle adresse)")
+    print(json.dumps(service.audit_line(out), ensure_ascii=False))
     return 0
 
 
@@ -323,6 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
     code_p.add_argument("--json", action="store_true", help="compte rendu JSON (banc)")
     code_p.add_argument("--hooks", action="store_true",
                         help="hooks des réglages (session_start, pre_tool, post_tool, turn_end), comme local.hooks")
+    code_p.add_argument("--project-skills", action="store_true",
+                        help="skills (les tiens, et ceux du dépôt auxquels tu as fait confiance), comme "
+                             "local.project_skills")
     code_p.set_defaults(func=_cmd_code)
 
     hooks_p = sub.add_parser("hooks", help="hooks du dépôt : voir leur empreinte, leur faire confiance (lot X3)")
@@ -337,6 +491,19 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "trust":
             hp.add_argument("--sha256", required=True, help="l'empreinte relue (nokker hooks show), recopiée")
         hp.set_defaults(func=_cmd_hooks, unscoped=True)
+
+    skills_p = sub.add_parser("skills", help="skills du dépôt (.nokker/skills) : empreinte, confiance")
+    skills_sub = skills_p.add_subparsers(dest="skills_command", required=True)
+    for name, help_text in (("show", "skills du dépôt, empreinte et confiance"),
+                            ("trust", "fait confiance aux skills du dépôt (cette empreinte, ce dossier)")):
+        sp = skills_sub.add_parser(name, help=help_text)
+        sp.add_argument("--workspace", default=".", help="dossier du dépôt (défaut : dossier courant)")
+        sp.add_argument("--settings", default=None,
+                        help="réglages de l'utilisateur (défaut : $NOKKER_HOME/settings.json, sinon "
+                             "~/.config/nokker/settings.json)")
+        if name == "trust":
+            sp.add_argument("--sha256", required=True, help="l'empreinte relue (nokker skills show), recopiée")
+        sp.set_defaults(func=_cmd_skills, unscoped=True)
 
     from nokker.review.cli import add_review_arguments
 
@@ -368,9 +535,32 @@ def build_parser() -> argparse.ArgumentParser:
     who = erase_p.add_mutually_exclusive_group(required=True)
     who.add_argument("--email")
     who.add_argument("--account", help="identifiant us_…")
+    who.add_argument("--pending", action="store_true",
+                     help="les comptes dont la personne a accordé la suppression (file account_deletions)")
     erase_p.add_argument("--apply", action="store_true", help="valide l'effacement (exige --confirm)")
     erase_p.add_argument("--confirm", help="l'identifiant us_… du compte, recopié")
+    erase_p.add_argument("--journal", metavar="PATH",
+                         help="avec --pending --apply : journal de rejeu (une ligne {tenant_id, erased_at} par compte, "
+                              "0600, en ajout, fsync avant validation)")
     erase_p.set_defaults(func=_cmd_erase, unscoped=True)
+
+    pages_p = sub.add_parser("pages", help="pages publiques : liste et retrait par l'opérateur (modération, §7.26)")
+    pages_sub = pages_p.add_subparsers(dest="pages_command", required=True)
+    list_p = pages_sub.add_parser("list", help="pages publiques vues par le relais : page, nom public, locataire, "
+                                               "date, taille (jamais le contenu ni le compte)")
+    which = list_p.add_mutually_exclusive_group()
+    which.add_argument("--public", action="store_true", help="les pages publiques (défaut)")
+    which.add_argument("--moderated", action="store_true", help="les pages retirées par la modération")
+    list_p.set_defaults(func=_cmd_pages, unscoped=True)
+    for name, help_text in (("unpublish", "retire une page de l'accès public (410), à blanc par défaut"),
+                            ("restore", "rend une page retirée à son auteur (il pourra la republier), à blanc par défaut")):
+        cp = pages_sub.add_parser(name, help=help_text)
+        cp.add_argument("target", help="https://<nom>--pub.nokker.app/<id public>, https://<nom>--pages.nokker.app/"
+                                       "<page_id>, ou le page_id")
+        cp.add_argument("--reason", required=True, help="motif (obligatoire, gardé à l'audit ; une adresse e-mail "
+                                                        "y est remplacée)")
+        cp.add_argument("--apply", action="store_true", help="agit (sinon : à blanc)")
+        cp.set_defaults(func=_cmd_pages, unscoped=True)
 
     return p
 

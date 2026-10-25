@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,13 @@ class PgStore:
                 cur.execute("INSERT INTO llm_calls (thread_id, turn_index, call) VALUES (%s, %s, %s)",
                             (turn.thread_id, turn.index, Jsonb(_enc_call(c))))
 
+    def last_turn_at(self, thread_id: str) -> datetime | None:
+        """Date d'enregistrement (fin) du dernier tour du fil, ou None (`GET /v1/local/sessions`, §7.4.1)."""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT MAX(created_at) FROM turns WHERE thread_id = %s", (thread_id,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
     def turns_after(self, after: tuple[str, str, int], limit: int) -> list[tuple[str, str, int, dict[str, Any]]]:
         """(created_at ISO, fil, indice, tour) des tours du locataire courant (RLS) après le curseur `after`, dans
         l'ordre — pour le miroir web ⇄ Lokkal (nokker/cloud/mirror.py)."""
@@ -232,6 +240,7 @@ class MemoryStore:
 
     _by_thread: dict[str, list[Turn]] = field(default_factory=dict)
     _order: list[tuple[str, int]] = field(default_factory=list)
+    _at: dict[str, datetime] = field(default_factory=dict)  # fil -> date d'ajout de son dernier tour
 
     def history(self, thread_id: str, limit: int | None = None) -> list[Turn]:
         turns = self._by_thread.get(thread_id, [])
@@ -246,6 +255,10 @@ class MemoryStore:
     def append(self, turn: Turn) -> None:
         self._by_thread.setdefault(turn.thread_id, []).append(turn)
         self._order.append((turn.thread_id, turn.index))
+        self._at[turn.thread_id] = datetime.now(timezone.utc)
+
+    def last_turn_at(self, thread_id: str) -> datetime | None:
+        return self._at.get(thread_id)
 
     def erase_mirror_copies(self, prefix: str) -> int:
         """Comme `PgStore.erase_mirror_copies` (même refus : copies du miroir seulement)."""

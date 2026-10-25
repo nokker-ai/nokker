@@ -1,0 +1,15 @@
+apiVersion: v2
+name: nokker
+description: >-
+  Nokker self-hosted for a team: the core (multi-tenant, single sign-on), the web app, a pod per code session,
+  OpenBao for secrets, CortHeXis memory. Runs under the OpenShift restricted SCC.
+type: application
+version: 0.1.0
+appVersion: "0.1.0-rc.6"
+kubeVersion: ">=1.27.0-0"
+home: https://nokker.ai
+sources:
+  - https://github.com/nokker-ai/nokker
+keywords: [agents, llm, coding, openshift]
+annotations:
+  nokker.ai/stage: beta

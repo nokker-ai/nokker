@@ -1,6 +1,7 @@
 ---
 name: mcp-scaffold
 description: Create an MCP server skeleton with tools and tests
+locality: local
 ---
 # Scaffolding an MCP server
 

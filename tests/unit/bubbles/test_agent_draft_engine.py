@@ -107,3 +107,38 @@ def test_mail_trigger_is_not_offered_and_a_mail_card_is_refused(hub):
                    ToolContext(t.id, 0, "api", "alice"))
     assert out.is_error and "mail:" in out.content and "pas disponible" in out.content
     assert hub.bubbles.list_thread(t.id) == []
+
+
+class _Watch:
+    def __init__(self, why=None):
+        self.why = why
+
+    def unavailable(self):
+        return self.why
+
+
+def test_with_the_mail_watch_the_tool_offers_mail_and_checks_the_filter(hub):
+    """Relève du courrier branchée (moteur + connecteurs) : `mail:<filtre>` revient dans le schéma, le filtre est
+    validé dès la proposition, et une boîte non reliée est dite au modèle tout de suite."""
+    engine = _Engine()
+    engine.mail_watch = _Watch()
+    hub.agents_hub = _agents(engine)
+    src = BubbleToolSource(hub=hub)
+    spec = _spec(src)
+    assert "mail:<filtre>" in json.dumps(spec.parameters, ensure_ascii=False)
+    t = hub.create_thread("Tri", "alice")
+    ctx = ToolContext(t.id, 0, "api", "alice")
+    out = src.call("agent_draft", {"name": "Tri", "role": "courrier",
+                                   "trigger": {"kind": "event", "event": "mail:from:billing@example.com  is:unread"}},
+                   ctx)
+    assert not out.is_error, out.content
+    b = hub.bubbles.list_thread(t.id)[0]
+    assert b.state["trigger"] == {"kind": "event", "event": "mail:from:billing@example.com is:unread"}
+    out = src.call("agent_draft", {"name": "Tri", "role": "courrier",
+                                   "trigger": {"kind": "event", "event": "mail:after:2026/01/01"}}, ctx)
+    assert out.is_error and "after:" in out.content
+    engine.mail_watch = _Watch("trigger.event mail:<filtre> : aucune boîte mail reliée à ce compte")
+    out = src.call("agent_draft", {"name": "Tri", "role": "courrier",
+                                   "trigger": {"kind": "event", "event": "mail:*"}}, ctx)
+    assert out.is_error and "aucune boîte" in out.content
+    assert len(hub.bubbles.list_thread(t.id)) == 1

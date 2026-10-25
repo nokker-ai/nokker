@@ -1,4 +1,4 @@
-"""Magasin Postgres du lien Lokkal (tables des migrations 014, 018, 019, 020, 021, 025 et 028), même interface que
+"""Magasin Postgres du lien Lokkal (tables des migrations 014, 018, 019, 020, 021, 025, 028 et 033), même interface que
 `MemoryLinkStore` (et `MemoryRelayStore` pour 021, `MemoryHandoffStore` et `MemoryMirrorNotes` pour 025).
 
 `lokkal_machines` et les tables de la passerelle sont hors RLS (cherchées par empreinte) ; la charge des machines
@@ -74,6 +74,11 @@ class PgLinkStore:
     def by_token(self, token_sha: str) -> Machine | None:
         rows = self._q(f"SELECT {self._MCOLS} FROM lokkal_machines WHERE token_sha256 = %s AND revoked_at IS NULL",
                        (token_sha,))
+        return self._mac(rows[0]) if rows else None
+
+    def by_host(self, host: str) -> Machine | None:
+        rows = self._q(f"SELECT {self._MCOLS} FROM lokkal_machines WHERE host = %s AND revoked_at IS NULL "
+                       "ORDER BY created_at DESC LIMIT 1", (host,))
         return self._mac(rows[0]) if rows else None
 
     def revoke(self, machine_id: str) -> None:
@@ -358,12 +363,115 @@ class PgMirrorNotes:
         return [dict(zip(cols, r, strict=True)) for r in _tq(self.dsn, tenant, f"SELECT {', '.join(cols)} FROM lokkal_mirror_notes "
                                                 "ORDER BY updated_at")]
 
+    def keys(self, tenant: str, machine: str) -> list[tuple[str, str]]:
+        return [(r[0], r[1]) for r in _tq(self.dsn, tenant, "SELECT project, name FROM lokkal_mirror_notes "
+                                          "WHERE machine_id = %s ORDER BY project, name", (machine,))]
+
     def erase(self, tenant: str, machine: str) -> int:
         return len(_tq(self.dsn, tenant, "DELETE FROM lokkal_mirror_notes WHERE machine_id = %s RETURNING name",
                        (machine,)))
 
 
-__all__ = ["PgGatewayAuthStore", "PgHandoffStore", "PgLinkStore", "PgMirrorNotes", "PgRelayStore"]
+class PgMirrorPages:
+    """Copies des pages (migration 033, docs/LOKKAL.md §7.23), même interface que
+    `nokker.cloud.mirror_pages.MemoryMirrorPages` ; sous RLS : lues et écrites dans le locataire de la machine."""
+
+    _LIST = "page_id, title, version, size, sha256, page_updated_at, mirrored_at"
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+
+    def put(self, tenant: str, machine: str, page_id: str, row: dict[str, Any], quota: int) -> int:
+        """Une transaction sous le verrou consultatif DU LOCATAIRE : deux copies simultanées ne dépassent pas le
+        plafond à elles deux."""
+        from nokker.cloud.mirror_pages import QuotaExceeded
+        from nokker.store.conn import connect
+        from nokker.tenancy.context import tenant_scope
+
+        with tenant_scope(tenant), connect(self.dsn) as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("mirror_pages:" + tenant,))
+            used = int(conn.execute("SELECT coalesce(sum(size), 0) FROM lokkal_mirror_pages WHERE NOT "
+                                    "(machine_id = %s AND page_id = %s)", (machine, page_id)).fetchone()[0])
+            if used + row["size"] > quota:
+                raise QuotaExceeded(used, quota)
+            conn.execute(
+                "INSERT INTO lokkal_mirror_pages (machine_id, page_id, tenant_id, title, version, size, sha256, html, "
+                "page_updated_at, mirrored_at, public_sha256, public_index) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (machine_id, page_id) DO UPDATE SET title = EXCLUDED.title, version = EXCLUDED.version, "
+                "size = EXCLUDED.size, sha256 = EXCLUDED.sha256, html = EXCLUDED.html, "
+                "page_updated_at = EXCLUDED.page_updated_at, mirrored_at = EXCLUDED.mirrored_at, "
+                "public_sha256 = EXCLUDED.public_sha256, public_index = EXCLUDED.public_index",
+                (machine, page_id, tenant, row["title"], row["version"], row["size"], row["sha256"], row["html"],
+                 row["page_updated_at"], row["mirrored_at"], row.get("public_sha256"),
+                 bool(row.get("public_index"))))
+            return used + row["size"]
+
+    def get(self, tenant: str, machine: str, page_id: str) -> dict[str, Any] | None:
+        rows = _tq(self.dsn, tenant, f"SELECT {self._LIST}, html FROM lokkal_mirror_pages WHERE machine_id = %s AND "
+                   "page_id = %s", (machine, page_id))
+        if not rows:
+            return None
+        r = rows[0]
+        return {"title": r[1], "version": r[2], "size": r[3], "sha256": r[4], "page_updated_at": r[5],
+                "mirrored_at": r[6], "html": bytes(r[7])}
+
+    def delete(self, tenant: str, machine: str, page_id: str) -> bool:
+        return bool(_tq(self.dsn, tenant, "DELETE FROM lokkal_mirror_pages WHERE machine_id = %s AND page_id = %s "
+                        "RETURNING page_id", (machine, page_id)))
+
+    def get_public(self, tenant: str, machine: str, public_sha256: str) -> dict[str, Any] | None:
+        """Copie publique (migration 035, §7.26) de cette machine par l'empreinte de son id public."""
+        rows = _tq(self.dsn, tenant, f"SELECT {self._LIST}, html, public_index FROM lokkal_mirror_pages WHERE "
+                   "machine_id = %s AND public_sha256 = %s LIMIT 1", (machine, public_sha256))
+        if not rows:
+            return None
+        r = rows[0]
+        return {"page_id": r[0], "title": r[1], "version": r[2], "size": r[3], "sha256": r[4], "page_updated_at": r[5],
+                "mirrored_at": r[6], "html": bytes(r[7]), "public_sha256": public_sha256, "public_index": bool(r[8])}
+
+    def clear_public(self, tenant: str, machine: str, page_id: str) -> bool:
+        return bool(_tq(self.dsn, tenant, "UPDATE lokkal_mirror_pages SET public_sha256 = NULL, public_index = false "
+                        "WHERE machine_id = %s AND page_id = %s AND public_sha256 IS NOT NULL RETURNING page_id",
+                        (machine, page_id)))
+
+    def of_machine(self, tenant: str, machine: str) -> list[dict[str, Any]]:
+        cols = ("page_id", "title", "version", "size", "sha256", "page_updated_at", "mirrored_at")
+        return [dict(zip(cols, r, strict=True)) for r in _tq(
+            self.dsn, tenant, f"SELECT {self._LIST} FROM lokkal_mirror_pages WHERE machine_id = %s ORDER BY page_id",
+            (machine,))]
+
+    def used(self, tenant: str) -> int:
+        return int(_tq(self.dsn, tenant, "SELECT coalesce(sum(size), 0) FROM lokkal_mirror_pages")[0][0])
+
+    def erase(self, tenant: str, machine: str) -> int:
+        return len(_tq(self.dsn, tenant, "DELETE FROM lokkal_mirror_pages WHERE machine_id = %s RETURNING page_id",
+                       (machine,)))
+
+
+class PgUsedJti:
+    """Jti des jetons de pages présentés au relais, toutes répliques (migration 035, §7.26), même interface que
+    `nokker.cloud.mirror_pages.MemoryUsedJti`. HORS RLS (cherché par empreinte, aucun locataire, aucune donnée
+    personnelle : l'empreinte d'un identifiant aléatoire de 60 s). Premier usage atomique par `INSERT … ON CONFLICT`."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self._swept = 0.0
+
+    def first_use(self, jti_sha256: str, expires_at: float, now: float) -> bool:
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            if now - self._swept > 60:
+                self._swept = now
+                conn.execute("DELETE FROM lokkal_relay_used_jti WHERE expires_at < %s", (now,))
+            cur = conn.execute(
+                "INSERT INTO lokkal_relay_used_jti (jti_sha256, expires_at) VALUES (%s, %s) ON CONFLICT (jti_sha256) "
+                "DO UPDATE SET expires_at = EXCLUDED.expires_at WHERE lokkal_relay_used_jti.expires_at < %s "
+                "RETURNING jti_sha256", (jti_sha256, expires_at, now))
+            return cur.fetchone() is not None
+
+
+__all__ = ["PgGatewayAuthStore", "PgHandoffStore", "PgLinkStore", "PgMirrorNotes", "PgMirrorPages", "PgRelayStore",
+           "PgUsedJti"]
 
 
 class PgDeckStore:

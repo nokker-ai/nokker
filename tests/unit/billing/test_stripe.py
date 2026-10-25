@@ -1,3 +1,5 @@
+from urllib import parse as urllib_parse
+
 import pytest
 
 from nokker.billing.stripe import StripeClient, StripeError, encode, sign, verify_signature
@@ -77,3 +79,28 @@ def test_cancel_subscription_is_idempotent_and_list_is_a_get():
     assert c.cancel_subscription("sub_1")["status"] == "canceled"
     assert seen[0][:3] == ("GET", "https://api.stripe.com/v1/subscriptions?customer=cus%201&status=all&limit=100", b"")
     assert seen[1] == ("DELETE", "https://api.stripe.com/v1/subscriptions/sub_1", b"", "nokker-cancel-sub_1")
+
+
+def _checkout_body(**kw):
+    seen = []
+
+    def transport(method, url, body, headers, timeout):
+        seen.append(urllib_parse.parse_qs(body.decode()))
+        return 200, {"url": "https://checkout.stripe.test/s"}
+
+    c = StripeClient("sk_test_x", transport=transport)
+    assert c.checkout_session("cus_1", "price_f", "tn_a", "famille", "https://s", "https://c", "fr", **kw) == \
+        "https://checkout.stripe.test/s"
+    return seen[0]
+
+
+def test_checkout_applies_the_beta_coupon_by_discounts_never_with_promotion_codes():
+    """Coupon de bêta (décision du 25.10) : `discounts[0][coupon]` ; Stripe refuse `discounts` avec
+    `allow_promotion_codes`, que le client n'envoie donc jamais."""
+    body = _checkout_body(coupon="COUPON_TEST")
+    assert body["discounts[0][coupon]"] == ["COUPON_TEST"]
+    assert not any(k.startswith("allow_promotion_codes") for k in body)
+    for none in ({}, {"coupon": ""}, {"coupon": None}):  # sans coupon : la requête d'avant, rien de plus
+        body = _checkout_body(**none)
+        assert not any(k.startswith(("discounts", "allow_promotion_codes")) for k in body)
+        assert body["line_items[0][price]"] == ["price_f"] and body["mode"] == ["subscription"]

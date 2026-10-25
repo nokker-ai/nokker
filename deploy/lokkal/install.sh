@@ -20,11 +20,13 @@
 #   --no-open           n'ouvre pas le navigateur
 #   --vault             coffre OpenBao pour les secrets du noyau (profil compose vault), descellé automatiquement
 #   --vault-manual      idem, mais la part de descellement est affichée une fois et redemandée à chaque redémarrage
+#   --local-llm         moteur d'inférence local (Ollama, CPU, profil compose local-llm), proposé dans /setup
+#   --local-llm-model M modèle Ollama à tirer (défaut : qwen3:4b) ; implique --local-llm
 # Variables (tests) : NOKKER_RELEASE_BASE (URL des pièces de release), NOKKER_SKIP_PULL=1, NOKKER_NO_CLI=1.
 set -eu
 
 REPO=nokker-ai/nokker
-VERSION=""; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""
+VERSION=""; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""; LLM=0; LLM_MODEL=""
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nokker"
 
 say()  { printf '\033[1m›\033[0m %s\n' "$*"; }
@@ -49,7 +51,9 @@ while [ $# -gt 0 ]; do
     --no-open) OPEN=0; shift;;
     --vault) VAULT=auto; shift;;
     --vault-manual) VAULT=manual; shift;;
-    -h|--help) sed -n '2,25p' "$0" 2>/dev/null || true; exit 0;;
+    --local-llm) LLM=1; shift;;
+    --local-llm-model) LLM=1; LLM_MODEL=${2:?}; shift 2;;
+    -h|--help) sed -n '2,27p' "$0" 2>/dev/null || true; exit 0;;
     *) die "option inconnue : $1";;
   esac
 done
@@ -172,6 +176,10 @@ setv() { # setv CLÉ valeur : remplace ou ajoute dans .env
   else printf '%s=%s\n' "$1" "$2" >> "$DIR/.env"; fi
 }
 getv() { grep "^$1=" "$DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-; }
+add_profile() { # add_profile NOM : ajoute un profil à COMPOSE_PROFILES sans retirer les autres (vault, local-llm)
+  cur=$(getv COMPOSE_PROFILES)
+  case ",$cur," in *",$1,"*) ;; *) setv COMPOSE_PROFILES "${cur:+$cur,}$1";; esac
+}
 
 if [ ! -f "$DIR/.env" ]; then
   [ "$MODE" = update ] && die "--update : aucune installation dans $DIR"
@@ -209,7 +217,15 @@ if [ -n "$VAULT" ]; then
   [ -f "$DIR/vault/init.sh" ] || die "--vault : cette version de Lokkal n'a pas le coffre OpenBao"
   [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ] || [ "$MODE" != update ] \
     || warn "coffre activé sur une installation existante : secrets du coffre fichier à migrer (nokker vault migrate --from file --to openbao)"
-  setv COMPOSE_PROFILES vault; setv NOKKER_SECRETS_PROVIDER openbao; setv NOKKER_VAULT_UNSEAL "$VAULT"
+  add_profile vault; setv NOKKER_SECRETS_PROVIDER openbao; setv NOKKER_VAULT_UNSEAL "$VAULT"
+fi
+if [ "$LLM" = 1 ]; then
+  grep -q '^  ollama:' "$DIR/docker-compose.yml" || die "--local-llm : cette version de Lokkal n'a pas le profil local-llm"
+  if [ -n "$LLM_MODEL" ]; then
+    case "$LLM_MODEL" in *[!A-Za-z0-9._:/-]*) die "--local-llm-model : nom de modèle invalide : $LLM_MODEL";; esac
+    setv NOKKER_LOCAL_LLM_MODEL "$LLM_MODEL"
+  fi
+  add_profile local-llm
 fi
 chmod 600 "$DIR/.env"; chmod 700 "$DIR/state"
 WEB_PORT=$(getv NOKKER_PORT); API_PORT=$(getv NOKKER_API_PORT)
@@ -241,6 +257,10 @@ if [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ]; then
 fi
 say "démarrage"
 compose up -d --remove-orphans >/dev/null 2>"$TMP/up.log" || { cat "$TMP/up.log" >&2; die "le démarrage a échoué (journal : docker compose -p nokker logs)"; }
+case ",$(getv COMPOSE_PROFILES)," in *,local-llm,*)
+  m=$(getv NOKKER_LOCAL_LLM_MODEL)
+  say "modèle local ${m:-qwen3:4b} en téléchargement en arrière-plan (docker compose -p nokker logs -f local-llm-pull)";;
+esac
 i=0
 until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:$API_PORT/healthz")" = 200 ]; do
   i=$((i + 1)); [ $i -gt 120 ] && die "le noyau ne répond pas après 6 min : docker compose -p nokker logs core"

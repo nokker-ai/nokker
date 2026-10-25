@@ -1,0 +1,1 @@
+../../../lokkal/vault/unseal.sh

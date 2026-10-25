@@ -51,6 +51,19 @@ def test_append_and_history_round_trip():
 
 
 @requires_pg
+def test_last_turn_at_is_the_latest_recorded_turn():
+    apply_migrations(DSN)
+    store = PgStore(DSN)
+    assert store.last_turn_at("it-last") is None
+    store.append(Turn(thread_id="it-last", index=store.next_index("it-last"), input=InputCheck(text="a")))
+    first = store.last_turn_at("it-last")
+    store.append(Turn(thread_id="it-last", index=store.next_index("it-last"), input=InputCheck(text="b")))
+    last = store.last_turn_at("it-last")
+    assert first is not None and first.tzinfo is not None and last >= first
+    store.close()
+
+
+@requires_pg
 def test_turns_table_is_append_only_update_rejected():
     apply_migrations(DSN)
     store = PgStore(DSN)

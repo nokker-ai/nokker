@@ -26,10 +26,10 @@ Status: private beta / early access. What a page describes is in the Lokkal inst
 | [permissions.md](permissions.md) | Effects, modes, `tool(pattern)` rules, settings files, hard limits, the sandbox |
 | [hooks.md](hooks.md) | Commands run at session start, before and after a tool call, at the end of a turn; trusting repository hooks |
 | [checkpoints.md](checkpoints.md) | Restore points and rollback |
-| [subagents.md](subagents.md) | Delegating to sub-agents in git worktrees |
+| [subagents.md](subagents.md) | Delegating to sub-agents in git worktrees, blocking or in the background |
 | [background.md](background.md) | Background commands (dev servers, watch) and private port previews |
 | [memory.md](memory.md) | Long-term, project and session memory; `AGENTS.md` / `NOKKER.md` / `CLAUDE.md`; what the agent learns; health check |
-| [skills.md](skills.md) | Skills: catalogue, guard, install and remove |
+| [skills.md](skills.md) | Skills: catalogue, guard, install and remove; project skills and their trust (beta) |
 | [review.md](review.md) | `nokker review`: line-by-line pull request review, GitHub Action and Forgejo Actions (packaging: rolling out) |
 
 ## Ops and agents
@@ -42,6 +42,8 @@ Status: private beta / early access. What a page describes is in the Lokkal inst
 | [packs.md](packs.md) | Agent packs (mail, social, jobs, brand, video, MCP builder, ops): skills plus agent templates proposed as cards; adding MCP servers |
 | [incidents.md](incidents.md) | Alerts, incidents, the plan and the morning brief (beta) |
 | [teams.md](teams.md) | Shared projects: roles, what is shared and what is not (beta) |
+| [code-server.md](code-server.md) | Code sessions on a shared server: one folder and one sandbox per user, forge credentials by name (beta) |
+| [household.md](household.md) | Household: one plan for up to six people, shared quota and memory, private profiles, minor profiles (beta) |
 
 ## Trust
 

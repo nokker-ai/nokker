@@ -230,43 +230,104 @@ def test_skills_catalog(w):
 
 
 def _note(name, text="La CI tourne sur Forgejo.", t=1_799_999_000.0, **kw):
-    return {"name": name, "kind": "fact", "title": "CI", "text": text, "updated_at": t, **kw}
+    return {"name": name, "kind": "fact", "title": "CI", "text": text, "updated_at": t, "locality": "both", **kw}
+
+
+def _ok(accepted=0, skipped=0, quarantined=0, refused=0):
+    return {"accepted": accepted, "skipped": skipped, "quarantined": quarantined, "refused": refused}
 
 
 def test_notes_need_mirror_and_conflicts_go_to_quarantine(w):
+    """Conflit = la dernière écriture REÇUE par nokker.ai gagne (horloge du serveur, pas celle des machines) ; la
+    version remplacée part en quarantaine (historique relu par un maintainer) : rien n'est effacé."""
     pid, mem, maint = w.pid, w.a["mem"], w.a["maint"]
     assert _status(w.team.push_notes, mem, pid, "mc_a", [_note("fact-ci")]) == (409, "mirror_off")
     assert _status(w.team.notes, mem, pid, None) == (409, "mirror_off")
     w.team.patch(w.a["owner"], pid, {"mirror": True})
-    assert w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci")]) == {"accepted": 1, "skipped": 0, "quarantined": 0}
+    assert w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci")]) == _ok(accepted=1)
     assert w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci")])["skipped"] == 1  # renvoi idempotent
     pulled = w.team.notes(w.a["view"], pid, None)
     assert [n["name"] for n in pulled["notes"]] == ["fact-ci"]
     sha = pulled["notes"][0]["sha"]
+    assert pulled["notes"][0]["updated_at"] == w.clock.t  # horloge du serveur, pas celle annoncée par la machine
     # le maintainer modifie la version qu'il a : pas de conflit
+    w.clock.t += 10
     r = w.team.push_notes(maint, pid, "mc_b", [_note("fact-ci", "CI sur Forgejo Actions.", t=1_799_999_100.0,
                                                      base_sha=sha)])
-    assert r == {"accepted": 1, "skipped": 0, "quarantined": 0}
-    # conflit : une version plus ancienne, sans la bonne base → quarantaine, la version du projet reste
-    r = w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci", "CI sur GitHub.", t=1_799_999_050.0, base_sha=sha)])
-    assert r == {"accepted": 0, "skipped": 0, "quarantined": 1}
-    assert w.team.store.note(mem, w.team.store.project(mem, pid), "fact-ci").text == "CI sur Forgejo Actions."
-    # conflit : une version plus récente gagne, l'ancienne part en quarantaine
-    r = w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci", "CI sur Woodpecker.", t=1_799_999_200.0)])
-    assert r == {"accepted": 1, "skipped": 0, "quarantined": 1}
+    assert r == _ok(accepted=1)
+    # conflit : la machine A écrit sur une base dépassée. Reçue après : elle gagne, même si son horloge dit « avant »
+    w.clock.t += 10
+    r = w.team.push_notes(mem, pid, "mc_a", [_note("fact-ci", "CI sur GitHub.", t=1_000.0, base_sha=sha)])
+    assert r == _ok(accepted=1, quarantined=1)
+    assert w.team.store.note(mem, w.team.store.project(mem, pid), "fact-ci").text == "CI sur GitHub."
+    # conflit sans base du tout (machine qui n'a jamais tiré) : même règle
+    w.clock.t += 10
+    r = w.team.push_notes(mem, pid, "mc_c", [_note("fact-ci", "CI sur Woodpecker.", t=9_999_999_999.0)])
+    assert r == _ok(accepted=1, quarantined=1)
     q = w.team.quarantined(maint, pid)["quarantine"]
-    assert [x["text"] for x in q] == ["CI sur GitHub.", "CI sur Forgejo Actions."]
+    assert [x["text"] for x in q] == ["CI sur Forgejo Actions.", "CI sur GitHub."]
     assert _status(w.team.quarantined, mem, pid)[0] == 403
     # curseur : seules les notes écrites après
     cur = pulled["cursor"]
     after = w.team.notes(w.a["view"], pid, cur)["notes"]
     assert [n["text"] for n in after] == ["CI sur Woodpecker."]
-    # effacement propagé : pierre tombale
+    # effacement propagé : pierre tombale ; la version oubliée reste dans l'historique
     last = w.team.notes(mem, pid, None)["notes"][-1]
-    w.team.push_notes(mem, pid, "mc_a", [{"name": "fact-ci", "kind": "fact", "deleted": True,
-                                          "updated_at": 1_799_999_300.0, "base_sha": last["sha"]}])
+    r = w.team.push_notes(mem, pid, "mc_a", [{"name": "fact-ci", "kind": "fact", "deleted": True, "locality": "both",
+                                              "updated_at": 1_799_999_300.0, "base_sha": last["sha"]}])
+    assert r == _ok(accepted=1)
     tomb = w.team.notes(mem, pid, None)["notes"][-1]
     assert tomb["deleted"] and "text" not in tomb
+    q = w.team.quarantined(maint, pid)["quarantine"]
+    assert q[-1]["text"] == "CI sur Woodpecker." and q[-1]["reason"].startswith("oubliée")
+    # un oubli rejoué ne refait rien
+    assert w.team.push_notes(mem, pid, "mc_a", [{"name": "fact-ci", "kind": "fact", "deleted": True,
+                                                 "locality": "both", "updated_at": 1.0,
+                                                 "base_sha": tomb["sha"]}]) == _ok(skipped=1)
+
+
+def test_project_note_that_says_local_never_lands(w):
+    """Seconde barrière (règle d'or) : une note qui se dit `local`, ou qui ne dit pas sa localité, n'est jamais gardée,
+    même poussée par une machine du projet."""
+    pid, mem = w.pid, w.a["mem"]
+    w.team.patch(w.a["owner"], pid, {"mirror": True})
+    local = {**_note("fact-a"), "locality": "local"}
+    silent = {k: v for k, v in _note("fact-b").items() if k != "locality"}
+    assert w.team.push_notes(mem, pid, "mc_a", [local, silent, _note("fact-c")]) == _ok(accepted=1, refused=2)
+    assert [n["name"] for n in w.team.notes(mem, pid, None)["notes"]] == ["fact-c"]
+
+
+def test_viewer_cannot_push_notes(w):
+    pid = w.pid
+    w.team.patch(w.a["owner"], pid, {"mirror": True})
+    assert _status(w.team.push_notes, w.a["view"], pid, "mc_v", [_note("fact-v")]) == (403, "forbidden")
+    assert _status(w.team.push_notes, w.a["out"], pid, "mc_o", [_note("fact-o")]) == (404, "not_found")
+    assert w.team.notes(w.a["view"], pid, None)["notes"] == []
+
+
+def test_concurrent_writers_keep_every_version(w):
+    """Deux machines écrivent la même note en même temps sur la même base : écritures sérialisées par projet, la
+    seconde reçue gagne, la première reste dans l'historique ; aucun numéro de curseur n'est perdu."""
+    import threading
+
+    pid = w.pid
+    w.team.patch(w.a["owner"], pid, {"mirror": True})
+    w.team.push_notes(w.a["mem"], pid, "mc_a", [_note("fact-ci")])
+    base = w.team.notes(w.a["mem"], pid, None)["notes"][0]["sha"]
+    out = []
+    gate = threading.Barrier(2)
+
+    def push(who, text):
+        gate.wait()
+        out.append(w.team.push_notes(w.a[who], pid, f"mc_{who}", [_note("fact-ci", text, base_sha=base)]))
+
+    ts = [threading.Thread(target=push, args=a) for a in (("mem", "version A"), ("maint", "version B"))]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert sorted(o["quarantined"] for o in out) == [0, 1] and all(o["accepted"] == 1 for o in out)
+    cur = w.team.notes(w.a["mem"], pid, None)["notes"][0]["text"]
+    kept = [q["text"] for q in w.team.quarantined(w.a["maint"], pid)["quarantine"]]
+    assert sorted([cur, *kept]) == ["version A", "version B"]
 
 
 def test_notes_are_validated_and_scrubbed(w):
@@ -276,6 +337,7 @@ def test_notes_are_validated_and_scrubbed(w):
                 {**_note("x"), "text": "a" * 1501}, {**_note("x"), "updated_at": "hier"}, "texte"):
         assert _status(w.team.push_notes, mem, pid, "mc_a", [bad])[0] == 400, bad
     assert _status(w.team.push_notes, mem, pid, "mc_a", [_note(f"f-{i}") for i in range(201)])[0] == 413
+    assert w.team.notes(mem, pid, None)["notes"] == []  # tout ou rien
     w.team.push_notes(mem, pid, "mc_a", [_note("fact-key", "la clé est sk-SECRET123")])
     assert w.team.notes(mem, pid, None)["notes"][0]["text"] == "la clé est [caviardé]"
 
@@ -295,12 +357,15 @@ def test_machine_view(w):
     assert w.team.machine_projects(w.a["mem"])["projects"][0]["mirror"] is False
 
 
-def test_project_agents_are_the_actors_own(w):
+def test_project_agents_list_the_members_agents_mine_in_full(w):
     pid = w.pid
     a1 = w.agents.create_agent(name="veille", role="r", model="", created_by=w.a["mem"].account_id, project=pid)
     w.agents.create_agent(name="autre", role="r", model="", created_by=w.a["mem"].account_id)
-    w.agents.create_agent(name="maint", role="r", model="", created_by=w.a["maint"].account_id, project=pid)
-    assert [a.id for a in w.team.project_agents(w.a["mem"], pid)] == [a1.id]
+    a3 = w.agents.create_agent(name="maint", role="r", model="", created_by=w.a["maint"].account_id, project=pid)
+    got = {x["id"]: x for x in w.team.project_agents(w.a["mem"], pid)}
+    assert set(got) == {a1.id, a3.id}  # tests/unit/team/test_project_agents.py : ce qu'on voit de ceux des autres
+    assert got[a1.id]["mine"] is True and "instructions" in got[a1.id]
+    assert got[a3.id]["mine"] is False and "instructions" not in got[a3.id]
 
 
 def test_limits(w):

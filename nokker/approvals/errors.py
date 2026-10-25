@@ -27,7 +27,9 @@ class ProofInvalid(ApprovalError):
 
 
 class StrongDeviceRequired(ProofInvalid):
-    """Appareil de simple connexion (code e-mail, Google) : il ne décide pas d'une approbation (403)."""
+    """Preuve trop faible pour cette carte (403, code `strong_device_required`) : appareil de simple connexion (code
+    e-mail, Google), qui ne décide jamais ; ou clé logicielle sur une carte « strong » (Mini App avec biométrie,
+    passkey avec vérification, ou app native attestée requises)."""
 
 
 class DeviceError(Exception):

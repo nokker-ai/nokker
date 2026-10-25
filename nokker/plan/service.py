@@ -134,6 +134,9 @@ class Plan:
     check_project: Callable[[str, str], str] | None = None
     publish: Callable[[str, dict], Any] | None = None
     scrub: Callable[[str], str] | None = None
+    # Livraison du brief hors de l'app (Telegram, e-mail : nokker/plan/delivery.py::BriefDelivery) ; None = dans l'app
+    # seulement (bulle + notification).
+    delivery: Any = None
     clock: Callable[[], float] = time.time
     cache_ttl_s: float = 30.0
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -643,6 +646,12 @@ class Plan:
             logger.info("brief %s rangé dans la bulle %s", run.id, b.id)
         except Exception:  # noqa: BLE001 — un brief non rangé ne casse jamais le passage
             logger.exception("brief : passage %s non rangé", getattr(run, "id", "?"))
+            return
+        if self.delivery is not None:
+            try:
+                self.delivery.deliver(owner, title, text)  # texte déjà caviardé (`_clean`), recaviardé là-bas
+            except Exception:  # noqa: BLE001 — une livraison ratée ne casse jamais le brief
+                logger.exception("brief : passage %s non livré hors de l'app", getattr(run, "id", "?"))
 
 
 def brief_instructions(has_calendar: bool) -> str:

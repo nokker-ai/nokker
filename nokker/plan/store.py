@@ -22,6 +22,8 @@ class BasePlan:
     def brief_agent(self, owner: str) -> str | None: raise NotImplementedError
     def set_brief(self, owner: str, agent_id: str | None, at: float) -> None: raise NotImplementedError
     def brief_owner(self, agent_id: str) -> str | None: raise NotImplementedError
+    def get_delivery(self, owner: str) -> dict[str, Any] | None: raise NotImplementedError
+    def put_delivery(self, owner: str, d: dict[str, Any]) -> None: raise NotImplementedError
 
 
 @dataclass
@@ -29,6 +31,7 @@ class MemoryPlan(BasePlan):
     _cards: dict[str, dict[str, Card]] = field(default_factory=dict)
     _props: dict[str, dict[str, Proposal]] = field(default_factory=dict)
     _briefs: dict[str, dict[str, str]] = field(default_factory=dict)
+    _delivery: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _t(self, d: dict[str, Any]) -> Any:
@@ -72,8 +75,22 @@ class MemoryPlan(BasePlan):
     def brief_owner(self, agent_id: str) -> str | None:
         return next((o for o, a in self._t(self._briefs).items() if a == agent_id), None)
 
+    def get_delivery(self, owner: str) -> dict[str, Any] | None:
+        import copy
+
+        d = self._t(self._delivery).get(owner)
+        return copy.deepcopy(d) if d is not None else None
+
+    def put_delivery(self, owner: str, d: dict[str, Any]) -> None:
+        import copy
+
+        with self._lock:
+            self._t(self._delivery)[owner] = copy.deepcopy(d)
+
 
 MIGRATION = Path(__file__).resolve().parent.parent / "store" / "migrations" / "029_plan_operate.sql"
+DELIVERY_MIGRATION = Path(__file__).resolve().parent.parent / "store" / "migrations" / "037_team_budget_brief.sql"
+_DELIVERY_COLS = ["telegram", "email", "email_armed", "arm_approval_id", "armed_by", "armed_at", "last", "updated_at"]
 _CARD_COLS = [f.name for f in fields(Card)]
 _PROP_COLS = [f.name for f in fields(Proposal)]
 _CARD_JSON = {"constraints", "decisions", "agents", "threads"}
@@ -91,7 +108,7 @@ class PgPlan(BasePlan):
         if not self.dsn:
             raise ValueError("PgPlan requiert un DSN Postgres")
         if self.migrate_now:
-            migrate(self.dsn, MIGRATION.read_text(encoding="utf-8"))
+            migrate(self.dsn, MIGRATION.read_text(encoding="utf-8"), DELIVERY_MIGRATION.read_text(encoding="utf-8"))
         self._db = TenantConn(self.dsn)
         self._lock = threading.Lock()
 
@@ -172,6 +189,20 @@ class PgPlan(BasePlan):
     def brief_owner(self, agent_id: str) -> str | None:
         rows = self._all("SELECT owner FROM nokker_plan_briefs WHERE agent_id = %s", (agent_id,))
         return rows[0][0] if rows else None
+
+    def get_delivery(self, owner: str) -> dict[str, Any] | None:
+        rows = self._all(f"SELECT {', '.join(_DELIVERY_COLS)} FROM nokker_brief_delivery WHERE owner = %s", (owner,))
+        return dict(zip(_DELIVERY_COLS, rows[0], strict=True)) if rows else None
+
+    def put_delivery(self, owner: str, d: dict[str, Any]) -> None:
+        from psycopg.types.json import Jsonb
+
+        vals = [Jsonb(d.get(c)) if c == "last" and d.get(c) is not None else d.get(c) for c in _DELIVERY_COLS]
+        vals[0] = bool(vals[0])
+        sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in _DELIVERY_COLS)
+        self._exec(f"INSERT INTO nokker_brief_delivery (owner, {', '.join(_DELIVERY_COLS)}) VALUES "
+                   f"(%s, {', '.join(['%s'] * len(_DELIVERY_COLS))}) ON CONFLICT (tenant_id, owner) DO UPDATE SET {sets}",
+                   [owner, *vals])
 
 
 __all__ = ["BasePlan", "MemoryPlan", "PgPlan"]

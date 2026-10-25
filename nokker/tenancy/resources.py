@@ -38,6 +38,9 @@ class TenantRegistry:
         self.internal = internal
         self.tester_sources = list(tester_sources)
         self.connectors: ConnectorProvider = connectors or NoConnectors()
+        # Profil mineur d'un foyer (lot X23, `nokker/household/guard.py::minor_tool_filter`) : locataire → prédicat des
+        # outils offerts (liste blanche des connecteurs et agents), ou None. None (défaut) : rien ne change.
+        self.restrict: Any = None
         self._tenants: dict[str, Registry] = {}
         self._lock = threading.Lock()
 
@@ -50,7 +53,13 @@ class TenantRegistry:
         if reg is not None:
             return reg
         sources, sure = self._available(tid)
-        reg = Registry(sources=[*sources, *self.connectors.sources_for(tid)])
+        sources = [*sources, *self.connectors.sources_for(tid)]
+        keep = self.restrict(tid) if self.restrict is not None else None
+        if keep is not None:
+            from nokker.household.guard import FilteredSource
+
+            sources = [FilteredSource(src, keep) for src in sources]
+        reg = Registry(sources=sources)
         if not sure:
             return reg  # disponibilité illisible : rien en cache, on relira au prochain appel
         with self._lock:
@@ -136,12 +145,27 @@ class TenantMemory:
     rappel part ensuite dans un pool de threads (`core/loop.py`) avec la bonne mémoire déjà choisie, que le pool emporte
     le contexte (`submit_in_context`) ou non. Hors scope, l'accès lève `NoTenant`."""
 
-    def __init__(self, internal: MemoryPort) -> None:
+    def __init__(self, internal: MemoryPort,
+                 tenant_memory: Callable[[str], MemoryPort | None] | None = None) -> None:
         self.internal = internal
         self.null = NullMemory()
+        # Mémoire d'un locataire testeur quand il en a une : la mémoire commune de son foyer (lot X23,
+        # nokker/household/memory.py) ; None (défaut, drapeau éteint) ou rien pour ce locataire : NullMemory.
+        self.tenant_memory = tenant_memory
 
     def for_tenant(self) -> MemoryPort:
-        return self.internal if current_tenant() == INTERNAL_TENANT else self.null
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT:
+            return self.internal
+        if self.tenant_memory is not None:
+            try:
+                mem = self.tenant_memory(tid)
+            except Exception:  # noqa: BLE001 — une mémoire illisible ne casse jamais le tour : rien de rappelé
+                logger.warning("mémoire du locataire %s illisible", tid, exc_info=True)
+                mem = None
+            if mem is not None:
+                return mem
+        return self.null
 
     @property
     def recall(self) -> Callable[..., list[Recall]]:

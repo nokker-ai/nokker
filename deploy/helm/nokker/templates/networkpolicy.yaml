@@ -1,0 +1,213 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+{{- $np := .Values.networkPolicy -}}
+{{- $inst := .Release.Name -}}
+# Everything of the release is closed by default, in and out; each component then gets exactly its flows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-default-deny
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/instance: {{ $inst }}}
+  policyTypes: [Ingress, Egress]
+---
+# Session pods (k8s_sandbox.py): nothing in, nothing out (not even DNS)… (policies add up: this one closes them all)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-sandbox-deny
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: nokker-sandbox}
+  policyTypes: [Ingress, Egress]
+---
+# … except, for network=egress pods only, the egress proxy on its port (it refuses private ranges itself), and DNS to
+# resolve the proxy's name (these pods already reach the Internet through the proxy: DNS adds no way out). Parity with
+# the Lokkal sandbox network (internal, egress proxy only). network=deny pods keep no DNS at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-sandbox-egress
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: nokker-sandbox, nokker.network: egress}
+  policyTypes: [Egress]
+  egress:
+    {{- include "nokker.np.dns" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "nokker.selector" (dict "root" . "component" "egress") | nindent 14 }}
+      ports: [{port: 3128, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-core
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "core") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {{- toYaml $np.ingressNamespaceSelector | nindent 12 }}
+      ports: [{port: 8742, protocol: TCP}]
+  egress:
+    {{- include "nokker.np.dns" . | nindent 4 }}
+    # models, DoH, identity providers, forges: the public Internet
+    {{- include "nokker.np.internet" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/instance: {{ $inst }}}
+      ports: [{port: 5432, protocol: TCP}, {port: 8080, protocol: TCP}, {port: 8200, protocol: TCP}]
+    {{- if .Values.code.enabled }}
+    # the Kubernetes API (session pods)
+    - {{- with $np.apiServer.cidrs }}
+      to:
+        {{- range . }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+      {{- end }}
+      ports:
+        {{- range $np.apiServer.ports }}
+        - {port: {{ . }}, protocol: TCP}
+        {{- end }}
+    {{- end }}
+    {{- with $np.coreExtraEgressCidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-web
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "web") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {{- toYaml $np.ingressNamespaceSelector | nindent 12 }}
+      ports: [{port: 8080, protocol: TCP}]
+{{- if .Values.database.dev.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-postgres
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "postgres") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "nokker.selector" (dict "root" . "component" "core") | nindent 14 }}
+      ports: [{port: 5432, protocol: TCP}]
+{{- end }}
+{{- if .Values.embed.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-embed
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "embed") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "nokker.selector" (dict "root" . "component" "core") | nindent 14 }}
+      ports: [{port: 8080, protocol: TCP}]
+  egress:   # model download from Hugging Face on first start
+    {{- include "nokker.np.dns" . | nindent 4 }}
+    {{- include "nokker.np.internet" . | nindent 4 }}
+{{- end }}
+{{- if and .Values.code.enabled (eq .Values.code.sandbox.network "egress") }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-egress
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "egress") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: nokker-sandbox, nokker.network: egress}
+      ports: [{port: 3128, protocol: TCP}]
+  egress:
+    {{- include "nokker.np.dns" . | nindent 4 }}
+    {{- include "nokker.np.internet" . | nindent 4 }}
+{{- end }}
+{{- if .Values.openbao.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-openbao
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "openbao") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "nokker.selector" (dict "root" . "component" "core") | nindent 14 }}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/instance: {{ $inst }}, app.kubernetes.io/component: openbao-init}
+      ports: [{port: 8200, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-openbao-init
+  labels: {{- include "nokker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/instance: {{ $inst }}, app.kubernetes.io/component: openbao-init}
+  policyTypes: [Egress]
+  egress:
+    {{- include "nokker.np.dns" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "nokker.selector" (dict "root" . "component" "openbao") | nindent 14 }}
+      ports: [{port: 8200, protocol: TCP}]
+    - {{- with $np.apiServer.cidrs }}
+      to:
+        {{- range . }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+      {{- end }}
+      ports:
+        {{- range $np.apiServer.ports }}
+        - {port: {{ . }}, protocol: TCP}
+        {{- end }}
+{{- end }}
+{{- end }}

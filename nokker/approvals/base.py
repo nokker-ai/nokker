@@ -33,6 +33,8 @@ from nokker.core.ports import Approval, Challenge, Proof
 from nokker.core.turn import ToolCall, Turn, Verdict
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_of_thread, tenant_scope
 
+GUARDIAN_RULE = "household:guardian"  # = nokker.household.model.GUARDIAN_RULE (sans dépendre du foyer)
+
 logger = logging.getLogger("nokker.approvals")
 
 DEFAULT_TTL_S = 24 * 3600.0
@@ -40,9 +42,9 @@ CHALLENGE_TTL_S = 120.0
 SESSION_TTL_S = 12 * 3600.0
 
 
-# Appareils nés d'une simple connexion (code e-mail, et Google plus tard) : ils ouvrent une session, ils ne décident
-# jamais d'une approbation (décision produit du 21.10.2026 — scope §16).
-LOGIN_ONLY_VIA = ("email-code", "google")
+# Appareils nés d'une simple connexion (code e-mail, SSO OIDC d'une équipe, et Google plus tard) : ils ouvrent une
+# session, ils ne décident jamais d'une approbation (décision produit du 21.10.2026 — scope §16).
+LOGIN_ONLY_VIA = ("email-code", "google", "sso:")
 
 
 def _require_deciding_device(device: Device) -> None:
@@ -80,6 +82,13 @@ class BaseApprovals:
     # Carte d'un testeur : notifiée à SON compte (son Telegram relié, `telegram/notify.py`), jamais à `notifier` qui écrit
     # aux opérateurs internes. `None` = pas de notification pour les testeurs (la carte reste visible dans l'app web).
     tester_notifier: Callable[[Approval], None] | None = None
+    # Foyer (lot X23) : locataire d'un profil mineur → compte de son représentant légal, seul décideur des cartes
+    # `household:guardian` (`Household.guardian_for_tenant`). `None` = aucune carte de ce genre ne se décide.
+    guardian_of: Callable[[str], str | None] | None = None
+    # Sessions de code multi-utilisateur (docs/LOKKAL.md §7.28) : fil → compte propriétaire de sa session (sous-agents
+    # `<fil>/sa-<id>` compris), ou None hors session (`CodeSessions.owner_of_thread`). Une carte d'un tel fil n'est
+    # décidée, listée et annoncée qu'à ce compte, pas aux autres membres du locataire. `None` = rien ne change.
+    thread_owner: Callable[[str], str | None] | None = None
     # Une décision (locale, signée, ou venue par nokker.ai) passe la carte de `pending` à `approved|rejected` sous ce
     # verrou : deux décisions concurrentes de la même carte (le propriétaire en local ET son téléphone, lot X10) n'en
     # appliquent qu'une, jamais les deux.
@@ -141,9 +150,12 @@ class BaseApprovals:
 
     # ─────────────────────── événements ───────────────────────
 
-    def _emit(self, event_type: str, data: dict) -> None:
+    def _emit(self, event_type: str, data: dict, thread_id: str | None = None) -> None:
         if self.on_event is not None:
             try:
+                owner = self._owner(thread_id) if thread_id else None
+                if owner is not None:  # carte d'une session de code : son propriétaire seul l'entend
+                    data = {**data, "_audience": [owner]}
                 self.on_event(event_type, data)
             except Exception:  # noqa: BLE001 — un abonné qui plante ne doit jamais casser le flux métier
                 logger.exception("on_event a levé pour %s", event_type)
@@ -169,10 +181,34 @@ class BaseApprovals:
             return self.account_tenant(user) if self.account_tenant is not None else None
         return INTERNAL_TENANT if self.is_authorized(user) else None
 
-    def decider_allowed(self, decided_by: str | None, card_tenant: str) -> bool:
+    def decider_allowed(self, decided_by: str | None, card_tenant: str, approval: Approval | None = None) -> bool:
         """Un décideur n'est accepté que dans le locataire de la carte : les opérateurs internes sur les cartes internes,
-        le compte du testeur sur les SIENNES ; jamais l'opérateur chez un testeur, jamais un testeur chez un autre."""
+        le compte du testeur sur les SIENNES ; jamais l'opérateur chez un testeur, jamais un testeur chez un autre.
+
+        Exception unique, la carte d'un profil mineur d'un foyer (`household:guardian`, lot X23) : SEUL son
+        représentant (le payeur du foyer, `guardian_of(locataire de la carte)`) la décide, depuis ses appareils ; le
+        mineur lui-même, jamais."""
+        if approval is not None and approval.rule == GUARDIAN_RULE:
+            guardian = self.guardian_of(card_tenant) if self.guardian_of is not None else None
+            return bool(decided_by) and guardian is not None and decided_by == guardian
+        if approval is not None and not self.visible_to(decided_by, approval):
+            return False  # carte d'une session de code (ou d'un de ses sous-agents) : son propriétaire seul
         return bool(decided_by) and self.user_tenant(decided_by) == card_tenant
+
+    def _owner(self, thread_id: str) -> str | None:
+        if self.thread_owner is None:
+            return None
+        try:
+            return self.thread_owner(thread_id)
+        except Exception:  # noqa: BLE001 — propriétaire illisible : échec fermé (personne ne la voit ni ne la décide)
+            logger.exception("propriétaire du fil %s illisible", thread_id)
+            return ""
+
+    def visible_to(self, user: str | None, approval: Approval) -> bool:
+        """Une carte est-elle pour `user` ? Toujours, sauf celle d'une session de code d'un autre compte
+        (`thread_owner`)."""
+        owner = self._owner(approval.thread_id)
+        return owner is None or (bool(owner) and user == owner)
 
     def device_visible(self, device: Device) -> bool:
         tid = current_tenant_or_none()
@@ -190,10 +226,11 @@ class BaseApprovals:
         )
         self._store_approval(approval)
         self._append_event(approval.id, "requested", {"rule": approval.rule, "strength": approval.strength})
-        self._emit("approval.requested", {"approval": approval})
+        self._emit("approval.requested", {"approval": approval}, approval.thread_id)
         if self.tenant_of(approval) != INTERNAL_TENANT:
-            # Le notificateur Telegram écrit aux opérateurs internes : une carte de testeur ne leur part jamais.
-            if self.tester_notifier is not None:
+            # Le notificateur Telegram écrit aux opérateurs internes : une carte de testeur ne leur part jamais. La carte
+            # d'un profil mineur (X23) ne part pas non plus au mineur : son représentant la décide (/v1/household/approvals).
+            if self.tester_notifier is not None and approval.rule != GUARDIAN_RULE:
                 try:
                     self.tester_notifier(approval)
                 except Exception:  # noqa: BLE001
@@ -324,11 +361,12 @@ class BaseApprovals:
         parti au téléphone. `approval.forwarded {approval_id, thread_id}` dit aux clients locaux (éditeurs) où la
         carte attend ; rien ne change dans la carte (le terminal peut toujours la décider)."""
         with tenant_scope(self.tenant_of(approval)):
-            self._emit("approval.forwarded", {"approval_id": approval.id, "thread_id": approval.thread_id})
+            self._emit("approval.forwarded", {"approval_id": approval.id, "thread_id": approval.thread_id},
+                       approval.thread_id)
 
     def _emit_decided(self, approval: Approval) -> None:
         self._emit("approval.decided", {"approval_id": approval.id, "decision": approval.status,
-                                        "by": approval.decided_by, "via": approval.decided_via})
+                                        "by": approval.decided_by, "via": approval.decided_via}, approval.thread_id)
 
     def decide(self, approval_id: str, decision: str, proof: Proof) -> Approval:
         with self._decision_lock:
@@ -337,7 +375,7 @@ class BaseApprovals:
             if not self._consume_nonce(nonce, approval_id):
                 raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
             decided_by, decided_via = self._verify_proof(approval, decision, proof)
-            if not self.decider_allowed(decided_by, self.tenant_of(approval)):
+            if not self.decider_allowed(decided_by, self.tenant_of(approval), approval):
                 raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
             approval = self._commit(approval, decision, decided_by, decided_via)
         self._emit_decided(approval)
@@ -351,10 +389,17 @@ class BaseApprovals:
             approval = self._pending_card(approval_id, decision)
             if args_sha256(approval.arguments) != approval.args_sha256:
                 raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+            if decision == "approve" and approval.rule == GUARDIAN_RULE:
+                # Profil mineur (X23) : seul le représentant approuve, à la clé de SON appareil (decide).
+                raise ProofInvalid("carte d'un profil mineur : son représentant l'approuve depuis ses appareils")
             if decision == "approve" and (approval.rule == "ops:prod" or approval.rule.startswith("ops:prod:")):
                 # Plancher prod (lot X11) : approuver se fait à la clé d'appareil seulement, jamais au jeton local
                 # (défense en profondeur : la route locale refuse déjà) ; refuser reste possible ici.
                 raise ProofInvalid("carte prod : clé d'appareil exigée (docs/APPROVALS.md), pas le jeton local")
+            if decision == "approve" and approval.rule == "pages:publish":
+                # Publier une page (docs/LOKKAL.md §7.26) : une sortie vers le public, signée à la clé d'appareil
+                # seulement ; refuser reste possible au jeton local.
+                raise ProofInvalid("publication de page : clé d'appareil exigée, pas le jeton local")
             approval = self._commit(approval, decision, decided_by, "local-token")
         self._emit_decided(approval)
         return approval
@@ -373,6 +418,8 @@ class BaseApprovals:
         laquelle l'outil s'exécute (le propriétaire de la machine) ; l'appareil et le compte vont au journal."""
         with self._decision_lock:
             approval = self._pending_card(approval_id, decision)
+            if decision == "approve" and approval.rule == GUARDIAN_RULE:
+                raise ProofInvalid("carte d'un profil mineur : son représentant l'approuve depuis ses appareils")
             nonce, via = self.verify_signed_decision(approval, decision, proof, device, origin=origin, rp_id=rp_id)
             if not self._consume_nonce(nonce, approval_id):
                 raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
@@ -473,8 +520,8 @@ class BaseApprovals:
             # Une clé logicielle (CLI : trousseau ou fichier 0600) n'est PAS libérée par biométrie : elle ne
             # suffit qu'au niveau standard. strong = Mini App (clé libérée par BiometricManager, initData
             # vérifié), passkey avec UV, ou plus tard app native attestée (docs/APPROVALS.md §1).
-            raise ProofInvalid("niveau « strong » : signature d'une clé logicielle refusée — approuver depuis "
-                               "la Mini App Telegram, une passkey ou l'app native")
+            raise StrongDeviceRequired("niveau « strong » : signature d'une clé logicielle refusée — approuver "
+                                       "depuis la Mini App Telegram, une passkey ou l'app native")
         return via
 
     # ─────────────────────── appareils (docs/CLIENT-API.md) ───────────────────────
@@ -554,6 +601,19 @@ class BaseApprovals:
         if device.status != "pending":
             raise ProofInvalid(f"appareil {device_id!r} déjà {device.status}")
         device.status, device.approved_at, device.approved_via = "approved", self.clock(), "email-code"
+        self._store_device(device)
+        return device
+
+    def confirm_device_by_sso(self, device_id: str, connection_id: str) -> Device:
+        """Confirme un appareil après une connexion OIDC vérifiée (nokker/sso/service.py : `state` consommé, ID token
+        vérifié, clé de cet appareil prouvée). Connexion seulement : `approved_via` = « sso:<connexion> », jamais une
+        décision ; `approved_at` = l'heure de la connexion SSO (« SSO obligatoire » mesure son âge)."""
+        device = self._load_device(device_id)
+        if device is None:
+            raise DeviceNotFound(device_id)
+        if device.status != "pending":
+            raise ProofInvalid(f"appareil {device_id!r} déjà {device.status}")
+        device.status, device.approved_at, device.approved_via = "approved", self.clock(), f"sso:{connection_id}"
         self._store_device(device)
         return device
 

@@ -26,6 +26,14 @@ from nokker.secrets.file import FileSecrets
 SECRET_KEY_ENV = "NOKKER_LOCAL_SECRET_KEY"
 ROUTER_URL = "https://router.sokkan.ch/v1"
 OLLAMA_CANDIDATES = ("http://host.docker.internal:11434", "http://127.0.0.1:11434")
+# Profil compose `local-llm` : le service `ollama` du compose (http://ollama:11434), posé par le compose dans cette
+# variable (liste séparée par des virgules) ; sans elle, les deux candidats ci-dessus.
+OLLAMA_URLS_ENV = "NOKKER_OLLAMA_URLS"
+
+
+def ollama_candidates() -> tuple[str, ...]:
+    urls = tuple(u.strip().rstrip("/") for u in os.environ.get(OLLAMA_URLS_ENV, "").split(",") if u.strip())
+    return urls or OLLAMA_CANDIDATES
 
 
 # Coffre inutilisable (clé absente, fichier illisible, OpenBao scellé ou injoignable) : l'erreur du coffre (X4).
@@ -82,9 +90,9 @@ def test_endpoint(base_url: str, api_key: str | None, timeout_s: float = 8.0) ->
     return {"ok": True, "models": models, "latency_ms": ms}
 
 
-def detect_local_models(candidates: tuple[str, ...] = OLLAMA_CANDIDATES) -> list[dict[str, Any]]:
+def detect_local_models(candidates: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     out = []
-    for base in candidates:
+    for base in candidates or ollama_candidates():
         try:
             r = httpx.get(base + "/api/tags", timeout=1.5)
         except httpx.HTTPError:
@@ -196,6 +204,10 @@ class LocalLink:
     base_url: str = "https://app.nokker.ai"
     client: Any = None  # httpx.Client injectable (tests)
     _pending: dict[str, Any] = field(default_factory=dict)
+    _pages_public: tuple[bool, float] | None = None  # (droit de publier, lu à), §7.26
+    # Pages de cette machine retirées par la modération de nokker.ai (§7.26 point 6), lues dans la même réponse :
+    # `{page_ids, public_sha256}` ; None = jamais su (nokker.ai sans registre ou injoignable : on ne touche à rien).
+    moderation: dict[str, list[str]] | None = None
 
     def _http(self) -> Any:
         return self.client or httpx.Client(timeout=10.0)
@@ -221,6 +233,41 @@ class LocalLink:
             return r.json() if r.status_code == 200 else None
         except (httpx.HTTPError, ValueError):
             return None
+
+    def pages_public(self, ttl_s: float = 300.0) -> bool:
+        """nokker.ai dit-il que ce compte peut publier des pages (abonné ou compte vérifié, §7.26) ? Lu dans
+        `GET /v1/gateway/machine` (jeton de machine), gardé `ttl_s` ; faux sans lien ou si nokker.ai ne répond pas."""
+        token = self.setup.vault.get("machine_token")
+        if not token:
+            return False
+        now = time.time()
+        if self._pages_public is not None and now - self._pages_public[1] < ttl_s:
+            return self._pages_public[0]
+        try:
+            r = self._http().get(self.base_url.rstrip("/") + "/v1/gateway/machine",
+                                 headers={"Authorization": f"Bearer {token}"})
+            body = (r.json() or {}) if r.status_code == 200 else {}
+            ok = body.get("pages_public") is True
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return False
+        if isinstance(body.get("moderated_pages"), list) and isinstance(body.get("moderated_public"), list):
+            self.moderation = {"page_ids": [str(x) for x in body["moderated_pages"]],
+                               "public_sha256": [str(x) for x in body["moderated_public"]]}
+        self._pages_public = (ok, now)
+        return ok
+
+    def purge_public(self, page_id: str) -> str:
+        """Dépublier sans miroir en marche : la copie publique de la page, s'il y en a une chez nokker.ai, est retirée
+        (`DELETE /v1/mirror/pages/{id}/public`). `done`, `none` (pas de lien), `pending` (nokker.ai injoignable)."""
+        token = self.setup.vault.get("machine_token")
+        if not token:
+            return "none"
+        try:
+            r = self._http().delete(self.base_url.rstrip("/") + f"/v1/mirror/pages/{page_id}/public",
+                                    headers={"Authorization": f"Bearer {token}"})
+            return "done" if r.status_code in (200, 404) else "pending"
+        except httpx.HTTPError:
+            return "pending"
 
     def status(self) -> dict[str, Any]:
         if "router" in self.setup.vault.names():

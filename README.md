@@ -131,6 +131,5 @@ Private beta / early access.
   mail and calendar connectors, hand-over from a web session to your machine, live file writing in the web app,
   images from the terminal, placement on several machines and the shared deck, the subscriber mirror, the VS Code
   extension on the Marketplace, the `nokker review` GitHub Action.
-- Beta (off by default): incidents and the plan, team projects.
-- Planned: project skills, `/memory` in the terminal, background sub-agents, `mail:` agent triggers, English
-  terminal labels.
+- Beta (off by default): incidents and the plan, team projects, project skills.
+- Planned: `/memory` in the terminal, `mail:` agent triggers, English terminal labels.

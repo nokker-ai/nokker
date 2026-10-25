@@ -14,6 +14,12 @@ Sortie de l'outil (docs/LOKKAL.md §7.4.9) : `on_result` reçoit chaque exécuti
 l'empreinte) d'une carte du modèle AVANT le tour de suite, pour le `tool.result` qui ferme l'appel resté « en attente »
 (`call_id` de la carte). L'exécuteur ne prend pas de verrou : son appelant le lance sous la file du fil (le serveur,
 `schedule_decision`), et le tour de suite reprend le même verrou (réentrant).
+
+Carte d'un SOUS-AGENT (fil `<parent>/sa-<id>`, docs/LOKKAL.md §7.22) : l'outil et le tour de suite tournent avec le
+noyau de l'ENFANT (`subagent_kernel(fil)`, son registre filtré, ses enveloppes), JAMAIS avec celui du parent (dont le
+registre rendrait `clarify`, `send_*`… appelables : élévation). Pas de noyau d'enfant (enfant annulé, arrêt du noyau,
+pas de résolveur) : la carte approuvée passe `failed` sans rien exécuter, son `tool.result` part en erreur ; refusée,
+elle n'a pas de tour de suite.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nokker.approvals.crypto import args_sha256
+from nokker.account.delete import ACCOUNT_CHANNEL
 from nokker.core.loop import DIRECT_CHANNEL, Kernel
 from nokker.tenancy.context import tenant_of_thread, tenant_scope
 from nokker.core.ports import Approval, ToolContext
@@ -31,6 +38,9 @@ from nokker.core.turn import Turn, TurnInput
 
 logger = logging.getLogger("nokker.approvals.executor")
 
+SUBAGENT_MARK = "/sa-"  # fil d'un sous-agent : `<fil parent>/sa-<id>` (nokker/tools/delegate.py)
+CHILD_GONE = ("sous-agent introuvable (terminé, annulé ou noyau redémarré) : carte refusée, jamais exécutée avec le "
+              "noyau du parent")
 RESULT_CHAR_LIMIT = 6000  # un résultat très long n'a pas sa place entière dans le bloc du tour (A-1 réservoir à part)
 
 
@@ -67,13 +77,27 @@ class ApprovalExecutor:
     # Noyau qui porte la suite d'un fil particulier (passage d'un agent Crew : ses portes, son budget, ses secrets) ;
     # None (ou une réponse None) = le noyau ordinaire.
     kernel_for: Callable[[str], Any] | None = None
+    # Noyau du sous-agent qui a posé une carte (`DelegateToolSource.kernel_for_card`) ; None = aucun : toute carte d'un
+    # fil `<parent>/sa-<id>` est alors refusée (jamais de repli sur le noyau du parent).
+    subagent_kernel: Callable[[str], Any] | None = None
 
     def _k(self, thread_id: str) -> Any:
+        if SUBAGENT_MARK in thread_id:  # jamais self.kernel : son registre n'est pas celui de l'enfant
+            if self.subagent_kernel is None:
+                return None
+            try:
+                return self.subagent_kernel(thread_id)
+            except Exception:  # noqa: BLE001 — résolveur en panne : échec fermé
+                logger.exception("noyau du sous-agent introuvable pour %s", thread_id)
+                return None
         k = self.kernel_for(thread_id) if self.kernel_for is not None else None
         return k if k is not None else self.kernel
     # Carte posée par le modèle : `on_result(approval, content, is_error, ms)` publie la sortie (`tool.result` du même
     # `call_id`) avant le tour de suite. None = rien n'est publié (tests, bancs).
     on_result: Callable[[Approval, str, bool, int | None], Any] | None = None
+    # Cartes « Mon compte » (canal `account`, nokker/account/delete.py) : une action du noyau, pas un outil du
+    # registre (le modèle ne peut pas la demander) ; aucun tour modèle après la décision.
+    account_actions: dict[str, Callable[[Approval], str]] = field(default_factory=dict)
 
     def run(self, approval: Approval) -> Turn | None:
         """À appeler APRÈS `approvals.decide()`. `approval.status` doit déjà être `approved` ou
@@ -84,12 +108,30 @@ class ApprovalExecutor:
             handler = self.handlers.get(approval.tool_name)
             if handler is not None:
                 return self._handle(approval, handler)
+            if SUBAGENT_MARK in approval.thread_id and approval.status in ("approved", "rejected") \
+                    and self._k(approval.thread_id) is None:
+                return self._child_gone(approval)
             if approval.status == "rejected":
                 return self._continue_with(approval, _approbation_block(
                     approval, outcome=f"refusé par {approval.decided_by or 'inconnu'}."), "refusé", True)
             if approval.status != "approved":
                 raise ValueError(f"ApprovalExecutor.run() appelé sur un statut inattendu : {approval.status!r}")
             return self._execute_approved(approval)
+
+    def _child_gone(self, approval: Approval) -> None:
+        """Carte d'un sous-agent qui n'existe plus : approuvée → `failed` sans rien exécuter (et son `tool.result` en
+        erreur) ; refusée → rien (pas de tour de suite)."""
+        logger.warning("carte %s d'un sous-agent disparu (%s) : %s", approval.id, approval.thread_id,
+                       "refusée" if approval.status == "approved" else "pas de suite")
+        if approval.status != "approved":
+            return None
+        approval = self.approvals.mark_failed(approval.id, CHILD_GONE)
+        if self.on_result is not None:
+            try:
+                self.on_result(approval, CHILD_GONE, True, None)
+            except Exception:  # noqa: BLE001
+                logger.exception("publication du refus de l'approbation %s impossible", approval.id)
+        return None
 
     def _handle(self, approval: Approval, handler: Callable[[Approval], str]) -> None:
         if approval.status not in ("approved", "rejected"):
@@ -113,6 +155,19 @@ class ApprovalExecutor:
             return self._continue_with(approval, _approbation_block(
                 approval, outcome="ÉCHEC — les arguments ont changé depuis la demande, exécution refusée."), error, True,
                 ran=True)
+
+        if approval.channel == ACCOUNT_CHANNEL:
+            action = self.account_actions.get(approval.tool_name)
+            try:
+                if action is None:
+                    raise LookupError(f"action de compte inconnue : {approval.tool_name}")
+                summary = action(approval)
+            except Exception as e:  # noqa: BLE001 — rien n'est fait : la carte passe en échec
+                self.approvals.mark_failed(approval.id, f"{type(e).__name__}: {e}")
+                logger.exception("action de compte en échec : approval=%s", approval.id)
+                return None
+            self.approvals.mark_executed(approval.id, summary)
+            return None
 
         kernel = self._k(approval.thread_id)
         spec = kernel.tools.spec(approval.tool_name)
@@ -146,6 +201,8 @@ class ApprovalExecutor:
 
     def _continue_with(self, approval: Approval, block: str, content: str = "", is_error: bool = False, *,
                        ran: bool = False, ms: int | None = None) -> Turn | None:
+        if approval.channel == ACCOUNT_CHANNEL:
+            return None  # refus d'une carte de compte : rien à faire, aucun tour modèle
         if approval.channel == DIRECT_CHANNEL:
             self.kernel.add_owner_note(approval.thread_id, "[hors tour] " + block)
             if self.on_direct is not None:
@@ -162,4 +219,4 @@ class ApprovalExecutor:
                                          channel=approval.channel, sender=approval.decided_by))
 
 
-__all__ = ["ApprovalExecutor"]
+__all__ = ["CHILD_GONE", "ApprovalExecutor"]

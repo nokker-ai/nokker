@@ -94,3 +94,16 @@ def test_mirror_erase_reaches_copies_only_and_turns_stay_append_only(pg):  # noq
     with psycopg.connect(pg["app"]) as conn, pytest.raises(psycopg.Error):
         conn.execute("SELECT set_config('app.tenant_id', %s, false)", (A,))
         conn.execute("DELETE FROM turns WHERE thread_id = %s", (scoped_thread_id(A, "web-e"),))
+
+
+@requires_pg
+def test_account_exports_are_isolated_by_rls(pg):  # noqa: F811
+    """Migration 016 : un export n'est lisible que chez son locataire, même avec son identifiant."""
+    from nokker.account.export import PgExports
+
+    ex = PgExports(pg["app"])
+    with tenant_scope(A):
+        meta = ex.create("us_a", b"\x1f\x8b-donnees-de-A", 100.0)
+        assert ex.get(meta.id, "us_a")[1] == b"\x1f\x8b-donnees-de-A" and ex.last_for("us_a").id == meta.id
+    with tenant_scope(B):
+        assert ex.get(meta.id, "us_a") is None and ex.last_for("us_a") is None

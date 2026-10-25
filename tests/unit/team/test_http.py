@@ -167,7 +167,31 @@ def test_agents_carry_their_project(on):
     assert st == 201 and plain["project"] is None  # §9.5 : champ toujours présent, nul hors projet
     st, lst = call("GET", f"/v1/projects/{pid}/agents", who="mem")
     assert [x["id"] for x in lst["agents"]] == [a["id"]]
-    assert call("GET", f"/v1/projects/{pid}/agents", who="maint")[1]["agents"] == []  # ceux de mem restent chez lui
+    # les autres membres le voient, sans sa carte complète ; seul l'owner du projet (ou mem) peut le désarmer
+    [seen] = call("GET", f"/v1/projects/{pid}/agents", who="maint")[1]["agents"]
+    assert seen["id"] == a["id"] and seen["mine"] is False and "instructions" not in seen
+    assert seen["owner"]["email"] == "mem@example.org"
+    assert call("POST", f"/v1/projects/{pid}/agents/{a['id']}/disarm", who="maint")[0] == 403
+    assert call("POST", f"/v1/projects/{pid}/agents/{a['id']}/disarm", who="out")[0] == 404
+    st, d = call("POST", f"/v1/projects/{pid}/agents/{a['id']}/disarm", who="owner")
+    assert st == 200 and d["agent"]["status"] == "paused" and d["agent"]["can_disarm"] is False
+    st, ev = call("GET", f"/v1/projects/{pid}/audit", who="maint")
+    assert st == 200 and ev["events"][0]["event"] == "agent_disarmed"
+    assert call("GET", f"/v1/projects/{pid}/audit", who="mem")[0] == 403
+
+
+def test_budget_routes(on):
+    call, _, _ = on
+    pid = _project_with_members(call)
+    assert call("PUT", f"/v1/projects/{pid}/budget", {"daily": 5}, who="mem")[0] == 403
+    st, b = call("PUT", f"/v1/projects/{pid}/budget", {"daily": 5, "monthly": 50}, who="maint")
+    assert st == 200 and b["budget"] == {"daily": 5.0, "monthly": 50.0, "currency": "EUR"}
+    st, v = call("GET", f"/v1/projects/{pid}/budget", who="view")
+    assert st == 200 and v["budget"]["daily"] == 5.0  # sans ledger branché : rangé, pas décompté
+    assert call("GET", f"/v1/projects/{pid}/budget", who="out")[0] == 404
+    assert call("PUT", f"/v1/projects/{pid}/budget", {"weekly": 5}, who="owner")[0] == 400
+    st, b = call("DELETE", f"/v1/projects/{pid}/budget", who="owner")
+    assert st == 200 and b == {"budget": None}
 
 
 def test_machine_routes(on):
@@ -177,7 +201,8 @@ def test_machine_routes(on):
     st, view = call("GET", "/v1/mirror/projects", token=machines["mem"])
     assert st == 200 and view["projects"][0]["rules"]["deny"] == ["terminal(rm -rf *)"]
     assert view["projects"][0]["mirror"] is False
-    note = {"name": "fact-ci", "kind": "fact", "title": "CI", "text": "Forgejo", "updated_at": 1_700_000_000.0}
+    note = {"name": "fact-ci", "kind": "fact", "title": "CI", "text": "Forgejo", "updated_at": 1_700_000_000.0,
+            "locality": "both"}
     st, err = call("POST", f"/v1/mirror/projects/{pid}/notes", {"notes": [note]}, token=machines["mem"])
     assert st == 409 and err["error"]["code"] == "mirror_off"
     call("PATCH", f"/v1/projects/{pid}", {"mirror": True}, who="owner")

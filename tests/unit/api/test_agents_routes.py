@@ -200,8 +200,43 @@ def test_mail_trigger_is_refused_at_creation_and_patch_with_a_clear_message(srv)
     mail = {"kind": "event", "event": "mail:is:unread"}
     st, out = call(port, "POST", "/v1/agents", {"name": "Tri", "role": "courrier", "trigger": mail})
     assert st == 400 and "mail:" in out["error"]["message"] and "webhook:" in out["error"]["message"]
+    assert out["error"]["code"] == "no_mail_trigger"  # code stable pour les écrans, le message reste en clair
     st, a = call(port, "POST", "/v1/agents", {"name": "Tri", "role": "courrier"})
     assert st == 201
     st, out = call(port, "PATCH", f"/v1/agents/{a['id']}", {"trigger": mail})
-    assert st == 400 and "mail:" in out["error"]["message"]
+    assert st == 400 and "mail:" in out["error"]["message"] and out["error"]["code"] == "no_mail_trigger"
+    st, out = call(port, "POST", "/v1/agents", {"name": "x"})  # erreur sans code : pas de champ `code`
+    assert st == 400 and "code" not in out["error"]
     assert call(port, "GET", f"/v1/agents/{a['id']}")[1]["trigger"] == {"kind": "manual"}
+
+
+def test_mail_trigger_with_the_watch_is_accepted_and_get_shows_its_state(srv, monkeypatch):
+    """Relève du courrier branchée : 201, filtre normalisé, `mail_watch` dans GET (liste et agent) ; filtre hors du
+    sous-ensemble : 400 avec la raison. L'identifiant de la boîte n'apparaît dans aucune réponse."""
+    from nokker.agents.mailwatch import MailWatcher
+    from nokker.connectors.crypto import SecretBox
+    from nokker.connectors.provider import ConnectorProvider
+    from nokker.connectors.store import MemoryConnectorStore
+
+    w, port, _, _ = srv
+    store = MemoryConnectorStore(SecretBox(SecretBox.generate_key()))
+    store.put("acc-1", "mail", {"preset": "custom", "address": "agent@corp.test", "imap_host": "imap.corp.test",
+                                "imap_port": 993, "smtp_host": "smtp.corp.test", "smtp_port": 465}, "pw-route-0099")
+    w.engine.mail_watch = MailWatcher(engine=w.engine, mailbox=ConnectorProvider(store, lambda t: "acc-1").mail_for,
+                                      clock=w.clock)
+    st, out = call(port, "POST", "/v1/agents", {"name": "Tri", "role": "courrier",
+                                                "trigger": {"kind": "event", "event": "mail:in:Archive"}})
+    assert st == 400 and "INBOX" in out["error"]["message"] and out["error"]["code"] == "bad_mail_filter"
+    st, a = call(port, "POST", "/v1/agents", {"name": "Tri", "role": "courrier",
+                                              "trigger": {"kind": "event", "event": "mail:subject:Facture  is:unread"}})
+    assert st == 201 and a["trigger"]["event"] == "mail:subject:Facture is:unread"
+    assert a["mail_watch"]["state"] == "off"  # créé au repos
+    st, armed = call(port, "POST", f"/v1/agents/{a['id']}/arm")
+    assert st == 200 and armed["mail_watch"]["state"] == "waiting"
+    got = call(port, "GET", f"/v1/agents/{a['id']}")[1]
+    assert got["mail_watch"]["folder"] == "INBOX" and got["mail_watch"]["poll_s"] == 120
+    listed = next(x for x in call(port, "GET", "/v1/agents")[1] if x["id"] == a["id"])
+    assert listed["mail_watch"]["state"] == "waiting"
+    other = call(port, "POST", "/v1/agents", {"name": "M", "role": "r"})[1]
+    assert "mail_watch" not in other
+    assert "pw-route-0099" not in json.dumps([got, listed])

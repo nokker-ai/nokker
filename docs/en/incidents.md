@@ -91,9 +91,29 @@ working days, Europe/Zurich time. Each run reads the plan (goals, work in progre
 incidents when `operate` is on) and your calendar if the connector is set up, and posts a `brief` card in its thread
 with a notification. `DELETE /v1/plan/brief` removes it.
 
+### Getting the brief outside the app
+
+Status: **beta**, with the `plan` flag. Off for everyone until you turn it on.
+
+```
+GET /v1/plan/brief/delivery
+PUT /v1/plan/brief/delivery {telegram?: true|false, email?: "you@example.com" | null}
+```
+
+- **Telegram**: the brief is sent to the Telegram chat linked to your account (`/start <code>` with the Nokker bot).
+  The bot only sends messages.
+- **E-mail**: the brief is sent from your own mailbox (your mail connector, see [security.md](security.md)) to the
+  address you choose. The first time, a **strong card** asks you to sign "send the morning brief to this address from this
+  mailbox". After that, this brief goes to this address every morning without a new card, and nothing else does: the
+  model cannot use it to send anything. Changing the address or the mailbox cancels it and asks again.
+- **Content**: the same redaction as every answer, and no link that opens something without signing in (page
+  links with a capability, links with a token in them are removed). The only link added is the app's address.
+- `last` in the answer says how the last delivery went (`sent`, `failed`, `not_armed`…), never what it said. A
+  failed delivery does not touch the brief: it is still in the app.
+
 ## Limits
 
 - Progress reads declared statuses only, not signals such as a failed run or an open incident.
 - Resolving an incident does not cancel an agent run that is still going.
-- The brief is delivered as a card and a notification in the app, nowhere else yet.
+- The brief goes out by Telegram and e-mail only; other channels (Slack, Teams) are not there yet.
 - Plan cards of a team project are visible only to the member who created them.

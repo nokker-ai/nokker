@@ -22,16 +22,19 @@ class FakeStripe(StripeClient):
         self.fail = False
         self.subs = {}
         self.gone = set()
+        self.bad_coupons = {}
 
     def create_customer(self, email, tenant_id, account_id):
         self.n += 1
         self.calls.append(("customer", email))
         return f"cus_{self.n}"
 
-    def checkout_session(self, customer, price_id, tenant_id, plan, success_url, cancel_url, lang):
+    def checkout_session(self, customer, price_id, tenant_id, plan, success_url, cancel_url, lang, coupon=None):
         if self.fail:
             raise StripeError("unavailable")
-        self.calls.append(("checkout", customer, price_id, success_url, lang))
+        self.calls.append(("checkout", customer, price_id, success_url, lang) + ((coupon,) if coupon else ()))
+        if coupon and coupon in self.bad_coupons:  # Stripe refuse la requête (coupon inconnu ou expiré)
+            raise StripeError(self.bad_coupons[coupon], 400)
         return "https://checkout.stripe.test/s"
 
     def list_subscriptions(self, customer):
@@ -269,3 +272,55 @@ def test_cancel_for_stripe_outage_raises_so_that_nothing_gets_erased(b):
     with pytest.raises(BillingError) as e:
         b.cancel_for(A.tenant_id)
     assert (e.value.code, e.value.status) == ("stripe_unavailable", 502)
+
+
+def test_paliers_de_foyer_moins_chers_au_tour_que_solo():
+    """X23 (décision produit du 25.10) : Famille 49 et Large 99 CHF/mois, quota commun, le tour moins cher que Solo (19 CHF,
+    40/200), et Large mieux que Famille. La semaine fait foi (52/12 semaines par mois)."""
+    from nokker.billing.plans import HOUSEHOLD_PLANS
+
+    price = {"solo": 19, "famille": 49, "large": 99}
+    weekly = {"solo": 200, **{p: DEFAULT_PLANS[p].caps["turns_per_week"] for p in ("famille", "large")}}
+    per_turn = {p: price[p] / (weekly[p] * 52 / 12) for p in price}
+    assert per_turn["large"] < per_turn["famille"] < per_turn["solo"]
+    assert HOUSEHOLD_PLANS == {"famille", "large"}
+    assert all(DEFAULT_PLANS[p].caps["household_members"] == 6 for p in HOUSEHOLD_PLANS)
+
+
+# ─────────────────────── coupon de bêta (décision du 25.10) ───────────────────────
+
+
+def _with_coupon(coupon):
+    return Billing(store=MemoryBilling(), stripe=FakeStripe(), plans=plans_from_config(None), prices=PRICES,
+                   webhook_secret=SECRET, app_url="https://app.nokker.ai/", clock=lambda: NOW, coupon=coupon)
+
+
+def test_beta_coupon_goes_with_every_checkout_and_empty_changes_nothing(b):
+    bill = _with_coupon("COUPON_TEST")
+    assert bill.coupon_for(A) == "COUPON_TEST" and bill.coupon_for(B) == "COUPON_TEST"  # global en bêta
+    bill.checkout(A, "solo")
+    bill.checkout(B, "essentiel")
+    assert [c[-1] for c in bill.stripe.calls if c[0] == "checkout"] == ["COUPON_TEST", "COUPON_TEST"]
+    # vide (défaut) : la requête d'avant, sans remise
+    assert b.coupon_for(A) is None and _with_coupon("  ").coupon_for(A) is None
+    b.checkout(A, "solo")
+    assert b.stripe.calls[-1] == ("checkout", "cus_1", "price_solo", "https://app.nokker.ai/account?billing=success", "fr")
+
+
+def test_refused_coupon_never_blocks_the_subscription(caplog):
+    """Coupon inconnu ou expiré chez Stripe : la session est recréée SANS remise, un journal le dit."""
+    for code in ("resource_missing", "coupon_expired", "invalid_request_error"):
+        bill = _with_coupon("COUPON_TEST")
+        bill.stripe.bad_coupons["COUPON_TEST"] = code
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="nokker.billing"):
+            assert bill.checkout(A, "solo") == "https://checkout.stripe.test/s"
+        checkouts = [c for c in bill.stripe.calls if c[0] == "checkout"]
+        assert [c[-1] for c in checkouts] == ["COUPON_TEST", "fr"]  # avec le coupon, puis sans
+        assert any("COUPON_TEST" in r.getMessage() and code in r.getMessage() for r in caplog.records)
+    # Stripe injoignable : pas de second essai, l'erreur d'avant
+    bill = _with_coupon("COUPON_TEST")
+    bill.stripe.fail = True
+    with pytest.raises(BillingError) as e:
+        bill.checkout(A, "solo")
+    assert e.value.code == "stripe_unavailable"

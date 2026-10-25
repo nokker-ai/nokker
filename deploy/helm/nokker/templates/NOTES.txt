@@ -1,0 +1,31 @@
+Nokker {{ .Chart.AppVersion }} — release {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+App: {{ .Values.core.publicUrl }}
+
+Before the first turn:
+  1. Model key (OpenAI-compatible endpoint {{ .Values.core.models.baseUrl }}):
+       kubectl -n {{ .Release.Namespace }} create secret generic {{ default (printf "%s-router" (include "nokker.fullname" .)) .Values.core.routerKey.existingSecret }} --from-literal=ROUTER_KEY=…
+       kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "nokker.fullname" . }}-core
+{{- if .Values.openbao.enabled }}
+  2. OpenBao: the init Job stores the core's AppRole and restarts the core once.
+{{- if eq .Values.openbao.unseal "manual" }}
+     MANUAL unseal: read the key ONCE in the Job's log, store it outside the cluster, then delete the Job:
+       kubectl -n {{ .Release.Namespace }} logs job/{{ include "nokker.fullname" . }}-openbao-init-{{ .Release.Revision }} -c init
+       kubectl -n {{ .Release.Namespace }} delete job {{ include "nokker.fullname" . }}-openbao-init-{{ .Release.Revision }}
+     After every OpenBao restart:
+       kubectl -n {{ .Release.Namespace }} exec -it {{ include "nokker.fullname" . }}-openbao-0 -c openbao -- bao operator unseal
+{{- end }}
+{{- end }}
+{{- if .Values.core.sso.enabled }}
+  3. Single sign-on: the account owner adds the identity provider in the web app (Team → Single sign-on); the
+     redirect URI to register at the provider is {{ trimSuffix "/" .Values.core.publicUrl }}/sso/callback.
+{{- end }}
+{{- if .Values.code.enabled }}
+
+Code sessions run one pod each (label app.kubernetes.io/name=nokker-sandbox), network: {{ .Values.code.sandbox.network }}.
+Workspaces: PVC {{ include "nokker.workspacesClaim" . }} ({{ .Values.code.workspaces.accessMode }}), kept on uninstall.
+{{- end }}
+{{- if .Values.database.dev.enabled }}
+
+WARNING: database.dev.enabled=true — in-chart Postgres for trials only (no backup, no HA).
+{{- end }}

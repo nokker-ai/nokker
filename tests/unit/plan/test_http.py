@@ -126,3 +126,40 @@ def test_signed_alert_over_http_and_incident_routes(api):
     assert api("DELETE", f"/v1/alerts/sources/{src['source']['id']}", who="ben")[0] == 404
     assert api("DELETE", f"/v1/alerts/sources/{src['source']['id']}", who="ana")[1] == {"deleted": True}
     assert api("POST", url, raw=body, headers={"X-Nokker-Signature": sign(src["secret"], body)})[0] == 404
+
+
+def test_brief_delivery_routes(api):
+    from nokker.plan.delivery import BriefDelivery
+
+    class AnyOwner:
+        sent: list = []
+
+        def telegram_chats(self, owner):
+            return ["4242"]
+
+        def send_telegram(self, chat_id, text):
+            self.sent.append(text)
+
+        def mail_sender(self, owner):
+            return f"{owner}@example.org"
+
+        def send_mail(self, owner, to, subject, body):
+            self.sent.append(body)
+
+    plan = plan_http.service()
+    assert api("GET", "/v1/plan/brief/delivery", who="ana")[0] == 404  # pas de livraison configurée : comme avant
+    plan.delivery = BriefDelivery(store=plan.store, transports=AnyOwner(), approvals=None)
+    try:
+        assert api("GET", "/v1/plan/brief/delivery")[0] == 401
+        st, d = api("GET", "/v1/plan/brief/delivery", who="ana")
+        assert st == 200 and d["telegram"] == {"enabled": False, "chats": 1} and d["email"]["state"] == "off"
+        st, d = api("PUT", "/v1/plan/brief/delivery", {"telegram": True}, who="ana")
+        assert st == 200 and d["telegram"]["enabled"] is True
+        assert api("GET", "/v1/plan/brief/delivery", who="ben")[1]["telegram"]["enabled"] is False  # par personne
+        st, err = api("PUT", "/v1/plan/brief/delivery", {"sms": True}, who="ana")
+        assert st == 400 and err["error"]["code"] == "invalid"
+        st, err = api("PUT", "/v1/plan/brief/delivery", {"email": "ana.perso@example.com"}, who="ana")
+        assert st == 503 and err["error"]["code"] == "approvals_unavailable"  # pas de carte forte : pas d'e-mail
+        assert AnyOwner.sent == []
+    finally:
+        plan.delivery = None

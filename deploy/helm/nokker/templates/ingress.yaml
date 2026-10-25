@@ -1,0 +1,38 @@
+{{- if .Values.ingress.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+# One host: /v1 → core (API and SSE, same origin as the app: no CORS), everything else → web.
+# Long-lived SSE streams need a generous read timeout on your controller (annotations).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fn }}
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      {{- with .Values.ingress.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service: {name: {{ $fn }}-core, port: {name: api}}
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: {{ $fn }}-web, port: {name: http}}
+{{- end }}

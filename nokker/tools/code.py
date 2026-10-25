@@ -225,6 +225,33 @@ class Workspace:
             pass
 
 
+class SharedEnv:
+    """L'environnement d'exécution d'un fil parent, prêté à un sous-agent (`CodeToolSource.share_workspace`) : chaque
+    commande part dans le dossier courant de l'ENFANT (le sien, suivi d'une commande à l'autre), le dossier courant du
+    parent n'est jamais déplacé par elle, et `cleanup` ne ferme rien (le bac à sable appartient au parent)."""
+
+    def __init__(self, inner: Any, cwd: str) -> None:
+        self._inner, self.cwd = inner, cwd
+
+    def execute(self, command: str, cwd: str = "", **kwargs: Any) -> dict[str, Any]:
+        before = getattr(self._inner, "cwd", None)
+        r = self._inner.execute(command, cwd=cwd or self.cwd, **kwargs)
+        seen = r.get("cwd") if isinstance(r, dict) and r.get("cwd_observed") else None
+        if seen:
+            self.cwd = seen
+            if before is not None and getattr(self._inner, "cwd", None) == seen != before:
+                self._inner.cwd = before  # l'amont range le dossier observé chez lui : celui du parent reste
+        return r
+
+    def cleanup(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("_inner", "cwd"):
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
@@ -269,6 +296,15 @@ class CodeToolSource:
     subdir: str = ""
     # Commandes en arrière-plan (lot X6, `local.background_processes`) : outils process_* présents seulement si vrai.
     background: bool = False
+    # backend « kubernetes » (sessions de code multi-utilisateur, docs/LOKKAL.md §7.28) : l'environnement d'exécution
+    # vient de `env_factory`, appelée avec la signature du module du bac à sable kubernetes
+    # (`KubernetesEnvironment(cfg, cwd, sub_path, labels, timeout)`) ; `k8s` = le bloc `code.kubernetes` tel quel,
+    # `sub_path` = la racine relative au volume des espaces de travail, `labels` = étiquettes du pod. Les lectures
+    # passent par le volume monté côté noyau (`root`), comme en docker ; écritures et commandes par l'environnement.
+    env_factory: Any = None
+    k8s: dict[str, Any] = field(default_factory=dict)
+    sub_path: str = ""
+    labels: dict[str, str] = field(default_factory=dict)
     # Backend local : journaux des processus en arrière-plan sous `<state_dir>/processes/<fil>/` (et fiches de ménage,
     # `reap_processes`). None = dossier temporaire de l'utilisateur.
     state_dir: str | None = None
@@ -277,8 +313,13 @@ class CodeToolSource:
 
     def __post_init__(self) -> None:
         self.root = os.path.realpath(self.root)
-        if self.backend not in ("docker", "local"):
-            raise ValueError(f"backend inconnu : {self.backend!r} (docker | local)")
+        if self.backend not in ("docker", "local", "kubernetes"):
+            raise ValueError(f"backend inconnu : {self.backend!r} (docker | local | kubernetes)")
+        if self.backend == "kubernetes":
+            if not callable(self.env_factory):
+                raise ValueError("backend kubernetes : fabrique d'environnement absente (nokker/tools/k8s_sandbox.py)")
+            if self.mount == WORKSPACE_MOUNT:
+                self.mount = str(self.k8s.get("workspace_mount") or WORKSPACE_MOUNT)
         if not os.path.isdir(self.root):
             raise ValueError(f"dossier de travail introuvable : {self.root}")
         self.subdir = self.subdir.strip("/")
@@ -296,6 +337,35 @@ class CodeToolSource:
         import dataclasses
 
         return dataclasses.replace(self, subdir=subdir)
+
+    def share_workspace(self, parent_thread: str, thread_id: str, subdir: str = "") -> Workspace:
+        """Espace d'un sous-agent (`thread_id`) dans le MÊME bac à sable que `parent_thread` : l'environnement du
+        parent (même container, même pod — jamais un second), vu par un `SharedEnv` qui garde son propre dossier courant
+        (`<montage>/<subdir>`, son worktree) et ne ferme jamais le bac à sable. Sessions de code multi-utilisateur
+        (docs/LOKKAL.md §7.28) ; idempotent ; `close(thread_id)` le retire sans toucher au parent."""
+        from tools.file_operations import ShellFileOperations
+        from tools.todo_tool import TodoStore
+
+        subdir = subdir.strip("/")
+        if subdir and (os.path.isabs(subdir) or ".." in subdir.split("/")):
+            raise ValueError(f"sous-dossier invalide : {subdir!r}")
+        with self._lock:
+            ws = self._spaces.get(thread_id)
+        if ws is not None:
+            return ws
+        parent = self.workspace(parent_thread)
+        cwd = self.mount + ("/" + subdir if subdir else "") if self.backend != "local" else \
+            (os.path.join(self.root, subdir) if subdir else self.root)
+        env = SharedEnv(parent.env, cwd)
+        reader = None
+        if parent.reader is not None:
+            from tools.environments.local import LocalEnvironment
+
+            base = os.path.join(self.root, subdir) if subdir else self.root
+            reader = ShellFileOperations(LocalEnvironment(cwd=base, timeout=60), cwd=base)
+        ws = Workspace(env=env, ops=ShellFileOperations(env, cwd=cwd), todos=TodoStore(), cwd=cwd, reader=reader)
+        with self._lock:
+            return self._spaces.setdefault(thread_id, ws)
 
     def specs(self) -> list[ToolSpec]:
         specs = (*_SPECS, *_PROCESS_SPECS) if self.background else _SPECS
@@ -333,6 +403,10 @@ class CodeToolSource:
             from tools.environments.local import LocalEnvironment
 
             env, cwd = LocalEnvironment(cwd=self._base, timeout=120), self._base
+        elif self.backend == "kubernetes":
+            cwd = self.mount + ("/" + self.subdir if self.subdir else "")
+            env = self.env_factory(cfg=dict(self.k8s), cwd=cwd, sub_path=self.sub_path, labels=dict(self.labels),
+                                   timeout=120)
         else:
             from tools.environments import docker as upstream_docker
             from tools.environments.docker import DockerEnvironment
@@ -363,7 +437,7 @@ class CodeToolSource:
                                                 *(["--network", self.network_name]
                                                   if self.network and self.network_name else [])])
         reader = None
-        if self.backend == "docker" and self.local_reads:
+        if self.backend in ("docker", "kubernetes") and self.local_reads:
             from tools.environments.local import LocalEnvironment
 
             reader = ShellFileOperations(LocalEnvironment(cwd=self._base, timeout=60), cwd=self._base)
@@ -586,5 +660,5 @@ class CodeToolSource:
         return out(table.stop(proc_id).view())
 
 
-__all__ = ["CODE_TOOLS", "PROCESS_TOOLS", "CodeToolSource", "DEFAULT_SANDBOX_IMAGE", "Workspace", "classify_command",
-           "hardline_reason", "reap_sandboxes"]
+__all__ = ["CODE_TOOLS", "PROCESS_TOOLS", "CodeToolSource", "DEFAULT_SANDBOX_IMAGE", "SharedEnv", "Workspace",
+           "classify_command", "hardline_reason", "reap_sandboxes"]

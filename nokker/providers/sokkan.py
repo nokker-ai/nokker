@@ -108,6 +108,8 @@ class SokkanProvider:
     # Le modèle de ce palier lit-il les images (X7) ? Lu par le noyau (`core/loop.py::_wire_messages`) : avec vision,
     # les images jointes partent en parties `image_url` (data URL) ; sans, une note texte les remplace. Défaut : non.
     vision: bool = False
+    # `vision: auto` (nokker/providers/vision_probe.py) : sonde unique au premier tour avec image ; None = pas de sonde.
+    vision_probe: Any = None
 
     def __post_init__(self) -> None:
         self._client = httpx.Client(timeout=self.timeout_s)

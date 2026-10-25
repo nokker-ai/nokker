@@ -47,7 +47,8 @@ logger = logging.getLogger("nokker.bubbles.hub")
 
 NOTIFY_TTL_S = 600.0
 # Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
-KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief"})
+# `pack_agents` (pack retiré, ses agents créés : désarmer / supprimer / garder) : ses actions touchent des agents.
+KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
@@ -399,6 +400,19 @@ class BubbleHub:
         self._emit_bubble("bubble.updated", b)
         return b
 
+    def page_changed(self, meta: Any) -> int:
+        """Publication ou localité d'une page changée hors d'un tour (docs/LOKKAL.md §7.26) : les bulles `artifact` de son
+        fil suivent (`public`, `public_version`, `public_index`, `locality`), une `bubble.updated` chacune. Rend leur
+        nombre."""
+        n = 0
+        keys = ("public", "public_version", "public_index", "locality", "moderated_at")
+        fresh = {k: v for k, v in meta.state().items() if k in keys}
+        for b in self.bubbles.list_thread(meta.thread_id):
+            if b.kind == "artifact" and b.closed_at is None and (b.state or {}).get("page_id") == meta.page_id:
+                self.update_from_kernel(b.id, state={**(b.state or {}), **fresh})
+                n += 1
+        return n
+
     def close_bubble(self, bubble_id: str, user: str | None) -> Bubble:
         self._writable(bubble_id, user)
         return self._close(bubble_id)
@@ -518,6 +532,8 @@ class BubbleHub:
                 return self.plan.decide(str((b.state or {}).get("proposal_id") or ""), action_id, user or "")
             except PlanError as e:
                 raise (BubbleNotFound(e.message) if e.status == 404 else BubbleError(e.message)) from None
+        if b.kind == "pack_agents":
+            return self._pack_agents_action(b, user, action_id)
         if b.kind == "agent_draft":
             # Seule action : `activate` (§9.4) — crée l'agent (Crew), ferme la bulle, publie `agent.created`. Pas de
             # carte ici : armer une règle d'écriture reste un geste à part, avec la carte forte (§9.5).
@@ -532,8 +548,11 @@ class BubbleHub:
             body = {k: s.get(k) for k in ("name", "role", "model", "tools", "instructions", "trigger", "secrets",
                                           "budget", "auto_approve", "placement", "needs", "project") if k in s}
             # Mêmes règles que POST /v1/agents (§9.5) : manuel sans écriture → armé, sinon au repos (à armer).
+            # Carte posée par un pack (lot X16) : l'agent garde son origine, que `pack_remove` relit.
+            origin = {"pack": s.get("pack"), "template": s.get("template")} if s.get("pack") else None
             try:
-                agent = self.agents_hub.create_from_body(body, user or b.created_by)
+                agent = self.agents_hub.create_from_body(body, user or b.created_by,
+                                                         **({"origin": origin} if origin else {}))
             except AgentError as e:
                 raise BubbleError(f"carte d'agent invalide : {e}") from None
             self._close(b.id)
@@ -545,6 +564,33 @@ class BubbleHub:
         text = f"[Action « {action.get('label') or action_id} » demandée sur la bulle « {b.title} » ({b.id})]"
         self._run_background_turn(b.thread_id, text, user)
         return {"accepted": True, "thread_id": b.thread_id}
+
+    def _pack_agents_action(self, b: Bubble, user: str | None, action_id: str) -> dict[str, Any]:
+        """Carte `pack_agents` (pack retiré, `pack_remove`) : `disarm` désarme, `delete` supprime, `keep` garde les
+        agents qu'elle nomme — et seulement ceux qui existent encore ET viennent toujours de ce pack (relus ici) : un
+        agent supprimé entre-temps est sauté, un agent d'un autre pack n'est jamais touché. La décision est celle de
+        l'utilisateur (membre du fil, `_writable`), jamais un tour du modèle ; la carte se ferme."""
+        if action_id not in ("disarm", "delete", "keep"):
+            raise BubbleNotFound(f"action inconnue : {action_id}")
+        if self.agents_hub is None:
+            raise BubbleError("crew (agents) non configuré")
+        state = dict(b.state or {})
+        pack = str(state.get("pack") or "")
+        named = {str(a.get("id")) for a in state.get("agents") or [] if isinstance(a, dict)}
+        owner = state.get("owner")
+        targets = [a for a in self.agents_hub.from_pack(pack) if a.id in named
+                   and (not owner or a.created_by == owner)] if pack else []
+        by = user or "inconnu"
+        done: list[str] = []
+        for a in targets:
+            if action_id == "disarm" and a.armed:
+                self.agents_hub.disarm(a.id, by)
+            elif action_id == "delete":
+                self.agents_hub.delete_agent(a.id, by)
+            done.append(a.id)
+        self._close(b.id)
+        key = {"disarm": "disarmed", "delete": "deleted", "keep": "kept"}[action_id]
+        return {"closed": True, key: done}
 
     # ─────────────────────────────── sessions qui se parlent ───────────────────────────────
 

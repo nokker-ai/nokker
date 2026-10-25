@@ -52,12 +52,23 @@ class Tenancy(Protocol):
 
     def account_for_tenant(self, tenant_id: str) -> Account | None: ...
 
+    def suspend_for_deletion(self, account_id: str, approval_id: str) -> None: ...
+
 
 @dataclass
 class MemoryTenancy:
     accounts: dict[str, Account] = field(default_factory=dict)
     identities: dict[tuple[str, str], str] = field(default_factory=dict)
+    deletions: dict[str, str] = field(default_factory=dict)  # account_id -> approval_id (file d'effacement)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def suspend_for_deletion(self, account_id: str, approval_id: str) -> None:
+        import dataclasses
+
+        with self._lock:
+            acc = self.accounts[account_id]
+            self.accounts[account_id] = dataclasses.replace(acc, status="suspended")
+            self.deletions.setdefault(account_id, approval_id)
 
     def create_account(self, email: str, lang: str = "fr", invitation_id: str | None = None) -> Account:
         email = _norm_email(email)
@@ -141,6 +152,18 @@ class PgTenancy:
     def account(self, account_id: str) -> Account | None:
         with self._conn() as conn:
             return self._acc(conn.execute("SELECT * FROM accounts WHERE id=%s", (account_id,)).fetchone())
+
+    def suspend_for_deletion(self, account_id: str, approval_id: str) -> None:
+        """Compte et locataire suspendus (plus aucune requête), ligne dans la file d'effacement (migration 017) : une
+        seule transaction. L'effacement lui-même est fait par l'outil d'opérateur (`nokker erase --pending`)."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE accounts SET status = 'suspended' WHERE id = %s RETURNING tenant_id", (account_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise KeyError(account_id)
+            cur.execute("UPDATE tenants SET status = 'suspended' WHERE id = %s", (row["tenant_id"],))
+            cur.execute("INSERT INTO account_deletions (account_id, tenant_id, approval_id) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (account_id) DO NOTHING", (account_id, row["tenant_id"], approval_id))
 
     def account_by_email(self, email: str) -> Account | None:
         return self.account_for_identity("email", _norm_email(email))

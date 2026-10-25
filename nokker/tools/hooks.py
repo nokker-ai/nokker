@@ -132,18 +132,22 @@ def project_hooks_block(root: str | Path) -> Any:
     return read_settings(Path(root) / ".nokker" / "settings.json").get("hooks")
 
 
-def is_trusted(user_settings: dict[str, Any], root: str, sha256: str) -> bool:
-    entries = user_settings.get("trusted_project_hooks") or []
+TRUST_KEY = "trusted_project_hooks"
+
+
+def is_trusted(user_settings: dict[str, Any], root: str, sha256: str, key: str = TRUST_KEY) -> bool:
+    """`key` : `trusted_project_hooks` (hooks) ou `trusted_project_skills` (skills du dépôt, nokker/tools/skills.py)."""
+    entries = user_settings.get(key) or []
     return any(isinstance(e, dict) and e.get("root") == root and e.get("sha256") == sha256 for e in entries)
 
 
-def trust_project_hooks(settings_path: str | Path, root: str, sha256: str) -> None:
+def trust_project_hooks(settings_path: str | Path, root: str, sha256: str, key: str = TRUST_KEY) -> None:
     """Écrit la confiance de l'utilisateur dans SES réglages : une entrée par dossier, la nouvelle empreinte remplace
     l'ancienne (un bloc déjà remplacé n'a plus de raison d'être de confiance)."""
     p = Path(settings_path).expanduser()
     data = read_settings(p)
-    entries = [e for e in (data.get("trusted_project_hooks") or []) if isinstance(e, dict) and e.get("root") != root]
-    data["trusted_project_hooks"] = [*entries, {"root": root, "sha256": sha256}]
+    entries = [e for e in (data.get(key) or []) if isinstance(e, dict) and e.get("root") != root]
+    data[key] = [*entries, {"root": root, "sha256": sha256}]
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")

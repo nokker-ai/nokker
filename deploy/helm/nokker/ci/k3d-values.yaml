@@ -1,0 +1,25 @@
+# k3d / k3s test values (ci/k3d-test.sh): one node, local-path storage (RWO only), Traefik in kube-system.
+core:
+  publicUrl: https://nokker.localtest.me:18443
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+code:
+  workspaces:
+    accessMode: ReadWriteOnce
+    colocateWithCore: true
+    size: 2Gi
+ingress:
+  host: nokker.localtest.me
+  tls:
+    enabled: false
+database:
+  dev:
+    size: 2Gi
+openbao:
+  size: 256Mi
+networkPolicy:
+  ingressNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: kube-system
+web:
+  replicas: 1

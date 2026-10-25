@@ -40,6 +40,7 @@ FILE_EDIT_TOOLS = frozenset({"write_file", "patch", "checkpoint_create"})
 MEMORY_EDIT_TOOLS = frozenset({"memory_note", "memory"})
 # Verdict d'un appel à effet d'un connecteur relayé (X20) : une carte par appel, sans règle « session » ni « always ».
 RELAY_CARD_RULE = "permissions:relayed_connector"
+LOCAL_STRONG_RULE = "permissions:local_connector_strong"  # boîte mail posée dans Lokkal : envoi, corbeille
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
 
@@ -137,14 +138,23 @@ class LocalPermissions:
         if rule not in rules:
             rules.append(rule)
 
+    def _project(self, thread_id: str | None) -> tuple[Mode | None, list[Rule], list[Rule]]:
+        """Restrictions du dépôt / de l'équipe du fil ; un sous-agent `<fil>/sa-<id>` a celles de son parent (elles ne
+        font que restreindre : déléguer ne les contourne pas). Les règles « pour cette session » (`thread_allow`) ne
+        s'étendent PAS à l'enfant."""
+        tid = thread_id or ""
+        while tid not in self.thread_project and "/sa-" in tid:
+            tid = tid.rsplit("/sa-", 1)[0]
+        return self.thread_project.get(tid, (None, [], []))
+
     def mode_for(self, thread_id: str | None = None) -> Mode:
         """Le mode en vigueur sur ce fil : celui de l'utilisateur, ou celui du dépôt s'il est plus strict."""
-        proj_mode = self.thread_project.get(thread_id or "", (None, [], []))[0]
+        proj_mode = self._project(thread_id)[0]
         return proj_mode if proj_mode and _STRICTNESS[proj_mode.value] > _STRICTNESS[self.mode.value] else self.mode
 
     def decide(self, call: ToolCall, effect: Effect, thread_id: str | None = None) -> tuple[Decision | None, str]:
         """(décision, motif). None = rien à dire : les portes du noyau décident seules (ex. destructif en mode auto)."""
-        _, proj_ask, proj_deny = self.thread_project.get(thread_id or "", (None, [], []))
+        _, proj_ask, proj_deny = self._project(thread_id)
         mode = self.mode_for(thread_id)
         for r in [*self.deny, *proj_deny]:
             if r.matches(call):
@@ -245,6 +255,16 @@ class PermissionGates:
                                    "une carte", subject=call.id,
                             strength="strong" if effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL)
                             else "standard")]
+        if getattr(spec, "locality", None) == "local" and str(getattr(spec, "source", "") or "").startswith(
+                "connector:") and effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL) and decision is not Decision.DENY:
+            # Boîte posée dans Lokkal (nokker/local/connectors.py) : l'envoi et la corbeille restent une carte FORTE,
+            # comme pour la boîte relayée (X20b) — ni le mode, ni une règle allow, ni un GO écrit n'en dispensent.
+            v1 = self.inner.invariants.check_action(call, spec, turn)
+            if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
+                return [v1]
+            return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=LOCAL_STRONG_RULE,
+                            reason="boîte mail de la machine : un envoi ou une mise à la corbeille passe par une carte "
+                                   "forte", subject=call.id, strength="strong")]
         if decision is None:
             return self.inner.action(call, spec, turn)
         if decision is Decision.ALLOW:

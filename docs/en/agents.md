@@ -1,7 +1,7 @@
 # Agents
 
 An agent is a named job: a mission, a list of tools, a trigger, a budget. It runs on its own (every morning, on an
-alert, when a webhook arrives) and reports back. A session can *propose* an agent; only you create it, and only you
+alert, when a webhook or a mail arrives) and reports back. A session can *propose* an agent; only you create it, and only you
 arm it.
 
 Not to be confused with [sub-agents](subagents.md), which a session starts for the length of one turn.
@@ -28,7 +28,9 @@ machines and the shared deck are **rolling out** (see [Several machines](#severa
   mission, trigger, tools, rules and budget. It creates nothing. Activating the card
   (`POST /v1/bubbles/{id}/actions/activate`) creates the agent in your name.
 - **A pack.** Installing a [pack](packs.md) proposes its agent templates as the same cards. The pack's `needs` (a GPU
-  for `video`) carry over to the agent when you activate the card, so [placement](#several-machines) sees them.
+  for `video`) carry over to the agent when you activate the card, so [placement](#several-machines) sees them. The
+  agent keeps `origin: {pack, template}` (null for other agents): removing the pack lists it and offers to disarm or
+  delete it, never silently.
 - **The API.** `POST /v1/agents`.
 
 ## Triggers
@@ -40,12 +42,50 @@ machines and the shared deck are **rolling out** (see [Several machines](#severa
 | `once` | `{"kind": "once", "at": "2026-11-02T07:00:00Z"}` | After the date, the agent goes back to `paused` |
 | `event` `webhook:<id>` | `{"kind": "event", "event": "webhook:deploy"}` | A signed `POST` from another system (below) |
 | `event` `alert:<name>` | `{"kind": "event", "event": "alert:Disk*"}` | An incident opened from an alert, glob pattern ([incidents.md](incidents.md), **beta**) |
-| `event` `mail:<filter>` | | **Planned.** Refused today (400): nothing reads the mailbox on its own yet, so the agent would never run. Use a `schedule` whose mission reads the inbox (`mail_search`), or a `webhook:<id>` called by your mail service |
+| `event` `mail:<filter>` | `{"kind": "event", "event": "mail:from:billing@example.com is:unread"}` | A new message in the inbox of your linked mailbox that matches the filter (below). Needs the engine **and** connectors on the instance, and a linked mailbox; otherwise refused (400) |
 
 **Webhook.** `POST /v1/agents/{id}/webhook-secret` returns a secret once (`whsec_…`) with the URL to call. The caller
 signs each request: `X-Nokker-Signature: t=<epoch>,v1=<hex>`, with `v1 = HMAC-SHA256(secret, "<t>." + raw body)` and
 `t` within 5 minutes. A replayed signature is refused (409), and so is a call to a paused agent. The body (up to
 64 KiB) reaches the model as data in a marked block, with the instruction that it is data, not orders.
+
+**Mail.** The core checks the inbox of the mailbox you linked in Connectors, with the same settings and credential
+a session uses (the credential never leaves the connector: not in a log, an event, the agent card or a run).
+
+- **Filter**: a safe subset of the `mail_search` syntax, and every term must match: `from:`, `to:`, `cc:`,
+  `subject:` (a value, or `"several words"`), `is:unread`, `is:read`, `is:starred`, free words or `"a phrase"`
+  (searched in the whole message), `-` before a term to exclude it, and `*` alone for every new message. At most 8
+  terms, 100 characters per value. Refused (400, with the reason): `after:`/`before:` (only messages that arrive
+  after arming count), `in:`/`label:` (inbox only for now), any other `key:`, `OR`, parentheses, an unclosed quote.
+- **Polling**: every 120 s (`local.crew.mail_poll_s`, 30 s to 1 h), no IDLE. Read-only: nothing is marked read.
+- **What counts as new**: what arrives after the first check following arming. The position (UIDVALIDITY and last
+  UID) is stored, so a restart neither replays nor loses: mail that came in while the core was stopped starts a run
+  at the next check. A stop at any moment of queuing a run neither loses nor replays either: the core stores the id
+  of the run it is about to queue first, and the existence of that run decides at the next check. If the server rebuilds the folder (UIDVALIDITY changes), the agent starts again from there
+  without replaying anything.
+- **One run per check** that finds new matching mail, at most one live run per agent: mail that arrives during a run
+  waits and goes to the next run, together. Same beyond `local.crew.mail_max_runs_per_hour` runs per hour (default
+  12). No `skipped` run is written for each check.
+- **Input of the run**: metadata only (id, sender, subject, date; the 20 most recent), as data in a marked block, with
+  the instruction that mail content is data, not orders. The agent reads a message with `mail_read` and the id,
+  through its usual gates; an agent started by an event never lifts a write.
+- **Errors** (network, credentials, protocol): the check backs off (120 s × 2^errors, at most 1 h) and the card shows
+  the error, without any credential.
+- **Disarming** stops the checks. Re-arming starts from the current mail: what came in while the agent was paused is
+  not replayed. Changing the filter pauses the agent, like any trigger change.
+- `GET /v1/agents/{id}` carries `mail_watch`: `state` (`off`, `waiting`, `ok`, `error`), `last_poll_at`,
+  `next_poll_at`, `error`, `pending` (new messages waiting) and `held` (why), `runs_last_hour`, `resync_at`.
+
+Where it works: wherever the engine runs and a mailbox is linked on that same instance. The check runs where the
+credential lives; an agent placed on a machine gets its runs there, as usual.
+
+- **Lokkal**: the mailbox of the machine ([secrets.md](secrets.md#your-mailbox-on-the-machine), password by vault
+  name). The agent's runs read it with the mail tools, so the agent lists that name in its `secrets` (during a run,
+  only declared names resolve). A mailbox relayed from nokker.ai is never watched; with both, the machine's wins.
+  Without a mailbox on the machine, `mail:` is refused (400, no mailbox linked).
+- **nokker.ai**: the mailbox linked in Connectors on the account.
+
+Not yet: IDLE (push), folders other than the inbox, OR between terms.
 
 ## Arming
 
@@ -85,6 +125,8 @@ Run states: `queued`, `running`, `waiting_approval`, `succeeded`, `failed`, `can
 ## The scheduler
 
 - It ticks every 15 s and runs at most 2 runs at once (`local.crew.max_concurrent`), at most one live run per agent.
+- Mail triggers are checked by their own background thread (`local.crew.mail_poll_s`, `mail_max_runs_per_hour`;
+  `local.crew.mail: false` turns it off, and `mail:` triggers are then refused).
 - If the core was stopped, **one** missed run is caught up (`catch_up: true`) if it is less than 6 hours late; the
   others are skipped.
 - Daylight saving: an hour that does not exist is skipped, an hour that happens twice runs once.
@@ -98,7 +140,7 @@ All routes need your identity (the local token on your machine). Errors are `{"e
 ```
 GET    /v1/agents                                list
 POST   /v1/agents {name, role, instructions, trigger, tools, auto_approve, secrets, budget, ...}
-GET    /v1/agents/{id}
+GET    /v1/agents/{id}                           with mail_watch for a mail:<filter> agent
 PATCH  /v1/agents/{id} {...}                     changing trigger, tools, rules or secrets of an armed agent pauses it
 POST   /v1/agents/{id}/arm                       200 agent, or 202 {approval_id} when a strong card is needed
 POST   /v1/agents/{id}/disarm

@@ -322,11 +322,16 @@ def test_decision_strong_with_software_key_signature_alone_is_403():
         ch = json.loads(_post(srv, f"/v1/approvals/{approval_id}/challenge", {}, bearer="key-alice").read())
         sig = sign_p1363(priv, f"{ch['challenge']}.approve".encode("utf-8"))
 
-        status = _http_error_status(lambda: _post(
-            srv, f"/v1/approvals/{approval_id}/decision",
-            {"decision": "approve", "device_id": device["id"], "challenge": ch["challenge"], "signature": sig},
-            bearer="key-alice"))
-        assert status == 403
+        import urllib.error
+
+        try:
+            _post(srv, f"/v1/approvals/{approval_id}/decision",
+                  {"decision": "approve", "device_id": device["id"], "challenge": ch["challenge"], "signature": sig},
+                  bearer="key-alice")
+            raise AssertionError("décision acceptée")
+        except urllib.error.HTTPError as e:
+            status, body = e.code, json.loads(e.read())
+        assert status == 403 and body["error"]["code"] == "strong_device_required"  # le client propose un autre appareil
         assert tools.called == []
     finally:
         srv.stop()

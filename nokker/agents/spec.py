@@ -3,8 +3,10 @@ d'un `agent_draft`. Tout ce qui sort d'ici est normalisé (dates ISO 8601 UTC, r
 
 Ce que le noyau refuse (400) :
   - un déclencheur inconnu, un cron sans échéance, un fuseau inconnu, une date `once` illisible ;
-  - `event` hors `alert:<nom>`, `webhook:<id>` ; `mail:<filtre>` est refusé avec un message à lui : aucune relève du
-    connecteur mail ne déclencherait l'agent, il ne tournerait jamais (revue de cohérence de la doc, 25.10) ;
+  - `event` hors `alert:<nom>`, `webhook:<id>`, `mail:<filtre>` ; `mail:<filtre>` n'est accepté que si l'appelant dit
+    que la relève du courrier est branchée (`mail=True` : moteur + connecteurs, `nokker/agents/mailwatch.py`), et son
+    filtre doit rester dans le sous-ensemble sûr (`parse_mail_filter`) ; sinon refusé avec `NO_MAIL_TRIGGER` (il ne
+    tournerait jamais) ;
   - un secret dont le NOM ressemble à une valeur (préfixe de clé connu, longue chaîne sans séparateur) ;
   - une règle `auto_approve` illisible ; une règle d'écriture sur un agent déclenché par un événement ;
   - un placement hors `auto`, `web`, `mc_…` ; sur Lokkal, tout placement autre que cette machine (il se choisit dans
@@ -24,9 +26,10 @@ from nokker.agents.types import TRIGGERS, AgentError
 MAX_INSTRUCTIONS = 20_000
 MAX_SECRETS = 32
 MAX_RULES = 40
-EVENT_KINDS = ("alert", "webhook")
-# `mail:<filtre>` : prévu, sans producteur (le connecteur mail ne relève rien de lui-même, il répond aux outils d'un
-# tour). Refusé tant qu'une relève n'appelle pas `AgentEngine.fire_event("mail:…")`.
+EVENT_KINDS = ("alert", "webhook", "mail")
+# `mail:<filtre>` : son producteur est la relève du courrier (`nokker/agents/mailwatch.py`), branchée sur le moteur
+# seulement quand l'instance a des connecteurs. Sans elle (pas de moteur, pas de connecteurs), refusé : il ne
+# tournerait jamais.
 NO_MAIL_TRIGGER = ("trigger.event mail:<filtre> : pas disponible (aucune relève du courrier ne déclenche un agent, il "
                    "ne tournerait jamais) — à la place : un déclencheur schedule dont la mission lit la boîte "
                    "(mail_search), ou webhook:<id> appelé par le service de courrier")
@@ -68,7 +71,8 @@ def iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def norm_trigger(raw: Any) -> dict[str, Any]:
+def norm_trigger(raw: Any, *, mail: bool = False) -> dict[str, Any]:
+    """`mail` : la relève du courrier est branchée ici (sinon `mail:<filtre>` est refusé, `NO_MAIL_TRIGGER`)."""
     if raw is None:
         return {"kind": "manual"}
     if not isinstance(raw, dict):
@@ -93,9 +97,13 @@ def norm_trigger(raw: Any) -> dict[str, Any]:
     event = str(raw.get("event") or "").strip()
     head, sep, tail = event.partition(":")
     if head == "mail" and sep:
-        raise AgentError(NO_MAIL_TRIGGER)
+        if not mail:
+            raise AgentError(NO_MAIL_TRIGGER, code="no_mail_trigger")
+        from nokker.agents.mailwatch import parse_mail_filter
+
+        event = "mail:" + parse_mail_filter(tail)[0]
     if not sep or head not in EVENT_KINDS or not tail.strip():
-        raise AgentError("trigger.event : alert:<nom> ou webhook:<id>")
+        raise AgentError("trigger.event : alert:<nom>, webhook:<id>" + (" ou mail:<filtre>" if mail else ""))
     if head == "webhook" and not _WEBHOOK_ID.match(tail):
         raise AgentError("trigger.event webhook:<id> : id de 1 à 64 caractères [A-Za-z0-9_.-]")
     if len(event) > 200:
@@ -236,8 +244,8 @@ def norm_tools(raw: Any) -> list[str]:
 
 
 def norm_fields(body: dict[str, Any], *, partial: bool, local_machine: str | None = None, policy: Any = None,
-                owner: str | None = None) -> dict[str, Any]:
-    """Champs reconnus de `body`, validés. `partial` (PATCH) : seulement ceux présents."""
+                owner: str | None = None, mail: bool = False) -> dict[str, Any]:
+    """Champs reconnus de `body`, validés. `partial` (PATCH) : seulement ceux présents. `mail` : voir `norm_trigger`."""
     out: dict[str, Any] = {}
 
     def has(key: str) -> bool:
@@ -258,7 +266,7 @@ def norm_fields(body: dict[str, Any], *, partial: bool, local_machine: str | Non
             raise AgentError(f"instructions : {MAX_INSTRUCTIONS} caractères au plus")
         out["instructions"] = text
     if has("trigger"):
-        out["trigger"] = norm_trigger(body.get("trigger"))
+        out["trigger"] = norm_trigger(body.get("trigger"), mail=mail)
     if has("secrets"):
         out["secrets"] = norm_secrets(body.get("secrets"))
     if has("budget"):

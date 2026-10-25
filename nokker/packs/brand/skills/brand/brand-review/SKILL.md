@@ -1,6 +1,7 @@
 ---
 name: brand-review
 description: Check texts and visuals against the brand charter
+locality: local
 ---
 # Brand review
 

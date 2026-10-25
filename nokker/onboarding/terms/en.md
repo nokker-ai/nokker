@@ -14,8 +14,8 @@ The beta is offered by **Ninabot Sàrl**, c/o Openest coworking SA, Chemin de Ri
   You may stop whenever you wish.
 
 ## 3. What we ask of you
-- Actually use Nokker during the beta and give us your feedback, in particular through a **short questionnaire every
-  Sunday evening** (2 minutes; Monday is still fine).
+- Actually use Nokker during the beta and give us your feedback, in particular through a
+  **short questionnaire every Sunday evening** (2 minutes; Monday is still fine).
 - **Do not entrust sensitive data**: health data, professional or banking secrets, main passwords, data of third
   parties that you have no right to share.
 - Do not use Nokker for unlawful purposes or to harm others.
@@ -59,8 +59,8 @@ data (§ 7) deletes your raw data; it does not change models that have already b
 - You may at any time ask for access to your data, its rectification or its erasure at the address in § 1.
 
 ## 8. Included usage
-Usage is counted in **messages** (one message = one conversation turn with Nokker). The beta "Solo" offer is **40
-messages per day and 200 per week**, over fixed-time windows shown in "My account" (with the reset time, Zurich time).
+Usage is counted in **messages** (one message = one conversation turn with Nokker). The beta "Solo" offer is
+**40 messages per day and 200 per week**, over fixed-time windows shown in "My account" (with the reset time, Zurich time).
 During the beta, **we warn you when you go over, without cutting you off**, while these limits are being calibrated;
 a safety cap of 150 messages per day still applies against abuse.
 

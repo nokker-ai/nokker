@@ -1,6 +1,7 @@
 ---
 name: social-setup
 description: Connect a post scheduler and a LinkedIn MCP server by name
+locality: local
 ---
 # Setting up the social pack
 

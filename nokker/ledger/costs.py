@@ -29,10 +29,18 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from nokker.core.turn import LLMCall, Verdict
+from nokker.ledger.attribution import current_tag
 from nokker.ledger.prices import PriceCatalog
 from nokker.ledger.prices import load as load_prices
 
 MIGRATION_SQL = (Path(__file__).parent / "migrations" / "0001_ledger_entries.sql").read_text(encoding="utf-8")
+# Colonnes du projet d'équipe (attribution d'un appel, docs/LOKKAL.md §7.15) : migration du noyau, rejouée ici pour
+# un ledger migré seul ; ses politiques d'équipe attendent la migration 023 (étape gardée).
+PROJECT_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "037_team_budget_brief.sql").read_text(
+    encoding="utf-8")
+# Colonnes du foyer (lot X23, quota commun) : même principe, migration 039 rejouée ici, étapes gardées.
+HOUSEHOLD_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "039_household.sql").read_text(
+    encoding="utf-8")
 
 
 # ─────────────────────────────── vues stockées ───────────────────────────────
@@ -60,6 +68,13 @@ class CallRecord:
     cost_source: str  # router | catalog | unknown
     created_at: datetime
     reusable_tokens: int | None = None  # LLMCall.reusable_tokens (préfixe identique à l'appel précédent du fil)
+    # Projet d'équipe de l'appel (`nokker/ledger/attribution.py`) : None hors projet.
+    project_id: str | None = None
+    project_tenant: str | None = None
+    account: str | None = None
+    # Foyer de l'appel (quota commun, lot X23) : None hors foyer.
+    household_id: str | None = None
+    household_tenant: str | None = None
 
     @property
     def new_tokens(self) -> int:
@@ -205,13 +220,15 @@ class _AggregatorMixin:
 class InMemoryLedger(_AggregatorMixin):
     """Backend de test / noyau sans Postgres. Même comportement que `PostgresLedger`."""
 
-    def __init__(self, prices: PriceCatalog | None = None) -> None:
+    def __init__(self, prices: PriceCatalog | None = None, *, clock: Any = None) -> None:
         self.prices = prices if prices is not None else load_prices()
+        self.clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._calls: list[CallRecord] = []
         self._verdicts: list[VerdictRecord] = []
 
     def record(self, thread_id: str, turn_index: int, call: LLMCall) -> None:
         chf, source = cost_for_call(call, self.prices)
+        tag = current_tag()
         self._calls.append(CallRecord(
             thread_id=thread_id, turn_index=turn_index, tier=call.tier.value, model=call.model,
             reasoning=call.reasoning, prefix_sha256=call.prefix_sha256, layer_tokens=dict(call.layer_tokens),
@@ -219,7 +236,10 @@ class InMemoryLedger(_AggregatorMixin):
             completion_tokens=call.usage.completion, reasoning_tokens=call.usage.reasoning,
             cached_reported=call.usage.cached_reported, latency_s=call.latency_s,
             route_reason=call.route_reason, chf=chf, cost_source=source,
-            created_at=datetime.now(timezone.utc), reusable_tokens=call.reusable_tokens,
+            created_at=self.clock(), reusable_tokens=call.reusable_tokens,
+            project_id=tag.project_id if tag else None, project_tenant=tag.project_tenant if tag else None,
+            account=tag.account if tag else None, household_id=tag.household_id if tag else None,
+            household_tenant=tag.household_tenant if tag else None,
         ))
 
     def record_verdict(self, thread_id: str, turn_index: int, verdict: Verdict) -> None:
@@ -242,6 +262,20 @@ class InMemoryLedger(_AggregatorMixin):
                 and (day is None or c.created_at.astimezone(timezone.utc).date() == day)
                 and (tier is None or c.tier == tier)]
 
+    def fetch_project_calls(self, project_id: str, project_tenant: str, *, since: datetime,
+                            actor: str) -> list[CallRecord]:
+        """Appels attribués au projet depuis `since`, tous comptes et locataires confondus (la vue du budget ; le
+        service a vérifié que `actor` est membre, la RLS le refait en Postgres)."""
+        return [c for c in self._calls if c.project_id == project_id and c.project_tenant == project_tenant
+                and c.created_at >= since]
+
+    def fetch_household_calls(self, household_id: str, household_tenant: str, *, since: datetime,
+                              actor: str) -> list[CallRecord]:
+        """Appels attribués au foyer depuis `since`, tous membres confondus (quota commun ; le service a vérifié que
+        `actor` est membre, la RLS le refait en Postgres)."""
+        return [c for c in self._calls if c.household_id == household_id and c.household_tenant == household_tenant
+                and c.created_at >= since]
+
     def fetch_verdicts(self, *, thread_id: str | None = None, turn_index: int | None = None,
                         day: date | None = None) -> list[VerdictRecord]:
         return [v for v in self._verdicts
@@ -251,6 +285,22 @@ class InMemoryLedger(_AggregatorMixin):
 
 
 # ─────────────────────────────── backend Postgres ───────────────────────────────
+
+_CALL_COLS = ("thread_id, turn_index, tier, model, reasoning, prefix_sha256, layer_tokens, prompt_tokens, "
+              "cached_tokens, completion_tokens, reasoning_tokens, cached_reported, latency_s, route_reason, "
+              "chf, cost_source, created_at, reusable_tokens, project_id, project_tenant, account, household_id, "
+              "household_tenant")
+
+
+def _call_record(r: Any) -> CallRecord:
+    return CallRecord(
+        thread_id=r[0], turn_index=r[1], tier=r[2], model=r[3], reasoning=r[4], prefix_sha256=r[5],
+        layer_tokens=r[6] or {}, prompt_tokens=r[7], cached_tokens=r[8], completion_tokens=r[9],
+        reasoning_tokens=r[10], cached_reported=r[11], latency_s=r[12], route_reason=r[13], chf=r[14],
+        cost_source=r[15], created_at=r[16], reusable_tokens=r[17], project_id=r[18], project_tenant=r[19],
+        account=r[20], household_id=r[21], household_tenant=r[22],
+    )
+
 
 
 class PostgresLedger(_AggregatorMixin):
@@ -269,20 +319,27 @@ class PostgresLedger(_AggregatorMixin):
         return self._pg.connect(self.dsn, autocommit=True)  # app.tenant_id = locataire courant (NoTenant hors scope)
 
     def migrate(self) -> None:
-        self._pg.migrate(self.dsn, MIGRATION_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
+        # en propriétaire, puis la RLS (nokker/store/conn.py) ; colonnes du projet ensuite (037, gardée)
+        self._pg.migrate(self.dsn, MIGRATION_SQL, PROJECT_SQL, HOUSEHOLD_SQL)
 
     def record(self, thread_id: str, turn_index: int, call: LLMCall) -> None:
         chf, source = cost_for_call(call, self.prices)
+        tag = current_tag()
         with self._connect() as conn:
+            if tag is not None:  # la politique `team_spend_tag` (037) vérifie que CE compte est membre du projet
+                conn.execute("SELECT set_config('app.account_id', %s, false)", (tag.account,))
             conn.execute(
                 "INSERT INTO ledger_entries (thread_id, turn_index, tier, model, reasoning, prefix_sha256, "
                 "layer_tokens, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, "
-                "cached_reported, latency_s, route_reason, chf, cost_source, reusable_tokens) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "cached_reported, latency_s, route_reason, chf, cost_source, reusable_tokens, project_id, "
+                "project_tenant, account, household_id, household_tenant) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (thread_id, turn_index, call.tier.value, call.model, call.reasoning, call.prefix_sha256,
                  json.dumps(call.layer_tokens), call.usage.prompt, call.usage.cached, call.usage.completion,
                  call.usage.reasoning, call.usage.cached_reported, call.latency_s, call.route_reason, chf, source,
-                 call.reusable_tokens),
+                 call.reusable_tokens, tag.project_id if tag else None, tag.project_tenant if tag else None,
+                 tag.account if tag else None, tag.household_id if tag else None,
+                 tag.household_tenant if tag else None),
             )
 
     def record_verdict(self, thread_id: str, turn_index: int, verdict: Verdict) -> None:
@@ -315,18 +372,35 @@ class PostgresLedger(_AggregatorMixin):
         if tier is not None:
             where.append("tier = %s")
             params.append(tier)
-        sql = ("SELECT thread_id, turn_index, tier, model, reasoning, prefix_sha256, layer_tokens, prompt_tokens, "
-               "cached_tokens, completion_tokens, reasoning_tokens, cached_reported, latency_s, route_reason, "
-               "chf, cost_source, created_at, reusable_tokens FROM ledger_entries WHERE " + " AND ".join(where))
+        # `app.account_id` n'est jamais posé ici : la politique `team_spend_read` (037) reste fermée, les lignes d'un
+        # projet d'équipe venues d'autres locataires ne s'y mêlent pas (`fetch_project_calls` les lit, à part).
+        sql = f"SELECT {_CALL_COLS} FROM ledger_entries WHERE " + " AND ".join(where)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-        return [CallRecord(
-            thread_id=r[0], turn_index=r[1], tier=r[2], model=r[3], reasoning=r[4], prefix_sha256=r[5],
-            layer_tokens=r[6] or {}, prompt_tokens=r[7], cached_tokens=r[8], completion_tokens=r[9],
-            reasoning_tokens=r[10], cached_reported=r[11], latency_s=r[12], route_reason=r[13], chf=r[14],
-            cost_source=r[15], created_at=r[16], reusable_tokens=r[17],
-        ) for r in rows]
+        return [_call_record(r) for r in rows]
+
+    def fetch_project_calls(self, project_id: str, project_tenant: str, *, since: datetime,
+                            actor: str) -> list[CallRecord]:
+        """Appels attribués au projet depuis `since`, tous locataires : `app.account_id` = `actor`, et la politique
+        `team_spend_read` (037) n'ouvre ces lignes qu'à un membre du projet, rien d'autre d'un autre locataire."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.account_id', %s, false)", (actor,))
+            cur.execute(f"SELECT {_CALL_COLS} FROM ledger_entries WHERE project_id = %s AND project_tenant = %s "
+                        "AND created_at >= %s", (project_id, project_tenant, since))
+            rows = cur.fetchall()
+        return [_call_record(r) for r in rows]
+
+    def fetch_household_calls(self, household_id: str, household_tenant: str, *, since: datetime,
+                              actor: str) -> list[CallRecord]:
+        """Appels attribués au foyer depuis `since`, tous locataires : `app.account_id` = `actor`, et la politique
+        `household_spend_read` (039) n'ouvre ces lignes qu'à un membre du foyer, rien d'autre d'un autre locataire."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT set_config('app.account_id', %s, false)", (actor,))
+            cur.execute(f"SELECT {_CALL_COLS} FROM ledger_entries WHERE household_id = %s AND household_tenant = %s "
+                        "AND created_at >= %s", (household_id, household_tenant, since))
+            rows = cur.fetchall()
+        return [_call_record(r) for r in rows]
 
     def fetch_verdicts(self, *, thread_id: str | None = None, turn_index: int | None = None,
                         day: date | None = None) -> list[VerdictRecord]:

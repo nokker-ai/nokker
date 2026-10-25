@@ -419,8 +419,47 @@ def _code_identifier(token: str) -> bool:
     return all(_word(x) or (x.isdigit() and len(x) <= 8) or numbered(x) for x in parts)
 
 
-def _looks_like_safe_token(token: str) -> bool:
+_VOWELS = frozenset("aeiouyäöüàâáãåæéèêëíìîïóòôõøœúùûÿ")
+
+
+def _letters_word(token: str) -> bool:
+    """Un mot fait SEULEMENT de lettres (accents et ß compris, aucun chiffre ni signe) : mot composé allemand
+    (« Speicherplatzverwaltung », rc.7), mot long, ou camelCase de mots. Un jeton tiré au hasard dans les lettres
+    seules mêle les casses (une lettre sur deux en majuscule) : il est écarté par la limite de majuscules (au plus une
+    pour six lettres, deux au minimum), puis par la part de voyelles (une « soupe » de consonnes n'est pas un mot)."""
+    if not token.isalpha():
+        return False
+    upper = sum(1 for c in token if c.isupper())
+    if upper > max(2, len(token) // 6):
+        return False
+    return sum(1 for c in token.lower() if c in _VOWELS) >= 0.15 * len(token)
+
+
+# Identifiants juridiques publics connus, reconnus SEULEMENT dans une URL (rc.7) : Légifrance (`JURITEXT` + 12 chiffres,
+# `LEGIARTI…`, `KALICONT…`) et ECLI (`ECLI:FR:CCASS:2019:C100123`, ou avec des « _ »). Hors URL, le repli juge comme
+# avant ; un morceau tiré au hasard collé à l'identifiant (autre segment du chemin) reste caviardé.
+_LEGAL_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?:JURI|LEGI|JORF|CETA|CONS|CNIL|KALI|ACCO)(?:TEXT|ARTI|SCTA|CONT)\d{12}|"
+    r"ECLI[:_][A-Z]{2}[:_][A-Z0-9.]{1,10}[:_]\d{4}[:_][A-Z0-9.]{1,30})(?![A-Za-z0-9])")
+_PUBLIC_URL_RE = re.compile(r"\bhttps?://[^\s<>\"'`]+")
+
+
+def _legal_id_in_url(token: str) -> bool:
+    """Le jeton (vu dans une URL) n'est fait que d'identifiants juridiques connus et de morceaux lisibles du chemin."""
+    stripped = _LEGAL_ID_RE.sub("loi", token)
+    if stripped == token:
+        return False
+    parts = [x for x in _WORDS_SPLIT_RE.split(stripped) if x]
+    return all(x == "loi" or (x.isalpha() and (len(x) <= 15 or _letters_word(x))) or (x.isdigit() and len(x) <= 8)
+               or bool(_VERSIONED_WORD_RE.match(x)) for x in parts)
+
+
+def _looks_like_safe_token(token: str, in_url: bool = False) -> bool:
     if _UUID_RE.match(token):
+        return True
+    if _letters_word(token.strip("/_+")):  # « …oberfläche/Datenschutzgrundverordnung » : le « / » ouvre le jeton
+        return True
+    if in_url and _legal_id_in_url(token):
         return True
     if _code_identifier(token):
         return True
@@ -438,7 +477,7 @@ def _looks_like_safe_token(token: str) -> bool:
     # « x86 ») est aussi un morceau lisible : `/opt/miniconda3/bin/activate` était caviardé dans la CONSIGNE même
     # (banc SWE-bench du 24.10 : 24 tâches sur 50 lançaient `source /[secret:entropy-…] testbed`).
     def readable(x: str) -> bool:
-        if x.isalpha() and len(x) <= 15:
+        if x.isalpha() and (len(x) <= 15 or _letters_word(x)):
             return True
         return digits_ok and ((x.isdigit() and len(x) <= 8) or bool(_VERSIONED_WORD_RE.match(x)))
 
@@ -451,9 +490,11 @@ def _looks_like_safe_token(token: str) -> bool:
 
 def _entropy_candidates(text: str) -> list[str]:
     out = []
+    urls = [u.span() for u in _PUBLIC_URL_RE.finditer(text)] if "://" in text else []
     for m in _ENTROPY_CANDIDATE_RE.finditer(text):
         token = m.group(0)
-        if _looks_like_safe_token(token):
+        in_url = any(start <= m.start() < end for start, end in urls)
+        if _looks_like_safe_token(token, in_url):
             continue
         classes = sum(bool(re.search(p, token)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
         if classes < 2:

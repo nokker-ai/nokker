@@ -407,7 +407,8 @@ class CloudCrew:
                                + "; ".join(x["message"] for x in missing), missing)
         body = {k: d.get(k) for k in ("name", "role", "model", "tools", "instructions", "trigger", "secrets",
                                       "budget", "auto_approve", "needs")}
-        f = norm_fields({**body, "placement": {"machine": to}}, partial=False, policy=self.policy, owner=account)
+        f = norm_fields({**body, "placement": {"machine": to}}, partial=False, policy=self.policy, owner=account,
+                        mail=hub.mail_watch() is not None)
         writes = hub.write_rules(f.get("auto_approve") or [])
         new = Agent(id=agent_id, created_by=account, created_at=self.clock(), updated_at=self.clock(),
                     armed=False, status="paused", **f)

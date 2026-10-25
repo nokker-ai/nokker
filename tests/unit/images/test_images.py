@@ -182,7 +182,8 @@ def test_engine_puts_image_parts_and_sheds_old_images(tmp_path):
     msgs = eng.assemble(cur, [old], [], [], Tier.SHIP).messages
     past, now = msgs[1]["content"], msgs[-1]["content"]
     assert now[0]["type"] == "text" and "et celle-ci ?" in now[0]["text"]
-    assert now[1] == {"type": "nokker_image", "sha256": "c" * 64, "media_type": "image/png", "name": "c.png"}
+    assert now[1] == {"type": "nokker_image", "sha256": "c" * 64, "media_type": "image/png", "name": "c.png",
+                      "turn": 1, "size": 2048}
     # budget 2 : l'image courante + la plus récente du passé ; la plus ancienne délestée en texte
     assert past[1]["type"] == "text" and "image délestée : a.png" in past[1]["text"] and "tour 0" in past[1]["text"]
     assert past[2]["type"] == "nokker_image" and past[2]["sha256"] == "b" * 64

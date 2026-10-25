@@ -1,6 +1,7 @@
 ---
 name: video-edit
 description: Assemble shots with transitions and captions in ffmpeg
+locality: local
 ---
 # Edit
 

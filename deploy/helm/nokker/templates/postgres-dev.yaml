@@ -1,0 +1,100 @@
+{{- if .Values.database.dev.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+# In-chart pgvector, for trials and CI only: one pod, no backup, no HA. Production: database.dev.enabled=false.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-postgres-init
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+data:
+  001-databases.sh: |
+    #!/bin/sh
+    # First start only (empty volume): pgvector in both databases; the memory database next to the core's.
+    set -eu
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE corthexis"
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d nokker -c "CREATE EXTENSION IF NOT EXISTS vector"
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d corthexis -c "CREATE EXTENSION IF NOT EXISTS vector"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    {{- include "nokker.selector" (dict "root" . "component" "postgres") | nindent 4 }}
+  ports:
+    - {name: pg, port: 5432, targetPort: 5432}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ $fn }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ include "nokker.image" (dict "root" . "image" .Values.database.dev.image "default" "pg16") }}
+          # Non-root under an arbitrary uid: the official entrypoint skips its chown/gosu steps when not root.
+          env:
+            - {name: POSTGRES_USER, value: postgres}
+            - {name: POSTGRES_DB, value: nokker}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ include "nokker.dbSecret" . }}, key: POSTGRES_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          args: ["-c", "shared_buffers=128MB", "-c", "max_connections=100"]
+          ports:
+            - {name: pg, containerPort: 5432}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "postgres", "-d", "nokker"]}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.database.dev.resources | nindent 12 }}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+        - name: init
+          configMap: {name: {{ $fn }}-postgres-init}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.database.dev.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.database.dev.size }}
+{{- end }}

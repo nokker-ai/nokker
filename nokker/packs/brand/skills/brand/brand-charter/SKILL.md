@@ -1,6 +1,7 @@
 ---
 name: brand-charter
 description: Build the brand charter and keep it in project memory
+locality: local
 ---
 # Brand charter
 

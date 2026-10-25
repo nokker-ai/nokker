@@ -21,8 +21,8 @@ passage `running` devient `failed` (interrompu), un passage `queued` repart, un 
 
 Déclencheurs par événement : `webhook:<id>` par `POST /v1/agents/{id}/webhooks/{hook}` signé HMAC (`webhook()`) ;
 `alert:<nom>` par l'API interne `fire_event()` (producteur : les incidents, `nokker/incidents/service.py`).
-`mail:<filtre>` n'a pas de producteur (le connecteur mail ne relève rien de lui-même) : refusé à la création
-(`spec.NO_MAIL_TRIGGER`).
+`mail:<filtre>` par la relève du courrier (`mail_watch`, `nokker/agents/mailwatch.py`), posée par `serve` quand
+l'instance a des connecteurs : sans elle, refusé à la création (`spec.NO_MAIL_TRIGGER`).
 Le corps reçu entre dans le message comme DONNÉE non fiable, dans un bloc à jeton (`<untrusted-data kind=… id=…>`).
 """
 from __future__ import annotations
@@ -65,7 +65,11 @@ _APPROVAL_REF = re.compile(r"\[approval:([A-Za-z0-9_-]{1,64})\]")
 # Lectures toujours permises dans un passage qui restreint ses outils (`tools` de la carte).
 _ALWAYS_TOOLS = frozenset({"memory_search", "memory_get", "clarify", "tool_find", "escalate_to_human"})
 # Cartes des planchers (`nokker/tools/ssh.py::PROD_RULE`, `TRUST_RULE`) : jamais levées par une règle d'agent.
-_FLOOR_RULES = frozenset({"ops:prod", "ops:trust_host"})
+_FLOOR_RULES = frozenset({"ops:prod", "ops:trust_host",
+                          # boîte mail posée dans Lokkal : envoi et corbeille, carte forte jamais levée par une règle
+                          "permissions:local_connector_strong",
+                          # profil mineur d'un foyer (X23) : envoi externe et destructif, carte forte de son représentant
+                          "household:guardian"})
 
 
 # ─────────────────────────────── portes du passage ───────────────────────────────
@@ -177,6 +181,8 @@ class AgentEngine:
     local_runs: bool = True
     on_guest: Callable[[AgentRun], None] | None = None
     wait_ttl_s: float = 24 * 3600.0  # passage en attente d'une machine, ou sans nouvelles d'elle : abandonné après
+    # Producteur du déclencheur `mail:<filtre>` (`mailwatch.MailWatcher`), lancé avec l'ordonnanceur ; None = refusé.
+    mail_watch: Any = None
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _live: dict[str, Any] = field(default_factory=dict, init=False, repr=False)  # run_id → noyau du passage
     _stop: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # run_id → motif d'arrêt
@@ -204,8 +210,10 @@ class AgentEngine:
     # ─────────── fond ───────────
 
     def start(self) -> None:
-        """Reprise après redémarrage, puis le fil de l'ordonnanceur."""
+        """Reprise après redémarrage, puis le fil de l'ordonnanceur (et celui de la relève du courrier)."""
         self.recover()
+        if self.mail_watch is not None:
+            self.mail_watch.start()
         if self._thread is not None:
             return
 
@@ -377,14 +385,18 @@ class AgentEngine:
     # ─────────── file ───────────
 
     def enqueue(self, a: Agent, trigger: str, *, scheduled_for: float | None = None, catch_up: bool = False,
-                event: str | None = None, input_block: str = "") -> AgentRun:
-        """Un passage en file ; `AgentConflict` si l'agent en a déjà un de vivant (un seul à la fois)."""
+                event: str | None = None, input_block: str = "", run_id: str | None = None) -> AgentRun:
+        """Un passage en file ; `AgentConflict` si l'agent en a déjà un de vivant (un seul à la fois). `run_id` : id
+        choisi d'avance (la relève du courrier y attache son curseur « en vol »)."""
         tid = current_tenant_or_none() or self.tenant_of(a)
         with self._lock:
             if self.store.live_run(a.id) is not None:
                 raise AgentConflict("un passage est déjà en cours pour cet agent")
-            run = self.store.new_run(a.id, trigger, status="queued", scheduled_for=scheduled_for or self.clock(),
-                                     catch_up=catch_up, event=event, input=input_block)
+            if run_id is not None and self.store.get_run(run_id) is not None:
+                raise AgentConflict(f"passage {run_id} déjà connu")
+            run = self.store.new_run(a.id, trigger, run_id=run_id, status="queued",
+                                     scheduled_for=scheduled_for or self.clock(), catch_up=catch_up, event=event,
+                                     input=input_block)
         self.hub.publish_run(run)
         self.hub.refresh(self.store.require(a.id))
         self.submit(self._execute, run.id, tid)
@@ -428,6 +440,10 @@ class AgentEngine:
         if missing:
             self._finish(run, "skipped", "identifiants manquants, pas d'exécution : " + "; ".join(missing))
             return
+        over = self._project_budget_refusal(a)
+        if over:
+            self._finish(run, "skipped", over)
+            return
         run.thread_id = self._open_thread(a, run)
         run.status, run.started_at = "running", self.clock()
         self.store.save_run(run)
@@ -438,6 +454,22 @@ class AgentEngine:
         text = self._message(a, run)
         turn = self._turn(rk, a, run, text)
         self._after_turn(run.id, turn)
+
+    def _project_budget_refusal(self, a: Agent) -> str | None:
+        """Agent d'un projet d'équipe dont le budget est atteint : le passage n'ouvre même pas son fil (docs/LOKKAL.md
+        §7.15). Le noyau refait le contrôle à chaque tour (suite après une carte comprise)."""
+        house = getattr(self.kernel, "household", None)
+        if house is not None:  # foyer (X23) : un passage d'agent consomme le quota commun comme un tour du membre
+            hticket = house.check("", a.created_by)
+            if hticket is not None and hticket.verdict is not None:
+                return hticket.reply.split("\n\n", 1)[0]
+        budget = getattr(self.kernel, "project_budget", None)
+        if budget is None or not a.project:
+            return None
+        ticket = budget.check_project(a.project, a.created_by)
+        if ticket is None or ticket.verdict is None:
+            return None
+        return ticket.reply.split("\n\n", 1)[0]
 
     def _missing_secrets(self, names: list[str]) -> list[str]:
         """Noms déclarés qu'on ne peut pas résoudre (absent du coffre, coffre scellé, pas de coffre) ; jamais une
@@ -822,7 +854,7 @@ class AgentEngine:
     # ─────────── déclencheurs par événement ───────────
 
     def fire_event(self, event: str, payload: Any = None) -> list[AgentRun]:
-        """API interne (`alert:<nom>`), dans le locataire courant : chaque agent armé dont le
+        """API interne (`alert:<nom>` ; `mail:` passe par `mail_watch`, un agent à la fois), dans le locataire courant : chaque agent armé dont le
         déclencheur couvre `event` (motif glob : `alert:disk-*`) reçoit un passage, ou un `skipped` s'il en a déjà
         un."""
         out = []

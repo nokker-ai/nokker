@@ -36,7 +36,7 @@ def test_effects():
     specs = {s.name: s.effect for s in McpConfigToolSource(path=None).specs()}  # type: ignore[arg-type]
     assert tuple(specs) == MCP_CONFIG_TOOLS
     assert specs == {"mcp_server_list": Effect.READ, "mcp_server_add": Effect.DESTRUCTIVE,
-                     "mcp_server_remove": Effect.DESTRUCTIVE}
+                     "mcp_server_read_tools": Effect.DESTRUCTIVE, "mcp_server_remove": Effect.DESTRUCTIVE}
 
 
 def test_add_by_secret_name_list_and_remove(src, tmp_path):

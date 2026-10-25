@@ -93,8 +93,10 @@ class BaseAgents:
         self._delete(agent_id)
 
     # ─────────── passages ───────────
-    def new_run(self, agent_id: str, trigger: str, **fields) -> AgentRun:
-        run = AgentRun(id=new_run_id(), agent_id=agent_id, trigger=trigger, created_at=self.clock(), **fields)
+    def new_run(self, agent_id: str, trigger: str, *, run_id: str | None = None, **fields) -> AgentRun:
+        """`run_id` : id choisi d'avance par l'appelant (relève du courrier : l'intention rangée avant la mise en file)."""
+        run = AgentRun(id=run_id or new_run_id(), agent_id=agent_id, trigger=trigger, created_at=self.clock(),
+                       **fields)
         self._store_run(run)
         return run
 

@@ -1,6 +1,7 @@
 ---
 name: ops-basics
 description: How every ops runbook works with hosts, roles and cards
+locality: local
 ---
 # Working on hosts
 

@@ -30,6 +30,7 @@ A **strong card** is for what is hard to undo or reaches other people:
 | Arming an agent that may write without asking ([agents.md](agents.md)) | Strong, for those exact rules |
 | Sending or deleting through a connector of your nokker.ai account (mail, calendar) | Strong, signed on your phone, checked by nokker.ai before it runs |
 | A destructive action asked from the web, through the gateway | Strong, decided on an enrolled device |
+| Making a page public | Strong, decided on an enrolled device (never the local token alone) |
 
 A written "go ahead" in a message never replaces a strong card. On strong cards, a reviewer model adds a short advice
 and a risk level ([models.md](models.md)); it advises, it never decides.
@@ -92,10 +93,15 @@ this just before anything is written to the network.
   drive it.
 - What goes out: the requests to the model you chose, and, only if you link an account, what the link needs: the
   load of the machine, the **names** of its resources, the deck (folder names and states), the cards to sign. The
-  subscriber mirror (threads and your `user` notes, never the work folder) is off unless you turn it on
-  (`local.mirror`), and is **rolling out**.
+  subscriber mirror (threads, your `user` notes, the project notes and pages you chose, never the work folder) is
+  off unless you turn it on (`local.mirror`), and is **rolling out**.
 - A web session that needs something local hands over to a session on your machine, with that machine's gates; the
   web side only receives the result ([gateway.md](gateway.md)).
+- A page leaves your machine only if you choose it: a copy for when the machine is off, or publication. Publishing
+  is a strong card that shows the exact version that will be public; a page pinned `local` can be neither copied nor
+  published; unpublishing is immediate and kills the address. Public pages get their own origin and a random id,
+  run with no network access and no forms, set no cookies, and are `noindex` by default
+  ([gateway.md](gateway.md#public-pages)). Status: **rolling out**.
 - Credentials of your nokker.ai connectors stay on nokker.ai; the machine never receives them ([models.md](models.md)).
 
 ## 8. The audit journal
@@ -113,7 +119,24 @@ outcome, hashes).
 Before any write, the folder is snapshotted in a shadow repository outside your own, so you can see what changed and
 roll back ([checkpoints.md](checkpoints.md)). Sub-agents work in separate git worktrees ([subagents.md](subagents.md)).
 
+## 10. Single sign-on for teams
+
+When a project uses its organisation's identity provider ([teams.md](teams.md#single-sign-on-oidc)):
+
+- Only RS256 and ES256 signatures are accepted; `alg: none` and shared-key algorithms are refused. Keys come from the
+  provider's published key set only, never from the token itself. Issuer, audience, expiry and nonce are checked.
+- Each sign-in attempt is used once, expires after 10 minutes, and is bound to the browser that started it.
+- Only e-mail addresses of domains proved by DNS can sign in, and the provider must say the address is verified.
+- The provider is reached over https only, never on a private or internal address.
+- The client secret is kept in the server's vault, by name; it is never stored in the database, shown, or logged.
+- The owner role never comes from SSO. With "SSO required", other ways of signing in are refused on the project.
+
 ## Known limits
+
+- Until `nokker.app` is on the Public Suffix List, browsers see all gateways as one site. Cookies are host-only
+  (`__Host-`) and the relay checks origins, but browser features that work per site (for example some storage and
+  cache partitioning) do not yet separate two gateways.
+- A public page runs its own script: it cannot reach the network, but it can hide the report link that the relay adds.
 
 - The local vault file is encrypted with a key on the same machine: it protects a copied file, not an account that
   can already read your files. Use the OpenBao provider for that ([secrets.md](secrets.md)).

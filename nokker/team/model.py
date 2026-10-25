@@ -52,9 +52,10 @@ _RE_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,253}$")
 class TeamError(Exception):
     """Refus d'une demande : `status` HTTP, `code` stable pour les clients, message en français."""
 
-    def __init__(self, status: int, code: str, message: str = "") -> None:
+    def __init__(self, status: int, code: str, message: str = "", **extra: str) -> None:
         super().__init__(message or code)
         self.status, self.code, self.message = status, code, message or code
+        self.extra = extra  # champs stables en plus pour le client (ex. `connection` d'un 403 sso_required)
 
 
 def not_found() -> TeamError:
@@ -91,11 +92,15 @@ class Project:
     description: str = ""
     repos: list[str] = field(default_factory=list)  # clés `hôte/chemin` (normalize_remote de X1)
     secret_names: list[dict[str, str]] = field(default_factory=list)  # [{name, description}] — jamais de valeur
-    budget: dict[str, Any] | None = None  # {monthly, currency}
+    budget: dict[str, Any] | None = None  # {daily?, monthly?, currency}
     rules: dict[str, Any] = field(default_factory=dict)  # {mode?, ask: [], deny: []}
     mirror: bool = False  # notes de projet en miroir pour les membres (§6.3, §6.7) ; défaut : en Lokkal seulement
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    # Type (migration 039) : `team`, ou `household` (foyer, lot X23, nokker/household/) — un foyer n'est servi que par
+    # les routes /v1/household*, jamais par /v1/projects* (même 404 qu'un projet inconnu).
+    kind: str = "team"
+    household_policy: dict[str, Any] = field(default_factory=dict)  # liste blanche des profils mineurs (foyer)
 
 
 @dataclass
@@ -123,6 +128,8 @@ class Invite:
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
     decided_at: float | None = None
+    kind: str = "team"  # `household` : invitation dans un foyer (migration 039)
+    profile: str = "adult"  # foyer : profil déclaré par le payeur (adult | teen | child), recopié dans l'adhésion
 
 
 @dataclass
@@ -298,20 +305,67 @@ def clean_skill(name: Any, body: Any) -> dict[str, Any]:
 
 
 def clean_budget(v: Any) -> dict[str, Any] | None:
+    """Plafond du projet : `daily` et/ou `monthly` (jour et mois civils, heure suisse), dans `currency` (EUR par
+    défaut). Décompté sur le ledger (nokker/team/budget.py) ; une clé absente = pas de plafond sur cette fenêtre."""
     if v is None:
         return None
     if not isinstance(v, dict):
-        raise TeamError(400, "bad_request", "budget : {monthly, currency} ou null")
-    try:
-        monthly = float(v.get("monthly"))
-    except (TypeError, ValueError):
-        raise TeamError(400, "bad_request", "budget.monthly : un nombre") from None
-    if not math.isfinite(monthly) or monthly < 0 or monthly > 1_000_000:
-        raise TeamError(400, "bad_request", "budget.monthly : entre 0 et 1 000 000")
+        raise TeamError(400, "bad_request", "budget : {daily?, monthly?, currency?} ou null")
+    unknown = set(v) - {"daily", "monthly", "currency"}
+    if unknown:
+        raise TeamError(400, "bad_request", f"budget : clé inconnue {min(unknown)}")
+    out: dict[str, Any] = {}
+    for key in ("daily", "monthly"):
+        if v.get(key) is None:
+            continue
+        try:
+            amount = float(v.get(key))
+        except (TypeError, ValueError):
+            raise TeamError(400, "bad_request", f"budget.{key} : un nombre") from None
+        if not math.isfinite(amount) or amount < 0 or amount > 1_000_000:
+            raise TeamError(400, "bad_request", f"budget.{key} : entre 0 et 1 000 000")
+        out[key] = round(amount, 2)
+    if not out:
+        raise TeamError(400, "bad_request", "budget : daily et/ou monthly (ou null pour aucun plafond)")
     currency = str(v.get("currency") or "EUR").upper()
     if currency not in CURRENCIES:
         raise TeamError(400, "bad_request", f"budget.currency : {' | '.join(CURRENCIES)}")
-    return {"monthly": round(monthly, 2), "currency": currency}
+    out["currency"] = currency
+    return out
+
+
+def note_sha(kind: str, title: str, text: str, deleted: bool) -> str:
+    """Empreinte d'une version de note de projet : la même des deux côtés (nokker.ai et la machine, qui s'en sert
+    comme `base_sha`). Une pierre tombale n'a ni titre ni texte."""
+    import hashlib
+
+    if deleted:
+        title = text = ""
+    return hashlib.sha256(f"{kind}\x00{title}\x00{text}\x00{int(deleted)}".encode()).hexdigest()
+
+
+# Issues d'une écriture de note (`resolve`) : rien à faire, nouvelle note, mise à jour sur la bonne base, conflit.
+SKIP, INSERT, UPDATE, CONFLICT = "skip", "insert", "update", "conflict"
+REASON_CONFLICT = "conflit : remplacée par une écriture reçue plus tard"
+REASON_FORGOTTEN = "oubliée par un membre du projet"
+REASON_RESTORED = "remplacée par la restauration d'une version de la quarantaine"
+
+
+def resolve(cur: Note | None, incoming: Note, base_sha: str) -> str:
+    """Règle déterministe du miroir des notes de projet (docs/LOKKAL.md §7.15) ; appelée sous le verrou d'écriture du
+    projet, donc dans l'ordre de RÉCEPTION par nokker.ai :
+      - même version que celle du projet → SKIP (renvoi après coupure) ; oubli d'une note inconnue → SKIP ;
+      - note inconnue → INSERT ;
+      - `base_sha` = version courante → UPDATE (l'auteur a modifié ce qu'il avait) ;
+      - sinon → CONFLICT : l'écriture reçue la dernière gagne (horloge du serveur, jamais celle des machines), la
+        version qu'elle remplace part en quarantaine, l'historique relu par un maintainer. Rien n'est effacé."""
+    if cur is None:
+        return SKIP if incoming.deleted else INSERT
+    if cur.sha == incoming.sha:
+        return SKIP
+    if cur.deleted and incoming.deleted:
+        return SKIP
+    return UPDATE if base_sha and base_sha == cur.sha else CONFLICT
 
 
 def clean_note(d: Any) -> dict[str, Any]:
@@ -327,12 +381,15 @@ def clean_note(d: Any) -> dict[str, Any]:
         raise TeamError(400, "bad_note", f"kind : {' | '.join(NOTE_KINDS)}")
     if d.get("scope") not in (None, "project"):
         raise TeamError(400, "bad_note", "seules les notes de portée projet passent par le projet")
-    try:
-        updated = float(d.get("updated_at"))
-    except (TypeError, ValueError):
-        raise TeamError(400, "bad_note", "updated_at : un horodatage") from None
-    if not math.isfinite(updated) or updated <= 0:
-        raise TeamError(400, "bad_note", "updated_at : un horodatage")
+    # `updated_at` de la machine : facultatif et seulement contrôlé ; nokker.ai date chaque écriture avec SON horloge.
+    updated = 0.0
+    if d.get("updated_at") is not None:
+        try:
+            updated = float(d.get("updated_at"))
+        except (TypeError, ValueError):
+            raise TeamError(400, "bad_note", "updated_at : un horodatage") from None
+        if not math.isfinite(updated) or updated <= 0:
+            raise TeamError(400, "bad_note", "updated_at : un horodatage")
     links = d.get("links") or []
     if not isinstance(links, list) or len(links) > 20 or not all(_RE_NOTE.match(str(x)) for x in links):
         raise TeamError(400, "bad_note", "links : 20 noms de notes au plus")
@@ -382,4 +439,6 @@ __all__ = [
     "new_invite_id",
     "new_project_id",
     "not_found",
+    "note_sha",
+    "resolve",
 ]

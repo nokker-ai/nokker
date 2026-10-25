@@ -1,0 +1,277 @@
+{{- if .Values.openbao.enabled }}
+{{- $fn := include "nokker.fullname" . -}}
+{{- $bao := include "nokker.image" (dict "root" . "image" .Values.openbao.image "default" "2.4.1") -}}
+# One OpenBao node (file storage on a PVC, non-root, disable_mlock, plain HTTP on the cluster network only: the
+# NetworkPolicy admits the core and the init Job alone). Initialised by the post-install Job below with the same
+# script as Lokkal (deploy/lokkal/vault/init.sh): KV v2 nokker/, policy and AppRole nokker-core, root token revoked.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-openbao
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao
+data:
+  config.hcl: |
+    ui            = false
+    disable_mlock = true
+    storage "file" { path = "/openbao/data" }
+    listener "tcp" {
+      address     = "0.0.0.0:8200"
+      tls_disable = true
+    }
+    api_addr = "{{ include "nokker.openbaoAddr" . }}"
+  init.sh: |
+    {{- .Files.Get "files/vault-init.sh" | nindent 4 }}
+  unseal.sh: |
+    {{- .Files.Get "files/vault-unseal.sh" | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-openbao
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao
+spec:
+  selector:
+    {{- include "nokker.selector" (dict "root" . "component" "openbao") | nindent 4 }}
+  ports:
+    - {name: http, port: 8200, targetPort: 8200}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fn }}-openbao
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao
+spec:
+  serviceName: {{ $fn }}-openbao
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nokker.selector" (dict "root" . "component" "openbao") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: openbao
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      containers:
+        - name: openbao
+          image: {{ $bao }}
+          command: ["bao", "server", "-config=/openbao/config/config.hcl"]
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: BAO_ADDR, value: "http://127.0.0.1:8200"}   # CLI in the pod (manual unseal)
+          ports:
+            - {name: http, containerPort: 8200}
+          readinessProbe:   # alive, sealed or not: sealed state shows in the core's health and the logs
+            httpGet: {path: "/v1/sys/health?sealedcode=200&uninitcode=200", port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.openbao.resources | nindent 12 }}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /openbao/data}
+            - {name: config, mountPath: /openbao/config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+        {{- if eq .Values.openbao.unseal "auto" }}
+        # Unseals every 30 s when sealed, with the key the init Job stored (Secret, read as a file, never an argument).
+        - name: unseal
+          image: {{ $bao }}
+          command: ["/bin/sh", "/scripts/unseal.sh"]
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: BAO_ADDR, value: "http://127.0.0.1:8200"}
+          resources: {requests: {cpu: 5m, memory: 16Mi}, limits: {cpu: 100m, memory: 32Mi}}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts, readOnly: true}
+            - {name: unseal, mountPath: /vault/unseal, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fn }}-openbao
+            items: [{key: config.hcl, path: config.hcl}]
+        - name: scripts
+          configMap:
+            name: {{ $fn }}-openbao
+            items: [{key: unseal.sh, path: unseal.sh}]
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 16Mi}
+        {{- if eq .Values.openbao.unseal "auto" }}
+        - name: unseal
+          secret:
+            secretName: {{ include "nokker.unsealSecret" . }}
+            optional: true
+            defaultMode: 0400
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.openbao.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.openbao.size }}
+---
+# ── init Job (every install and upgrade; idempotent) ────────────────────────────────────────────────────────────
+# 1. init.sh (OpenBao image) initialises and writes role_id, secret_id and, in auto mode, the unseal key into a
+#    memory-backed emptyDir; an already initialised vault with its AppRole Secret present is left alone.
+# 2. kubectl (core image) stores them in the release's Secrets, then the emptyDir goes with the pod.
+# The Job's account may create Secrets in this namespace, read and update the two OpenBao Secrets by name, and
+# restart the core; its token is mounted in the Job's pod only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fn }}-openbao-init
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao-init
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fn }}-openbao-init
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao-init
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ include "nokker.approleSecret" . | quote }}, {{ include "nokker.unsealSecret" . | quote }}]
+    verbs: [get, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [{{ printf "%s-core" $fn | quote }}]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fn }}-openbao-init
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao-init
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fn }}-openbao-init
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fn }}-openbao-init
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # one Job per revision (a Job's template cannot change): runs WITH the install, not after it — the core waits for
+  # its AppRole, so a post-install hook would deadlock `helm --wait`
+  name: {{ $fn }}-openbao-init-{{ .Release.Revision }}
+  labels:
+    {{- include "nokker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao-init
+spec:
+  backoffLimit: 6
+  {{- if eq .Values.openbao.unseal "auto" }}
+  ttlSecondsAfterFinished: 3600
+  {{- end }}
+  # manual mode: the key is in this Job's log; the Job stays until the operator has read it and deletes it
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "nokker.labels" . | nindent 8 }}
+        app.kubernetes.io/component: openbao-init
+    spec:
+      serviceAccountName: {{ $fn }}-openbao-init
+      restartPolicy: Never
+      enableServiceLinks: false
+      securityContext:
+        {{- include "nokker.podSecurityContext" . | nindent 8 }}
+      {{- include "nokker.pullSecrets" . | nindent 6 }}
+      initContainers:
+        - name: init
+          image: {{ $bao }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /vault/approle /vault/unseal
+              # AppRole already stored (upgrade): init.sh sees it and exits 0 without touching the vault
+              if [ -s /existing/role_id ] && [ -s /existing/secret_id ]; then
+                cp /existing/role_id /existing/secret_id /vault/approle/; touch /vault/existing
+              fi
+              rc=0; sh /scripts/init.sh || rc=$?
+              # 3 = initialised but the AppRole is missing: repair by hand (generate-root), never re-init
+              [ "$rc" = 0 ] || { echo "init.sh exit $rc" >&2; exit "$rc"; }
+              touch /vault/done
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: BAO_ADDR, value: {{ include "nokker.openbaoAddr" . | quote }}}
+            - {name: VAULT_UNSEAL, value: {{ .Values.openbao.unseal | quote }}}
+          resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {cpu: 200m, memory: 64Mi}}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts, readOnly: true}
+            - {name: out, mountPath: /vault}
+            - {name: existing, mountPath: /existing, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        - name: store
+          image: {{ include "nokker.image" (dict "root" . "image" (default .Values.core.image .Values.openbao.jobImage) "default" (printf "%s-lokkal" .Chart.AppVersion)) }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              put() {  # put <secret> <dir>: create or replace the Secret from the files of <dir>, nothing printed
+                kubectl create secret generic "$1" --from-file="$2" --dry-run=client -o yaml \
+                  | kubectl label --local -f - app.kubernetes.io/instance={{ .Release.Name }} \
+                      app.kubernetes.io/name=nokker -o yaml | kubectl apply -f - >/dev/null
+              }
+              if [ -e /vault/existing ]; then echo "openbao: already initialised, AppRole in place"; exit 0; fi
+              put {{ include "nokker.approleSecret" . }} /vault/approle
+              if [ -s /vault/unseal/unseal.key ]; then put {{ include "nokker.unsealSecret" . }} /vault/unseal; fi
+              # the core mounted an optional, still absent Secret: restart it once so it reads its AppRole
+              kubectl rollout restart deployment/{{ $fn }}-core >/dev/null
+              echo "openbao: initialised, AppRole stored"
+          env:
+            - {name: HOME, value: /tmp}
+          resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
+          securityContext:
+            {{- include "nokker.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: out, mountPath: /vault, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $fn }}-openbao
+            items: [{key: init.sh, path: init.sh}]
+        - name: out
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 16Mi}
+        - name: existing
+          secret:
+            secretName: {{ include "nokker.approleSecret" . }}
+            optional: true
+{{- end }}
