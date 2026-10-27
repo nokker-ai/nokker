@@ -5,7 +5,7 @@ description: >-
   OpenBao for secrets, CortHeXis memory. Runs under the OpenShift restricted SCC.
 type: application
 version: 0.1.0
-appVersion: "0.1.0-rc.6"
+appVersion: "0.1.0-rc.8"
 kubeVersion: ">=1.27.0-0"
 home: https://nokker.ai
 sources:

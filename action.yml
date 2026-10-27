@@ -3,7 +3,7 @@
 # hooks ni pilote de diff.
 #
 # Emballage (image, release, Marketplace) : équipe release. Publication sur le GitHub Marketplace = décision D3.
-# L'image par défaut ci-dessous est épinglée à la release qui contient `nokker review` et git (rc.6, avec git depuis
+# L'image par défaut ci-dessous est épinglée à la release qui contient `nokker review` et git (rc.8 ; git y est depuis
 # X13) ; idéalement par digest.
 name: Nokker review
 description: Line-by-line pull request review by the Nokker judge. Advisory only, it never approves.
@@ -58,7 +58,7 @@ inputs:
   image:
     description: Container image that runs the review.
     required: false
-    default: ghcr.io/nokker-ai/nokker:0.1.0-rc.6-lokkal
+    default: ghcr.io/nokker-ai/nokker:0.1.0-rc.8-lokkal
 
 outputs:
   verdict:

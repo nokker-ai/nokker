@@ -1,6 +1,6 @@
-# gitleaks (v8.21.2) — règles par défaut, plus quatre exceptions ciblées (six valeurs) : chacune vise UN fichier de test ET ses faux
+# gitleaks (v8.21.2) — règles par défaut, plus cinq exceptions ciblées (sept valeurs) : chacune vise UN fichier de test ET ses faux
 # secrets exacts, sous la règle qui les signale. Ce sont des données de test volontaires (caviardage, refus de jetons
-# en config, faux jeton GitHub, forme d'une clé SSH) : elles ne sont pas modifiées, elles sont déclarées ici.
+# en config, faux jeton GitHub, fausse clé BYOK, forme d'une clé SSH) : elles ne sont pas modifiées, elles sont déclarées ici.
 title = "nokker"
 
 [extend]
@@ -29,6 +29,13 @@ id = "generic-api-key"
   condition = "AND"
   paths = ['''(^|/)tests/unit/tools/test_mcp_config\.py$''']
   regexes = ['''^sk-live-0123456789abcdef$''', '''^a1b2c3d4e5f6a7b8c9d0e1f2a3$''', '''^a1b2c3d4e5f6a7b8c9d0e1f2a3b4$''']
+
+  # Fausse clé d'un point d'inférence BYOK (le test vérifie que les juges gardent le lien, pas cette clé).
+  [[rules.allowlists]]
+  description = "fausse clé BYOK du test du lien Lokkal"
+  condition = "AND"
+  paths = ['''(^|/)tests/unit/test_lokkal_link_live\.py$''']
+  regexes = ['''^byok-key-0123456789$''']
 
 [[rules]]
 id = "private-key"
