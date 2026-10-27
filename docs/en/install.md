@@ -34,7 +34,7 @@ curl -fsSL https://nokker.ai/install.sh | sh -s -- --workspace ~/code --yes
 | `--no-open` | Do not open the browser |
 
 `--workspace` is applied on first install only. To change it later, edit `NOKKER_HOST_WORKSPACE` in `~/.nokker/.env`
-and run `docker compose -p nokker --env-file ~/.nokker/.env -f ~/.nokker/docker-compose.yml up -d`.
+and run `docker compose -f ~/.nokker/docker-compose.yml up -d`.
 
 ## Windows
 
@@ -71,8 +71,9 @@ is in progress.
    - `state/` (mode 0700): the local token, `settings.json`, the encrypted vault, skills, restore points;
    - `bin/nokker`: the command-line client.
 4. Writes `~/.config/nokker/lokkal.json`, which tells the client where the install lives (see [cli.md](cli.md)).
-5. Pulls the signed images from `ghcr.io/nokker-ai` and starts the stack with `docker compose -p nokker`. Nothing is
-   built on your machine.
+5. Pulls the signed images from `ghcr.io/nokker-ai` and starts the stack as its own Docker Compose project, `nokker-<your user name>`. Nothing is
+   built on your machine. Each install has its own project name (written to `.env` and `lokkal.json`), so two
+   accounts on one machine never share containers or data; an install made by an earlier release keeps the name `nokker`.
 6. Waits for the core to answer on `/healthz`, adds `~/.nokker/bin` to your `PATH` (in `~/.zshrc`, `~/.bashrc` or
    `~/.profile` if they exist), and opens the onboarding page.
 

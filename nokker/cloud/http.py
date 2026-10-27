@@ -1081,9 +1081,7 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
         if body.get("stream"):
             with httpx.Client(timeout=httpx.Timeout(30.0, read=600.0)) as client, \
                     client.stream("POST", url, headers=headers, content=raw) as r:
-                h.send_response(r.status_code)
-                h.send_header("Content-Type", r.headers.get("content-type", "text/event-stream"))
-                h.send_header("Transfer-Encoding", "chunked")
+                h._begin_stream(r.status_code, r.headers.get("content-type", "text/event-stream"))
                 h.end_headers()
                 usage: dict[str, Any] = {}
                 for chunk in r.iter_raw():

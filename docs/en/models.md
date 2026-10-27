@@ -54,7 +54,7 @@ protocol).
   memory (`NOKKER_LOCAL_LLM_MEM`). On a 36-core CPU, a turn with `qwen3:4b` took about 50 s once the model was loaded,
   and close to 3 min for the first one: good enough to try Lokkal offline, slow for daily coding.
 - **A GPU** for that Ollama: add a `docker-compose.override.yml` next to `~/.nokker/docker-compose.yml`, then
-  `docker compose -p nokker up -d`:
+  `docker compose -f ~/.nokker/docker-compose.yml up -d`:
 
   ```yaml
   services:

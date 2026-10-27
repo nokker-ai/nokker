@@ -36,7 +36,7 @@ hosts:
 Put the keys in the vault ([secrets.md](secrets.md)), from a file so the value never shows in your shell:
 
 ```bash
-docker compose -p nokker exec -T core python3 -m nokker --config /etc/nokker/config.yaml secret set SSH_WEB1 < ~/.ssh/id_web1
+docker compose -f ~/.nokker/docker-compose.yml exec -T core python3 -m nokker --config /etc/nokker/config.yaml secret set SSH_WEB1 < ~/.ssh/id_web1
 ```
 
 The file is read **once, when a session opens** (the session answer carries `ops: {enabled, hosts, roles, notices}`);
@@ -109,9 +109,9 @@ Arguments and preview are redacted; long strings are cut (the full arguments' ha
 the card when the call came from one.
 
 ```bash
-docker compose -p nokker exec core python3 -m nokker --config /etc/nokker/config.yaml audit verify
+docker compose -f ~/.nokker/docker-compose.yml exec core python3 -m nokker --config /etc/nokker/config.yaml audit verify
 #  journal intact : 128 entrée(s), ancre 128:5f1c…
-docker compose -p nokker exec core python3 -m nokker --config /etc/nokker/config.yaml audit export --format csv --since 2026-10-01 > audit.csv
+docker compose -f ~/.nokker/docker-compose.yml exec core python3 -m nokker --config /etc/nokker/config.yaml audit export --format csv --since 2026-10-01 > audit.csv
 ```
 
 | Command | What it does |

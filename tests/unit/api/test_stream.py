@@ -84,7 +84,7 @@ def raw_post(port: int, *, tokens: bool, thread: str = "t-stream") -> tuple[byte
         if t_headers is None and b"\r\n\r\n" in data:
             t_headers = time.monotonic() - t0
         if data.endswith(b"\r\n0\r\n\r\n") or data.endswith(b"\r\n\r\n0\r\n\r\n"):
-            break  # dernier chunk (le serveur garde la connexion : `Connection: keep-alive`)
+            break  # dernier chunk (la connexion se ferme juste après : `Connection: close`)
     s.close()
     head, _, chunked = data.partition(b"\r\n\r\n")
     assert b" 200 " in head.split(b"\r\n")[0]
@@ -296,3 +296,29 @@ def test_turn_error_after_headers_is_reported_in_stream_without_done(monkeypatch
     assert json.loads(data[-1])["error"]["message"] == "panne interne"
     assert "[DONE]" not in data
     assert gateway_read(body) == ("", False)  # la gateway rapporte « fermé trop tôt », pas un texte vide
+
+
+def test_stream_is_http11_and_the_connection_closes_after_the_last_chunk():
+    """27.10 : en HTTP/1.0 + `Connection: keep-alive`, cloudflared (client Go) ignorait le cadrage chunked et attendait
+    une fermeture qui ne venait pas — le web gardait « envoi en cours » jusqu'à la coupure d'inactivité de Cloudflare.
+    Une requête keep-alive (celle d'un proxy) doit recevoir du HTTP/1.1 et voir la connexion se fermer après `0`."""
+    srv = start_server(kernel_with(SlowShip(delay_s=0.0)))
+    body = json.dumps({"model": "hermes-agent", "messages": [{"role": "user", "content": "salut"}],
+                       "stream": True}).encode()
+    req = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+           f"X-Hermes-Session-Id: t-close\r\nContent-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n"
+           ).encode() + body
+    try:
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+        s.sendall(req)
+        data = b""
+        while part := s.recv(65536):  # fin du flux = fermeture par le serveur, sinon socket.timeout
+            data += part
+        s.close()
+    finally:
+        srv.stop()
+    head, _, chunked = data.partition(b"\r\n\r\n")
+    lines = head.decode().split("\r\n")
+    assert lines[0].startswith("HTTP/1.1 200")
+    assert "Connection: close" in lines and "Transfer-Encoding: chunked" in lines
+    assert chunked.endswith(b"\r\n0\r\n\r\n") and b"data: [DONE]" in chunked

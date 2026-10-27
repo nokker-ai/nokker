@@ -20,7 +20,8 @@
 # Réseaux (aucun port publié hors 127.0.0.1) :
 #   internal    core, web, postgres, embed, init, openbao, ollama — interne : pas d'Internet
 #   dockerapi   core ↔ dockerproxy seulement — interne
-#   sandbox     `nokker-sandbox` : bacs à sable ↔ egress seulement — interne ; nom fixe, le noyau le passe à docker
+#   sandbox     `<projet>-sandbox` (NOKKER_SANDBOX_NETWORK ; `nokker-sandbox` pour une installation antérieure) :
+#               bacs à sable ↔ egress seulement — interne ; nom fixe par installation, le noyau le passe à docker
 #   front       web seul : publie 127.0.0.1:${NOKKER_PORT} (docker ne publie pas depuis un réseau interne)
 #   outbound    core (modèles : Router Nokker ou fournisseur choisi), egress, embed et ollama (téléchargement des
 #               modèles)
@@ -198,7 +199,7 @@ services:
     environment:
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}
       NOKKER_HOST_SKILLS: ${NOKKER_HOST_SKILLS:-}
-      NOKKER_SANDBOX_NETWORK: nokker-sandbox
+      NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_SANDBOX_EGRESS: http://egress:3128
       NOKKER_SANDBOX_IMAGES: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
     volumes:
@@ -339,7 +340,7 @@ networks:
   internal: {internal: true}
   dockerapi: {internal: true}
   sandbox:
-    name: nokker-sandbox
+    name: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
     internal: true
   outbound: {}
   front: {}

@@ -2207,6 +2207,20 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                        {**approval_to_json(final), "approval_id": decided.id, "continuation": continuation,
                         "scope": scope, "rule": rule if scope != "once" else None})
 
+        def _begin_stream(self, status: int, content_type: str = "text/event-stream") -> None:
+            """En-têtes d'une réponse en flux (SSE, inférence relayée). Le serveur parle HTTP/1.0 par défaut : un
+            client Go (cloudflared devant app.nokker.ai/v1) ignore alors `Transfer-Encoding: chunked`, lit le cadrage
+            comme du corps et attend la fermeture — que `Connection: keep-alive` n'envoie jamais (le bouton Envoyer
+            du web restait grisé jusqu'à la coupure d'inactivité de Cloudflare). Ici : HTTP/1.1 chunked, connexion
+            fermée après le dernier morceau."""
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")  # un nginx devant le noyau ne doit pas retenir le flux
+
         def _write_chunk(self, data: bytes) -> None:
             self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
 
@@ -2764,11 +2778,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             # manquée avant de basculer en direct — sans ça, un client qui perd sa connexion quelques
             # secondes perd silencieusement les cartes arrivées pendant la coupure.
             last_event_id_raw = self.headers.get("Last-Event-ID")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Transfer-Encoding", "chunked")
+            self._begin_stream(200)
             self.end_headers()
             q = events.subscribe()
             try:
@@ -2966,12 +2976,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 finally:
                     events_q.put(("done", None))
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("X-Accel-Buffering", "no")  # un nginx devant le noyau ne doit pas retenir le flux
+            self._begin_stream(200)
             self.end_headers()
             # Le tour emporte le contexte de la requête (locataire courant, docs/TENANCY.md §2).
             worker = threading.Thread(target=contextvars.copy_context().run, args=(_work,),

@@ -71,20 +71,48 @@ rand() { # rand <octets> : base64 url sans remplissage
 }
 fernet() { head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_'; }  # 32 octets, base64 url AVEC « = »
 
-compose() { docker compose -p nokker --env-file "$DIR/.env" -f "$DIR/docker-compose.yml" "$@"; }
+# Projet compose PROPRE à l'installation : les noms de projet sont globaux au démon docker, et un projet partagé fait
+# reprendre à une 2e installation (autre compte, autre --dir) les containers et le volume postgres de la 1re (et son
+# --purge les effacerait). Nouvelle installation : nokker-<compte>, plus une empreinte du dossier hors ~/.nokker ;
+# installation existante sans COMPOSE_PROJECT_NAME dans .env : « nokker » (ses volumes nokker_* sont gardés). Le nom
+# est écrit dans .env (COMPOSE_PROJECT_NAME : `docker compose -f $DIR/docker-compose.yml …` le retrouve seul) et dans
+# lokkal.json (`project`, relu par la commande nokker). Le réseau des bacs à sable suit : <projet>-sandbox.
+envv() { grep "^$1=" "$DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-; }
+if [ -f "$DIR/.env" ]; then
+  PROJECT=$(envv COMPOSE_PROJECT_NAME); PROJECT=${PROJECT:-nokker}
+  SANDBOX_NET=$(envv NOKKER_SANDBOX_NETWORK); SANDBOX_NET=${SANDBOX_NET:-nokker-sandbox}
+else
+  u=$(id -un | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')
+  PROJECT="nokker-${u:-user}"
+  [ "$DIR" = "$HOME/.nokker" ] || PROJECT="$PROJECT-$(printf %s "$DIR" | cksum | cut -d' ' -f1)"
+  SANDBOX_NET="$PROJECT-sandbox"
+fi
+compose() { docker compose -p "$PROJECT" --env-file "$DIR/.env" -f "$DIR/docker-compose.yml" "$@"; }
+# Refus si le projet appartient à une autre installation (containers d'un autre dossier), ou, pour une installation
+# neuve, si son volume postgres existe déjà (données d'une autre installation, ou d'une ancienne effacée sans --purge).
+guard_project() {
+  real=$(cd "$DIR" 2>/dev/null && pwd -P || echo "$DIR")
+  other=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
+            --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u | grep -vxF -e "$DIR" -e "$real" || true)
+  [ -z "$other" ] || die "le projet docker « $PROJECT » appartient à une autre installation ($other) : rien n'a été touché. Installez avec un autre --dir, ou arrêtez l'autre depuis son compte."
+  if [ "${1:-}" = new ] && docker volume inspect "${PROJECT}_postgres" >/dev/null 2>&1; then
+    die "le volume docker ${PROJECT}_postgres existe déjà (autre installation, ou ancienne installation retirée sans --purge) : rien n'a été touché. S'il est à vous et à jeter : docker volume rm ${PROJECT}_postgres"
+  fi
+}
 
 # ------------------------------------------------------------------------------------------------- désinstallation
 if [ "$MODE" = uninstall ]; then
   [ -f "$DIR/docker-compose.yml" ] || die "rien d'installé dans $DIR"
+  guard_project
   if [ "$PURGE" = 1 ]; then
     ask "Effacer AUSSI la base, la mémoire et l'état de Nokker (irréversible) ?" || die "abandon"
     compose down -v --remove-orphans
-    for c in $(docker ps -aq --filter label=nokker.sandbox); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    for c in $(docker ps -aq --filter label=nokker.sandbox --filter "network=$SANDBOX_NET"); do docker rm -f "$c" >/dev/null 2>&1 || true; done
     rm -rf "$DIR" "$CONF_DIR/lokkal.json"
     say "Nokker Lokkal désinstallé, données effacées. Vos dossiers de travail n'ont pas été touchés."
   else
     compose down --remove-orphans
-    for c in $(docker ps -aq --filter label=nokker.sandbox); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    for c in $(docker ps -aq --filter label=nokker.sandbox --filter "network=$SANDBOX_NET"); do docker rm -f "$c" >/dev/null 2>&1 || true; done
     say "Nokker Lokkal arrêté ; données gardées dans $DIR (--uninstall --purge pour tout effacer)."
   fi
   exit 0
@@ -153,6 +181,7 @@ case $sig in
 esac
 
 # ------------------------------------------------------------------------------------------------- pose des fichiers
+if [ -f "$DIR/.env" ]; then guard_project; else guard_project new; fi
 umask 077
 mkdir -p "$DIR" "$DIR/state" "$DIR/bin" "$CONF_DIR"
 tar -xzf "$TMP/$PKG" -C "$TMP"
@@ -203,6 +232,8 @@ NOKKER_HOST_WORKSPACE=$ws
 NOKKER_PORT=$WEB_PORT
 NOKKER_API_PORT=$API_PORT
 DOCKER_SOCKET=$SOCK
+COMPOSE_PROJECT_NAME=$PROJECT
+NOKKER_SANDBOX_NETWORK=$SANDBOX_NET
 NOKKER_PG_ADMIN_PASSWORD=$(rand 24)
 NOKKER_OWNER_PASSWORD=$(rand 24)
 NOKKER_APP_PASSWORD=$(rand 24)
@@ -228,10 +259,14 @@ if [ "$LLM" = 1 ]; then
   add_profile local-llm
 fi
 chmod 600 "$DIR/.env"; chmod 700 "$DIR/state"
+# Réseau des bacs à sable de CETTE installation dans la config du noyau (le proxy docker n'accepte que lui).
+sed "s|^\(    network_name:\) nokker-sandbox\$|\1 $SANDBOX_NET|" "$DIR/config/config.yaml" > "$TMP/core-config.yaml"
+grep -q "^    network_name: $SANDBOX_NET\$" "$TMP/core-config.yaml" || die "config.yaml : network_name introuvable"
+cp "$TMP/core-config.yaml" "$DIR/config/config.yaml"; chmod 644 "$DIR/config/config.yaml"
 WEB_PORT=$(getv NOKKER_PORT); API_PORT=$(getv NOKKER_API_PORT)
 
 cat > "$CONF_DIR/lokkal.json" <<EOF
-{"compose": "$DIR/docker-compose.yml", "project": "nokker", "version": "$VERSION", "core_service": "core",
+{"compose": "$DIR/docker-compose.yml", "project": "$PROJECT", "version": "$VERSION", "core_service": "core",
  "api_url": "http://127.0.0.1:$API_PORT", "web_url": "http://127.0.0.1:$WEB_PORT",
  "token_path": "$DIR/state/local-token", "env_file": "$DIR/.env", "install_dir": "$DIR"}
 EOF
@@ -250,20 +285,20 @@ if [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ]; then
   case $rc in
     0) ;;
     3) warn "coffre initialisé sans AppRole dans $DIR/vault/approle : le noyau n'y aura pas accès (LOKKAL §7, generate-root)";;
-    *) die "initialisation du coffre échouée (docker compose -p nokker logs openbao)";;
+    *) die "initialisation du coffre échouée (docker compose -p $PROJECT logs openbao)";;
   esac
   [ "$(getv NOKKER_VAULT_UNSEAL)" = manual ] && ! compose exec -T openbao bao status >/dev/null 2>&1 \
-    && warn "coffre scellé (mode manuel) : docker compose -p nokker exec openbao bao operator unseal"
+    && warn "coffre scellé (mode manuel) : docker compose -p $PROJECT exec openbao bao operator unseal"
 fi
 say "démarrage"
-compose up -d --remove-orphans >/dev/null 2>"$TMP/up.log" || { cat "$TMP/up.log" >&2; die "le démarrage a échoué (journal : docker compose -p nokker logs)"; }
+compose up -d --remove-orphans >/dev/null 2>"$TMP/up.log" || { cat "$TMP/up.log" >&2; die "le démarrage a échoué (journal : docker compose -p $PROJECT logs)"; }
 case ",$(getv COMPOSE_PROFILES)," in *,local-llm,*)
   m=$(getv NOKKER_LOCAL_LLM_MODEL)
-  say "modèle local ${m:-qwen3:4b} en téléchargement en arrière-plan (docker compose -p nokker logs -f local-llm-pull)";;
+  say "modèle local ${m:-qwen3:4b} en téléchargement en arrière-plan (docker compose -p $PROJECT logs -f local-llm-pull)";;
 esac
 i=0
 until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:$API_PORT/healthz")" = 200 ]; do
-  i=$((i + 1)); [ $i -gt 120 ] && die "le noyau ne répond pas après 6 min : docker compose -p nokker logs core"
+  i=$((i + 1)); [ $i -gt 120 ] && die "le noyau ne répond pas après 6 min : docker compose -p $PROJECT logs core"
   sleep 3
 done
 

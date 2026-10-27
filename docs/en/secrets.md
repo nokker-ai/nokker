@@ -9,9 +9,9 @@ it.
 
 ```bash
 # in the Lokkal install (the core container)
-docker compose -p nokker exec core python3 -m nokker --config /etc/nokker/config.yaml secret set GITHUB_TOKEN
+docker compose -f ~/.nokker/docker-compose.yml exec core python3 -m nokker --config /etc/nokker/config.yaml secret set GITHUB_TOKEN
 # from a file or a pipe (one trailing newline is dropped)
-docker compose -p nokker exec -T core python3 -m nokker --config /etc/nokker/config.yaml secret set DEPLOY_KEY < ~/.ssh/deploy
+docker compose -f ~/.nokker/docker-compose.yml exec -T core python3 -m nokker --config /etc/nokker/config.yaml secret set DEPLOY_KEY < ~/.ssh/deploy
 ```
 
 | Command | What it does |
@@ -105,7 +105,7 @@ compose network); elsewhere use `https://` (`ca_file` for your own CA) or set `a
 
 The core **never unseals** OpenBao and never sees an unseal key share. Install with `install.sh --vault` (the
 companion `vault-unseal` unseals it after a reboot from a key file on your machine) or `--vault-manual` (the key is
-shown once at init; after a reboot run `docker compose -p nokker exec openbao bao operator unseal`, it asks for the
+shown once at init; after a reboot run `docker compose -f ~/.nokker/docker-compose.yml exec openbao bao operator unseal`, it asks for the
 key without echo). While sealed, secret routes answer 503 "coffre scellé", references fail, and nothing falls back
 to the file. Without the `vault` profile the credential files are absent: choosing `openbao` then answers 503
 "coffre OpenBao non configuré", and the core keeps running.
@@ -124,8 +124,8 @@ local:
 ### Moving from `file` to `openbao`
 
 ```bash
-docker compose -p nokker exec core python3 -m nokker --config /etc/nokker/config.yaml vault migrate --from file --to openbao --check
-docker compose -p nokker exec core python3 -m nokker --config /etc/nokker/config.yaml vault migrate --from file --to openbao
+docker compose -f ~/.nokker/docker-compose.yml exec core python3 -m nokker --config /etc/nokker/config.yaml vault migrate --from file --to openbao --check
+docker compose -f ~/.nokker/docker-compose.yml exec core python3 -m nokker --config /etc/nokker/config.yaml vault migrate --from file --to openbao
 ```
 
 Both scopes are copied, each value is read back and compared. Running it again changes nothing. A name that already

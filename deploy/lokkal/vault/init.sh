@@ -4,7 +4,7 @@
 # `nokker-core`, root token révoqué à la fin. Le noyau ne reçoit que role_id et secret_id (/vault/approle, 0600).
 #   VAULT_UNSEAL=auto   (défaut) la part va dans /vault/unseal/unseal.key (0600) ; vault-unseal descelle seul.
 #   VAULT_UNSEAL=manual la part est affichée UNE fois sur la sortie standard, puis oubliée ; descellement à la main
-#                       (`docker compose -p nokker exec openbao bao operator unseal`, la part est demandée sans écho).
+#                       (`docker compose -f ~/.nokker/docker-compose.yml exec openbao bao operator unseal`, la part est demandée sans écho).
 # Idempotent : un coffre déjà initialisé n'est pas réinitialisé (sortie 0 si l'AppRole est en place, 3 sinon).
 set -eu
 umask 077
@@ -57,6 +57,6 @@ if [ "$MODE" = auto ]; then
 else
   echo "coffre initialisé (descellement MANUEL). Part de descellement, affichée une seule fois, à ranger hors de cette machine :"
   echo "  $KEY"
-  echo "Après chaque redémarrage : docker compose -p nokker exec openbao bao operator unseal"
+  echo "Après chaque redémarrage : docker compose -f ~/.nokker/docker-compose.yml exec openbao bao operator unseal"
 fi
 unset KEY
