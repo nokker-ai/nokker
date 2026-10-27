@@ -20,6 +20,7 @@ from nokker.cloud import http as cloud_http
 from nokker.cloud import moderation as md
 from nokker.pages.store import PageError, PageStore
 from tests.unit.test_mirror_pages import PAGE, _call, _worker, cloud  # noqa: F401 — fixture
+from tests.unit.bubbles.conftest import clock, hub, rec  # noqa: F401 — fixtures du hub
 from tests.unit.test_public_pages import HTML, Link, _http, lokkal  # noqa: F401 — fixture
 
 KEY = {"X-Nokker-Relay-Key": "k" * 32}
@@ -303,3 +304,190 @@ def test_author_sees_the_removal_and_cannot_republish(lokkal):  # noqa: F811
     assert _http(port, "GET", f"/v1/pages/public/{pub.public_id}")[0] == 404
     link = json.loads(_http(port, "POST", f"/v1/pages/{meta.page_id}/link", api.token, {})[2])
     assert link["moderated_at"] == got.moderated_at and "public_url" not in link
+
+
+# ─────────────────── exposé des motifs à l'auteur (DSA art. 17, décision du 25.10) ───────────────────
+
+
+APPEAL_FR = "Pour contester ce retrait, répondez à moderation@nokker.ai en citant l'identifiant de la page."
+APPEAL_EN = "To contest this removal, reply to moderation@nokker.ai quoting the page identifier."
+
+
+def _no_address(obj):
+    """Rien de ce qui part vers la machine ne porte une adresse (sauf la boîte de modération, publique) ni un compte."""
+    raw = json.dumps(obj, ensure_ascii=False).replace("moderation@nokker.ai", "")
+    assert "@" not in raw and "us_" not in raw and "tn_" not in raw and "mc_" not in raw, raw
+
+
+def test_registry_hands_the_reason_date_and_appeal_of_each_removed_page():
+    s = md.MemoryPublicPages()
+    assert md.APPEAL == {"fr": APPEAL_FR, "en": APPEAL_EN}
+    s.view("mc_1", "tn_a", SHA, PG, 1200, now=100.0)
+    s.set_moderation("mc_1", "tn_a", None, SHA, "unpublish", md.clean_reason("haine, signalé par x@example.org"),
+                     now=200.0)
+    assert s.moderated_of("mc_1") == {"page_ids": [PG], "public_sha256": [SHA]}  # contrat d'avant inchangé
+    got = s.notices_of("mc_1")
+    assert got == [{"page_id": PG, "public_sha256": SHA, "at": 200.0,
+                    "reason": "haine, signalé par [adresse retirée]", "appeal": md.APPEAL}]
+    _no_address(got)
+    # une identité retirée par contagion (machine qui ment sur le page_id) porte le même motif
+    other = "pg_" + "c" * 16
+    assert s.view("mc_1", "tn_a", SHA, other, 1200, now=210.0) is True
+    notices = s.notices_of("mc_1")
+    assert {n["page_id"] for n in notices} == {PG, other}
+    assert {n["reason"] for n in notices} == {"haine, signalé par [adresse retirée]"}
+    # rendue : plus de motif ; l'audit garde tout, en ajout seul
+    s2 = md.MemoryPublicPages()
+    s2.set_moderation("mc_1", "tn_a", PG, None, "unpublish", "spam", now=50.0)
+    assert [n["reason"] for n in s2.notices_of("mc_1")] == ["spam"]
+    s2.set_moderation("mc_1", "tn_a", PG, None, "restore", "erreur", now=60.0)
+    assert s2.notices_of("mc_1") == [] and s2.moderated_of("mc_1") == {"page_ids": [], "public_sha256": []}
+    assert [(e["action"], e["reason"]) for e in s2.events()] == [("unpublish", "spam"), ("restore", "erreur")]
+    # registre d'avant (ligne retirée sans motif rangé) : la note part quand même, motif nul
+    s2.rows[1]["moderated_at"], s2.rows[1]["reason"] = 70.0, None
+    assert s2.notices_of("mc_1")[0]["reason"] is None
+
+
+def test_gateway_machine_carries_the_notices_without_any_address(operator, capsys):
+    run, reg, machine, port, mt, _, _ = operator
+    assert _check(port, machine)[0] == 200
+    url = f"https://atelier--pub.nokker.app/{PUB}"
+    assert run("unpublish", url, "--reason", "contenu trompeur, voir jean@example.com", "--apply") == 0
+    capsys.readouterr()
+    got = _call(port, "GET", "/v1/gateway/machine", token=mt)[1]
+    assert got["moderated_pages"] == [PG] and got["moderated_public"] == [SHA]
+    (notice,) = got["moderation_notices"]
+    assert notice["page_id"] == PG and notice["public_sha256"] == SHA and isinstance(notice["at"], float)
+    assert notice["reason"] == "contenu trompeur, voir [adresse retirée]"
+    assert notice["appeal"] == {"fr": APPEAL_FR, "en": APPEAL_EN}
+    _no_address(got["moderation_notices"])
+    assert run("restore", PG, "--reason", "rendue", "--apply") == 0
+    got = _call(port, "GET", "/v1/gateway/machine", token=mt)[1]
+    assert got["moderation_notices"] == [] and got["moderated_pages"] == []
+
+
+def test_link_check_keeps_the_notices_for_the_machine():
+    from nokker.local.setup import LocalLink
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    notice = {"page_id": PG, "public_sha256": SHA, "at": 200.0, "reason": "spam", "appeal": md.APPEAL,
+              "tenant": "tn_x", "junk": 1}
+
+    class Client:
+        body = {"pages_public": True, "moderated_pages": [PG], "moderated_public": [SHA],
+                "moderation_notices": [notice, "pas un objet", {"page_id": 3}]}
+
+        def get(self, url, headers=None):
+            return Resp(self.body)
+
+    class Vault:
+        def get(self, name):
+            return "mt_x" if name == "machine_token" else None
+
+    link = LocalLink(setup=type("S", (), {"vault": Vault(), "state": {}})(), client=Client())
+    assert link.pages_public() is True
+    assert link.moderation["notices"] == [{"page_id": PG, "public_sha256": SHA, "at": 200.0, "reason": "spam",
+                                           "appeal": md.APPEAL}]
+    Client.body = {"pages_public": True, "moderated_pages": [PG], "moderated_public": []}  # nokker.ai d'avant
+    assert link.pages_public(ttl_s=0.0) is True and link.moderation.get("notices", []) == []
+
+
+def test_machine_store_exposes_the_moderation_and_restore_removes_it(tmp_path):
+    s = PageStore(tmp_path / "pages")
+    a = s.create("th_a", "a.html", "A", HTML)
+    pa = s.publish(a.page_id, 1, hashlib.sha256(HTML).hexdigest())
+    sha_a = hashlib.sha256(pa.public_id.encode()).hexdigest()
+    notice = {"page_id": None, "public_sha256": sha_a, "at": 450.0, "reason": "spam", "appeal": md.APPEAL}
+    assert [m.page_id for m in s.apply_moderation({"page_ids": [], "public_sha256": [sha_a], "notices": [notice]},
+                                                  now=500.0)] == [a.page_id]
+    got = s.get(a.page_id)
+    assert got.moderated_at == 500.0
+    assert got.moderation == {"at": 450.0, "reason": "spam", "appeal": md.APPEAL}
+    assert got.state()["moderation"] == got.moderation
+    assert PageStore(tmp_path / "pages").get(a.page_id).moderation == got.moderation   # gardé sur disque
+    # motif précisé par l'opérateur : la page suit (bulle), sans nouveau retrait
+    notice2 = {**notice, "reason": "spam répété", "at": 460.0}
+    assert [m.page_id for m in s.apply_moderation({"page_ids": [], "public_sha256": [sha_a], "notices": [notice2]},
+                                                  now=600.0)] == [a.page_id]
+    assert s.get(a.page_id).moderated_at == 500.0 and s.get(a.page_id).moderation["reason"] == "spam répété"
+    # nokker.ai sans note (d'avant) : la marque, la date du retrait vu ici, la phrase fixe
+    b = s.create("th_a", "b.html", "B", HTML.replace(b"v1", b"vb"))
+    s.apply_moderation({"page_ids": [b.page_id], "public_sha256": [sha_a], "notices": [notice2]}, now=700.0)
+    assert s.get(b.page_id).moderation == {"at": 700.0, "reason": None, "appeal": md.APPEAL}
+    # rendue : les champs disparaissent
+    s.apply_moderation({"page_ids": [], "public_sha256": [], "notices": []}, now=800.0)
+    for pid in (a.page_id, b.page_id):
+        m = s.get(pid)
+        assert m.moderated_at is None and m.moderation is None and "moderation" not in m.state()
+
+
+def test_author_is_told_once_at_the_first_removal_seen(tmp_path):
+    from tests.unit.test_local_api import _api
+
+    api = _api(tmp_path)
+    api.state_dir, api.pages_enabled = tmp_path / "state", True  # jamais le dossier de l'utilisateur
+    meta = api.pages.create("th_a", "index.html", "Démo", HTML)
+    told, changed = [], []
+    api.page_moderated, api.page_changed = told.append, changed.append
+    notice = {"page_id": meta.page_id, "public_sha256": None, "at": 10.0, "reason": "spam", "appeal": md.APPEAL}
+    api.link = type("L", (), {"moderation": {"page_ids": [meta.page_id], "public_sha256": [], "notices": [notice]}})()
+    api.sync_moderation()
+    assert [m.page_id for m in told] == [meta.page_id] and told[0].moderation["reason"] == "spam"
+    api.sync_moderation()
+    api.link.moderation["notices"] = [{**notice, "reason": "spam (précisé)"}]
+    api.sync_moderation()                                     # motif précisé : la bulle suit, pas de 2e alerte
+    assert len(told) == 1 and len(changed) == 2
+    api.link.moderation = {"page_ids": [], "public_sha256": [], "notices": []}
+    api.sync_moderation()                                     # rendue
+    assert api.pages.get(meta.page_id).moderation is None and len(told) == 1
+    api.link.moderation = {"page_ids": [meta.page_id], "public_sha256": [], "notices": [notice]}
+    api.sync_moderation()                                     # retirée de nouveau : un nouveau retrait, une alerte
+    assert len(told) == 2
+
+
+def test_hub_tells_the_author_once_and_the_bubble_drops_the_fields_on_restore(hub, rec, tmp_path):  # noqa: F811
+    s = PageStore(tmp_path / "pages")
+    m = s.create("th_a", "r.html", "Rapport", HTML)
+    hub.threads.ensure("th_a", "local-owner", "x")
+    b = hub.create_kernel_bubble("th_a", kind="artifact", title="Rapport", state=m.state())
+    notice = {"page_id": m.page_id, "public_sha256": None, "at": 10.0, "reason": "spam", "appeal": md.APPEAL}
+    (got,) = s.apply_moderation({"page_ids": [m.page_id], "public_sha256": [], "notices": [notice]}, now=20.0)
+    hub.page_changed(got)
+    st = hub.bubbles.get(b.id).state
+    assert st["moderated_at"] == 20.0 and st["moderation"] == {"at": 10.0, "reason": "spam", "appeal": md.APPEAL}
+    n = hub.page_moderated(got, fallback_user="local-owner")
+    assert n == 1
+    (note,) = hub.list_notifications("local-owner")
+    assert note.kind == "notify" and "Rapport" in note.title
+    assert m.page_id in note.state["text"] and "moderation@nokker.ai" in note.state["text"]
+    assert "spam" in note.state["text"]
+    (back,) = s.apply_moderation({"page_ids": [], "public_sha256": [], "notices": []}, now=30.0)
+    hub.page_changed(back)
+    st = hub.bubbles.get(b.id).state
+    assert st["moderated_at"] is None and "moderation" not in st
+
+
+def test_link_route_shows_the_moderation_to_its_author(lokkal):  # noqa: F811
+    port, api, _, _ = lokkal
+    meta = api.pages.create("th_a", "index.html", "Démo", HTML)
+    notice = {"page_id": meta.page_id, "public_sha256": None, "at": 10.0, "reason": "spam", "appeal": md.APPEAL}
+
+    class ModeratedLink(Link):
+        moderation = None
+
+        def pages_public(self, ttl_s=300.0):
+            self.moderation = {"page_ids": [meta.page_id], "public_sha256": [], "notices": [notice]}
+            return True
+
+    api.link = ModeratedLink()
+    assert _http(port, "POST", f"/v1/pages/{meta.page_id}/publish", api.token, {})[0] == 403
+    link = json.loads(_http(port, "POST", f"/v1/pages/{meta.page_id}/link", api.token, {})[2])
+    assert link["moderation"] == {"at": 10.0, "reason": "spam", "appeal": md.APPEAL}

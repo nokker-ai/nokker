@@ -405,13 +405,30 @@ class BubbleHub:
         fil suivent (`public`, `public_version`, `public_index`, `locality`), une `bubble.updated` chacune. Rend leur
         nombre."""
         n = 0
-        keys = ("public", "public_version", "public_index", "locality", "moderated_at")
+        keys = ("public", "public_version", "public_index", "locality", "moderated_at", "moderation")
         fresh = {k: v for k, v in meta.state().items() if k in keys}
         for b in self.bubbles.list_thread(meta.thread_id):
             if b.kind == "artifact" and b.closed_at is None and (b.state or {}).get("page_id") == meta.page_id:
-                self.update_from_kernel(b.id, state={**(b.state or {}), **fresh})
+                state = {**(b.state or {}), **fresh}
+                if "moderation" not in fresh:  # rendue par l'opérateur : l'exposé des motifs disparaît
+                    state.pop("moderation", None)
+                self.update_from_kernel(b.id, state=state)
                 n += 1
         return n
+
+    def page_moderated(self, meta: Any, *, fallback_user: str | None = None) -> int:
+        """Page retirée par la modération de nokker.ai (§7.26 point 6), vue pour la PREMIÈRE fois par la machine : une
+        bulle `notify` à chaque personne du fil de la page (sinon `fallback_user`) — motif, identifiant de la page et
+        comment contester (le détail complet reste dans `moderation` de la bulle `artifact`). Rend leur nombre."""
+        mod = getattr(meta, "moderation", None) or {}
+        audience = self.thread_audience(meta.thread_id) or ({fallback_user} if fallback_user else set())
+        appeal = (mod.get("appeal") or {}).get("fr") or ""
+        reason = mod.get("reason") or "non précisé"
+        text = f"Identifiant : {meta.page_id}. {appeal} Motif : {reason}".strip()
+        for user in sorted(audience):
+            self.notify_user(user, title=f"Page retirée par la modération : {meta.title or meta.path}", text=text,
+                             from_thread=meta.thread_id if self.threads.get(meta.thread_id) else None)
+        return len(audience)
 
     def close_bubble(self, bubble_id: str, user: str | None) -> Bubble:
         self._writable(bubble_id, user)

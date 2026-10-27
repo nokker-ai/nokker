@@ -47,6 +47,9 @@ _CONSENT_DIR = Path(__file__).parent / "consent"
 _RE_KIND = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
+MINORS_MODES = ("all", "allowlist")
+
+
 @dataclass(frozen=True)
 class Settings:
     plan: str = DEFAULTS["plan"]
@@ -56,10 +59,13 @@ class Settings:
     max_members: int = DEFAULTS["max_members"]
     mode: str = DEFAULTS["mode"]  # hard : refus au-delà ; soft : on compte, on prévient une fois, on ne coupe pas
     minors: bool = False  # drapeau `household_minors`
+    # `all` : tout payeur peut déclarer des profils mineurs ; `allowlist` : seulement les payeurs que l'opérateur a
+    # autorisés un par un (table household_minor_grants, `python -m nokker household minors allow`).
+    minors_mode: str = "all"
 
     @classmethod
     def from_config(cls, settings: dict[str, Any] | None, *, billing_plans: dict[str, Any] | None = None,
-                    minors: bool = False) -> Settings:
+                    minors: bool = False, minors_mode: str = "all") -> Settings:
         """`household_settings` de la configuration, puis le palier `plan` (défaut `famille`) des paliers de la
         facturation (`DEFAULT_PLANS` surchargés par `billing_plans`, la même table que `Billing.plans`) : ses
         `turns_per_day` / `turns_per_week` sont le quota commun, `household_members` les sièges (borné par
@@ -73,6 +79,8 @@ class Settings:
                 cfg[key] = tier[key]
         if "household_members" in tier and "max_members" not in (settings or {}):
             cfg["max_members"] = min(int(tier["household_members"]), HARD_MAX_MEMBERS)
+        if minors_mode not in MINORS_MODES:
+            raise ValueError(f"household_minors_mode inconnu : {minors_mode!r} ({' | '.join(MINORS_MODES)})")
         mode = str(cfg["mode"])
         if mode not in ("soft", "hard"):
             raise ValueError(f"household_settings.mode inconnu : {mode!r} (soft | hard)")
@@ -91,7 +99,7 @@ class Settings:
             raise ValueError(f"household_settings.max_members : entre 1 et {HARD_MAX_MEMBERS}")
         return cls(plan=plan, turns_per_day=cap("turns_per_day"), turns_per_week=cap("turns_per_week"),
                    member_turns_per_day=cap("member_turns_per_day"), max_members=max_members, mode=mode,
-                   minors=bool(minors))
+                   minors=bool(minors), minors_mode=minors_mode)
 
     def for_plan(self, plan: str, caps: dict[str, Any] | None) -> Settings:
         """Les réglages d'un foyer dont le payeur a le palier `plan` (facturation branchée) : `turns_per_day` /

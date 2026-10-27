@@ -13,8 +13,8 @@ CortHeXis holds three memories, kept apart from each other:
 | **session** | the closed episodes of a thread (summary and your messages) | that thread only |
 
 Status: all three are on in the Lokkal install (`memory_mode: direct`, `local.project_memory: true`,
-`context_corthexis.enabled: true`) and off by default in the core itself. The `/memory` slash command is **planned**
-in the terminal client; the core route it uses is ready. Sharing project memory with a team is **beta**
+`context_corthexis.enabled: true`) and off by default in the core itself. In the terminal client, `/memory` shows
+what it knows. Sharing project memory with a team is **beta**
 ([teams.md](teams.md)).
 
 ## Long-term memory
@@ -100,7 +100,7 @@ memory {"action": "forget", "name": "<note>"}
 ```
 
 A client can call it without a model turn through `POST /v1/local/tools/call` (the terminal slash commands
-`/memory`, `/memory <note>`, `/memory forget <note>` are planned). Forgetting moves the note out of the index into a `.forgotten`
+`/memory`, `/memory <note>`, `/memory forget <note>` use it). Forgetting moves the note out of the index into a `.forgotten`
 folder: nothing is destroyed. A section of an instruction file cannot be forgotten: edit the file, the memory follows.
 
 ## Where it is stored

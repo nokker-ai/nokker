@@ -24,6 +24,8 @@ from typing import Any
 
 ISSUER = "https://app.nokker.ai"
 AUDIENCE = "nokker.app"
+ATTEST_TYP = "nokker-approval-attest"  # `typ` (en-tête et claim) d'une attestation de décision Telegram
+ATTEST_TTL_S = 120
 _USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789"  # sans voyelles ni caractères ambigus
 
 
@@ -112,12 +114,12 @@ class Signer:
         return {"keys": [{"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": self.kid,
                           "x": _b64u(nums.x.to_bytes(32, "big")), "y": _b64u(nums.y.to_bytes(32, "big"))}]}
 
-    def sign(self, claims: dict[str, Any]) -> str:
+    def sign(self, claims: dict[str, Any], typ: str = "JWT") -> str:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-        head = _b64u(json.dumps({"alg": "ES256", "typ": "JWT", "kid": self.kid}, separators=(",", ":")).encode())
+        head = _b64u(json.dumps({"alg": "ES256", "typ": typ, "kid": self.kid}, separators=(",", ":")).encode())
         body = _b64u(json.dumps(claims, separators=(",", ":")).encode())
         r, s = decode_dss_signature(self._key.sign(f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256())))
         return f"{head}.{body}.{_b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
@@ -157,14 +159,29 @@ class Signer:
         return self.sign(claims)
 
 
+    def attestation_token(self, account: str, machine: str, approval_id: str, challenge_sha256: str, decision: str,
+                          device_id: str, args_sha256: str | None = None, ttl_s: int = ATTEST_TTL_S,
+                          now: float | None = None, jti: str | None = None) -> str:
+        """Attestation de décision Telegram (lot X10, docs/LOKKAL.md §7.3) : nokker.ai a vérifié la preuve Telegram d'un
+        appareil du compte (initData, clé de l'appareil) ; la MACHINE l'accepte à la place de la preuve elle-même.
+        Liée à UNE machine (`aud`), UN compte (`sub`), UNE carte (`approval_id`) et UN défi (`challenge_sha256`, empreinte
+        du texte exact déposé par la machine : nonce, outil et empreinte des arguments y sont), UNE décision. 120 s au
+        plus, usage unique tenu par la machine (`jti`). Jamais un jeton d'accès : `typ` dédié, `aud` = la machine."""
+        t = int(now or time.time())
+        claims = {"iss": self.issuer, "aud": machine, "sub": account, "typ": ATTEST_TYP, "approval_id": approval_id,
+                  "challenge_sha256": challenge_sha256, "decision": decision, "via": "telegram", "device_id": device_id,
+                  "iat": t, "exp": t + max(1, min(int(ttl_s), ATTEST_TTL_S)), "jti": jti or uuid.uuid4().hex}
+        if args_sha256:
+            claims["args_sha256"] = args_sha256
+        return self.sign(claims, typ=ATTEST_TYP)
+
+
 class TokenError(ValueError):
     """Jeton signé refusé (forme, signature, émetteur, audience, expiration, machine)."""
 
 
-def verify_token(token: str, jwks: dict[str, Any], *, machine: str | None = None, now: float | None = None,
-                 issuer: str = ISSUER) -> dict:
-    """Vérifie un jeton ES256 de nokker.ai contre le JWKS (noyau local et relais). `machine` : si le jeton nomme une
-    machine (délégation), elle doit être celle-ci."""
+def _verify_signed(token: str, jwks: dict[str, Any]) -> tuple[dict, dict]:
+    """(en-tête, claims) d'un jeton ES256 dont la signature vérifie contre le JWKS ; rien d'autre n'est contrôlé."""
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -175,18 +192,30 @@ def verify_token(token: str, jwks: dict[str, Any], *, machine: str | None = None
         head, claims, sig = json.loads(_b64u_dec(head_s)), json.loads(_b64u_dec(body_s)), _b64u_dec(sig_s)
     except (ValueError, json.JSONDecodeError) as e:
         raise TokenError("jeton illisible") from e
+    if not isinstance(head, dict) or not isinstance(claims, dict):
+        raise TokenError("jeton illisible")
     if head.get("alg") != "ES256" or len(sig) != 64:
         raise TokenError("algorithme refusé")
-    key = next((k for k in jwks.get("keys", []) if k.get("kid") == head.get("kid")), None)
+    key = next((k for k in (jwks or {}).get("keys", []) if k.get("kid") == head.get("kid")), None)
     if key is None:
         raise TokenError("clé inconnue")
-    pub = ec.EllipticCurvePublicNumbers(int.from_bytes(_b64u_dec(key["x"]), "big"),
-                                        int.from_bytes(_b64u_dec(key["y"]), "big"), ec.SECP256R1()).public_key()
     try:
+        pub = ec.EllipticCurvePublicNumbers(int.from_bytes(_b64u_dec(key["x"]), "big"),
+                                            int.from_bytes(_b64u_dec(key["y"]), "big"), ec.SECP256R1()).public_key()
         pub.verify(encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")),
                    f"{head_s}.{body_s}".encode(), ec.ECDSA(hashes.SHA256()))
     except InvalidSignature as e:
         raise TokenError("signature invalide") from e
+    except (KeyError, ValueError) as e:
+        raise TokenError("clé illisible") from e
+    return head, claims
+
+
+def verify_token(token: str, jwks: dict[str, Any], *, machine: str | None = None, now: float | None = None,
+                 issuer: str = ISSUER) -> dict:
+    """Vérifie un jeton ES256 de nokker.ai contre le JWKS (noyau local et relais). `machine` : si le jeton nomme une
+    machine (délégation), elle doit être celle-ci."""
+    _head, claims = _verify_signed(token, jwks)
     t = now or time.time()
     if claims.get("iss") != issuer or claims.get("aud") != AUDIENCE:
         raise TokenError("émetteur ou audience refusés")
@@ -194,6 +223,47 @@ def verify_token(token: str, jwks: dict[str, Any], *, machine: str | None = None
         raise TokenError("jeton expiré")
     if "machine" in claims and machine is not None and claims["machine"] != machine:
         raise TokenError("jeton d'une autre machine")
+    return claims
+
+
+def challenge_sha256(challenge: str) -> str:
+    """Empreinte du texte EXACT d'un défi (celui que la machine a déposé) : ce que l'attestation lie."""
+    return _sha(challenge)
+
+
+def verify_attestation(token: str, jwks: dict[str, Any], *, machine: str, account: str, approval_id: str,
+                       challenge: str, issuer: str = ISSUER, now: float | None = None) -> dict:
+    """Attestation de décision Telegram (`Signer.attestation_token`), vérifiée PAR LA MACHINE : signature par le JWKS
+    épinglé au lien, `typ` (en-tête ET claim), émetteur, `aud` = cette machine, `sub` = le compte lié, la carte en
+    attente, le défi qu'elle a déposé, décision connue, durée de vie bornée, non expirée. Rend les claims ; l'usage unique
+    (`jti`) est tenu par l'appelant."""
+    head, claims = _verify_signed(token, jwks)
+    t = now or time.time()
+    if head.get("typ") != ATTEST_TYP or claims.get("typ") != ATTEST_TYP:
+        raise TokenError("ce jeton n'est pas une attestation de décision")
+    if claims.get("iss") != issuer:
+        raise TokenError("émetteur refusé")
+    if claims.get("aud") != machine:
+        raise TokenError("attestation d'une autre machine")
+    if claims.get("sub") != account or not account:
+        raise TokenError("attestation d'un autre compte")
+    if claims.get("approval_id") != approval_id:
+        raise TokenError("attestation d'une autre carte")
+    if claims.get("challenge_sha256") != _sha(challenge):
+        raise TokenError("attestation d'un autre défi")
+    if claims.get("decision") not in ("approve", "reject"):
+        raise TokenError("décision inconnue")
+    if claims.get("via") != "telegram":
+        raise TokenError("attestation d'une autre voie")
+    exp, iat = claims.get("exp"), claims.get("iat")
+    if not isinstance(exp, int) or not isinstance(iat, int) or exp - iat > ATTEST_TTL_S or exp <= iat:
+        raise TokenError("durée de l'attestation invalide")
+    if t >= exp:
+        raise TokenError("attestation expirée")
+    if iat > t + 30:
+        raise TokenError("attestation datée du futur")
+    if not isinstance(claims.get("jti"), str) or not claims["jti"] or not isinstance(claims.get("device_id"), str):
+        raise TokenError("attestation incomplète")
     return claims
 
 
@@ -526,4 +596,4 @@ class LinkService:
 
 
 __all__ = ["AUDIENCE", "ISSUER", "LinkService", "Machine", "MemoryLinkStore", "Signer", "SigningKeyError", "TokenError",
-           "slug", "verify_token"]
+           "slug", "verify_attestation", "verify_token", "challenge_sha256", "ATTEST_TYP", "ATTEST_TTL_S"]

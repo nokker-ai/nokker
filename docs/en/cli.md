@@ -2,8 +2,8 @@
 
 `nokker` is a terminal client for your local Lokkal. Run it in a folder and you get a coding session on that folder.
 
-> Terminal labels are currently in French (tool lines, approval card). English labels are planned. This page uses the
-> English names.
+> The terminal speaks English by default and French when your locale is French (`LANG=fr…`); `--lang` or `NOKKER_LANG`
+> chooses explicitly.
 
 ```sh
 cd ~/nokker/my-project
@@ -56,8 +56,7 @@ On failure: `{"error": "...", "refused": []}` and exit code 1.
 
 ## In a session
 
-Under each turn, a dim line gives its cost: `12.4 k tokens · €0.03` (the terminal shows it in French:
-`12,4 k jetons · 0,03 €`). See [Cost per turn](#cost-per-turn).
+Under each turn, a dim line gives its cost: `12.4 k tokens · €0.03` (in French: `12,4 k jetons · 0,03 €`). See [Cost per turn](#cost-per-turn).
 
 Each tool call shows its effect in plain words (read, write, destructive, send, spend, secret), then its duration.
 Results are folded to three lines: press `o` (with an empty input) or type `/out` to unfold, `/tools` to unfold all.
@@ -120,7 +119,7 @@ displayed card and cancels the turn, otherwise quits.
 | `/plan` | The session's work plan, with each step's state |
 | `/agents` | Sub-agents of the thread: goal, state, last tool, duration |
 | `/cost` | Cost of the session (thread and its sub-agents) and of the day (UTC): tokens, and the amount when the model has a price |
-| `/memory [note\|forget <note>]` | Project memory: learned notes and instruction sections; one note; forget it. **Planned** in the terminal; the core side is ready (see [memory.md](memory.md)) |
+| `/memory [note\|forget <note>]` | Project memory: learned notes and instruction sections; one note; forget it (after confirmation). See [memory.md](memory.md) |
 | `/cancel` | Cancel the running turn (Esc too) |
 | `/out` | Unfold or fold the preview of the last tool call (`o` too) |
 | `/tools` | Unfold or fold all previews |

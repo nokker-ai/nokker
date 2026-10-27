@@ -71,6 +71,18 @@ seul endroit où je décris le besoin, comme convenu.
   décidée/expirée (lu depuis `status` au chargement **et** compte à rebours côté client), erreurs
   réseau (retry), `initData` absent (page ouverte hors Telegram).
 
+## Carte d'une machine Lokkal liée (lot X10, 26.10)
+
+La Mini App ouvre aussi la carte forte d'une **machine** liée (docs/LOKKAL.md §7.3, « Attestation Telegram ») : le
+`start_param` vaut `mc_<16 hex>-<approval_id>` (ou l'URL porte `?machine=…&approval=…`, ce que fait le bouton « Signer
+(Face ID) » de la notification). Elle lit `GET /v1/link/machines/{m}/approvals/{id}` (en-tête `X-Telegram-Init-Data`, pas
+de session) : titre, motif, avis du juge, résumé rendu par nokker.ai (cartes de connecteur) ou « décrit par ta machine »
+avec l'empreinte (cartes locales). Elle signe `challenge + "." + decision` (le défi lu dans la carte, jamais reconstruit)
+avec la clé libérée par `BiometricManager`, puis poste `{decision, proof: {device_id, signature, telegram_init_data}}` à
+`POST …/decision`. nokker.ai vérifie la preuve et remet à la machine une attestation signée ; la page attend ensuite
+(~30 s) que la machine dise `approved|rejected`, ou qu'elle ait refusé la preuve (la carte revient en attente avec la
+raison). Logique pure (cible, chemins, preuve, lecture de la carte, statut) : `approve-core.js`, testée par `node --test`.
+
 ## Limites connues
 
 - **`BiometricManager` absent** sur certains clients (desktop Telegram notamment, certaines versions

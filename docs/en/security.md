@@ -28,11 +28,14 @@ A **strong card** is for what is hard to undo or reaches other people:
 | A destructive command, restoring a restore point, installing a skill or a pack | Strong: **once** only, never "for the session" or "always" |
 | Any change on a host with role `prod` ([ops.md](ops.md)) | Strong, in every mode, whatever your `allow` rules. Never approved with the local token. |
 | Arming an agent that may write without asking ([agents.md](agents.md)) | Strong, for those exact rules |
-| Sending or deleting through a connector of your nokker.ai account (mail, calendar) | Strong, signed on your phone, checked by nokker.ai before it runs |
-| A destructive action asked from the web, through the gateway | Strong, decided on an enrolled device |
+| Sending or deleting through a connector of your nokker.ai account (mail, calendar) | Strong, signed on your phone with a passkey, checked by nokker.ai before it runs |
+| A destructive action asked from the web, through the gateway | Strong, decided on an enrolled device (passkey, or the Telegram Mini App on nokker.ai's attestation: see below) |
 | Making a page public | Strong, decided on an enrolled device (never the local token alone) |
 
-A written "go ahead" in a message never replaces a strong card. On strong cards, a reviewer model adds a short advice
+Locally, naming the exact command ("run exactly: `rm -rf build`") counts as approval only inside the sandbox of a code
+session (`terminal`, `process_start`: it mounts only the session folder, which is snapshotted before every call, so the
+action is reversible by restore points), and never from the web. Anywhere else (`ssh_run`, connectors, MCP tools, a
+thread outside a code session) a written "go ahead" never replaces a strong card. On strong cards, a reviewer model adds a short advice
 and a risk level ([models.md](models.md)); it advises, it never decides.
 
 ## 3. Approving from your phone
@@ -43,10 +46,20 @@ When a strong card waits on your machine, the machine posts it to your account. 
 you paired it) with a link to `app.nokker.ai/approve/…`. Nothing is decided in the notification. You sign on the page
 with a **passkey that verifies you** (Face ID, Touch ID, Windows Hello).
 
-nokker.ai is only a mailbox: it has no device key and cannot decide. **Your machine checks the signature itself**,
-against the public key of your device (pinned the first time it sees it), the challenge it created for that card,
-the hash of the exact arguments, and a one-time nonce. A replayed or altered signature is refused. A device that only
-logs in (e-mail code, Google) cannot decide.
+nokker.ai is a mailbox: it has no device key and cannot decide a card on its own. **For a passkey, your machine checks
+the signature itself**, against the public key of your device (pinned the first time it sees it), the challenge it
+created for that card, the hash of the exact arguments, and a one-time nonce. A replayed or altered signature is
+refused. A device that only logs in (e-mail code, Google) cannot decide.
+
+**The Telegram Mini App is the one place where your machine trusts nokker.ai.** The machine does not hold the bot token,
+so it cannot verify Telegram's proof. nokker.ai verifies it (Telegram sign-in data, an enrolled device of the account
+that owns the machine and linked to that Telegram user, the device signature on the machine's exact challenge) and signs
+an attestation that the machine accepts: tied to that machine, account, card, challenge and decision, valid 120 seconds,
+usable once (the machine remembers the identifier). It is never accepted for a `prod` change, a page publication, a
+minor's profile or a relayed connector, which need the passkey. A compromised nokker.ai (a stolen gateway key) could
+therefore get a strong card approved through this path; it cannot through a passkey. Set
+`local.remote_approvals_attested: false` and only a passkey, verified by your machine, decides from your phone. Later,
+the machine will verify Telegram's own Ed25519 signature and this trust will not be needed.
 
 ## 4. What you see when you sign
 

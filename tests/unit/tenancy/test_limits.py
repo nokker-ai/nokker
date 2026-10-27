@@ -103,3 +103,29 @@ def test_from_config_defaults_to_the_solo_plan_in_soft_mode():
     assert (limits.mode, limits.turns_per_day, limits.turns_per_week, limits.hard_turns_per_day) == ("soft", 40, 200, 150)
     with pytest.raises(ValueError):
         TenantLimits.from_config({"mode": "strict"})
+
+
+def test_pg_usage_connection_goes_through_store_conn_connect(monkeypatch):
+    """`PgUsage._conn` passe par `store.conn.connect` (pose `app.tenant_id`) avec le locataire PASSÉ EN ARGUMENT, même
+    hors de tout `tenant_scope` (le compteur est appelé avec le locataire de la machine)."""
+    from nokker.tenancy.context import current_tenant_or_none
+    from nokker.tenancy.limits import PgUsage
+
+    seen = []
+
+    class FakeConn:
+        autocommit = True
+
+        def execute(self, sql, params=()):
+            seen.append((sql, params))
+
+    def fake_connect(dsn, **kw):
+        seen.append(("connect", dsn, kw))
+        return FakeConn()
+
+    monkeypatch.setattr("nokker.store.conn.psycopg.connect", fake_connect)
+    assert current_tenant_or_none() is None
+    PgUsage("postgresql://x/y")._conn(TESTER)
+    assert seen[0] == ("connect", "postgresql://x/y", {"autocommit": True})
+    assert seen[1] == ("SELECT set_config('app.tenant_id', %s, false)", (TESTER,))
+    assert current_tenant_or_none() is None  # le scope temporaire est rendu

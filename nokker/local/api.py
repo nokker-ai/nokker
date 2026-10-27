@@ -200,6 +200,9 @@ class LocalApi:
     settings_path: Path | None = None  # réglages de l'utilisateur, où « always » écrit
     relay_host: str | None = None  # <nom>.nokker.app : accepté comme Host seulement tunnel ouvert (§7.5)
     tunnel: Any = None  # nokker.local.tunnel.Tunnel, posé par serve quand la machine est liée
+    # (relay_url, local_base, web_base) : posé par serve, il permet de lancer le tunnel à l'approbation du lien, sans
+    # redémarrage (`link_approved`). None = pas de passerelle configurée.
+    tunnel_args: tuple[str, str, str | None] | None = None
     # (thread_id, cwd) -> dict | None : serve y lit le `.nokker/settings.json` du dépôt ; un dict rendu est ajouté à la
     # réponse d'ouverture (ex. `hooks`, avec l'avis des hooks du dépôt pas encore de confiance)
     on_session_open: Any = None
@@ -235,6 +238,9 @@ class LocalApi:
     _preview: Any = None
     # Bulles `artifact` d'une page changée hors d'un tour (`BubbleHub.page_changed`), posé par le serveur.
     page_changed: Any = None
+    # Prévenir l'auteur d'une page retirée par la modération, UNE fois, au premier retrait vu (§7.26 point 6) : une
+    # bulle `notify` (`BubbleHub.page_moderated`), posé par le serveur.
+    page_moderated: Any = None
 
     @property
     def preview_signer(self) -> Any:
@@ -269,6 +275,10 @@ class LocalApi:
         if self.emit is not None:
             self.emit(name, payload)
 
+    def __post_init__(self) -> None:
+        if self.link is not None and getattr(self.link, "on_approved", 1) is None:
+            self.link.on_approved = self.link_approved  # fin du flux d'appareil : effets sans redémarrage
+
     @property
     def pages(self) -> Any:
         """Magasin des pages de session (docs/BUBBLES.md §10), sous `state_dir/pages`."""
@@ -279,10 +289,13 @@ class LocalApi:
         return self._pages
 
     def start_tunnel(self, relay_url: str, local_base: str, web_base: str | None = None) -> bool:
-        """Ouvre le tunnel si la machine est liée (jeton de machine au coffre, nom connu). Rend True si lancé."""
+        """Ouvre le tunnel si la machine est liée (jeton de machine au coffre, nom connu). Rend True si lancé ; False
+        si non liée ou si un tunnel tourne déjà (jamais deux)."""
         from nokker.local.tunnel import Tunnel
 
         if self.setup is None:
+            return False
+        if self.tunnel is not None and getattr(self.tunnel, "running", False):
             return False
         token = self.setup.vault.get("machine_token")
         self.relay_host = self.setup.state.get("relay_host")
@@ -292,6 +305,34 @@ class LocalApi:
                              on_up=self.load.kick if self.load is not None else None)  # charge envoyée à la connexion
         self.tunnel.start()
         return True
+
+    def stop_tunnel(self) -> None:
+        """Ferme le tunnel (lien retiré) : le Host `<nom>.nokker.app` n'est plus accepté."""
+        tunnel, self.tunnel, self.relay_host = self.tunnel, None, None
+        if tunnel is not None:
+            tunnel.stop()
+
+    def link_approved(self) -> None:
+        """Fin du flux d'appareil (`LocalLink.status` vient de ranger la clé et le jeton de machine) : tout ce qui
+        n'était lu qu'au démarrage est pris en compte tout de suite — modèle par défaut (clé du lien sur Ship, Deep,
+        petit palier et juges du Router) et tunnel de la passerelle. Les valeurs entrent au caviardage sans attendre
+        le rafraîchissement du coffre."""
+        if self.setup is None:
+            return
+        if self.vault is not None:
+            for name in ("router", "machine_token"):
+                try:
+                    value = self.setup.vault.get(name)
+                except Exception:  # noqa: BLE001 — coffre illisible : rien à caviarder de plus
+                    value = None
+                if value:
+                    self.vault.known.note("system", name, value)
+        if self.on_default_model is not None:
+            chosen = self.setup.provider_for_default()
+            if chosen is not None:
+                self.on_default_model(*chosen)
+        if self.tunnel_args is not None and self.start_tunnel(*self.tunnel_args):
+            logger.info("lokkal : tunnel de la passerelle lancé à l'approbation du lien (%s)", self.tunnel_args[0])
 
     @classmethod
     def from_config(cls, local: dict[str, Any], port: int) -> LocalApi:
@@ -434,11 +475,16 @@ class LocalApi:
         try:
             claims = verify_token(tok, jwks, machine=self.setup.state.get("machine_id"),
                                   issuer=self.link.base_url.rstrip("/") if self.link is not None else ISSUER)
-        except TokenError:
+        except TokenError as e:
+            logger.info("passerelle : jeton refusé (%s)", e)  # la raison, jamais le jeton
             return None
         if claims.get("scope") not in (None, "lokkal:session"):
+            logger.info("passerelle : jeton refusé (portée %r)", claims.get("scope"))
             return None
-        return claims if claims.get("sub") == account else None
+        if claims.get("sub") != account:
+            logger.info("passerelle : jeton refusé (compte du jeton ≠ compte lié à cette machine)")
+            return None
+        return claims
 
     def delegation_claims(self, authorization: str | None) -> dict[str, Any] | None:
         """Claims d'un jeton de DÉLÉGATION valide (noyau de nokker.ai, X21), sinon None."""
@@ -547,7 +593,9 @@ class LocalApi:
                 return 404, {"error": {"message": "pas de session locale sur ce fil"}}
             return 200, {"thread_id": thread_id, "skills": st}
         if path == "/v1/local/sessions" and method == "GET":
-            return 200, {"sessions": [self._session_row(t, c) for t, c in self.code.sessions().items()]}
+            # `roots` : où une session peut s'ouvrir (le web propose ces dossiers ; un `cwd` hors racine → 403).
+            return 200, {"sessions": [self._session_row(t, c) for t, c in self.code.sessions().items()],
+                         "roots": list(self.roots)}
         if path.startswith("/v1/local/setup") and self.setup is not None:
             return self._setup(method, path, body)
         if path == "/v1/local/machine" and method == "GET":
@@ -747,15 +795,23 @@ class LocalApi:
         moderation = getattr(self.link, "moderation", None) if self.link is not None else None
         if not isinstance(moderation, dict) or (not self.pages_enabled and self._pages is None):
             return []
+        before = {m.page_id for m in self.pages.all() if m.moderated_at is not None}
         changed = self.pages.apply_moderation(moderation)
         for meta in changed:
             if self.page_changed is not None:
                 self.page_changed(meta)
+            # premier retrait vu (un retrait déjà connu, même au redémarrage, est sur disque : pas de 2e alerte)
+            if meta.moderated_at is not None and meta.page_id not in before and self.page_moderated is not None:
+                try:
+                    self.page_moderated(meta)
+                except Exception:  # noqa: BLE001 — l'alerte ne doit pas empêcher la page d'être marquée
+                    logger.exception("alerte de retrait de la page %s impossible", meta.page_id)
         return changed
 
     def _link(self, method: str, path: str) -> tuple[int, dict[str, Any]] | None:
         if self.link is None:
             return 404, {"error": {"message": "lien de compte non configuré"}}
+        self.__post_init__()  # lien posé après coup (tests, rechargement) : même câblage
         import socket
 
         try:
@@ -768,7 +824,9 @@ class LocalApi:
                     self.sync_moderation()  # lue dans la même réponse de nokker.ai (§7.26 point 6)
                 return 200, st
             if path == "/v1/local/link" and method == "DELETE":
-                return 200, self.link.unlink()
+                out = self.link.unlink()
+                self.stop_tunnel()
+                return 200, out
         except VaultError as e:
             return 503, {"error": {"message": str(e)}}
         except (httpx.HTTPError, KeyError, ValueError):

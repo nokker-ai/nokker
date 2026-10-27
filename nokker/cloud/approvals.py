@@ -1,10 +1,16 @@
 """Approbations fortes par la passerelle, côté nokker.ai (lot X10, docs/LOKKAL.md §7.3) : une boîte aux lettres.
 
-nokker.ai ne décide JAMAIS. Il garde la carte déposée par la machine liée (`deposit`), la montre au compte, garde telle
-quelle la preuve signée par un appareil du compte (`decide` → `forwarded`), la rend à la machine (`decisions`, attente
-longue), et n'affiche `approved|rejected|expired` que quand la machine l'a dit (`result`), après avoir vérifié la
-preuve elle-même contre la clé publique de l'appareil. Sans clé privée d'appareil, nokker.ai (ou un compte volé, ou le
-jeton de machine) ne peut produire aucune preuve valable.
+nokker.ai ne décide JAMAIS une carte. Il garde la carte déposée par la machine liée (`deposit`), la montre au compte,
+garde telle quelle la preuve de passkey signée par un appareil du compte (`decide` → `forwarded`), la rend à la machine
+(`decisions`, attente longue), et n'affiche `approved|rejected|expired` que quand la machine l'a dit (`result`), après
+avoir vérifié la preuve elle-même contre la clé publique de l'appareil. Sans clé privée d'appareil, nokker.ai (ou un
+compte volé, ou le jeton de machine) ne peut produire aucune preuve de passkey valable.
+
+Une seule exception, voulue (26.10) : la preuve Telegram de la Mini App, que la machine ne sait pas vérifier (elle n'a pas
+le jeton du bot). nokker.ai la vérifie (`nokker/cloud/attest.py`) et met dans la décision relevée une attestation signée
+de sa clé de passerelle, liée à cette machine, ce compte, cette carte, ce défi et cette décision, 120 s ; la machine la
+vérifie à son tour et décide (`decide_attested`). La machine fait alors confiance à nokker.ai pour cette carte-là ;
+`local.remote_approvals_attested: false` le lui interdit.
 
 Statuts : `pending` (déposée, à signer) → `forwarded` (preuve transmise, la machine vérifie) → `approved|rejected`
 (dit par la machine) ; `expired` (passé `expires_at` sans décision, ou dit par la machine). Une preuve refusée par la
@@ -344,6 +350,23 @@ class RelayService:
         else:
             for k in PROOF_FIELDS[2:]:
                 proof.pop(k, None)
+        return self._forward(tenant, machine_id, approval_id, decision, proof)
+
+    def card(self, tenant: str, machine_id: str, approval_id: str) -> RelayedApproval | None:
+        """La carte telle que gardée (défi exact compris), pour que nokker.ai vérifie une preuve Telegram contre ELLE."""
+        return self.store.get(tenant, machine_id, approval_id)
+
+    def decide_attested(self, tenant: str, machine_id: str, approval_id: str, decision: str,
+                        proof: dict[str, str]) -> RelayedApproval:
+        """Décision par la Mini App Telegram : `proof` est l'attestation que nokker.ai vient de signer
+        (`nokker/cloud/attest.py`), pas une preuve du client. Passe la carte à `forwarded` ; la machine l'accepte (ou la
+        refuse, et la carte revient à `pending`)."""
+        if decision not in ("approve", "reject"):
+            raise RelayError(400, "decision invalide (approve|reject)")
+        return self._forward(tenant, machine_id, approval_id, decision, proof)
+
+    def _forward(self, tenant: str, machine_id: str, approval_id: str, decision: str,
+                 proof: dict[str, str]) -> RelayedApproval:
         current = self.store.get(tenant, machine_id, approval_id)
         if current is None:
             raise RelayError(404, "carte inconnue")
@@ -360,12 +383,16 @@ class RelayService:
 class RelayedApprovalNotifier:
     """Carte relayée → Telegram du compte, s'il est appairé (bot de nokker.ai, `sendMessage` seulement) : la phrase de
     tête rendue par nokker.ai (X20c) quand la carte porte ses arguments, sinon le titre et le motif marqués « décrit
-    par ta machine », et un bouton vers la page de décision. Ni destinataire ni contenu dans Telegram : le détail est
-    sur la page. Rien ne se décide dans Telegram : la preuve se donne sur la page, avec la clé de l'appareil."""
+    par ta machine », et un bouton vers la page de décision, plus (carte forte, Mini App configurée) un bouton qui ouvre
+    la carte dans la Mini App Telegram. Ni destinataire ni contenu dans Telegram : le détail est sur la page. Rien ne se
+    décide dans le message : la preuve se donne dans la page ou la Mini App, avec la clé de l'appareil."""
 
     tenancy: Any
-    bot: Any  # BotApi : send_with_button(chat_id, text, label, url), sinon send(chat_id, text)
+    bot: Any  # BotApi : send_with_buttons (Mini App) ou send_with_button(chat_id, text, label, url), sinon send(chat_id, text)
     app_url: str = "https://app.nokker.ai"
+    # Page de la Mini App (`…/miniapp/approve.html`) : avec elle, un bouton ouvre CETTE carte dans la Mini App (Face ID),
+    # à côté du lien vers la page web. Vide : le seul lien web, comme avant.
+    mini_app_url: str = ""
 
     def __call__(self, machine: Any, card: RelayedApproval) -> None:
         account = self.tenancy.account(card.account) if hasattr(self.tenancy, "account") else None
@@ -383,7 +410,13 @@ class RelayedApprovalNotifier:
         else:
             text = f"{head}\n{said} : {card.title}" + (f"\n{card.reason}" if card.reason else "")
         url = f"{self.app_url.rstrip('/')}/approve/{card.machine_id}/{card.approval_id}"
+        mini = f"{self.mini_app_url}?machine={card.machine_id}&approval={card.approval_id}" if self.mini_app_url else ""
         for chat in chats:
+            send_buttons = getattr(self.bot, "send_with_buttons", None)
+            if mini and callable(send_buttons) and card.strength == "strong":
+                send_buttons(chat, text, [{"text": "Signer (Face ID)" if fr else "Sign (Face ID)", "web_app": {"url": mini}},
+                                          {"text": "Page web" if fr else "Web page", "url": url}])
+                continue
             send = getattr(self.bot, "send_with_button", None)
             if callable(send):
                 send(chat, text, "Décider" if fr else "Decide", url)

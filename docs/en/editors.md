@@ -47,7 +47,7 @@ Both integrations use the same local routes as the terminal client (local token 
 
 - `POST /v1/local/sessions {cwd}` opens a session; add `thread_id` (or its alias `resume`) to reopen an existing
   thread. Giving both with different values is refused (400).
-- `GET /v1/local/sessions` lists open sessions. Each entry has `thread_id`, `cwd`, `title` (null before the first
+- `GET /v1/local/sessions` lists open sessions, and `roots`: the folders a session may open under. Each entry has `thread_id`, `cwd`, `title` (null before the first
   turn), `last_turn_at` (ISO 8601, end of the last recorded turn, or null), `working` (a turn is running or queued on
   the thread) and `pending_approvals` (cards waiting on the thread and its sub-agents).
 

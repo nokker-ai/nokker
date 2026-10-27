@@ -18,6 +18,8 @@ ACC = {A: "us_aaaaaaaaaaaa", B: "us_bbbbbbbbbbbb"}
 CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connector_credentials": {"kind": "mail"},
            # foyer (039) : une attestation est toujours attestée, pour un profil mineur
            "parental_consents": {"attested": True, "profile": "teen"}, "account_minors": {"profile": "teen"},
+           # foyers autorisés aux profils mineurs (043) : l'audit n'accepte que allow | revoke
+           "household_minor_grant_audit": {"action": "allow"},
            # modération des pages publiques (040) : une page désignée par son page_id ou son empreinte ; un motif
            "lokkal_public_pages": {"page_id": "pg_0123456789abcdef"},
            "lokkal_page_moderation": {"action": "unpublish", "reason": "signalement"}}

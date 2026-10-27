@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS devices (
     telegram_user_id   TEXT
 );
 
+-- 27.10.2026 (docs/APPROVALS.md §3.4) : dernier `signCount` WebAuthn vu pour l'appareil (anti-clonage). NULL = jamais
+-- présenté ; reste à 0 pour un passkey synchronisé (compteur toujours nul, accepté sans protection).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS sign_count BIGINT;
+
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices ("user");
 
 CREATE TABLE IF NOT EXISTS sessions (

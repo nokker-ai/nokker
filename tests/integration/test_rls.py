@@ -67,6 +67,9 @@ OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "
               "sso_routes", "sso_domain_claims", "sso_flows", "sso_identities",
               # foyer (039) : « ce compte est un profil mineur », lu avant le locataire (SSO, consentements)
               "account_minors",
+              # foyers autorisés à déclarer des profils mineurs (043) : lus dans le tour du mineur (autre locataire que
+              # le payeur) et par l'opérateur ; audit en ajout seul
+              "household_minor_grants", "household_minor_grant_audit",
               # modération des pages publiques (040) : registre lu par le relais avant le locataire, et par
               # l'opérateur pour tous les locataires ; audit en ajout seul
               "lokkal_public_pages", "lokkal_page_moderation",

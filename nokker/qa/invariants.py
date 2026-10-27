@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nokker.core.ports import ToolSpec, call_effect
-from nokker.core.turn import Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
+from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
 from nokker.qa.secrets import KnownSecrets, redact, redact_messages
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
@@ -365,6 +365,13 @@ class DeterministicInvariants:
             return Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="effect:send_bulk",
                            reason="envoi de masse toujours refusé, même sur demande humaine explicite "
                                   "(règle du service)", subject=subject)
+
+        if effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL, Effect.SPEND) and turn.channel == RELAY_CHANNEL:
+            # Tour venu du web (relais, X10) : un GO textuel ne lève jamais la carte forte, même d'un expéditeur
+            # autorisé, et l'allowlist n'y change rien : signature au téléphone.
+            return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=f"effect:{effect.value}:relayed",
+                           reason="action demandée depuis le web : carte forte signée au téléphone, aucun GO "
+                                  "textuel n'y supplée", subject=subject, strength="strong")
 
         if effect is Effect.DESTRUCTIVE:
             text_go = has_explicit_go(turn.input.text, call, spec)

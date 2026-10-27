@@ -16,6 +16,14 @@ import {
   signChallengeDecision,
   verifyChallengeDecision,
   CHALLENGE_AUD,
+  parseTarget,
+  machineStartParam,
+  machineCardPath,
+  machineDecisionPath,
+  buildTelegramProof,
+  machineDecisionBody,
+  readMachineCard,
+  classifyMachineStatus,
 } from "./approve-core.js";
 
 test("canonicalJson trie les clés et n'ajoute aucun espace", () => {
@@ -122,4 +130,146 @@ test("deux signatures d'un même défi ne divulguent pas de clé réutilisée en
   const sig2 = await signChallengeDecision(privateKey, challenge, "approve");
   assert.equal(await verifyChallengeDecision(publicKey, challenge, "approve", sig1), true);
   assert.equal(await verifyChallengeDecision(publicKey, challenge, "approve", sig2), true);
+});
+
+// ---------------------------------------------------------------------------
+// Carte d'une machine Lokkal liée (lot X10)
+// ---------------------------------------------------------------------------
+
+const MACHINE = "mc_0123456789abcdef";
+
+test("parseTarget : start_param d'une carte machine", () => {
+  assert.deepEqual(parseTarget({ startParam: `${MACHINE}-ap_1-x_Y` }), {
+    kind: "machine",
+    machine: MACHINE,
+    approval: "ap_1-x_Y",
+  });
+});
+
+test("parseTarget : start_param d'une carte du compte reste une carte cloud", () => {
+  assert.deepEqual(parseTarget({ startParam: "8b1e4f2a-0c" }), { kind: "cloud", approval: "8b1e4f2a-0c" });
+});
+
+test("parseTarget : paramètres machine et approval de l'URL", () => {
+  assert.deepEqual(parseTarget({ search: `?machine=${MACHINE}&approval=abc123` }), {
+    kind: "machine",
+    machine: MACHINE,
+    approval: "abc123",
+  });
+});
+
+test("parseTarget : ?startapp= dans l'URL vaut start_param, et start_param passe avant l'URL", () => {
+  assert.deepEqual(parseTarget({ search: `?startapp=${MACHINE}-abc` }), { kind: "machine", machine: MACHINE, approval: "abc" });
+  assert.deepEqual(parseTarget({ startParam: "card1", search: `?machine=${MACHINE}&approval=abc` }), {
+    kind: "cloud",
+    approval: "card1",
+  });
+});
+
+test("parseTarget : identifiant mal formé ignoré (jamais une route construite avec un texte libre)", () => {
+  assert.equal(parseTarget({ search: "?machine=mc_zz&approval=abc" }), null);
+  assert.equal(parseTarget({ search: `?machine=${MACHINE}&approval=../../x` }), null);
+  assert.equal(parseTarget({ startParam: "a/b" }), null);
+  assert.equal(parseTarget({ search: `?machine=${MACHINE}` }), null);
+  assert.equal(parseTarget({}), null);
+  assert.equal(parseTarget(), null);
+});
+
+test("machineStartParam / chemins : forme exacte et refus des identifiants invalides", () => {
+  assert.equal(machineStartParam(MACHINE, "abc"), `${MACHINE}-abc`);
+  assert.deepEqual(parseTarget({ startParam: machineStartParam(MACHINE, "abc") }), {
+    kind: "machine",
+    machine: MACHINE,
+    approval: "abc",
+  });
+  assert.throws(() => machineStartParam("mc_x", "abc"));
+  assert.equal(machineCardPath(MACHINE, "abc"), `/v1/link/machines/${MACHINE}/approvals/abc`);
+  assert.equal(machineDecisionPath(MACHINE, "abc"), `/v1/link/machines/${MACHINE}/approvals/abc/decision`);
+});
+
+test("buildTelegramProof : exactement {device_id, signature, telegram_init_data}", () => {
+  const proof = buildTelegramProof({ deviceId: "dev1", signature: "sig", initData: "query_id=x&hash=y" });
+  assert.deepEqual(proof, { device_id: "dev1", signature: "sig", telegram_init_data: "query_id=x&hash=y" });
+  assert.throws(() => buildTelegramProof({ deviceId: "dev1", signature: "", initData: "x" }));
+  assert.throws(() => buildTelegramProof({ deviceId: "dev1", signature: "s", initData: "" }));
+});
+
+test("machineDecisionBody : décision connue seulement", () => {
+  const proof = { device_id: "d", signature: "s", telegram_init_data: "i" };
+  assert.deepEqual(machineDecisionBody("approve", proof), { decision: "approve", proof });
+  assert.throws(() => machineDecisionBody("maybe", proof));
+});
+
+test("la signature d'une carte machine porte sur le défi exact de la carte lue, plus la décision", async () => {
+  const { privateKey, publicKey } = await generateDeviceKeyPair();
+  const challenge = buildChallengePayload({ approvalId: "ap1", argsSha256: "h", nonce: "n", exp: 1 });
+  const sig = await signChallengeDecision(privateKey, challenge, "approve");
+  assert.equal(await verifyChallengeDecision(publicKey, challenge, "approve", sig), true);
+  assert.equal(await verifyChallengeDecision(publicKey, challenge, "reject", sig), false);
+  assert.equal(await verifyChallengeDecision(publicKey, `${challenge} `, "approve", sig), false);
+});
+
+test("readMachineCard : carte décrite par nokker.ai (connecteur relayé)", () => {
+  const card = readMachineCard({
+    approval_id: "ap1",
+    title: "mail_send : x",
+    reason: "motif de la machine",
+    advice: "[risk:high] vérifie le destinataire",
+    strength: "strong",
+    expires_at: "2026-10-26T12:00:00+00:00",
+    challenge: "{...}",
+    status: "pending",
+    args_sha256: "abc",
+    summary_source: "nokker.ai",
+    summary: {
+      headline: "Envoyer un e-mail à a@b.ch",
+      lines: [
+        { key: "to", label: "À", value: "a@b.ch", items: ["a@b.ch", "c@d.ch"] },
+        { key: "subject", label: "Objet", value: "Bonjour" },
+      ],
+    },
+  });
+  assert.equal(card.describedBy, "nokker.ai");
+  assert.equal(card.headline, "Envoyer un e-mail à a@b.ch");
+  assert.deepEqual(card.lines, [
+    { label: "À", value: "a@b.ch, c@d.ch" },
+    { label: "Objet", value: "Bonjour" },
+  ]);
+  assert.equal(card.advice, "[risk:high] vérifie le destinataire");
+  assert.equal(card.challenge, "{...}");
+});
+
+test("readMachineCard : carte locale = décrite par la machine, aucune ligne de nokker.ai", () => {
+  const card = readMachineCard({
+    approval_id: "ap2",
+    title: "ssh_run : prod",
+    reason: "déployer",
+    strength: "strong",
+    summary_source: "machine",
+    summary: { headline: "ne doit pas être repris", lines: [{ label: "x", value: "y" }] },
+    args_sha256: "deadbeef",
+    status: "pending",
+  });
+  assert.equal(card.describedBy, "machine");
+  assert.equal(card.headline, "");
+  assert.deepEqual(card.lines, []);
+  assert.equal(card.title, "ssh_run : prod");
+  assert.equal(card.argsSha256, "deadbeef");
+});
+
+test("readMachineCard : réponse vide ou inattendue sans exception", () => {
+  const card = readMachineCard(null);
+  assert.equal(card.title, "");
+  assert.equal(card.status, null);
+  assert.deepEqual(card.lines, []);
+});
+
+test("classifyMachineStatus : attente, issue dite par la machine, preuve refusée", () => {
+  assert.equal(classifyMachineStatus({ status: "forwarded" }), "waiting");
+  assert.equal(classifyMachineStatus({ status: "pending" }), "waiting");
+  assert.equal(classifyMachineStatus({ status: "approved" }), "approved");
+  assert.equal(classifyMachineStatus({ status: "rejected" }), "rejected");
+  assert.equal(classifyMachineStatus({ status: "expired" }), "expired");
+  assert.equal(classifyMachineStatus({ status: "pending", error: "preuve refusée par la machine : x" }), "refused");
+  assert.equal(classifyMachineStatus(null), "waiting");
 });

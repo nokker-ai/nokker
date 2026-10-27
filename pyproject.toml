@@ -26,24 +26,24 @@ dependencies = [
                          # docs/LICENSES-DEPENDENCIES.md.
 ]
 
-# hermes-agent (branche patchée hermes-nokker, D0 : notre harness, pas un fork ; l'amont
-# fournit des briques derrière nos interfaces — gateway/canaux, STT, client MCP) n'est PAS
-# déclaré ci-dessus : upstream bloque volontairement tout build de wheel/sdist pour ce paquet
-# (hermes-nokker/setup.py — "[upstream] is distributed via the shell installer, Docker image, or
-# Nix. [...] use an editable install instead"), donc un simple `… @ git+…` dans `dependencies`
-# échoue toujours (pip tente un build de wheel même pour une URL VCS, et un `#egg=name[extras]`
-# est rejeté par pip récent : "invalid-egg-fragment"). La seule install qui marche est un clone
-# PUIS un install éditable LOCAL avec extras (`build_editable`, jamais `bdist_wheel`) :
+# hermes-agent (hermes-nokker) EST un fork patché de l'agent amont (Nous Research, MIT) : le harness Nokker
+# l'utilise comme runtime (gateway/canaux, STT, client MCP) derrière nos interfaces, le reste (ports, boucle,
+# approbations, portes, outils, API /v1, Lokkal) est à nous. L'épingle (dépôt, tag, commit, extras) vit dans
+# HERMES.lock ; docs/UPSTREAM.md dit comment la monter. Il n'est PAS déclaré ci-dessus : upstream bloque
+# volontairement tout build de wheel/sdist pour ce paquet (hermes-nokker/setup.py — "[upstream] is distributed via
+# the shell installer, Docker image, or Nix. [...] use an editable install instead"), donc un simple `… @ git+…`
+# dans `dependencies` échoue toujours (pip tente un build de wheel même pour une URL VCS, et un
+# `#egg=name[extras]` est rejeté par pip récent : "invalid-egg-fragment"). La seule install qui marche est un
+# clone PUIS un install éditable LOCAL avec extras (`build_editable`, jamais `bdist_wheel`) :
 #
 #   git clone --depth 1 --branch nokker-hermes-v0.22.2-n1 \
 #     https://github.com/nokker-ai/hermes-nokker.git /opt/hermes-src
 #   pip install -e "/opt/hermes-src[messaging,stt-whisper]"
 #
-# Voir Dockerfile (étape de build) et docs/REPO.md pour la procédure en dev local. Extras réels
-# du pyproject de hermes-agent (vérifiés dans hermes-nokker@nokker-hermes-v0.22.2-n1) :
-# messaging (adaptateurs de canaux — gateway) et stt-whisper (faster-whisper, STT local gardé
-# derrière interface, §3 PLAN-P1). Monter de version = changer le tag ci-dessus (UPSTREAM.md de
-# hermes-nokker), jamais un rebase ici.
+# Voir Dockerfile (étape de build) et docs/REPO.md pour la procédure en dev local. Extras réels du pyproject de
+# hermes-agent : messaging (adaptateurs de canaux — gateway) et stt-whisper (faster-whisper, STT local gardé
+# derrière interface, §3 PLAN-P1). Monter de version = changer HERMES.lock (et le tag ci-dessus, un test les
+# compare), jamais un rebase ici.
 
 # PAS de [project.scripts] : `nokker` est déjà le nom du binaire fourni par la dépendance épinglée
 # hermes-agent (alias de couche de marque, docs/BRAND.md, `/opt/hermes/bin/nokker` dans l'image) — un

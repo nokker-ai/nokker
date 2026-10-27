@@ -170,6 +170,14 @@ def _delete(srv, path, bearer=None):
     return urllib.request.urlopen(req, timeout=5)
 
 
+def _error_body(fn):
+    try:
+        fn()
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read())["error"]
+    raise AssertionError("une erreur HTTP était attendue")
+
+
 def _http_error_status(fn):
     try:
         fn()
@@ -256,6 +264,34 @@ def test_delete_device_by_owner_succeeds():
 
 
 # ═══════════════════════════ chemin heureux : carte -> défi -> signature -> exécution ═══════════════════════════
+
+
+def test_miniapp_enrollment_from_the_linked_telegram_is_confirmed_and_can_decide():
+    """Mini App (décision produit du 26.10) : identité tirée de l'initData seul, celui du Telegram RELIÉ au compte →
+    l'appareil enrôlé est confirmé tout de suite (`telegram:<id>`) et décide. Avec une session (Bearer), il reste
+    `pending` ; un Telegram non relié n'enrôle rien."""
+    from tests.unit.approvals.conftest import telegram_init_data
+
+    bot, uid = "123456:FAKE-BOT-TOKEN", 1000000001
+    approvals = InMemoryApprovals(telegram_bot_token=bot)
+    kernel, _ = make_kernel_with_approvals(approvals)
+    srv = start_full_server(kernel, approvals=approvals, api_keys={"key-alice": "alice"}, telegram_bot_token=bot,
+                            telegram_ids={str(uid): "alice"})
+    try:
+        _, spki = gen_keypair()
+        dev = json.loads(_post(srv, "/v1/devices", {"public_key_spki": spki, "name": "Mini App",
+                                                    "init_data": telegram_init_data(bot, uid)}).read())
+        assert (dev["status"], dev["approved_via"], dev["telegram"]) == ("approved", f"telegram:{uid}", True)
+        _, spki2 = gen_keypair()
+        dev2 = json.loads(_post(srv, "/v1/devices", {"public_key_spki": spki2, "name": "web",
+                                                     "init_data": telegram_init_data(bot, uid)},
+                                bearer="key-alice").read())
+        assert dev2["status"] == "pending"
+        _, spki3 = gen_keypair()
+        assert _http_error_status(lambda: _post(srv, "/v1/devices", {
+            "public_key_spki": spki3, "name": "x", "init_data": telegram_init_data(bot, 2000000002)})) == 401
+    finally:
+        srv.stop()
 
 
 def test_full_approval_happy_path_over_http():
@@ -497,6 +533,10 @@ def test_web_enrollment_without_identity_stays_pending_until_confirmed_then_sess
                                                           "signature": sig}).read())
 
         assert _http_error_status(login) is not None  # pending : aucune session
+        # l'écran sait POURQUOI : appareil en attente, pas une panne ; appareil inconnu : oublier la clé locale
+        err = _error_body(lambda: _post(srv, f"/v1/devices/{device['id']}/session-challenge", {}))
+        assert (err["code"], err["device_status"]) == ("device_not_approved", "pending")
+        assert _error_body(lambda: _post(srv, "/v1/devices/inconnu/session-challenge", {}))["code"] == "device_unknown"
 
         approvals.confirm_device_cli(device["code"])
         session = login()

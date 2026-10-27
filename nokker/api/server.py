@@ -57,7 +57,8 @@ from nokker.agents.types import (
 from nokker.approvals import crypto as approvals_crypto
 from nokker.approvals.base import BaseApprovals
 from nokker.approvals.errors import (
-    ApprovalError, ApprovalExpired, ApprovalNotFound, ApprovalNotPending, DeviceError, DeviceNotFound, ProofInvalid,
+    ApprovalError, ApprovalExpired, ApprovalNotFound, ApprovalNotPending, DeviceError, DeviceNotApproved, DeviceNotFound,
+    ProofInvalid,
     StrongDeviceRequired,
 )
 from nokker.approvals.executor import ApprovalExecutor
@@ -79,7 +80,7 @@ from nokker.context.tools import RecallContextSource
 from nokker.context.types import ContextBudgets
 from nokker.core.loop import DIRECT_CHANNEL, Kernel
 from nokker.core.ports import Approval, Invariants, Proof
-from nokker.core.turn import Decision, Gate, Tier, Turn, TurnInput, Verdict
+from nokker.core.turn import RELAY_CHANNEL, Decision, Gate, Tier, Turn, TurnInput, Verdict
 from nokker.core.turn_lock import TurnLocks
 from nokker.ledger.costs import InMemoryLedger, LedgerBackend, PostgresLedger
 from nokker.ledger.metrics import render as render_metrics
@@ -325,6 +326,8 @@ def judge_tier(config: NokkerConfig) -> Tier:
 
 def _warn_judge_without_key(config: NokkerConfig, flag: str) -> None:
     j = config.judge_config()
+    if config.local:  # Lokkal : la clé vient du lien de compte (coffre local), posée après coup par `serve`
+        return
     if j.api_key_env and not j.api_key():
         logger.warning("%s sans clé du juge (%s) : chaque appel échouera, carte sans avis et diff non relu",
                        flag, j.api_key_env)
@@ -611,6 +614,21 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
     if 0 < len(relay_key) < 32:  # une clé tronquée dans le Secret se lirait sinon comme « miroir des pages éteint »
         logger.warning("%s fait %d caractères (32 au moins) : pages du miroir servies machine éteinte DÉSACTIVÉES",
                        relay_key_env, len(relay_key))
+    # Décision d'une carte machine par la Mini App Telegram : nokker.ai vérifie la preuve (initData du bot, appareil du
+    # compte, signature) et signe pour la machine une attestation (nokker/cloud/attest.py). Sans jeton de bot ou sans
+    # backend d'approbations, cette voie est fermée (la page web et la passkey restent).
+    attestor = None
+    bot_token = config.telegram_bot_token()
+    if bot_token and approvals is not None:
+        from nokker.cloud.attest import TelegramAttestor
+
+        def account_of_telegram(tg_user_id: str) -> str | None:
+            acc = tenancy.account_for_identity("telegram", tg_user_id) if tg_user_id else None
+            return acc.account_id if acc is not None else None
+
+        attestor = TelegramAttestor(signer=signer, bot_token=bot_token, account_of=account_of_telegram,
+                                    devices_of=lambda acc: approvals.list_devices(acc),
+                                    max_age_s=approvals.telegram_max_age_s)
     cloud_http.configure(CloudLink(
         relay=relay, handoffs=handoffs, mirror_notes=mirror_notes, crew=crew,
         mirror_pages=mirror_pages, mirror_pages_quota=int(float(cl.get("mirror_pages_quota_mb", 50)) * 1024 * 1024),
@@ -624,6 +642,7 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
         # X20c : le résumé d'une carte relayée est caviardé avec les secrets connus du noyau de nokker.ai.
         approvals_relay=relay_service,
         devices_of=(lambda acc: approvals.list_devices(acc)) if approvals is not None else None,
+        attestor=attestor,
         router_base=deep.base_url, router_key=deep.api_key, record_usage=record_usage, store=store,
         # Inférence relayée : modèles des paliers servis par le même point d'accès que Deep, plafonds du noyau.
         models=frozenset(t.model for t in config.tiers.values() if t.base_url == deep.base_url and t.model),
@@ -699,7 +718,8 @@ def configure_household(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, 
     from nokker.household.service import Household
 
     settings = Settings.from_config(config.household_settings, billing_plans=getattr(config, "billing_plans", None),
-                                    minors=config.household_minors)
+                                    minors=config.household_minors,
+                                    minors_mode=config.household_minors_mode)
     ob = onboarding_http._onboarding
     house = Household(team=team, settings=settings, consents=getattr(ob, "consents", None) if ob else None)
     billing = billing_http.service()
@@ -1075,8 +1095,13 @@ def configure_telegram(config: NokkerConfig, tenancy: Tenancy, kernel: Kernel, h
         # vers la page de décision (sendMessage seulement ; on ne décide rien dans Telegram).
         from nokker.cloud.approvals import RelayedApprovalNotifier
 
+        base = cloud_http._cloud.links.base_url.rstrip("/")
+        mini = ""
+        if cloud_http._cloud.attestor is not None:  # bouton Mini App seulement si nokker.ai sait vérifier la preuve
+            mini = str((config.cloud_link or {}).get("mini_app_url") or config.telegram_mini_app_url
+                       or f"{base}/miniapp/approve.html")  # la Mini App déjà déclarée chez BotFather
         cloud_http._cloud.notify_approval = RelayedApprovalNotifier(
-            tenancy=tenancy, bot=bot, app_url=cloud_http._cloud.links.base_url)
+            tenancy=tenancy, bot=bot, app_url=base, mini_app_url=mini)
 
 
 def tool_loading(config: NokkerConfig) -> str:
@@ -1262,7 +1287,8 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         if tier is Tier.SMALL and tier_cfg.api_key_env and not tier_cfg.api_key():
             # Petit palier sans clé (Lokkal sans lien de compte, clé de l'utilisateur ailleurs) : pas de palier, la
             # politique se replie sur Ship (X8) au lieu d'un appel qui échoue à chaque politesse.
-            logger.info("config : petit palier sans clé (%s), ignoré", tier_cfg.api_key_env)
+            logger.info("config : petit palier sans clé (%s), %s", tier_cfg.api_key_env,
+                        "en attente du lien de compte" if config.local else "ignoré")
             continue
         extra = {"reasoning_off_body": tier_cfg.reasoning_off_body} if tier_cfg.reasoning_off_body is not None else {}
         probe = None
@@ -1360,7 +1386,8 @@ def device_to_json(d: Device) -> dict[str, Any]:
     (pas un secret, mais inutile au client une fois l'enrôlement fait ; conforme au principe « jamais
     une valeur de plus que nécessaire dans une réponse »)."""
     return {"id": d.id, "code": d.code, "name": d.name, "user": d.user, "status": d.status,
-            "created_at": _iso(d.created_at), "approved_at": _iso(d.approved_at), "approved_via": d.approved_via}
+            "created_at": _iso(d.created_at), "approved_at": _iso(d.approved_at), "approved_via": d.approved_via,
+            "telegram": bool(d.telegram_user_id)}  # un booléen, jamais l'identifiant Telegram
 
 
 def _display_name(user_id: str) -> str:
@@ -1395,6 +1422,14 @@ def _approvals_error_status(exc: Exception) -> int:
     if isinstance(exc, ProofInvalid):
         return 403
     return 400  # ApprovalError/DeviceError génériques, ou décision inconnue
+
+
+def _device_error_code(exc: Exception) -> str:
+    if isinstance(exc, DeviceNotFound):
+        return "device_unknown"
+    if isinstance(exc, DeviceNotApproved):
+        return "device_not_approved"
+    return "device_error"
 
 
 def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend | None = None, *,
@@ -1598,6 +1633,13 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
         if hub is not None:  # pages retirées par la modération (§7.26 point 6) : les bulles suivent
             local_api.page_changed = hub.page_changed
 
+            def page_moderated(meta: Any) -> None:
+                """Premier retrait vu : l'auteur est prévenu une fois (bulle `notify`, motif et recours)."""
+                with tenant_scope(tenant_of_thread(meta.thread_id)):
+                    hub.page_moderated(meta, fallback_user=LOCAL_OWNER)
+
+            local_api.page_moderated = page_moderated
+
         def describe_local_session(thread_id: str) -> dict[str, Any]:
             """Champs ajoutés à `GET /v1/local/sessions` (§7.4.1) : titre du fil au hub (aucun avant le premier tour),
             date du dernier tour rangé, tour en cours ou en file sur le fil, cartes en attente du fil et de ses
@@ -1651,12 +1693,12 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if local_api is not None and not local_api.host_ok(self.headers.get("Host")):
                 self._json(403, {"error": {"message": "host refusé"}})
                 return False
-            if local_api is not None and self.headers.get("X-Nokker-Relay") \
+            if local_api is not None and self._via_relay() \
                     and local_api.is_owner(self.headers.get("Authorization")):
                 # Le jeton local ne sort jamais de la machine : présenté par la passerelle, il est refusé (§7.5).
                 self._json(403, {"error": {"message": "jeton local refusé par la passerelle"}})
                 return False
-            if local_api is not None and self.headers.get("X-Nokker-Relay") and not local_api.delegation_allows(
+            if local_api is not None and self._via_relay() and not local_api.delegation_allows(
                     self.command, urlparse(self.path).path, self.headers.get("X-Session-Id"),
                     self.headers.get("Authorization")):
                 # Jeton de délégation de nokker.ai (X21) : les routes de SA session seulement, rien d'autre de la machine.
@@ -1707,7 +1749,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return True
             body = self._read_json_body() if method in ("POST", "PUT") else {}
             out = local_api.handle(method, path, self.headers.get("Authorization"), body,
-                                   relayed=bool(self.headers.get("X-Nokker-Relay")))
+                                   relayed=self._via_relay())
             self._json(*(out or (404, {"error": {"message": "not found"}})))
             return True
 
@@ -1868,7 +1910,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 else:
                     body = self._read_json_body()
                     download = bool(body.get("download"))
-                    if self.headers.get("X-Nokker-Relay"):
+                    if self._via_relay():
                         # Interface servie par la passerelle : lien d'entrée sur <nom>--pages.nokker.app, signé par
                         # nokker.ai à la demande de cette machine (même route pour le client, en local comme à distance).
                         got = local_api.link.pages_token(meta.page_id, bool(body.get("embed")), download) \
@@ -1884,6 +1926,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         got = {**got, "public_url": pub, "public_version": meta.public_version}
                     if got and meta.moderated_at is not None:  # « retirée par la modération » (§7.26 point 6)
                         got = {**got, "moderated_at": meta.moderated_at}
+                        if meta.moderation is not None:  # exposé des motifs : {at, reason, appeal}
+                            got["moderation"] = dict(meta.moderation)
                     self._json(200, got) if got else self._json(502, {"error": {"message": "nokker.ai injoignable"}})
                 return
             if method != "GET":
@@ -1935,7 +1979,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             from nokker.pages.store import PAGE_HEADERS
             from nokker.tools.processes import ProcessError
 
-            relayed = bool(self.headers.get("X-Nokker-Relay"))
+            relayed = self._via_relay()
             if path == "/v1/local/processes" and method == "GET":
                 if not self._local_owner():
                     self._json(401, {"error": {"message": "jeton local requis"}})
@@ -2068,14 +2112,14 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             """Le propriétaire de la machine : jeton local (sur la machine), ou jeton signé par nokker.ai arrivé par la
             passerelle (§7.5)."""
             auth = self.headers.get("Authorization")
-            if self.headers.get("X-Nokker-Relay"):
+            if self._via_relay():
                 return local_api.relayed_owner(auth) is not None
             return local_api.is_owner(auth)
 
         def _local_approvals(self, method: str, path: str) -> None:
             """Cartes des sessions locales, décidées avec le jeton local (docs/LOKKAL.md §7.4.3)."""
             from nokker.local.approvals import append_user_rule, suggested_rules
-            from nokker.qa.permissions import RELAY_CARD_RULE, Rule
+            from nokker.qa.permissions import RELAY_CARD_RULE, RELAYED_STRONG_RULE, Rule
 
             if approvals is None:
                 self._json(404, {"error": {"message": "approbations désactivées"}})
@@ -2119,7 +2163,14 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                                                       "(POST /v1/approvals/{id}/decision, docs/APPROVALS.md)",
                                            "code": "device_key_required"}})
                 return
-            if card.strength == "strong" and self.headers.get("X-Nokker-Relay"):
+            if card.rule == RELAYED_STRONG_RULE and decision == "approve":
+                # Tour venu du web (X10) : la carte forte se signe à la clé d'appareil (téléphone), jamais au jeton
+                # local, que le modèle peut lire en backend local. Refuser reste possible.
+                self._json(403, {"error": {"code": "device_key_required",
+                                           "message": "action demandée depuis le web : signe la carte sur ton "
+                                                      "téléphone (app.nokker.ai)"}})
+                return
+            if card.strength == "strong" and self._via_relay():
                 # À distance, une carte forte se signe avec la clé d'appareil (app.nokker.ai, téléphone), §7.3.
                 self._json(403, {"error": {"message": "carte forte : décide-la sur app.nokker.ai ou ton téléphone"}})
                 return
@@ -2178,7 +2229,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             auth = self.headers.get("Authorization", "")
             token = auth[7:].strip() if auth.startswith("Bearer ") else ""
             sender = api_keys.get(token)
-            if sender is None and token and local_api is not None and self.headers.get("X-Nokker-Relay") \
+            if sender is None and token and local_api is not None and self._via_relay() \
                     and local_api.relayed_owner(auth) is not None:
                 sender = LOCAL_OWNER  # le propriétaire, par la passerelle, avec un jeton signé par nokker.ai (§7.5)
             if sender is None and token and approvals is not None:
@@ -2199,6 +2250,16 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             except json.JSONDecodeError:
                 return {}
 
+        def _via_relay(self) -> bool:
+            """Requête venue du WEB par la passerelle : le relais le dit (`X-Nokker-Relay`), ou elle est arrivée par
+            notre tunnel (`X-Nokker-Tunnel` = son secret de processus, posé par nokker/local/tunnel.py sur CHAQUE
+            requête relayée). Le second ne dépend pas du relais : un en-tête perdu ne rend jamais un tour web « local »."""
+            if self.headers.get("X-Nokker-Relay"):
+                return True
+            tunnel = getattr(local_api, "tunnel", None) if local_api is not None else None
+            secret = getattr(tunnel, "secret", "") if tunnel is not None else ""
+            return bool(secret) and hmac.compare_digest(self.headers.get("X-Nokker-Tunnel") or "", secret)
+
         def _resolve_identity(self, body: dict[str, Any] | None = None) -> str | None:
             """Identité vérifiée pour `/v1/approvals*`, `/v1/devices*`, `/v1/sessions` — trois preuves
             possibles : (1) clé Bearer statique (`api_keys`) ; (2) jeton de SESSION
@@ -2216,6 +2277,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     session = approvals.verify_session(token)
                     if session is not None:
                         return session.user
+                if local_api is not None and self._via_relay() and local_api.relayed_owner(auth) is not None:
+                    # Le propriétaire par la passerelle (§7.5), comme dans `_authenticate` : sans ça, le web servi par
+                    # `<nom>.nokker.app` ouvrait sa session puis prenait 401 sur /v1/threads (recette du 26.10).
+                    return LOCAL_OWNER
             init_data = self.headers.get("X-Telegram-Init-Data") or (body or {}).get("init_data")
             if init_data and telegram_bot_token and approvals is not None:
                 try:
@@ -2835,7 +2900,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     self._json(404, {"error": {"message": "fil inconnu"}})
                     return
             refs = [kernel.images.put(thread_id, img) for img in raw_images] if raw_images else []  # type: ignore[attr-defined]
-            inp = TurnInput(thread_id=thread_id, user_text=user_text, channel="api", sender=sender, images=refs)
+            # Un tour arrivé par le relais (en-tête posé par la passerelle, qui exige déjà un jeton signé par nokker.ai
+            # pour l'identité du propriétaire) porte son propre canal : les portes n'y accordent aucun GO textuel.
+            channel = RELAY_CHANNEL if self._via_relay() else "api"
+            inp = TurnInput(thread_id=thread_id, user_text=user_text, channel=channel, sender=sender, images=refs)
             if stream:
                 tokens = (self.headers.get("X-Nokker-Stream-Tokens") or "").strip() == "1"
                 self._stream_turn(inp, tokens)
@@ -3167,6 +3235,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     telegram_user_id = None  # jamais de lien Telegram sur un enrôlement sans preuve
                 device = approvals.enroll_device(user=sender, name=name, public_key_spki=public_key_spki,
                                                  telegram_user_id=telegram_user_id)
+                if not anonymous and telegram_user_id and not self.headers.get("Authorization"):
+                    # Identité tirée de l'initData seul : ce Telegram est celui relié au compte. La Mini App enrôle
+                    # son appareil, confirmé tout de suite (sinon il restait `pending` sans moyen de le confirmer).
+                    device = approvals.confirm_device_by_telegram(device.id, telegram_user_id)
                 if anonymous:
                     logger.warning("appareil web en attente pour %s : code %s (devices approve <code>)",
                                    sender, device.code)
@@ -3202,7 +3274,12 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 try:
                     ch = approvals.login_challenge(m.group(1))
                 except (ApprovalError, DeviceError) as e:
-                    self._json(_approvals_error_status(e), {"error": {"message": str(e)}})
+                    # Code stable : un écran distingue « appareil inconnu » (oublier la clé locale, se reconnecter) et
+                    # « appareil en attente / révoqué » d'une panne du service.
+                    err: dict[str, Any] = {"message": str(e), "code": _device_error_code(e)}
+                    if getattr(e, "status", None):
+                        err["device_status"] = e.status
+                    self._json(_approvals_error_status(e), {"error": err})
                     return
                 self._json(200, {"challenge": ch.canonical(), "nonce": ch.nonce, "exp": ch.exp})
                 return
@@ -3428,6 +3505,85 @@ def build_tenancy(config: NokkerConfig) -> Tenancy:
     return PgTenancy(dsn) if dsn else MemoryTenancy()
 
 
+def link_endpoint(state: dict[str, Any], get_secret: Any) -> tuple[str, str] | None:
+    """(base_url, clé) du lien de compte, ou None sans lien. La clé du lien est un jeton de MACHINE valable sur
+    l'inférence relayée par nokker.ai (`state["inference_base"]`, `<nokker.ai>/v1/inference`), PAS sur le Router
+    (`router.sokkan.ch`) qui la refuse (401 « invalid or revoked API key ») ; un lien ancien sans `inference_base`
+    retombe sur le Router (même règle que `LocalSetup.provider_for_default`)."""
+    from nokker.local.setup import ROUTER_URL
+
+    key = get_secret("router") or ""
+    return (str(state.get("inference_base") or ROUTER_URL), key) if key else None
+
+
+def default_model_applier(config: NokkerConfig, kernel: Kernel, link_endpoint_fn: Any) -> Any:
+    """Rend `use_default_model(base_url, clé, modèle)` : branche à chaud le modèle par défaut de Lokkal sur le noyau.
+    Appelée au démarrage (Lokkal déjà lié) ET à l'approbation du lien : la clé reçue sert tout de suite. Les paliers et
+    les juges de la config qui visent le Router (`router.sokkan.ch`) sans `ROUTER_KEY` passent, comme Ship, par
+    l'inférence du lien (base ET clé du lien). `link_endpoint_fn()` rend `(base, clé)` du lien, ou None. La clé ne sort
+    jamais : ni journal, ni erreur."""
+    from nokker.local.setup import ROUTER_URL
+
+    def same(a: str, b: str) -> bool:
+        return a.rstrip("/") == b.rstrip("/")
+
+    def use_default_model(base_url: str, api_key: str, model: str) -> None:
+        # Le modèle choisi à l'onboarding sert les deux paliers, en direct (pas de redémarrage).
+        mode = config.vision_mode_for_model(model)  # palier de la config qui sert ce modèle, sinon local.vision
+        probe = None
+        if mode == "auto":
+            from nokker.providers.vision_probe import VisionProbe
+
+            probe = VisionProbe(base_url, model, config.vision_probe_path())
+        provider = SokkanProvider(base_url=base_url, api_key=api_key, model=model, vision=mode == "true",
+                                  vision_probe=probe)
+        kernel.providers[Tier.SHIP] = provider
+        kernel.providers[Tier.DEEP] = provider
+        link = link_endpoint_fn()
+
+        def endpoint_of(cfg: Any) -> tuple[str, str] | None:
+            """(base, clé) sous lesquels un palier ou le juge de la config sert : ceux de la config avec ROUTER_KEY ;
+            sans elle, le lien si la config vise le Router ou le point d'accès du lien."""
+            if cfg.api_key():
+                return cfg.base_url, cfg.api_key()
+            if link is not None and (same(cfg.base_url, ROUTER_URL) or same(cfg.base_url, link[0])):
+                return link
+            if same(cfg.base_url, base_url):  # même point d'accès que le modèle choisi (clé de l'utilisateur)
+                return base_url, api_key
+            return None
+
+        # X8 : hors du point d'accès du petit palier (clé de l'utilisateur, modèle local), un seul modèle — le petit
+        # palier part (la politique se replie sur Ship) et le juge non choisi en config suit le modèle choisi.
+        # Quand le modèle choisi est celui du lien (ou du Router), le petit palier est (re)construit sur le même point
+        # d'accès avec ROUTER_KEY si elle est posée, sinon avec le lien : il n'est plus « sans clé » une fois lié.
+        small = config.tiers.get("small")
+        ep = endpoint_of(small) if small is not None and (same(small.base_url, base_url)
+                                                          or same(base_url, link[0] if link else "")) else None
+        if small is None or ep is None:
+            kernel.providers.pop(Tier.SMALL, None)
+        else:
+            small_extra = ({"reasoning_off_body": small.reasoning_off_body}
+                           if small.reasoning_off_body is not None else {})
+            kernel.providers[Tier.SMALL] = SokkanProvider(base_url=ep[0], api_key=ep[1], model=small.model,
+                                                          vision=small.vision, **small_extra)
+            logger.info("lokkal : petit palier branché (%s)", small.model)
+        for role in (kernel.reviewer, kernel.advisor):
+            t = getattr(role, "transport", None)
+            if t is None:
+                continue
+            if not config.judge_explicit:
+                t.base_url, t.api_key, t.model = base_url, api_key, model
+                t._plain = False  # le nouvel amont accepte peut-être `reasoning_effort`
+                role.model_name = model
+                continue
+            # Juge choisi en config : il garde son modèle ; sur le Router sans ROUTER_KEY, il passe par le lien.
+            jep = endpoint_of(config.judge_config())
+            if jep is not None:
+                t.base_url, t.api_key = jep
+
+    return use_default_model
+
+
 def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
           ledger: LedgerBackend | None = None) -> None:
     config = config or load_config()
@@ -3635,30 +3791,16 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
 
         kernel.escalator = LocalEscalator()  # en local, personne d'autre que le propriétaire
 
-        def use_default_model(base_url: str, api_key: str, model: str) -> None:
-            # Le modèle choisi à l'onboarding sert les deux paliers, en direct (pas de redémarrage).
-            mode = config.vision_mode_for_model(model)  # palier de la config qui sert ce modèle, sinon local.vision
-            probe = None
-            if mode == "auto":
-                from nokker.providers.vision_probe import VisionProbe
+        def link_endpoint_fn() -> tuple[str, str] | None:
+            """(base, clé) du lien lus au coffre local à chaque appel ; None sans lien ou coffre illisible."""
+            if local_api.setup is None:
+                return None
+            try:
+                return link_endpoint(local_api.setup.state, local_api.setup.vault.get)
+            except Exception:  # noqa: BLE001 — coffre sans clé : pas de lien, jamais d'erreur qui porte la clé
+                return None
 
-                probe = VisionProbe(base_url, model, config.vision_probe_path())
-            provider = SokkanProvider(base_url=base_url, api_key=api_key, model=model, vision=mode == "true",
-                                      vision_probe=probe)
-            kernel.providers[Tier.SHIP] = provider
-            kernel.providers[Tier.DEEP] = provider
-            # X8 : hors du point d'accès du petit palier (clé de l'utilisateur, modèle local), un seul modèle — le petit
-            # palier part (la politique se replie sur Ship) et le juge non choisi en config suit le modèle choisi.
-            small = config.tiers.get("small")
-            if small is None or small.base_url.rstrip("/") != base_url.rstrip("/"):
-                kernel.providers.pop(Tier.SMALL, None)
-            if not config.judge_explicit:
-                for role in (kernel.reviewer, kernel.advisor):
-                    t = getattr(role, "transport", None)
-                    if t is not None:
-                        t.base_url, t.api_key, t.model = base_url, api_key, model
-                        t._plain = False  # le nouvel amont accepte peut-être `reasoning_effort`
-                        role.model_name = model
+        use_default_model = default_model_applier(config, kernel, link_endpoint_fn)
 
         local_api.on_default_model = use_default_model
         try:
@@ -3668,14 +3810,25 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             chosen = None
         if chosen is not None:
             use_default_model(*chosen)
+        for flag, role in (("judge_review", kernel.reviewer), ("judge_advice", kernel.advisor)):
+            t = getattr(role, "transport", None)
+            if t is not None and not t.api_key:  # ni ROUTER_KEY ni lien de compte : le juge échouera à chaque appel
+                logger.warning("%s sans clé du juge (ROUTER_KEY ni lien de compte) : carte sans avis et diff non relu",
+                               flag)
         if config.local.get("reasoning", True):  # banc L0 (L01, 23.10) : sans raisonnement, le 397B pense à voix haute
             getattr(kernel.policy, "inner", kernel.policy).ship_reasoning = True
+        from nokker.tools.code import CODE_TOOLS
+
         kernel.gates = PermissionGates(inner=kernel.gates, permissions=LocalPermissions.load(
             # accept_edits par défaut : chaque écriture du dossier est photographiée (points de retour), donc
             # réversible ; les commandes et le destructif restent demandés.
             mode=config.local.get("mode"), fallback=Mode.ACCEPT_EDITS,
             user_settings=Path(config.local.get("settings_path") or "~/.config/nokker/settings.json").expanduser()),
-            code_session=lambda tid: local_api.code.for_thread(tid) is not None)
+            code_session=lambda tid: local_api.code.for_thread(tid) is not None,
+            # GO textuel : valable dans le bac à sable d'une session de code seulement (docker ou kubernetes, jamais le
+            # backend « local », qui tourne sur l'hôte) ; ailleurs le destructif reste une carte forte.
+            go_sandbox=lambda tid: local_api.code.backend != "local" and local_api.code.for_thread(tid) is not None,
+            session_tools=frozenset(CODE_TOOLS))
         perms = kernel.gates.permissions
         if local_api.project_skills is not None:
             # Skills du dépôt (drapeau `local.project_skills`) : jamais en mode plan (mode du fil, dépôt compris),
@@ -3876,12 +4029,18 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         local_api.remote_approvals = RemoteApprovals(
             base_url=local_api.link.base_url if local_api.link else "https://app.nokker.ai", token=machine_token,
             account=lambda: setup.state.get("account"), approvals=approvals, apply=local_api.apply_decision,
-            scrub=kernel.invariants.scrub_output, decided_by=LOCAL_OWNER, state=setup.state, save=setup._save)
+            scrub=kernel.invariants.scrub_output, decided_by=LOCAL_OWNER, state=setup.state, save=setup._save,
+            # Décision produit (26.10) : une carte approuvée dans la Mini App Telegram est acceptée sur attestation de
+            # nokker.ai ; `local.remote_approvals_attested: false` la refuse (seule une passkey, vérifiée ici, décide).
+            attested=bool(config.local.get("remote_approvals_attested", True)))
         approvals.notifier = ChainNotifier((approvals.notifier, local_api.remote_approvals))
         if local_api.relayed is not None:  # X20b : la signature vérifiée d'une carte forte part avec l'appel relayé
             local_api.relayed.signed = local_api.remote_approvals.signed_proof
         local_api.remote_approvals.start()
     if local_api is not None and config.local.get("relay_url"):
+        # Gardé pour lancer le tunnel à l'approbation du lien (LocalApi.link_approved), sans redémarrage.
+        local_api.tunnel_args = (config.local["relay_url"], f"http://127.0.0.1:{config.port}",
+                                 config.local.get("web_base"))
         if local_api.start_tunnel(config.local["relay_url"], f"http://127.0.0.1:{config.port}",
                                   config.local.get("web_base")):
             logger.info("lokkal : tunnel de la passerelle lancé vers %s", config.local["relay_url"])

@@ -212,14 +212,15 @@ def sha256_bytes(data: bytes) -> bytes:
 
 def verify_webauthn_assertion(public_key_spki: str, client_data_json_b64url: str, authenticator_data_b64url: str,
                               signature_der_b64url: str, *, expected_challenge: bytes, expected_origin: str,
-                              expected_type: str = "webauthn.get", require_uv: bool = False,
-                              expected_rp_id: str | None = None) -> None:
-    """Lève `WebAuthnError` si l'assertion ne vérifie pas. `expected_challenge` : 32 octets attendus
+                              expected_rp_id: str, expected_type: str = "webauthn.get",
+                              require_uv: bool = False) -> int:
+    """Lève `WebAuthnError` si l'assertion ne vérifie pas ; rend le `signCount` de l'authentificateur (octets 33..36
+    de `authenticatorData`, big-endian) que l'appelant compare au dernier vu pour cet appareil. `expected_challenge` : 32 octets attendus
     EXACTEMENT dans `clientDataJSON.challenge` une fois décodé (ADR : `sha256(challenge + "." +
     decision)` pour une décision, `sha256(challenge)` pour une connexion — calculé par l'appelant,
     jamais ici). `require_uv` : `True` pour une approbation `strong` (docs/APPROVALS.md §1).
-    `expected_rp_id` : si posé, `rpIdHash` (32 premiers octets de `authenticatorData`) doit valoir
-    `sha256(expected_rp_id)` — exigé pour une décision venue par nokker.ai (docs/LOKKAL.md §7.3)."""
+    `expected_rp_id` (obligatoire, aucun chemin ne vérifie « parfois ») : `rpIdHash` (32 premiers octets de
+    `authenticatorData`) doit valoir `sha256(expected_rp_id)`."""
     try:
         client_data_json = b64url_decode(client_data_json_b64url)
         authenticator_data = b64url_decode(authenticator_data_b64url)
@@ -245,7 +246,7 @@ def verify_webauthn_assertion(public_key_spki: str, client_data_json_b64url: str
 
     if len(authenticator_data) < 37:
         raise WebAuthnError("authenticatorData trop court (< 37 octets)")
-    if expected_rp_id is not None and not hmac.compare_digest(
+    if not expected_rp_id or not hmac.compare_digest(
             authenticator_data[:32], hashlib.sha256(expected_rp_id.encode("utf-8")).digest()):
         raise WebAuthnError(f"rpIdHash de authenticatorData ne correspond pas à {expected_rp_id!r}")
     flags = authenticator_data[32]
@@ -264,6 +265,7 @@ def verify_webauthn_assertion(public_key_spki: str, client_data_json_b64url: str
         raise WebAuthnError("signature WebAuthn invalide pour ce message/cette clé") from e
     except ValueError as e:  # DER malformé — cryptography lève ValueError, pas InvalidSignature
         raise WebAuthnError(f"signature WebAuthn malformée : {e}") from e
+    return int.from_bytes(authenticator_data[33:37], "big")
 
 
 __all__ = [

@@ -421,11 +421,58 @@ def _cmd_pages(args: argparse.Namespace) -> int:
         print(f"À BLANC (rien n'est fait ; --apply pour agir) — {where} {verb} ; motif : {out['reason']}")
         return 0
     if action == "unpublish":
-        print(f"RETIRÉE — {where} : le relais répond 410, la machine la dépublie à sa prochaine synchronisation "
+        print(f"RETIRÉE — {where} : le relais répond 410, la machine la dépublie à sa prochaine synchronisation, "
+              f"son auteur reçoit le motif et la façon de contester "
               f"(copie publique du miroir effacée : {out['mirror_cleared']})")
     else:
         print(f"RENDUE — {where} : son auteur pourra la republier (nouvelle carte, nouvelle adresse)")
     print(json.dumps(service.audit_line(out), ensure_ascii=False))
+    return 0
+
+
+def _cmd_household(args: argparse.Namespace) -> int:
+    """Foyers autorisés à déclarer des profils mineurs (docs/LOKKAL.md §7.29.4). Sorties : le code court `mg-…` du
+    foyer, jamais l'adresse ni l'identifiant d'un compte."""
+    import json
+
+    from nokker.household import grants as gr
+
+    who = {"email": args.email, "account": args.account}
+    try:
+        service = gr.open_operator(load_config(args.config))
+        if args.minors_command == "list":
+            rows = service.listing(**who)
+            print("foyer\tétat\tautorisé le\tretiré le\tprofils mineurs")
+            for r in rows:
+                print(f"{r['code']}\t{r['state']}\t{r['granted']}\t{r['revoked'] or '-'}\t{r['minors']}")
+            print(f"[{len(rows)} foyer(s)]", file=sys.stderr)
+            return 0
+        revoke = args.minors_command == "revoke"
+        out = (service.revoke if revoke else service.allow)(**who, apply=args.apply)
+    except gr.GrantError as e:
+        print(f"[erreur: {e}]", file=sys.stderr)
+        return 1
+    where = f"foyer {out['code']}" if out["code"] else "ce foyer"
+    if revoke:
+        if out["state"] in ("none", "already"):
+            print(f"RIEN À FAIRE — {where} : " + ("aucune autorisation" if out["state"] == "none" else "déjà retirée"))
+            return 0
+        if not out["applied"]:
+            print(f"À BLANC (rien n'est fait ; --apply pour agir) — {where} serait retiré ; "
+                  f"{out['suspended']} profil(s) mineur(s) serai(en)t suspendu(s), rien n'est supprimé")
+            return 0
+        print(f"RETIRÉ — {where} : {out['suspended']} profil(s) mineur(s) suspendu(s), rien n'est supprimé")
+    else:
+        if out["state"] == "already":
+            print(f"RIEN À FAIRE — {where} : déjà autorisé")
+            return 0
+        if not out["applied"]:
+            print(f"À BLANC (rien n'est fait ; --apply pour agir) — {where if out['code'] else 'un foyer'} serait "
+                  f"{'autorisé de nouveau' if out['state'] == 'restored' else 'autorisé'}")
+            return 0
+        print(f"AUTORISÉ — {where}" + (" (de nouveau ; profils suspendus à renouveler par le représentant)"
+                                          if out["state"] == "restored" else ""))
+    print(json.dumps(service.audit_line(out, "revoke" if revoke else "allow"), ensure_ascii=False))
     return 0
 
 
@@ -557,10 +604,28 @@ def build_parser() -> argparse.ArgumentParser:
         cp = pages_sub.add_parser(name, help=help_text)
         cp.add_argument("target", help="https://<nom>--pub.nokker.app/<id public>, https://<nom>--pages.nokker.app/"
                                        "<page_id>, ou le page_id")
-        cp.add_argument("--reason", required=True, help="motif (obligatoire, gardé à l'audit ; une adresse e-mail "
-                                                        "y est remplacée)")
+        cp.add_argument("--reason", required=True, help="motif (obligatoire, gardé à l'audit et, pour un retrait, "
+                                                        "transmis à l'auteur ; une adresse e-mail y est remplacée)")
         cp.add_argument("--apply", action="store_true", help="agit (sinon : à blanc)")
         cp.set_defaults(func=_cmd_pages, unscoped=True)
+
+    household_p = sub.add_parser("household", help="foyers : commandes d'opérateur (profils mineurs, §7.29.4)")
+    household_sub = household_p.add_subparsers(dest="household_command", required=True)
+    minors_p = household_sub.add_parser("minors", help="foyers autorisés à déclarer des profils mineurs "
+                                                         "(household_minors_mode: allowlist)")
+    minors_sub = minors_p.add_subparsers(dest="minors_command", required=True)
+    for name, help_text in (("allow", "autorise le foyer d'un payeur, à blanc par défaut"),
+                            ("revoke", "retire l'autorisation et suspend ses profils mineurs (rien n'est supprimé), "
+                                       "à blanc par défaut"),
+                            ("list", "les foyers autorisés : code, état, dates, nombre de profils mineurs "
+                                     "(jamais l'adresse ni le compte)")):
+        mp = minors_sub.add_parser(name, help=help_text)
+        sel = mp.add_mutually_exclusive_group(required=name != "list")
+        sel.add_argument("--email", help="adresse du payeur (jamais affichée)")
+        sel.add_argument("--account", help="identifiant us_… du payeur (jamais affiché)")
+        if name != "list":
+            mp.add_argument("--apply", action="store_true", help="agit (sinon : à blanc)")
+        mp.set_defaults(func=_cmd_household, unscoped=True)
 
     return p
 

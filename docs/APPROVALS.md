@@ -30,8 +30,8 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
   `NokkerConfig.approvals_enabled=True`), le noyau appelle `approvals.request(turn, call, verdict, advice)` — enregistre
   l'appel EXACT (`tool_name`, `arguments`), son empreinte `args_sha256` (JSON canonique de `arguments` SEUL : clés
   triées, sans espaces, UTF-8 — `nokker.approvals.crypto.args_sha256`), `strength` (`Verdict.strength`), `rule`/`reason`
-  (`Verdict.rule`/`.reason`), `advice` (pas encore produit par un pilier amont : toujours `None` aujourd'hui — un futur
-  chantier le remplira, le champ existe déjà), `expires_at` (`created_at + 24h`, fixe pour l'instant — pas de
+  (`Verdict.rule`/`.reason`), `advice` (avis court et niveau de risque du modèle relecteur sur une carte forte — `nokker/qa/review.py`, derrière
+  `judge_advice`, éteint par défaut — `None` sinon ; il conseille, il ne décide jamais), `expires_at` (`created_at + 24h`, fixe pour l'instant — pas de
   différenciation par effet). Le notificateur pousse la carte (`nokker.approvals.notify.TelegramNotifier`, désactivé
   par défaut : `sendMessage` + bouton `web_app` vers `<telegram_mini_app_url>?startapp=<approval_id>`).
 - **Décision** : le client demande un défi (§3), le signe/le prouve, et renvoie la preuve. `Approvals.decide()`
@@ -51,7 +51,7 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
   Outil : <tool_name>
   Décision : executed|failed|rejected
   Décideur : <decided_by>
-  Moyen : signature|signature+telegram|webauthn|totp|rejected
+  Moyen : signature|signature+telegram|telegram-attested|webauthn|totp|rejected
   Résultat : <contenu caviardé, tronqué à 2000 caractères>
   [/Approbation]
   ```
@@ -123,8 +123,32 @@ attendue ci-dessus, le flag **UP** (user present) toujours exigé, le flag **UV*
 serveur : c'est l'inverse, la signature WebCrypto brute du §3.3, qui est en P1363) — sur
 `authenticatorData ‖ SHA-256(clientDataJSON)` avec la clé publique SPKI enrôlée (même routine d'enrôlement que la
 CLI : `response.getPublicKey()` rend déjà du SPKI DER côté client). `decided_via` devient `"webauthn"`.
-**Limite connue** : pas de vérification du `rpIdHash` dans `authenticatorData` (confiance dans l'origine déjà
-vérifiée) ; Safari non supporté côté client tant qu'il n'expose pas `getPublicKey()` (WebAuthn niveau 3).
+**`rpIdHash`** (sur TOUS les chemins : `decide`, `decide_remote`, le relais de nokker.ai et la connexion
+`create_session`) : les 32 premiers octets de `authenticatorData` doivent valoir `SHA-256(rpId)`, où `rpId` est le nom
+d'hôte de l'origine configurée (`urlsplit(webauthn_origin).hostname`) — une assertion valide mais produite pour un
+autre `rpId` est refusée ; une origine sans hôte refuse WebAuthn. **`signCount`** (octets 33..36 de
+`authenticatorData`, big-endian) : le dernier compteur vu est retenu par appareil (`devices.sign_count`, `BIGINT`, en
+mémoire ou Postgres) et un compteur qui ne le dépasse pas strictement est refusé (« compteur de signature non
+croissant : clé possiblement clonée »), connexion comprise. **Limite** : un compteur toujours à 0 (passkeys
+synchronisés iCloud/Google) est accepté et n'offre donc aucune protection anti-clonage ; l'appareil d'un compte lié que
+nokker.ai rend à la machine (`decide_remote`) n'a pas de ligne locale, son compteur n'est tenu que par processus.
+Safari non supporté côté client tant qu'il n'expose pas `getPublicKey()` (WebAuthn niveau 3).
+
+### 3.4bis Décision d'une carte MACHINE dans la Mini App — attestation (26.10, lot X10)
+
+Une carte forte déposée par une machine Lokkal liée (docs/LOKKAL.md §7.3) peut se signer dans la Mini App Telegram,
+comme une carte du compte (§3.3), mais **la preuve Telegram ne va pas à la machine** : elle n'a pas le jeton du bot.
+`POST /v1/link/machines/{m}/approvals/{id}/decision {decision, proof: {device_id, signature, telegram_init_data}}` ;
+`signature` : P1363 sur `"<challenge>.<decision>"`, `challenge` = celui que la machine a déposé pour cette carte.
+nokker.ai vérifie l'`initData` (HMAC du bot, âge), l'appareil (du compte qui possède la machine, `approved`, pas de
+simple connexion, `telegram_user_id` = `initData.user.id`) et la signature, puis signe une **attestation** (JWT ES256,
+clé de passerelle, `typ` `nokker-approval-attest`) : `{iss, aud: <machine_id>, sub: <compte>, approval_id,
+challenge_sha256, args_sha256, decision, via: "telegram", device_id, iat, exp ≤ iat + 120 s, jti}`. La machine la vérifie
+(JWKS du lien, `aud`, `sub`, carte, défi déposé, `jti` jamais vu, non expirée) et décide :
+`BaseApprovals.decide_attested`, `decided_via` = `"telegram-attested"`. Réglage machine
+`local.remote_approvals_attested` (vrai par défaut) ; faux = attestation refusée. Refusée aussi : cartes `ops:prod*`,
+`pages:publish`, `household:guardian` et connecteurs relayés (clé d'appareil exigée). La machine fait donc confiance à
+nokker.ai pour cette carte (courte, à usage unique) ; une passkey (§3.4), vérifiée par la machine, n'en dépend pas.
 
 ### 3.5 Décision — TOTP (niveau `standard` SEULEMENT)
 
@@ -217,13 +241,13 @@ si le fichier existe sur disque.
 
 ## 6. Limites connues
 
-- `advice` (avis de Nina) n'est jamais rempli aujourd'hui : `Kernel._tool_step` appelle `approvals.request(turn, tc,
-  rule, None)` — un futur chantier (pilier Nina QA/risques) devra produire ce texte avant l'appel.
+- `advice` n'est rempli que sur une carte forte et seulement si `judge_advice` est allumé (éteint par défaut) :
+  `Kernel._card_advice` appelle alors le modèle relecteur avant `approvals.request`, sinon `None`.
 - `expires_at` est fixe (24 h) quel que soit l'effet — la mention « `SEND_BULK` 1 h » d'une version antérieure de ce
   document n'a jamais pu s'appliquer : `SEND_BULK` reste `DENY`, jamais soumis à approbation (§1).
 - Le renouvellement d'un jeton de session (`POST /v1/sessions`) n'est pas implémenté : à l'expiration (12 h), le
   client refait la danse `session-challenge` → signature.
-- WebAuthn ne vérifie pas `rpIdHash` dans `authenticatorData` (voir §3.4) ; Safari non supporté côté client.
+- Un `signCount` WebAuthn toujours à 0 (passkeys synchronisés) n'offre aucune protection anti-clonage (voir §3.4) ; Safari non supporté côté client.
 - Le bus d'événements (`/v1/events`, `EventBus`) est en mémoire, un seul processus — pas de reprise si le serveur
   redémarre entre deux connexions (fenêtre de reprise bornée à `max_buffer`/`max_age_s`, pas un journal persistant).
 - `PgApprovals` est câblée et testée par construction (même logique que `InMemoryApprovals`, voir §4), mais son

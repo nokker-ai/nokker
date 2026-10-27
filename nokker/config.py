@@ -231,6 +231,9 @@ class NokkerConfig:
     # max_members: 6 (au plus), mode: hard|soft} — le palier `plan` de `billing_plans`, s'il existe, donne le quota.
     household: bool = False
     household_minors: bool = False
+    # household_minors_mode : `all` (défaut) tout payeur ; `allowlist` les seuls payeurs autorisés un par un par
+    # l'opérateur (`python -m nokker household minors allow`, en base, §7.29.4). Autre 403 `minors_not_enabled`.
+    household_minors_mode: str = "all"
     household_settings: dict[str, Any] | None = None
     # SSO OIDC des équipes (docs/LOKKAL.md §7.24, nokker/sso/) : connexion par le fournisseur d'une organisation,
     # groupes → rôles des projets, « SSO obligatoire ». Demande `team`. Éteint par défaut : aucune route /v1/sso*,

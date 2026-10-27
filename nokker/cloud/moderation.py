@@ -17,6 +17,10 @@ Une page publique vit sur la machine de son auteur ; nokker.ai n'en voit que ce 
   de la republier tant que l'opérateur ne l'a pas rendue (`restore`).
 - **Audit** (`lokkal_page_moderation`, migration 040, ajout seul) : page, empreinte, machine, locataire, action, motif,
   date. Le motif est obligatoire ; une adresse e-mail qu'il contiendrait est remplacée avant d'être rangée.
+- **Exposé des motifs à l'auteur** (DSA art. 17, décision du 25.10) : le registre garde le motif du retrait en cours
+  (`moderation_reason`, migration 041) ; `GET /v1/gateway/machine` → `moderation_notices` en donne, pour chaque page
+  retirée, le `page_id` et l'empreinte (que la machine connaît), la date, le motif nettoyé et la phrase fixe pour
+  contester (`APPEAL`, FR et EN). Ni locataire, ni machine, ni compte, ni adresse.
 """
 from __future__ import annotations
 
@@ -38,7 +42,11 @@ _PUBLIC_ID = re.compile(r"^[A-Za-z0-9_-]{24}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 _COLS = ("id", "machine_id", "tenant_id", "page_id", "public_sha256", "size", "first_seen_at", "last_seen_at",
-         "moderated_at")
+         "moderated_at", "reason")
+# Comment contester un retrait (exposé des motifs, DSA art. 17) : phrase fixe, la même pour toutes les pages ; la seule
+# adresse qui part vers la machine, celle, publique, de la boîte de modération.
+APPEAL = {"fr": "Pour contester ce retrait, répondez à moderation@nokker.ai en citant l'identifiant de la page.",
+          "en": "To contest this removal, reply to moderation@nokker.ai quoting the page identifier."}
 
 
 class ModerationError(ValueError):
@@ -62,6 +70,27 @@ def clean_reason(reason: str | None) -> str:
     if len(text) > MAX_REASON:
         raise ModerationError(f"motif de {MAX_REASON} caractères au plus")
     return text
+
+
+def _scrub(reason: str | None) -> str | None:
+    """Motif tel qu'il part vers l'auteur : celui de l'audit (déjà nettoyé), re-nettoyé par prudence (ligne d'avant)."""
+    if not reason:
+        return None
+    return _EMAIL.sub("[adresse retirée]", " ".join(str(reason).split()))[:MAX_REASON] or None
+
+
+def _notices(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`moderation_notices` d'une machine : une note par ligne retirée, sans locataire, machine ni compte."""
+    out = [{"page_id": r["page_id"], "public_sha256": r["public_sha256"], "at": float(r["moderated_at"]),
+            "reason": _scrub(r.get("reason")), "appeal": dict(APPEAL)}
+           for r in rows if r["moderated_at"] is not None]
+    return sorted(out, key=lambda n: (n["at"], n["page_id"] or "", n["public_sha256"] or ""))
+
+
+def _latest_reason(match: list[dict[str, Any]]) -> str | None:
+    """Motif du retrait le plus récent parmi des lignes d'une même page (propagé à une identité retirée par contagion)."""
+    done = [r for r in match if r["moderated_at"] is not None]
+    return max(done, key=lambda r: r["moderated_at"]).get("reason") if done else None
 
 
 def _plan(match: list[dict[str, Any]], page_id: str | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -96,6 +125,8 @@ def _fold(keep: dict[str, Any], drop: list[dict[str, Any]]) -> None:
         keep["first_seen_at"] = min(keep["first_seen_at"], r["first_seen_at"])
         keep["last_seen_at"] = max(keep["last_seen_at"], r["last_seen_at"])
         if r["moderated_at"] is not None:
+            if keep["moderated_at"] is None or r["moderated_at"] > keep["moderated_at"]:
+                keep["reason"] = r.get("reason")  # le motif suit le retrait le plus récent
             keep["moderated_at"] = max(keep["moderated_at"] or 0.0, r["moderated_at"])
         keep["page_id"] = keep["page_id"] or r["page_id"]
         keep["public_sha256"] = keep["public_sha256"] or r["public_sha256"]
@@ -133,17 +164,19 @@ class MemoryPublicPages:
             if keep is None:
                 self._insert({"machine_id": machine_id, "tenant_id": tenant_id, "page_id": page_id,
                               "public_sha256": public_sha256, "size": int(size), "first_seen_at": now,
-                              "last_seen_at": now, "moderated_at": None})
+                              "last_seen_at": now, "moderated_at": None, "reason": None})
                 return False
             if blocked and any(_conflict(r, page_id, public_sha256) for r in match):
                 at = max(r["moderated_at"] for r in match if r["moderated_at"] is not None)
+                why = _latest_reason(match)
                 for r in match:  # tout ce qui a été vu avec une identité retirée est retiré ; rien n'est réécrit
                     r["last_seen_at"] = now
-                    r["moderated_at"] = r["moderated_at"] or at
+                    if r["moderated_at"] is None:
+                        r["moderated_at"], r["reason"] = at, why
                 for pid, sha in _blocked_extras(match, page_id, public_sha256):
                     self._insert({"machine_id": machine_id, "tenant_id": tenant_id, "page_id": pid,
                                   "public_sha256": sha, "size": int(size), "first_seen_at": now, "last_seen_at": now,
-                                  "moderated_at": at})
+                                  "moderated_at": at, "reason": why})
                 return True
             _fold(keep, drop)
             for r in drop:
@@ -157,6 +190,11 @@ class MemoryPublicPages:
             rows = [r for r in self.rows.values() if r["machine_id"] == machine_id and r["moderated_at"] is not None]
         return {"page_ids": sorted(r["page_id"] for r in rows if r["page_id"]),
                 "public_sha256": sorted(r["public_sha256"] for r in rows if r["public_sha256"])}
+
+    def notices_of(self, machine_id: str) -> list[dict[str, Any]]:
+        """Exposé des motifs des pages retirées de cette machine (`moderation_notices`)."""
+        with self.lock:
+            return _notices([dict(r) for r in self.rows.values() if r["machine_id"] == machine_id])
 
     def listing(self, moderated: bool = False) -> list[dict[str, Any]]:
         with self.lock:
@@ -181,12 +219,13 @@ class MemoryPublicPages:
                 if action == "unpublish":
                     self._insert({"machine_id": machine_id, "tenant_id": tenant_id, "page_id": page_id,
                                   "public_sha256": public_sha256, "size": 0, "first_seen_at": now,
-                                  "last_seen_at": now, "moderated_at": now})
+                                  "last_seen_at": now, "moderated_at": now, "reason": reason})
             else:
                 _fold(keep, drop)
                 for r in drop:
                     del self.rows[r["id"]]
                 keep["moderated_at"] = now if action == "unpublish" else None
+                keep["reason"] = reason if action == "unpublish" else None
                 page_id, public_sha256 = keep["page_id"], keep["public_sha256"]
             event = {"at": now, "machine_id": machine_id, "tenant_id": tenant_id, "page_id": page_id,
                      "public_sha256": public_sha256, "action": action, "reason": reason}
@@ -214,7 +253,7 @@ class PgPublicPages:
     def _rows(cur: Any) -> list[dict[str, Any]]:
         return [dict(zip(_COLS, r, strict=True)) for r in cur.fetchall()]
 
-    _SELECT = f"SELECT {', '.join(_COLS)} FROM lokkal_public_pages"
+    _SELECT = f"SELECT {', '.join(_COLS[:-1])}, moderation_reason FROM lokkal_public_pages"
 
     def _match(self, conn: Any, machine_id: str, page_id: str | None, sha: str | None) -> list[dict[str, Any]]:
         cur = conn.execute(f"{self._SELECT} WHERE machine_id = %s AND (page_id = %s OR public_sha256 = %s) ORDER BY id",
@@ -225,15 +264,16 @@ class PgPublicPages:
         if drop:
             conn.execute("DELETE FROM lokkal_public_pages WHERE id = ANY(%s)", ([r["id"] for r in drop],))
         conn.execute("UPDATE lokkal_public_pages SET page_id = %s, public_sha256 = %s, size = %s, first_seen_at = %s, "
-                     "last_seen_at = %s, moderated_at = %s WHERE id = %s",
+                     "last_seen_at = %s, moderated_at = %s, moderation_reason = %s WHERE id = %s",
                      (keep["page_id"], keep["public_sha256"], keep["size"], keep["first_seen_at"],
-                      keep["last_seen_at"], keep["moderated_at"], keep["id"]))
+                      keep["last_seen_at"], keep["moderated_at"], keep.get("reason"), keep["id"]))
 
     def _insert(self, conn: Any, row: dict[str, Any]) -> None:
         conn.execute("INSERT INTO lokkal_public_pages (machine_id, tenant_id, page_id, public_sha256, size, "
-                     "first_seen_at, last_seen_at, moderated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                     "first_seen_at, last_seen_at, moderated_at, moderation_reason) "
+                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                      (row["machine_id"], row["tenant_id"], row["page_id"], row["public_sha256"], row["size"],
-                      row["first_seen_at"], row["last_seen_at"], row["moderated_at"]))
+                      row["first_seen_at"], row["last_seen_at"], row["moderated_at"], row.get("reason")))
 
     @staticmethod
     def _lock(conn: Any, machine_id: str) -> None:
@@ -256,16 +296,19 @@ class PgPublicPages:
             if keep is None:
                 self._insert(conn, {"machine_id": machine_id, "tenant_id": tenant_id, "page_id": page_id,
                                     "public_sha256": public_sha256, "size": int(size), "first_seen_at": now,
-                                    "last_seen_at": now, "moderated_at": None})
+                                    "last_seen_at": now, "moderated_at": None, "reason": None})
                 return False
             if blocked and any(_conflict(r, page_id, public_sha256) for r in match):
                 at = max(r["moderated_at"] for r in match if r["moderated_at"] is not None)
-                conn.execute("UPDATE lokkal_public_pages SET last_seen_at = %s, moderated_at = COALESCE(moderated_at, %s) "
-                             "WHERE id = ANY(%s)", (now, at, [r["id"] for r in match]))
+                why = _latest_reason(match)
+                conn.execute("UPDATE lokkal_public_pages SET last_seen_at = %s, "
+                             "moderation_reason = CASE WHEN moderated_at IS NULL THEN %s ELSE moderation_reason END, "
+                             "moderated_at = COALESCE(moderated_at, %s) WHERE id = ANY(%s)",
+                             (now, why, at, [r["id"] for r in match]))
                 for pid, sha in _blocked_extras(match, page_id, public_sha256):
                     self._insert(conn, {"machine_id": machine_id, "tenant_id": tenant_id, "page_id": pid,
                                         "public_sha256": sha, "size": int(size), "first_seen_at": now,
-                                        "last_seen_at": now, "moderated_at": at})
+                                        "last_seen_at": now, "moderated_at": at, "reason": why})
                 return True
             _fold(keep, drop)
             keep.update(public_sha256=public_sha256, page_id=page_id or keep["page_id"], size=int(size),
@@ -278,6 +321,11 @@ class PgPublicPages:
             rows = conn.execute("SELECT page_id, public_sha256 FROM lokkal_public_pages WHERE machine_id = %s "
                                 "AND moderated_at IS NOT NULL", (machine_id,)).fetchall()
         return {"page_ids": sorted(r[0] for r in rows if r[0]), "public_sha256": sorted(r[1] for r in rows if r[1])}
+
+    def notices_of(self, machine_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            return _notices(self._rows(conn.execute(f"{self._SELECT} WHERE machine_id = %s AND moderated_at IS NOT NULL "
+                                                    "ORDER BY id", (machine_id,))))
 
     def listing(self, moderated: bool = False) -> list[dict[str, Any]]:
         cond = "IS NOT NULL" if moderated else "IS NULL"
@@ -300,10 +348,11 @@ class PgPublicPages:
                 if action == "unpublish":
                     self._insert(conn, {"machine_id": machine_id, "tenant_id": tenant_id, "page_id": page_id,
                                         "public_sha256": public_sha256, "size": 0, "first_seen_at": now,
-                                        "last_seen_at": now, "moderated_at": now})
+                                        "last_seen_at": now, "moderated_at": now, "reason": reason})
             else:
                 _fold(keep, drop)
                 keep["moderated_at"] = now if action == "unpublish" else None
+                keep["reason"] = reason if action == "unpublish" else None
                 self._apply(conn, keep, drop)
                 page_id, public_sha256 = keep["page_id"], keep["public_sha256"]
             conn.execute("INSERT INTO lokkal_page_moderation (at, machine_id, tenant_id, page_id, public_sha256, "
@@ -498,5 +547,5 @@ def open_operator(config: Any) -> Moderation:
                       mirror_pages=PgMirrorPages(dsn), domain=domain)
 
 
-__all__ = ["REMOVED", "MemoryPublicPages", "Moderation", "ModerationError", "PgMachines", "PgPublicPages", "Target",
+__all__ = ["APPEAL", "REMOVED", "MemoryPublicPages", "Moderation", "ModerationError", "PgMachines", "PgPublicPages", "Target",
            "check_view", "clean_reason", "open_operator", "public_sha"]

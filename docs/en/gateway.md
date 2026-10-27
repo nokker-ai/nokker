@@ -42,8 +42,9 @@ The code is open source (Apache-2.0); the relay is a Nokker service, so the gate
   limited to `GET` and `HEAD` of the web interface files. A local token is refused by the relay, and the core also
   refuses a local token on a relayed request.
 - **The core checks again.** It re-verifies the token itself and keeps its own approval cards. Any destructive action
-  asked from the web needs a **strong approval card**, signed on an enrolled device with a passkey on
-  `https://app.nokker.ai` (see [Approving from your phone](#approving-from-your-phone)), never with the local token.
+  asked from the web needs a **strong approval card**, signed on an enrolled device (a passkey on
+  `https://app.nokker.ai`, or the Telegram Mini App) (see [Approving from your phone](#approving-from-your-phone)),
+  never with the local token.
 - **No cookies shared.** Every cookie the relay sets uses the `__Host-` prefix (no `Domain`, so it belongs to one
   name only); it sets no other cookie, strips `Cookie` toward your machine and `Set-Cookie` from it. Sign-in routes
   also require the exact `Origin` and `Sec-Fetch-Site: same-origin`, and the private pages cookie only counts for a
@@ -65,6 +66,15 @@ When a strong card waits on a linked machine, the machine posts it to your accou
 that verifies you. nokker.ai only carries the signature: your machine checks it against your device's public key, the
 card's challenge and the hash of the exact arguments, and uses it once. What the page shows, and who wrote it: see
 [security.md](security.md#4-what-you-see-when-you-sign).
+
+You can also approve in the **Telegram Mini App** (Face ID or your fingerprint, through Telegram's biometric manager):
+the Telegram message has a button that opens that very card. Your machine does not hold the Telegram bot token, so it
+cannot check Telegram's proof itself. **nokker.ai checks it** (the Telegram sign-in data, your enrolled device, its
+signature on the exact challenge your machine created) and hands your machine a signed **attestation**: tied to that
+machine, your account, that card, that challenge and that decision, valid for 120 seconds and usable once. For a card
+approved this way, your machine therefore trusts nokker.ai; for a passkey it does not, because the machine verifies the
+passkey itself. A card for a `prod` change, a page publication or a relayed connector always needs the passkey. Set
+`local.remote_approvals_attested: false` to turn the Telegram path off: only a passkey then decides from your phone.
 
 ## Public pages
 

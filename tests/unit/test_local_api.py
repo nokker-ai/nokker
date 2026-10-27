@@ -50,6 +50,7 @@ def test_sessions_only_under_declared_roots(tmp_path):
     status, body = api.handle("POST", "/v1/local/sessions", auth, {"cwd": str(tmp_path / "projets" / "app")})
     assert status == 201 and body["thread_id"].startswith("th_")
     assert api.handle("GET", "/v1/local/sessions", auth, {})[1]["sessions"][0]["thread_id"] == body["thread_id"]
+    assert api.handle("GET", "/v1/local/sessions", auth, {})[1]["roots"] == api.roots  # proposées par le web
 
 
 def test_session_tools_route_by_thread(tmp_path):
@@ -267,6 +268,61 @@ def test_local_token_opens_threads_bubbles_events_and_chat(tmp_path):
                                      headers={"Authorization": f"Bearer {api.token}"})
         with urllib.request.urlopen(req, timeout=5) as r:
             assert r.status == 200 and r.headers["Content-Type"].startswith("text/event-stream")
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+
+
+def test_web_served_by_the_gateway_opens_threads_with_the_browser_token(tmp_path):
+    """Le web servi par `<nom>.nokker.app` ouvre sa session par code + PKCE (jeton lié à CETTE machine), puis lit ses
+    fils : même identité LOCAL_OWNER que le jeton local. Recette du 26.10 : 401 sur /v1/threads, la connexion échouait."""
+    from nokker.api.events import EventBus
+    from nokker.bubbles.hub import BubbleHub
+    from nokker.bubbles.memory import InMemoryBubbles
+    from nokker.cloud.link import Signer
+    from nokker.local.setup import LocalSetup, LocalVault
+    from nokker.threads.memory import InMemoryThreads
+
+    api = _api(tmp_path)
+    bus = EventBus()
+    hub = BubbleHub(threads=InMemoryThreads(), bubbles=InMemoryBubbles(), publish=bus.publish,
+                    known_users=frozenset(), spawn=lambda fn: fn())
+    kernel = make_kernel("ok")
+    kernel.observer, hub.kernel, hub.scrub = hub, kernel, kernel.invariants.scrub_output
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, events=bus, hub=hub,
+                                                               local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    signer = Signer.generate()
+    api.setup = LocalSetup(state_path=tmp_path / "setup.json", vault=LocalVault(tmp_path / "v.bin"), detect=lambda: [])
+    api.setup.state.update(jwks=signer.jwks(), account="us_pierre", machine_id="mc_1")
+
+    class Up:
+        state = "up"
+
+    api.relay_host, api.tunnel = "pierre.nokker.app", Up()
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    def relayed(path, token):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                     headers={"Authorization": f"Bearer {token}", "X-Nokker-Relay": "1"})
+        req.add_unredirected_header("Host", "pierre.nokker.app")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        browser = signer.access_token("us_pierre", "tn_pierre", machine="mc_1")
+        assert relayed("/v1/threads", browser) == 200
+        assert relayed("/v1/local/sessions", browser) == 200  # liste + racines pour « + session de code » du web
+        assert relayed("/v1/notifications", browser) == 200
+        assert relayed("/v1/threads", signer.access_token("us_pierre", "tn_pierre", machine="mc_2")) == 401
+        assert relayed("/v1/threads", signer.access_token("us_autre", "tn_autre", machine="mc_1")) == 401
+        assert relayed("/v1/threads", Signer.generate().access_token("us_pierre", "tn_pierre", machine="mc_1")) == 401
+        assert _req(port, "/v1/threads", token=browser)[0] == 401  # sans la passerelle, ce jeton n'est rien
     finally:
         httpd.shutdown()
         t.join(timeout=5)

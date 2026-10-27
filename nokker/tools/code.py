@@ -52,7 +52,12 @@ MAX_OUTPUT_CHARS = 30_000  # sortie de commande gardée (tête + queue) ; le ré
 # Commandes de lecture pure : aucune écriture, aucun réseau, aucun code du dépôt exécuté. Une commande composée
 # n'est READ que si CHAQUE segment l'est et qu'aucune redirection n'écrit.
 _READ_ONLY = {"ls", "cat", "head", "tail", "wc", "pwd", "grep", "rg", "file", "stat", "tree", "du", "which",
-              "echo", "diff", "sort", "uniq", "cut", "basename", "dirname", "realpath", "env", "printenv"}
+              "echo", "diff", "sort", "uniq", "cut", "basename", "dirname", "realpath", "env", "printenv",
+              "id", "whoami", "groups", "uname", "nproc"}
+# Lecture seulement SANS argument : `env CMD…` lance CMD.
+_READ_ONLY_BARE = {"env"}
+# Options qui font écrire une commande de lecture (fichier de sortie, base magique compilée).
+_WRITES_WITH = {"sort": ("-o", "--output"), "tree": ("-o",), "file": ("-C", "--compile"), "uniq": ()}
 _GIT_READ = {"status", "diff", "log", "show", "blame", "rev-parse", "ls-files", "branch", "grep"}
 _FIND_WRITES = re.compile(r"\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b")
 _SEGMENTS = re.compile(r"&&|\|\||[;|&\n]")
@@ -78,6 +83,13 @@ def hardline_reason(command: str) -> str | None:
     return str(why) if hit else None
 
 
+def _has_option(args: list[str], opt: str) -> bool:
+    """`--output`, `--output=x` ; `-o`, `-ox`, et une lettre groupée (`-uo`) : prudent, une fausse alerte donne WRITE."""
+    if opt.startswith("--"):
+        return any(a == opt or a.startswith(opt + "=") for a in args)
+    return any(a.startswith("-") and not a.startswith("--") and opt[1] in a[1:] for a in args)
+
+
 def _read_only(command: str) -> bool:
     if re.search(r"[<>`]|\$\(", command):  # redirection, substitution : on ne lit pas ce qui s'exécute
         return False
@@ -100,6 +112,12 @@ def _read_only(command: str) -> bool:
             if _FIND_WRITES.search(seg):
                 return False
         elif head not in _READ_ONLY:
+            return False
+        elif head in _READ_ONLY_BARE and len(words) > 1:
+            return False
+        elif head == "uniq" and len([w for w in words[1:] if not w.startswith("-")]) > 1:  # uniq ENTRÉE SORTIE
+            return False
+        elif any(_has_option(words[1:], o) for o in _WRITES_WITH.get(head, ())):
             return False
     return True
 

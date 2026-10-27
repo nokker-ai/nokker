@@ -238,6 +238,52 @@ def test_household_quota_is_read_from_the_ledger_across_tenants_by_members_only(
 
 
 @requires_pg
+def test_minor_grants_allow_revoke_suspend_audit_append_only(fam):
+    """043 : l'autorisation vit en base (hors RLS), l'outil d'opérateur passe par le rôle applicatif ; un retrait
+    suspend les profils mineurs sans rien supprimer ; l'audit n'accepte ni UPDATE ni DELETE hors effacement."""
+    import psycopg
+
+    from nokker.household.model import Settings
+    from nokker.household.service import Household
+    from nokker.tenancy.context import tenant_scope
+
+    base, app, su = fam["hh"], fam["pg"]["app"], fam["pg"]["su"]
+    store = base.store
+
+    def kid_active(hh):  # lu dans le tour du mineur : son locataire
+        with tenant_scope(TK):
+            return hh.minor_state(K.account_id).active
+
+    hh = Household(team=base.team, settings=Settings(minors=True, minors_mode="allowlist"))
+    assert store.minor_grant(P.account_id) is None and hh.minors_open(P.account_id) is False
+    assert kid_active(hh) is False  # profil déclaré avant l'autorisation : rien tant qu'elle manque
+    row, state = store.grant_allow(P.account_id, TP, 10.0)
+    assert state == "new" and row["code"].startswith("mg-") and row["revoked_at"] is None
+    assert store.grant_allow(P.account_id, TP, 11.0)[1] == "already"
+    assert hh.minors_open(P.account_id) is True and hh.minors_open(Q.account_id) is False
+    assert kid_active(hh) is True
+    assert store.grant_minors(P.account_id) == 1 and [g["code"] for g in store.grant_list()] == [row["code"]]
+    _, n = store.grant_revoke(P.account_id, 12.0)
+    assert n == 1 and hh.minors_open(P.account_id) is False and kid_active(hh) is False
+    assert store.grant_revoke(P.account_id, 13.0)[1] == 0
+    with psycopg.connect(su) as conn:  # suspendu, rien de supprimé
+        assert conn.execute("SELECT status FROM household_members WHERE account_id = %s",
+                            (K.account_id,)).fetchone()[0] == "suspended"
+        assert conn.execute("SELECT count(*) FROM account_minors WHERE account_id = %s", (K.account_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM parental_consents WHERE tenant_id = %s", (TP,)).fetchone()[0] == 1
+        assert conn.execute("SELECT action, suspended FROM household_minor_grant_audit ORDER BY id").fetchall() == \
+            [("allow", 0), ("revoke", 1)]
+    for sql in ("UPDATE household_minor_grant_audit SET suspended = 9", "DELETE FROM household_minor_grant_audit"):
+        with psycopg.connect(app) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(sql)
+    assert store.grant_allow(P.account_id, TP, 14.0)[1] == "restored"
+    assert kid_active(hh) is False  # réautorisé, mais le profil reste suspendu jusqu'au renouvellement (service)
+    with psycopg.connect(su) as conn:  # remise en état pour la suite (le renouvellement est couvert en unitaire)
+        conn.execute("UPDATE household_members SET status = 'active' WHERE account_id = %s", (K.account_id,))
+    assert kid_active(hh) is True
+
+
+@requires_pg
 def test_erase_a_member_a_minor_and_the_payer(fam):
     import psycopg
 
@@ -259,7 +305,9 @@ def test_erase_a_member_a_minor_and_the_payer(fam):
     assert count("SELECT count(*) FROM parental_consents WHERE minor_email = %s", (K.email,)) == 0
     assert count("SELECT count(*) FROM account_minors WHERE account_id = %s", (K.account_id,)) == 0
     assert count("SELECT count(*) FROM household_members WHERE household_id = %s", (hid,)) == 1  # le payeur reste
+    assert count("SELECT count(*) FROM household_minor_grants WHERE tenant_id = %s", (TP,)) == 1
     r = erase_account(app, account_id=P.account_id, apply=True, confirm=P.account_id)
     assert r.applied and not r.unscoped
-    for t in ("household_members", "parental_consents", "team_projects"):
+    for t in ("household_members", "parental_consents", "team_projects", "household_minor_grants",
+              "household_minor_grant_audit"):
         assert count(f"SELECT count(*) FROM {t} WHERE tenant_id = %s", (TP,)) == 0, t

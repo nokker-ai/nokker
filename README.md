@@ -30,8 +30,9 @@ choose the model.
   are only the entry point: the agent writes down the rules and corrections you give it, per project, and recalls them
   by relevance. Memory runs on your machine, in [CortHeXis](https://github.com/ninabot-ch/corthexis).
 - **Approval from your phone** (rolling out). Strong cards (a `prod` change, an e-mail sent in your name, a deletion)
-  are signed with a passkey on your phone. Your machine checks the signature itself, and the page shows what you are
-  signing, and who described it.
+  are signed on your phone: with a passkey, which your machine checks itself, or in the Telegram Mini App (Face ID),
+  where nokker.ai checks Telegram's proof and hands your machine a signed, single-use attestation that it can refuse
+  (`local.remote_approvals_attested: false`). The page shows what you are signing, and who described it.
 - **Web and machine, each with its own reach** (rolling out). A connector you set up on nokker.ai (mail, calendar)
   works from your machine too, and its credentials stay on nokker.ai. What lives on your machine (your repositories,
   ssh keys, your local network) never goes to the web: a web session that needs it hands the task over to a session
@@ -87,7 +88,7 @@ $ nokker
 > /diff
 ```
 
-Terminal labels are currently in French; English labels are planned.
+The terminal speaks English by default, French when your locale is French (`--lang` or `NOKKER_LANG` to choose).
 
 ## Documentation
 
@@ -111,10 +112,10 @@ to reproduce them: [docs/en/benchmarks.md](docs/en/benchmarks.md).
 
 ## Tests
 
-Tests run on every push to `main` and on every pull request: more than 2,300 tests (2,173 unit tests and 139
-integration tests against a real Postgres with pgvector and a disposable OpenBao on the last run), plus `ruff`. Tests
-that need a hosted model or a local llama.cpp server skip themselves there.
-Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Tests run on every push to `main` and on every pull request: unit tests, integration tests against a real Postgres with
+pgvector and a disposable OpenBao, plus `ruff`. Tests that need a hosted model or a local llama.cpp server skip
+themselves there. The current counts are in the latest run of the workflow:
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Licence
 
@@ -132,4 +133,3 @@ Private beta / early access.
   images from the terminal, placement on several machines and the shared deck, the subscriber mirror, the VS Code
   extension on the Marketplace, the `nokker review` GitHub Action.
 - Beta (off by default): incidents and the plan, team projects, project skills.
-- Planned: `/memory` in the terminal, `mail:` agent triggers, English terminal labels.

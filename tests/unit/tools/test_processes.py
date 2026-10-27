@@ -132,11 +132,28 @@ def test_stop_kills_the_whole_group_and_survives_sigterm_trap(tmp_path, tables):
     t = _table(tmp_path, tables)
     # un enfant qui ignore SIGTERM : tué par le SIGKILL après la grâce
     p = t.start("trap '' TERM; sleep 60 & sleep 60; wait")
-    _wait(lambda: subprocess.run(["pgrep", "-g", str(p.pgid)], capture_output=True).stdout.count(b"\n") >= 2)
+    _wait(lambda: len(_group_alive(p.pgid)) >= 2)
     t0 = time.time()
     assert t.stop(p.id).state == "stopped"
     assert time.time() - t0 < 10
-    assert _wait(lambda: not subprocess.run(["pgrep", "-g", str(p.pgid)], capture_output=True).stdout.strip())
+    assert _wait(lambda: not _group_alive(p.pgid))
+
+
+def _group_alive(pgid: int) -> list[int]:
+    """Processus VIVANTS du groupe, d'après /proc : un zombie (état Z) est mort. Sans init qui récolte (conteneur de job
+    de la CI forge, PID 1 = `tail -f`), les enfants tués restent zombies et `pgrep -g` les compte encore."""
+    alive = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            alive.append(int(d))
+    return alive
 
 
 def test_cap_per_thread_and_unknown_id(tmp_path, tables):

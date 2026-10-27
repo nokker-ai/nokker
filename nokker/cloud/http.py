@@ -27,6 +27,8 @@ Approbations fortes par la passerelle (lot X10, docs/LOKKAL.md §7.3, nokker/clo
     GET  /v1/gateway/devices (jeton de machine) → {devices: [{device_id, public_key_spki, status, can_decide, name}]}
     GET  /v1/link/machines/{machine_id}/approvals[/{approval_id}] (session du compte)
     POST /v1/link/machines/{machine_id}/approvals/{approval_id}/decision {decision, proof} (session) → 202 forwarded
+        proof Telegram {device_id, signature, telegram_init_data} (Mini App) : session OU `initData` (en-tête
+        `X-Telegram-Init-Data` / champ de la preuve) ; nokker.ai vérifie et remet à la machine une attestation signée
     GET  /v1/mirror/projects, GET|POST /v1/mirror/projects/{id}/notes (Bearer jeton de machine) → équipe (X17,
          drapeau `team`, nokker/team/http.py ; 404 drapeau éteint)
 Délégation web → Lokkal par besoin (lot X21, docs/LOKKAL.md §7.16, nokker/cloud/handoff.py) :
@@ -50,7 +52,8 @@ Pages publiques (docs/LOKKAL.md §7.26) :
 Modération des pages publiques (§7.26, point 6 ; nokker/cloud/moderation.py, migration 040) :
     POST   /v1/gateway/public-page/check {host, public_id, page_id?, size?} (clé du relais) → 200 {allowed} | 410
            moderated | 404 : demandé par le relais AVANT de servir une page publique ; la vue est inscrite au registre
-    GET    /v1/gateway/machine → … + moderated_pages, moderated_public : pages de cette machine retirées par l'opérateur
+    GET    /v1/gateway/machine → … + moderated_pages, moderated_public : pages de cette machine retirées par l'opérateur ;
+           moderation_notices [{page_id, public_sha256, at, reason, appeal: {fr, en}}] (exposé des motifs, migration 041)
     POST   /v1/gateway/mirror/public-page → 410 moderated pour une copie publique retirée
 Deck multi-machines et agents placés (lot X15, docs/LOKKAL.md §7.19, nokker/cloud/crew.py) :
     GET  /v1/link/deck (session du compte) → toutes les machines du compte, leurs sessions, leurs agents, leurs cartes
@@ -118,6 +121,10 @@ class CloudLink:
     approvals_relay: Any = None
     devices_of: Callable[[str], list[Any]] | None = None
     notify_approval: Callable[[Any, Any], None] | None = None
+    # Décision d'une carte machine par la Mini App Telegram : nokker.ai vérifie la preuve Telegram et remet à la machine
+    # une attestation signée (nokker.cloud.attest.TelegramAttestor) ; None = cette voie est fermée (la page web et la
+    # passkey restent).
+    attestor: Any = None
     # Délégation web → Lokkal (lot X21) : demandes de relais ; None = routes /v1/handoffs absentes (404).
     handoffs: Any = None
     mirror_notes: Any = None  # notes en miroir (MemoryMirrorNotes / PgMirrorNotes, migration 025)
@@ -386,7 +393,9 @@ def handle(h: Any, method: str, path: str) -> bool:
         if c.public_pages is not None:
             try:  # §7.26 point 6 : la machine dépublie et marque ses pages retirées par l'opérateur
                 mod = c.public_pages.moderated_of(machine.id)
-                out.update(moderated_pages=mod["page_ids"], moderated_public=mod["public_sha256"])
+                out.update(moderated_pages=mod["page_ids"], moderated_public=mod["public_sha256"],
+                           # exposé des motifs (DSA art. 17) : date, motif nettoyé, comment contester ; aucun compte
+                           moderation_notices=c.public_pages.notices_of(machine.id))
             except Exception:  # noqa: BLE001 — sans la liste, la machine garde ce qu'elle savait ; le relais bloque
                 logger.exception("registre de modération illisible (machine %s)", machine.id)
         h._json(200, out)
@@ -820,18 +829,33 @@ def _machine_relay(h: Any, c: CloudLink, machine: Any, method: str, path: str) -
 
 
 def _account_relay(h: Any, c: CloudLink, method: str, m: Any) -> None:
-    """Côté compte (page https://app.nokker.ai/approve/<machine_id>/<approval_id>) : lire les cartes d'une de SES
-    machines, transmettre une décision signée par un appareil. nokker.ai garde la preuve, ne la croit pas (202
-    `forwarded`) : c'est la machine qui la vérifie et rend le statut final. Machine d'un autre compte : 404."""
+    """Côté compte (page https://app.nokker.ai/approve/<machine_id>/<approval_id>, ou Mini App Telegram) : lire les
+    cartes d'une de SES machines, transmettre une décision signée par un appareil. nokker.ai garde la preuve d'une
+    passkey sans la croire (202 `forwarded`) : c'est la machine qui la vérifie et rend le statut final. Une preuve
+    Telegram (Mini App) est différente : la machine n'a pas le jeton du bot, nokker.ai la vérifie lui-même et remet à la
+    machine une attestation signée, liée à la carte (`nokker/cloud/attest.py`). Identité : session du compte, ou
+    `initData` Telegram valide d'un Telegram appairé au compte (en-tête `X-Telegram-Init-Data` de la Mini App). Machine
+    d'un autre compte : 404."""
     from nokker.cloud.approvals import RelayError
 
+    machine_id, approval_id, decide = m.group(1), m.group(2), bool(m.group(3))
+    posting = method == "POST" and decide
+    if posting and _too_big(h):
+        return
+    body = h._read_json_body() if posting else {}
+    body = body if isinstance(body, dict) else {}
+    raw_proof = body.get("proof") if isinstance(body.get("proof"), dict) else {}
+    telegram = bool(raw_proof.get("telegram_init_data"))
     account = c.identity(h)
+    if not account and c.attestor is not None:  # la Mini App n'a pas de session : son initData fait foi
+        init = h.headers.get("X-Telegram-Init-Data") or raw_proof.get("telegram_init_data")
+        account = c.attestor.identify(init) if isinstance(init, str) and init else None
     tenant = c.tenant_of(account) if account else None
     if not account or not tenant:
         h._json(401, {"error": {"message": "session du compte requise"}})
         return
-    machine_id, approval_id, decide = m.group(1), m.group(2), bool(m.group(3))
-    if c.approvals_relay is None or c.links.machine_of(account, machine_id) is None:
+    machine = c.links.machine_of(account, machine_id)
+    if c.approvals_relay is None or machine is None:
         h._json(404, {"error": {"message": "not found"}})
         return
     try:
@@ -842,19 +866,44 @@ def _account_relay(h: Any, c: CloudLink, method: str, m: Any) -> None:
             found = c.approvals_relay.get(tenant, machine_id, approval_id)
             h._json(200, found) if found else h._json(404, {"error": {"message": "carte inconnue"}})
             return
-        if method == "POST" and decide:
-            if _too_big(h):
-                return
+        if posting:
             if not c.rate_ok(f"relay-decide:{account}"):
                 h._json(429, {"error": "rate", "retry_after_s": int(RATE_WINDOW_S)})
                 return
-            body = h._read_json_body()
-            c.approvals_relay.decide(tenant, machine_id, approval_id, body if isinstance(body, dict) else {})
+            if telegram:
+                _attested_decision(h, c, machine, tenant, account, approval_id, body)
+                return
+            c.approvals_relay.decide(tenant, machine_id, approval_id, body)
             h._json(202, {"status": "forwarded"})
             return
         h._json(404, {"error": {"message": "not found"}})
     except RelayError as e:
         h._json(e.status, {"error": {"message": str(e)}})
+
+
+def _attested_decision(h: Any, c: CloudLink, machine: Any, tenant: str, account: str, approval_id: str,
+                       body: dict[str, Any]) -> None:
+    """Preuve Telegram d'une carte machine : nokker.ai la vérifie, signe l'attestation, la met dans la décision que la
+    machine relève (`forwarded`). Rien n'est décidé ici : la machine accepte ou refuse l'attestation."""
+    from nokker.cloud.approvals import RelayError
+    from nokker.cloud.attest import AttestError
+
+    if c.attestor is None:
+        h._json(404, {"error": {"message": "décision par Telegram non configurée"}})
+        return
+    card = c.approvals_relay.card(tenant, machine.id, approval_id)
+    if card is None:
+        h._json(404, {"error": {"message": "carte inconnue"}})
+        return
+    decision = body.get("decision")
+    try:
+        proof = c.attestor.attest(machine_id=machine.id, account=account, card=card, decision=decision,
+                                  proof=body["proof"])
+        c.approvals_relay.decide_attested(tenant, machine.id, approval_id, decision, proof)
+    except (AttestError, RelayError) as e:
+        h._json(e.status, {"error": {"message": str(e)}})
+        return
+    h._json(202, {"status": "forwarded"})
 
 
 def _pages_link(h: Any, c: CloudLink, machine: Any, account: str, tenant: str, body: dict[str, Any]) -> None:

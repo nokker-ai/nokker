@@ -118,3 +118,40 @@ def test_moderation_never_rewrites_a_removed_identity_pg(pg):  # noqa: F811
     assert s.view("mc_c", A, sha2, other, 10, now=230.0) is True
     assert s.moderated_of("mc_c") == {"page_ids": sorted([pid, other]), "public_sha256": sorted([sha, sha2])}
     assert not [r for r in s.listing() if r["machine_id"] == "mc_c"]
+
+
+@requires_pg
+def test_moderation_notices_carry_the_reason_to_the_author_pg(pg):  # noqa: F811
+    """Exposé des motifs (migration 041, DSA art. 17) : le registre garde le motif du retrait en cours, propagé à une
+    identité retirée par contagion, effacé par `restore` ; l'audit reste en ajout seul ; ligne retirée avant 041 :
+    le motif est repris de l'audit au démarrage (migration rejouée)."""
+    import psycopg
+
+    from nokker.cloud.moderation import APPEAL, PgPublicPages
+    from nokker.store.pg import apply_migrations
+
+    s = PgPublicPages(pg["app"])
+    pid, other = "pg_eeeeeeeeeeeeeeee", "pg_ffffffffffffffff"
+    sha = hashlib.sha256(b"EeEeEeEeEeEeEeEeEeEeEe_-").hexdigest()
+    assert s.view("mc_e", A, sha, pid, 10, now=100.0) is False
+    assert s.notices_of("mc_e") == []
+    s.set_moderation("mc_e", A, None, sha, "unpublish", "contenu trompeur", now=200.0)
+    assert s.notices_of("mc_e") == [{"page_id": pid, "public_sha256": sha, "at": 200.0, "reason": "contenu trompeur",
+                                     "appeal": APPEAL}]
+    assert s.view("mc_e", A, sha, other, 10, now=210.0) is True        # page_id mensonger : retiré, même motif
+    assert {(n["page_id"], n["reason"]) for n in s.notices_of("mc_e")} == {(pid, "contenu trompeur"),
+                                                                            (other, "contenu trompeur")}
+    s.set_moderation("mc_e", A, pid, None, "restore", "infondé", now=300.0)
+    assert [n["page_id"] for n in s.notices_of("mc_e")] == [other]
+    with psycopg.connect(pg["app"], autocommit=True) as conn:
+        assert conn.execute("SELECT moderation_reason FROM lokkal_public_pages WHERE page_id = %s",
+                            (pid,)).fetchone()[0] is None
+        with pytest.raises(psycopg.errors.RaiseException):           # l'audit ne bouge pas
+            conn.execute("UPDATE lokkal_page_moderation SET reason = 'autre'")
+    # une ligne retirée « d'avant 041 » (motif absent) : la migration rejouée reprend le dernier retrait de l'audit
+    s.set_moderation("mc_e", A, pid, None, "unpublish", "récidive", now=400.0)
+    with psycopg.connect(pg["app"], autocommit=True) as conn:
+        conn.execute("UPDATE lokkal_public_pages SET moderation_reason = NULL WHERE page_id = %s", (pid,))
+    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e")}[pid] is None
+    assert apply_migrations(pg["owner"], strict=True)
+    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e")} == {pid: "récidive", other: "contenu trompeur"}

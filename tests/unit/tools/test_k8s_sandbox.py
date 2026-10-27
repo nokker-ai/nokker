@@ -134,6 +134,13 @@ def test_labels_fixes_non_ecrasables():
     assert labels["nokker.network"] == "egress" and labels["nokker.instance"] == "c-0" and labels["nokker.tenant"] == "t"
 
 
+def test_git_fait_confiance_au_montage():
+    """Le dépôt est cloné par le noyau (autre uid) : safe.directory sur le montage, sinon git refuse tout."""
+    env = {e["name"]: e["value"] for e in manifest()["spec"]["containers"][0]["env"]}
+    assert (env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]) == ("1", "safe.directory",
+                                                                                         "/workspace")
+
+
 def test_colocation_rwo():
     m = manifest(colocate_with_core=True, core_pod_labels={"app.kubernetes.io/component": "core"})
     term = m["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
@@ -145,7 +152,9 @@ def test_aucun_secret_dans_le_manifeste():
     cfg = ks.K8sSandboxConfig.from_dict(CFG)
     m = ks.pod_manifest(cfg, "p", "a/b", LABELS, "core-0", env={"GIT_AUTHOR_NAME": "x"})
     env = m["spec"]["containers"][0]["env"]
-    assert {e["name"] for e in env} == {"HOME", "GIT_AUTHOR_NAME"}  # seulement ce que l'appelant donne, plus HOME
+    # seulement ce que l'appelant donne, plus HOME et le safe.directory de git
+    assert {e["name"] for e in env} == {"HOME", "GIT_AUTHOR_NAME", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
+                                        "GIT_CONFIG_VALUE_0"}
     assert all(set(e) == {"name", "value"} for e in env)  # aucune référence à un Secret (valueFrom, secretKeyRef)
     assert not any(v.get("secret") for v in m["spec"]["volumes"])
 

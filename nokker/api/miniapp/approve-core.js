@@ -167,3 +167,114 @@ function assertDecision(decision) {
     throw new Error(`decision invalide: ${JSON.stringify(decision)} (attendu "approve" ou "reject")`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Carte d'une MACHINE Lokkal liée (lot X10, docs/LOKKAL.md §7.3) — partie pure.
+//
+// La machine dépose sa carte forte chez nokker.ai ; la Mini App la lit et la signe ici comme une carte du compte, mais
+// la preuve part vers nokker.ai (`POST /v1/link/machines/{m}/approvals/{id}/decision`) qui la vérifie et remet à la
+// machine une attestation signée. Le défi à signer est celui que la machine a déposé : il vient de la carte lue, jamais
+// reconstruit ici.
+// ---------------------------------------------------------------------------
+
+const RE_MACHINE_ID = /^mc_[0-9a-f]{16}$/;
+const RE_APPROVAL_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Cible de la Mini App : `{kind: "machine", machine, approval}`, `{kind: "cloud", approval}` ou `null`.
+ * Sources, par ordre : `start_param` Telegram (`mc_<16 hex>-<approval_id>` pour une carte machine, sinon l'id d'une carte
+ * du compte), puis l'URL (`?machine=…&approval=…`, ou `?startapp=…` comme `start_param`). Un identifiant qui ne colle pas
+ * au format est ignoré : la page ne construit jamais une route avec un texte libre.
+ */
+export function parseTarget({ startParam, search } = {}) {
+  const params = new URLSearchParams(search || "");
+  const fromParam = (value) => {
+    if (!value) return null;
+    const m = /^(mc_[0-9a-f]{16})-([A-Za-z0-9_-]{1,64})$/.exec(value);
+    if (m) return { kind: "machine", machine: m[1], approval: m[2] };
+    return RE_APPROVAL_ID.test(value) ? { kind: "cloud", approval: value } : null;
+  };
+  const viaStart = fromParam(startParam);
+  if (viaStart) return viaStart;
+  const machine = params.get("machine");
+  const approval = params.get("approval");
+  if (machine && approval && RE_MACHINE_ID.test(machine) && RE_APPROVAL_ID.test(approval)) {
+    return { kind: "machine", machine, approval };
+  }
+  return fromParam(params.get("startapp"));
+}
+
+/** `start_param` d'une carte machine (le bouton de la notification et les tests croisés s'appuient sur la même forme). */
+export function machineStartParam(machine, approval) {
+  if (!RE_MACHINE_ID.test(machine || "") || !RE_APPROVAL_ID.test(approval || "")) {
+    throw new Error("identifiant de machine ou de carte invalide");
+  }
+  return `${machine}-${approval}`;
+}
+
+export function machineCardPath(machine, approval) {
+  return `/v1/link/machines/${machine}/approvals/${approval}`;
+}
+
+export function machineDecisionPath(machine, approval) {
+  return `${machineCardPath(machine, approval)}/decision`;
+}
+
+/**
+ * Preuve Telegram d'une carte machine : l'appareil (clé libérée par BiometricManager) a signé `<défi>.<décision>`,
+ * `initData` prouve que c'est bien ce Telegram. nokker.ai refuse tout autre champ.
+ */
+export function buildTelegramProof({ deviceId, signature, initData }) {
+  if (!deviceId || !signature || !initData) throw new Error("preuve incomplète (appareil, signature, initData)");
+  return { device_id: deviceId, signature, telegram_init_data: initData };
+}
+
+/** Corps de `POST …/decision` d'une carte machine. */
+export function machineDecisionBody(decision, proof) {
+  assertDecision(decision);
+  return { decision, proof };
+}
+
+/**
+ * Lecture de la carte rendue par `GET /v1/link/machines/{m}/approvals/{id}` (`nokker/cloud/approvals.py::view`).
+ * `headline` et `lines` : ce que nokker.ai décrit lui-même (cartes de connecteurs relayés) ; sans cela (carte locale), la
+ * carte est « décrite par ta machine » : titre et motif de la machine, avec l'empreinte des arguments.
+ */
+export function readMachineCard(view) {
+  const summary = view && typeof view.summary === "object" && view.summary ? view.summary : {};
+  const lines = Array.isArray(summary.lines) ? summary.lines : [];
+  const described = view?.summary_source === "nokker.ai" && !!summary.headline;
+  return {
+    approvalId: view?.approval_id ?? null,
+    title: String(view?.title ?? ""),
+    reason: String(view?.reason ?? ""),
+    advice: view?.advice ?? null,
+    strength: view?.strength ?? "standard",
+    expiresAt: view?.expires_at ?? null,
+    challenge: view?.challenge ?? null,
+    status: view?.status ?? null,
+    error: view?.error ?? null,
+    argsSha256: view?.args_sha256 ?? null,
+    describedBy: described ? "nokker.ai" : "machine",
+    headline: described ? String(summary.headline) : "",
+    lines: described ? lines.map((l) => ({ label: String(l?.label ?? l?.key ?? ""), value: lineValue(l) })) : [],
+  };
+}
+
+function lineValue(line) {
+  if (Array.isArray(line?.items) && line.items.length) return line.items.join(", ");
+  return String(line?.value ?? "");
+}
+
+/**
+ * Où en est une carte machine après l'envoi de la décision :
+ *  - `waiting`  : transmise (`forwarded`) ou en attente, la machine n'a pas encore répondu ;
+ *  - `approved` / `rejected` / `expired` : dit par la machine ;
+ *  - `refused`  : la machine a refusé la preuve (la carte est revenue en attente avec `error`) : on peut signer à nouveau.
+ */
+export function classifyMachineStatus(view) {
+  const status = view?.status ?? null;
+  if (status === "approved" || status === "rejected" || status === "expired") return status;
+  if (status === "pending" && view?.error) return "refused";
+  return "waiting";
+}

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ import httpx
 
 from nokker.secrets.base import SecretsError, SecretsProvider
 from nokker.secrets.file import FileSecrets
+
+logger = logging.getLogger("nokker.local.setup")
 
 SECRET_KEY_ENV = "NOKKER_LOCAL_SECRET_KEY"
 ROUTER_URL = "https://router.sokkan.ch/v1"
@@ -191,6 +194,24 @@ class LocalSetup:
 
 
 
+
+def _notice(raw: Any) -> dict[str, Any] | None:
+    """Une note de `moderation_notices` (nokker.ai, §7.26 point 6), réduite à ce que la page garde : `page_id`,
+    `public_sha256`, `at`, `reason`, `appeal` {fr, en}. Tout autre champ est jeté ; une note illisible aussi."""
+    if not isinstance(raw, dict):
+        return None
+    page_id, sha = raw.get("page_id"), raw.get("public_sha256")
+    if not (isinstance(page_id, str) or isinstance(sha, str)) or not all(v is None or isinstance(v, str)
+                                                                         for v in (page_id, sha)):
+        return None
+    at = raw.get("at")
+    reason = raw.get("reason")
+    appeal = raw.get("appeal") if isinstance(raw.get("appeal"), dict) else {}
+    return {"page_id": page_id, "public_sha256": sha,
+            "at": float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
+            "reason": reason[:500] if isinstance(reason, str) and reason else None,
+            "appeal": {k: str(appeal[k])[:300] for k in ("fr", "en") if isinstance(appeal.get(k), str)} or None}
+
 @dataclass
 class LocalLink:
     """Lien de Lokkal avec un compte nokker.ai, par flux d'appareil (docs/LOKKAL.md §7.2), côté machine.
@@ -208,6 +229,9 @@ class LocalLink:
     # Pages de cette machine retirées par la modération de nokker.ai (§7.26 point 6), lues dans la même réponse :
     # `{page_ids, public_sha256}` ; None = jamais su (nokker.ai sans registre ou injoignable : on ne touche à rien).
     moderation: dict[str, list[str]] | None = None
+    # Appelé (sans argument) une fois que la clé et le jeton de machine sont au coffre : la clé du lien et le tunnel
+    # sont pris en compte sans redémarrage (LocalApi.link_approved). Une panne ici ne casse pas la réponse du lien.
+    on_approved: Any = None
 
     def _http(self) -> Any:
         return self.client or httpx.Client(timeout=10.0)
@@ -253,6 +277,8 @@ class LocalLink:
         if isinstance(body.get("moderated_pages"), list) and isinstance(body.get("moderated_public"), list):
             self.moderation = {"page_ids": [str(x) for x in body["moderated_pages"]],
                                "public_sha256": [str(x) for x in body["moderated_public"]]}
+            if isinstance(body.get("moderation_notices"), list):  # exposé des motifs (§7.26 point 6)
+                self.moderation["notices"] = [n for n in map(_notice, body["moderation_notices"]) if n is not None]
         self._pages_public = (ok, now)
         return ok
 
@@ -307,6 +333,12 @@ class LocalLink:
                 self.setup.state["default"] = "router"
             self.setup._save()
             self._pending = {}
+            if self.on_approved is not None:
+                try:
+                    self.on_approved()
+                except Exception as e:  # noqa: BLE001 — le lien est fait ; seul le type est journalisé (jamais la clé)
+                    logger.warning("lien approuvé mais effets non appliqués (%s) : redémarrage nécessaire",
+                                   type(e).__name__)
             return {"state": "approved", "account": d.get("account")}
         if state in ("expired", "denied"):
             self._pending = {}

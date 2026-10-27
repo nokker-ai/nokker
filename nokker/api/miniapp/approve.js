@@ -21,6 +21,10 @@
  *      POST) et NE fait PAS la danse `POST /v1/sessions` — en supposant que `initData` suffit comme
  *      preuve d'identité pour un client Mini App. Si le serveur exige quand même un Bearer de
  *      session, tout passe par `apiFetch()` ci-dessous : un seul endroit à modifier.
+ *   Carte d'une MACHINE Lokkal liée (lot X10) : `machine` + `approval` (start_param `mc_<hex>-<id>` ou URL). Même
+ *      signature qu'une carte du compte, mais la carte se lit et la preuve Telegram `{device_id, signature,
+ *      telegram_init_data}` part vers `/v1/link/machines/{m}/approvals/{id}[/decision]` : nokker.ai la vérifie et remet à la
+ *      machine une attestation signée (voir `runMachineApproval`).
  *   3. Forme de la réponse de `POST /v1/devices` (code d'appairage) et de `GET /v1/devices`
  *      (statut par appareil) : non spécifiée. Lus défensivement (`id`/`device_id`,
  *      `pairing_code`/`code`, `status`/`state`).
@@ -151,9 +155,16 @@ function applyTheme() {
   }
 }
 
+// Clé de stockage PAR origine d'API et PAR utilisateur Telegram : la WebView de Telegram garde son stockage d'un
+// lancement à l'autre ; sans ce cloisonnement, l'appareil d'un autre compte (ou d'un autre noyau) était repris.
+function deviceStorageKey() {
+  const uid = tg?.initDataUnsafe?.user?.id ?? "anon";
+  return `${LS_DEVICE_ID}:${window.location.origin}:${uid}`;
+}
+
 function getStoredDeviceId() {
   try {
-    return localStorage.getItem(LS_DEVICE_ID);
+    return localStorage.getItem(deviceStorageKey());
   } catch {
     return null;
   }
@@ -161,7 +172,7 @@ function getStoredDeviceId() {
 
 function setStoredDeviceId(id) {
   try {
-    if (id) localStorage.setItem(LS_DEVICE_ID, id);
+    if (id) localStorage.setItem(deviceStorageKey(), id);
   } catch {
     /* stockage indisponible (navigation privée, quota) — pas bloquant, on retentera plus tard */
   }
@@ -175,14 +186,34 @@ function setStoredDeviceId(id) {
  * En tout dernier recours, `BiometricManager.deviceId` (identifiant Telegram, pas forcément celui du
  * serveur) : mieux qu'un échec silencieux, et un mauvais id sera rejeté proprement par le serveur.
  */
+/**
+ * L'appareil rangé appartient-il bien à l'identité de CET initData, et est-il approuvé ? `GET /v1/devices` ne liste
+ * que les appareils de l'utilisateur relié à ce compte Telegram. Faux (ou erreur) : il faut ré-enrôler ici.
+ */
+async function storedDeviceIsMine(initData) {
+  try {
+    const resp = await apiFetch("/v1/devices", { initData });
+    const list = Array.isArray(resp) ? resp : resp?.devices ?? [];
+    const stored = getStoredDeviceId();
+    // Seulement SON appareil : approuvé ET enrôlé par une Mini App (`telegram`). Jamais l'appareil web du compte, dont
+    // elle n'a pas la clé (vu le 26.10 : appareil d'invitation repris, attestation refusée).
+    const ok = (d) => (d?.status ?? "approved") === "approved" && d?.telegram === true;
+    if (!stored) return false;
+    return list.some((d) => (d?.id ?? d?.device_id) === stored && ok(d));
+  } catch {
+    return false;
+  }
+}
+
 async function resolveDeviceId(initData) {
   const stored = getStoredDeviceId();
   if (stored) return stored;
   try {
     const resp = await apiFetch("/v1/devices", { initData });
     const list = Array.isArray(resp) ? resp : resp?.devices ?? [];
-    if (list.length === 1) {
-      const onlyId = list[0]?.id ?? list[0]?.device_id ?? null;
+    const mine = list.filter((d) => d?.telegram === true && (d?.status ?? "approved") === "approved");
+    if (mine.length === 1) {
+      const onlyId = mine[0]?.id ?? mine[0]?.device_id ?? null;
       if (onlyId) {
         setStoredDeviceId(onlyId);
         return onlyId;
@@ -460,6 +491,11 @@ function showTerminalStatus(approval, status) {
       title: "Demande expirée",
       detail: "Cette carte a expiré avant toute décision. Si c'est toujours nécessaire, l'action devra être redemandée.",
     },
+    forwarded: {
+      icon: "…",
+      title: "Décision déjà transmise",
+      detail: "Une décision est déjà partie vers ta machine ; elle la vérifie et l'applique.",
+    },
     failed: {
       icon: "⚠",
       title: "Exécution en échec",
@@ -576,7 +612,7 @@ function onCardExpired() {
   }
 }
 
-function wireCardActions(approval, initData) {
+function wireCardActions(approval, initData, onDecide = handleDecision) {
   const hasSecondary = !!tg?.SecondaryButton;
 
   if (tg?.MainButton) {
@@ -585,7 +621,7 @@ function wireCardActions(approval, initData) {
     } catch {
       /* ignore */
     }
-    mainButtonHandler = () => handleDecision("approve", approval, initData);
+    mainButtonHandler = () => onDecide("approve", approval, initData);
     tg.MainButton.setParams({ text: "Approuver", is_visible: true, is_active: true });
     tg.MainButton.onClick(mainButtonHandler);
   }
@@ -597,7 +633,7 @@ function wireCardActions(approval, initData) {
     } catch {
       /* ignore */
     }
-    secondaryButtonHandler = () => handleDecision("reject", approval, initData);
+    secondaryButtonHandler = () => onDecide("reject", approval, initData);
     tg.SecondaryButton.setParams({ text: "Refuser", is_visible: true, is_active: true, position: "bottom" });
     tg.SecondaryButton.onClick(secondaryButtonHandler);
   } else {
@@ -606,7 +642,7 @@ function wireCardActions(approval, initData) {
     $("#fallback-actions").hidden = false;
     $("#btn-approve-fallback").hidden = true;
     $("#btn-reject-fallback").hidden = false;
-    $("#btn-reject-fallback").onclick = () => handleDecision("reject", approval, initData);
+    $("#btn-reject-fallback").onclick = () => onDecide("reject", approval, initData);
   }
 }
 
@@ -721,6 +757,157 @@ function showDecisionResult(decision, decisionResp) {
 }
 
 // ---------------------------------------------------------------------------
+// Écran : carte d'une machine Lokkal liée (lot X10)
+// ---------------------------------------------------------------------------
+
+const MACHINE_POLL_MS = 2000;
+const MACHINE_POLL_MAX = 15; // ~30 s : la machine relève en continu quand une carte attend
+
+async function runMachineApproval(target, initData) {
+  showScreen("screen-loading", "Chargement de la carte de ta machine…");
+  let view;
+  try {
+    view = await apiFetch(core.machineCardPath(target.machine, target.approval), { initData });
+  } catch (e) {
+    showError("Impossible de charger la carte", describeApiError(e), {
+      onRetry: () => runMachineApproval(target, initData),
+    });
+    return;
+  }
+  const card = core.readMachineCard(view);
+  if (card.status && card.status !== "pending") {
+    // `forwarded` : une décision attend déjà la machine ; les autres statuts sont dits par la machine.
+    showTerminalStatus(view, card.status);
+    return;
+  }
+  if (card.strength !== "strong" || !card.challenge) {
+    showError("Carte non signable ici", "Cette carte n'est pas une carte forte avec un défi : ouvre-la depuis la page web.");
+    return;
+  }
+  renderMachineCard(card);
+  wireCardActions({ ...card, _target: target }, initData, handleMachineDecision);
+}
+
+function renderMachineCard(card) {
+  knockHaptic();
+  state.currentApproval = card;
+  $("#card-tool").textContent = card.headline || card.title || "Action sur ta machine";
+
+  let argsText;
+  if (card.describedBy === "nokker.ai") {
+    argsText = card.lines.map((l) => `${l.label} : ${l.value}`).join("\n");
+  } else {
+    // Carte locale : les arguments ne quittent pas la machine ; on montre ce qu'elle en dit et l'empreinte du défi.
+    argsText = `Décrit par ta machine : ${card.title}${card.argsSha256 ? `\nEmpreinte des arguments : ${card.argsSha256}` : ""}`;
+  }
+  $("#card-arguments").textContent = argsText;
+  $("#args-details").open = argsText.length <= 220;
+
+  $("#card-reason").textContent = card.reason || "—";
+  if (card.advice) {
+    $("#field-advice-wrap").hidden = false;
+    $("#card-advice").textContent = card.advice;
+  } else {
+    $("#field-advice-wrap").hidden = true;
+  }
+  $("#badge-level").textContent = "Niveau fort";
+  $("#badge-level").className = "badge badge-level-strong";
+  $("#badge-effect").textContent = "ta machine";
+  $("#card-error").hidden = !card.error;
+  if (card.error) $("#card-error").textContent = card.error;
+  $("#fallback-actions").hidden = false;
+
+  startCountdown(card.expiresAt);
+  showScreen("screen-card");
+}
+
+async function handleMachineDecision(decision, card, initData) {
+  if (decisionInFlight) return;
+  decisionInFlight = true;
+  setButtonsBusy(true);
+  const target = card._target;
+  const backToCard = () => {
+    renderMachineCard(card);
+    wireCardActions(card, initData, handleMachineDecision);
+  };
+  try {
+    safeHaptic("impact");
+    showScreen("screen-biometric-wait");
+    $("#biometric-wait-label").textContent =
+      decision === "approve"
+        ? "Confirme ton approbation avec Face ID / Touch ID / ton empreinte…"
+        : "Confirme ton refus avec Face ID / Touch ID / ton empreinte…";
+    const { ok, token } = await biometricAuthenticate(
+      `${decision === "approve" ? "Approuver" : "Refuser"} : ${(card.headline || card.title).slice(0, 80)}`,
+    );
+    if (!ok || !token) {
+      showError(
+        "Biométrie refusée ou indisponible",
+        "La décision n'a pas été signée : sans preuve biométrique valide, rien n'est exécuté sur ta machine. Aucun repli silencieux n'a été tenté.",
+        { onRetry: backToCard },
+      );
+      return;
+    }
+    // Le défi signé est celui que la machine a déposé, lu tel quel dans la carte (jamais reconstruit ici).
+    const privateKey = await core.importPrivateKeyForSigning(token);
+    const signature = await core.signChallengeDecision(privateKey, card.challenge, decision);
+    const deviceId = await resolveDeviceId(initData);
+    showScreen("screen-loading", "Envoi à nokker.ai…");
+    const proof = core.buildTelegramProof({ deviceId, signature, initData });
+    await apiFetch(core.machineDecisionPath(target.machine, target.approval), {
+      method: "POST",
+      initData,
+      body: core.machineDecisionBody(decision, proof),
+    });
+    await waitMachineOutcome(decision, card, initData, backToCard);
+  } catch (e) {
+    showError("La décision n'a pas pu être envoyée", describeApiError(e), { onRetry: backToCard });
+  } finally {
+    decisionInFlight = false;
+    setButtonsBusy(false);
+  }
+}
+
+// nokker.ai a vérifié la preuve Telegram et remis une attestation à la machine ; la machine la vérifie à son tour,
+// applique la carte puis rend le statut : on l'attend un moment avant de conclure.
+async function waitMachineOutcome(decision, card, initData, backToCard) {
+  const target = card._target;
+  showScreen("screen-loading", "Ta machine vérifie et applique la décision…");
+  for (let i = 0; i < MACHINE_POLL_MAX; i += 1) {
+    await new Promise((r) => setTimeout(r, MACHINE_POLL_MS));
+    let view;
+    try {
+      view = await apiFetch(core.machineCardPath(target.machine, target.approval), { initData });
+    } catch {
+      continue; // réseau instable : on réessaie, la décision est déjà partie
+    }
+    const outcome = core.classifyMachineStatus(view);
+    if (outcome === "waiting") continue;
+    if (outcome === "refused") {
+      showError("Ta machine a refusé la preuve", view.error || "La carte reste en attente : tu peux signer à nouveau.", {
+        onRetry: backToCard,
+      });
+      return;
+    }
+    if (outcome === "expired") showTerminalStatus(view, "expired");
+    else showDecisionResult(outcome === "rejected" ? "reject" : "approve", { status: outcome });
+    return;
+  }
+  showScreen("screen-result");
+  $("#result-icon").textContent = "…";
+  $("#result-title").textContent = "Décision transmise";
+  $("#result-detail").textContent =
+    "nokker.ai a transmis ta décision ; ta machine ne l'a pas encore appliquée (éteinte ou hors ligne ?). Elle le fera à son retour si la carte n'a pas expiré.";
+  $("#btn-close").onclick = () => {
+    try {
+      tg.close();
+    } catch {
+      /* hors Telegram : rien à fermer */
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Point d'entrée
 // ---------------------------------------------------------------------------
 
@@ -774,20 +961,25 @@ async function main() {
 
   // start_param n'existe que pour un lien t.me (Mini App déclarée chez BotFather) ; un bouton `web_app` inline
   // (TelegramNotifier) ouvre l'URL telle quelle : l'id arrive alors dans `?startapp=` de l'URL.
-  const approvalId = tg.initDataUnsafe?.start_param
-    || new URLSearchParams(window.location.search).get("startapp") || null;
+  const target = core.parseTarget({ startParam: tg.initDataUnsafe?.start_param, search: window.location.search });
 
-  if (!tg.BiometricManager.isBiometricTokenSaved) {
+  // Un jeton biométrique déjà rangé ne suffit pas : il peut venir d'un autre compte ou d'un autre noyau (vu le
+  // 26.10 : clé d'un autre compte reprise). On vérifie que l'appareil est à CET utilisateur.
+  if (!tg.BiometricManager.isBiometricTokenSaved || !(await storedDeviceIsMine(initData))) {
     const enrolled = await runEnrollment(initData);
     if (!enrolled) return; // un écran d'erreur a déjà été affiché par runEnrollment
   }
 
-  if (!approvalId) {
+  if (!target) {
     showScreen("screen-no-target");
     return;
   }
 
-  await runApproval(approvalId, initData);
+  if (target.kind === "machine") {
+    await runMachineApproval(target, initData);
+    return;
+  }
+  await runApproval(target.approval, initData);
 }
 
 main().catch((e) => showError("Erreur inattendue", describeApiError(e)));

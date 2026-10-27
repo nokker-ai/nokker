@@ -99,14 +99,29 @@ class Tunnel:
     _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _tasks: dict[int, asyncio.Task] = field(default_factory=dict, init=False, repr=False)
+    _loop: Any = field(default=None, init=False, repr=False)
+    _ws: Any = field(default=None, init=False, repr=False)
 
     # ── cycle de vie ──
     def start(self) -> None:
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="nokker-tunnel", daemon=True)
         self._thread.start()
 
+    @property
+    def running(self) -> bool:
+        """Lancé et pas arrêté : sert à ne jamais ouvrir un second tunnel pendant que le premier tourne."""
+        return self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
+
     def stop(self) -> None:
+        """Arrête le tunnel : la connexion ouverte est fermée tout de suite, l'état passe à `down`."""
         self._stop.set()
+        loop, ws = self._loop, self._ws
+        if loop is not None and ws is not None:
+            try:
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(ws.close()))
+            except RuntimeError:  # boucle déjà terminée
+                pass
+        self._set("down")
 
     def _set(self, state: str) -> None:
         if state == self.state:
@@ -123,15 +138,21 @@ class Tunnel:
         import websockets
 
         delay = 1.0
+        self._loop = asyncio.get_running_loop()
         while not self._stop.is_set():
             try:
                 async with websockets.connect(
                         self.url, subprotocols=[SUBPROTOCOL], max_size=MAX_FRAME,
                         additional_headers={"Authorization": f"Bearer {self.machine_token}"},
                         ping_interval=None, proxy=True) as ws:
+                    self._ws = ws
+                    if self._stop.is_set():  # arrêté pendant la connexion
+                        return
                     self._set("up")
                     delay = 1.0
                     await self._serve(ws)
+                    if self._stop.is_set():
+                        return
             except Exception as e:  # noqa: BLE001 — réseau, relais redémarré : on retente
                 code = getattr(getattr(e, "rcvd", None), "code", None)
                 if code == 4001:
@@ -140,6 +161,8 @@ class Tunnel:
                     return
                 logger.info("tunnel coupé (%s) : nouvel essai dans %.0f s", type(e).__name__, delay)
             self._set("down")
+            if self._stop.is_set():
+                return
             await asyncio.sleep(delay + random.uniform(0, delay / 2))
             delay = min(delay * 2, 60.0)
 

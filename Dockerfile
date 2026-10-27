@@ -10,7 +10,7 @@
 # écrit (squelette vide posé par F0, cf. docs/PLAN-P1.md) — les chantiers F2+ brancheront
 # la vraie CMD de ce Dockerfile sur `nokker/api/server.py` au lieu de la passerelle amont brute.
 #
-# hermes-nokker (public : https://github.com/nokker-ai/hermes-nokker, tag nokker-hermes-v0.22.2-n1) est cloné
+# hermes-nokker (public : https://github.com/nokker-ai/hermes-nokker, tag nokker-hermes-v0.22.2-n1, épinglé dans HERMES.lock) est cloné
 # EN AMONT du build, comme étape du workflow (.github/workflows/lokkal-images.yml), dans `hermes-src/`, pas dans
 # une RUN de ce Dockerfile.
 # Essayé d'abord en RUN BuildKit (secret mount + `--network=host` + `--allow network.host`) :
@@ -136,5 +136,8 @@ RUN set -eu; \
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* && git --version
 
-# --- Stage par défaut (dernier du fichier) = l'image de la BÊTA, identique à `runtime` : rien de docker en prod ---
+# --- Stage par défaut (dernier du fichier) = l'image de la BÊTA : `runtime` + kubectl, rien de docker en prod ---
+# kubectl (même binaire épinglé que le stage lokkal) : les sessions de code de la bêta (bloc `code`, backend kubernetes)
+# pilotent leurs pods par `kubectl` (nokker/tools/k8s_sandbox.py) ; sans lui, toute création de session échoue.
 FROM runtime AS beta
+COPY --from=lokkal /usr/local/bin/kubectl /usr/local/bin/kubectl

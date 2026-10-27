@@ -41,7 +41,9 @@ class DeviceNotFound(DeviceError):
 
 
 class DeviceNotApproved(DeviceError):
-    pass
+    def __init__(self, message: str, status: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # pending (enrôlé, à confirmer), revoked… : le client dit quoi faire
 
 
 class SessionError(Exception):

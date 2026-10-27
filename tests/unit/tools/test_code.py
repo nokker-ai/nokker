@@ -45,6 +45,12 @@ def test_bad_root_or_backend_is_refused(tmp_path):
     ("find . -name '*.py'", True), ("find . -name '*.pyc' -delete", False), ("cat a > b", False),
     ("echo $(rm -rf x)", False), ("python3 -m pytest", False), ("git branch -D main", False),
     ("git push origin main", False), ("npm install", False), ("ls; rm x", False),
+    # une commande composée de lectures reste une lecture (vu en bêta le 25.10 : une carte pour un `ls`)
+    ("id -u; pwd; ls -la; git log --oneline -1", True), ("whoami && uname -a", True),
+    # `env CMD` lance CMD ; des options font écrire une commande de lecture
+    ("env", True), ("env python3 x.py", False), ("sort a", True), ("sort -o out a", False), ("sort -uo out a", False),
+    ("sort --output=out a", False), ("tree -L 2", True), ("tree -o f", False), ("uniq -c a", True), ("uniq a b", False),
+    ("file -C -m x", False),
 ])
 def test_read_only_detection(command, read_only):
     assert code._read_only(command) is read_only

@@ -23,6 +23,14 @@ Une carte décidée sur la machine (CLI) pendant qu'elle attend chez nokker.ai :
 machine ne décide jamais rien : sans clé privée d'appareil, ni nokker.ai, ni un compte volé, ni le relais ne produisent
 de preuve valable.
 
+Décision par la Mini App Telegram (attestation) : la machine n'a pas le jeton du bot, elle ne peut pas vérifier l'`initData`.
+nokker.ai le vérifie (appareil du compte, signature, `initData`) et remet une ATTESTATION signée par sa clé de passerelle
+(`nokker/cloud/attest.py`) dans la décision relevée : `proof = {attestation, device_id, via: "telegram"}`. La machine la
+vérifie ICI (signature par le JWKS épinglé au lien, `typ`, `aud` = cette machine, `sub` = le compte lié, la carte, le défi
+qu'elle a déposé, 120 s, `jti` jamais vu — mémoire persistante dans l'état local) puis décide par `decide_attested`
+(`decided_via` = `telegram-attested`). Ici la machine fait confiance à nokker.ai pour cette carte, courte et à usage unique ;
+`local.remote_approvals_attested: false` le lui interdit (la passkey, vérifiée par la machine, ne dépend pas de nokker.ai).
+
 Connecteurs relayés (X20b) : le défi déposé lie aussi l'outil ; la signature d'une carte approuvée au téléphone, une fois
 vérifiée ici, reste en mémoire (`signed_proof`) le temps que l'exécuteur la joigne à l'appel relayé : nokker.ai la
 vérifie à son tour avant tout envoi externe ou destructif.
@@ -47,6 +55,7 @@ import httpx
 from nokker.approvals.errors import ApprovalExpired, ApprovalNotFound, ApprovalNotPending, ProofInvalid, \
     StrongDeviceRequired
 from nokker.approvals.types import Device
+from nokker.cloud.link import TokenError, verify_attestation
 from nokker.core.ports import Approval, Proof
 from nokker.qa.permissions import RELAY_CARD_RULE
 from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
@@ -60,6 +69,7 @@ POLL_WAIT_S = 25.0
 SCAN_S = 15.0
 MAX_TITLE, MAX_REASON = 200, 600
 MAX_SIGNED = 256  # signatures vérifiées gardées pour les appels relayés (les plus récentes)
+MAX_JTI = 2048  # attestations vues (jusqu'à leur expiration) ; au-delà, les plus anciennes sortent de la mémoire
 _FINAL = {"approved": "approved", "executed": "approved", "failed": "approved", "rejected": "rejected",
           "expired": "expired"}
 
@@ -87,6 +97,9 @@ class RemoteApprovals:
     devices_ttl_s: float = DEVICES_TTL_S
     poll_wait_s: float = POLL_WAIT_S
     scan_s: float = SCAN_S
+    # `local.remote_approvals_attested` (décision produit, défaut vrai) : accepter l'attestation de nokker.ai pour une carte
+    # approuvée dans la Mini App Telegram. Faux : seule une preuve d'appareil vérifiée ICI (passkey) décide.
+    attested: bool = True
     client: Any = None  # httpx.Client injectable (tests)
     clock: Callable[[], float] = time.time
     last_status: int | None = None  # statut HTTP de la dernière relève (None : aucune)
@@ -95,6 +108,7 @@ class RemoteApprovals:
     _skip: set[str] = field(default_factory=set, init=False, repr=False)  # refusées au dépôt (déjà décidées là-bas)
     # approval_id → signature vérifiée d'une carte approuvée ici (X20b) : jointe à l'appel relayé par l'exécuteur
     _signed: dict[str, dict[str, str]] = field(default_factory=dict, init=False, repr=False)
+    _jti_mem: dict[str, float] = field(default_factory=dict, init=False, repr=False)  # sans état local (tests)
     _devices: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _devices_at: float = field(default=0.0, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -297,10 +311,14 @@ class RemoteApprovals:
                       webauthn_authenticator_data=raw.get("webauthn_authenticator_data"),
                       webauthn_signature=raw.get("webauthn_signature"))
         origin = (self.origin or self.base_url).rstrip("/")
+        attestation = raw.get("attestation")
         try:
-            device = self._device(token, str(raw.get("device_id") or ""))
-            decided = self.approvals.decide_remote(aid, str(d.get("decision") or ""), proof, device, origin=origin,
-                                                   rp_id=urlsplit(origin).hostname, decided_by=self.decided_by)
+            if attestation:  # Mini App Telegram : nokker.ai a vérifié, la machine vérifie son attestation
+                decided = self._decide_attested(aid, d, str(attestation), proof.challenge or "")
+            else:
+                device = self._device(token, str(raw.get("device_id") or ""))
+                decided = self.approvals.decide_remote(aid, str(d.get("decision") or ""), proof, device, origin=origin,
+                                                       rp_id=urlsplit(origin).hostname, decided_by=self.decided_by)
         except ProofInvalid as e:
             logger.warning("approbation relayée %s : preuve refusée (%s)", aid, e)
             self._result(token, aid, "pending", error=f"preuve refusée par la machine : {e}")
@@ -316,7 +334,7 @@ class RemoteApprovals:
             self._result(token, aid, status)  # déjà décidée (ici ou par une relève précédente) : jamais deux fois
             self._forget(aid)
             return status
-        if decided.status == "approved":  # avant l'exécution : l'exécuteur la joint à l'appel relayé
+        if decided.status == "approved" and not attestation:  # avant l'exécution : jointe à l'appel relayé
             self._keep_signed(aid, proof)
         self._result(token, aid, decided.status)
         self._forget(aid)
@@ -325,6 +343,44 @@ class RemoteApprovals:
         else:
             self._run(token, decided)
         return decided.status
+
+    def _decide_attested(self, aid: str, d: dict[str, Any], attestation: str, challenge: str) -> Approval:
+        """Décide la carte `aid` sur la foi d'une attestation de nokker.ai (voir l'en-tête du module). Lève `ProofInvalid`
+        (attestation refusée : la carte reste en attente, l'appareil peut signer à nouveau)."""
+        if not self.attested:
+            raise ProofInvalid("décision par Telegram désactivée sur cette machine (local.remote_approvals_attested)")
+        state = self.state if self.state is not None else {}
+        issuer = (self.origin or self.base_url).rstrip("/")
+        try:
+            claims = verify_attestation(attestation, state.get("jwks") or {}, machine=str(state.get("machine_id") or ""),
+                                        account=str(self.account() or ""), approval_id=aid, challenge=challenge,
+                                        issuer=issuer, now=self.clock())
+        except TokenError as e:
+            raise ProofInvalid(f"attestation refusée : {e}") from e
+        if claims["decision"] != str(d.get("decision") or ""):
+            raise ProofInvalid("attestation refusée : décision différente de celle relevée")
+        self._burn_jti(claims["jti"], float(claims["exp"]))
+        return self.approvals.decide_attested(aid, claims["decision"], challenge, decided_by=self.decided_by,
+                                              account=claims["sub"], device_id=claims["device_id"], jti=claims["jti"])
+
+    def _burn_jti(self, jti: str, exp: float) -> None:
+        """Une attestation ne sert qu'une fois : son `jti` est gardé dans l'état local jusqu'à son expiration (donc
+        après un redémarrage aussi) ; un `jti` déjà vu est refusé."""
+        now = self.clock()
+        with self._lock:
+            seen = self.state.setdefault("attest_jti", {}) if self.state is not None else self._jti_mem
+            for k in [k for k, e in seen.items() if not isinstance(e, (int, float)) or e <= now]:
+                del seen[k]  # purge : une attestation expirée est refusée de toute façon
+            if jti in seen:
+                raise ProofInvalid("attestation déjà utilisée (jti rejoué)")
+            seen[jti] = exp
+            while len(seen) > MAX_JTI:
+                seen.pop(next(iter(seen)))
+        if self.save is not None and self.state is not None:
+            try:
+                self.save()
+            except Exception:  # noqa: BLE001 — la mémoire du processus tient en attendant
+                logger.warning("mémoire des attestations non sauvée", exc_info=True)
 
     def _run(self, token: str, decided: Approval) -> None:
         """Le chemin de la décision locale (exécuteur), puis l'issue rendue à nokker.ai pour une carte approuvée."""

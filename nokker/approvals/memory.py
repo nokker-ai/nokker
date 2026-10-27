@@ -81,6 +81,8 @@ class InMemoryApprovals(BaseApprovals):
             d = self._devices.pop(device_id, None)
             if d is not None:
                 self._devices_by_code.pop(d.code, None)
+        with self._sign_lock:
+            self._sign_counts.pop(device_id, None)
 
     def _load_totp(self, user: str) -> tuple[str, int | None] | None:
         with self._lock:

@@ -154,7 +154,10 @@ def pod_manifest(cfg: K8sSandboxConfig, name: str, sub_path: str, labels: dict[s
         pod_sc["runAsGroup"] = cfg.run_as_user
     if cfg.fs_group is not None:
         pod_sc["fsGroup"] = cfg.fs_group
-    env_vars = {"HOME": "/tmp", **(env or {})}
+    # safe.directory : le dépôt est cloné par le noyau (autre uid que la session) ; sans lui git refuse tout
+    # (« dubious ownership ») et le modèle demande une carte de plus pour le poser. Tout le montage est à la session.
+    env_vars = {"HOME": "/tmp", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": cfg.workspace_mount, **(env or {})}
     if cfg.network == "egress":
         env_vars.update({"HTTP_PROXY": cfg.egress_proxy, "HTTPS_PROXY": cfg.egress_proxy,
                          "http_proxy": cfg.egress_proxy, "https_proxy": cfg.egress_proxy,

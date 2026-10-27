@@ -59,6 +59,10 @@ local:
   settings_path: /opt/data/settings.json
   allowed_hosts_env: NOKKER_ALLOWED_HOSTS      # « 127.0.0.1:7420,localhost:7420 », calculé par l'installeur
   allowed_hosts: ["127.0.0.1:8742", "localhost:8742"]   # repli si la variable est absente
+  relay_url: wss://relay.nokker.app/v1/tunnel   # passerelle <nom>.nokker.app (docs/en/gateway.md) : le tunnel s'ouvre
+                                               # dès que la machine est liée (au démarrage, ou à l'approbation du lien)
+  web_base: http://web:8080                    # interface web du compose (nginx, web/lokkal.conf) : les chemins hors
+                                               # /v1 et /healthz relayés par le tunnel y vont, pas au noyau (401)
   max_calls: 60
   pages: true                                  # pages de session + bulle artifact (docs/BUBBLES.md §10) : les clients de
                                                # nokker-apps ≥ 8e01708 (APPS_REF ef9440d) savent afficher un kind inconnu

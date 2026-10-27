@@ -73,6 +73,11 @@ class BotApi:
         self._call("sendMessage", {"chat_id": chat_id, "text": text[:MAX_LEN], "disable_web_page_preview": True,
                                    "reply_markup": {"inline_keyboard": [[{"text": label, "url": url}]]}})
 
+    def send_with_buttons(self, chat_id: int | str, text: str, buttons: list[dict[str, Any]]) -> None:
+        """Une rangée de boutons inline : `{"text", "url"}` ou `{"text", "web_app": {"url"}}` (Mini App). `sendMessage`."""
+        self._call("sendMessage", {"chat_id": chat_id, "text": text[:MAX_LEN], "disable_web_page_preview": True,
+                                   "reply_markup": {"inline_keyboard": [buttons]}})
+
     def typing(self, chat_id: int | str) -> None:
         try:
             self._call("sendChatAction", {"chat_id": chat_id, "action": "typing"})

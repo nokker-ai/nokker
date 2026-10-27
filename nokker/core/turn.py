@@ -178,11 +178,17 @@ class ImageRef:
                    name=str(d.get("name", "")))
 
 
+# Canal d'un tour arrivé par le relais `<nom>.nokker.app` (jeton de passerelle signé par nokker.ai, en-tête
+# `X-Nokker-Relay`). Même identité que le tour local (`local-owner`), mais les portes savent qu'il vient du WEB :
+# aucun GO textuel ne lève une carte forte (X10, docs/LOKKAL.md §7.3).
+RELAY_CHANNEL = "relay"
+
+
 @dataclass
 class TurnInput:
     thread_id: str
     user_text: str
-    channel: str = "api"  # telegram | slack | webchat | api
+    channel: str = "api"  # telegram | slack | webchat | api | relay
     sender: str | None = None
     attachments: list[dict[str, Any]] = field(default_factory=list)
     # Images déjà validées et rangées au magasin (X7) : le noyau ne reçoit jamais d'octets dans le tour.

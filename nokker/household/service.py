@@ -53,6 +53,13 @@ def payer_only() -> TeamError:
     return TeamError(403, "forbidden", "réservé au payeur du foyer")
 
 
+def minors_not_enabled() -> TeamError:
+    return TeamError(403, "minors_not_enabled",
+                     "Le mode parent/mineur n'est pas encore ouvert pour votre foyer (bêta : foyers autorisés un par "
+                     "un). / Parent/minor mode is not enabled for your household yet (beta: households are enabled "
+                     "one by one).")
+
+
 def suspended() -> TeamError:
     return TeamError(402, "household_suspended", "foyer suspendu : l'abonnement du payeur ne comprend plus de foyer "
                                                  "(Famille ou Large) ; aucune invitation tant qu'il n'est pas repris")
@@ -205,6 +212,23 @@ class Household:
                 "turns": {"today": used["today"], "week": used["week"]},
                 "cap": {"turns_per_day": cap, "source": source}}
 
+    def minors_open(self, payer_account: str | None) -> bool:
+        """Les profils mineurs sont-ils ouverts pour le foyer de ce payeur ? Drapeau `household_minors` ET, en mode
+        `allowlist`, une autorisation de l'opérateur non retirée. Liste illisible : fermé (jamais d'ouverture par
+        défaut)."""
+        if not self.settings.minors:
+            return False
+        if self.settings.minors_mode == "all":
+            return True
+        if not payer_account:
+            return False
+        try:
+            grant = self.store.minor_grant(payer_account)
+        except Exception:  # noqa: BLE001 — base injoignable : on ferme
+            logger.warning("foyer : liste des foyers autorisés (mineurs) illisible, profils mineurs fermés")
+            return False
+        return grant is not None and grant.get("revoked_at") is None
+
     def view(self, actor: Any) -> dict[str, Any]:
         """`GET /v1/household` : membres, tours par membre (jour, semaine), plafonds — jamais de contenu."""
         p, _, mine = self._mine(actor)
@@ -235,7 +259,7 @@ class Household:
             out["invitations"] = [self._invite_json(i) for i in self.store.invites_of(actor, p.id)
                                   if i.state == "pending" and i.expires_at > now]
             out["policy"] = Policy.of(p.household_policy).to_json()
-            out["minors"] = {"enabled": s.minors}
+            out["minors"] = {"enabled": self.minors_open(actor.account_id)}
         return out
 
     # ── invitations ──
@@ -251,6 +275,8 @@ class Household:
             raise suspended()
         email = tm.clean_email(body.get("email"))
         profile = hm.clean_profile(body.get("profile"), minors=self.settings.minors)
+        if profile in hm.MINOR_PROFILES and not self.minors_open(actor.account_id):
+            raise minors_not_enabled()
         attestation = hm.clean_attestation(body.get("attestation")) if profile in hm.MINOR_PROFILES else None
         rows = self.store.hh_members(actor, p.id)
         now = self.clock()
@@ -304,6 +330,8 @@ class Household:
             raise TeamError(404, "not_found", "invitation inconnue ou expirée")
         if inv.profile in hm.MINOR_PROFILES and not self.settings.minors:
             raise TeamError(400, "minors_disabled", "les profils mineurs ne sont pas encore ouverts")
+        if inv.profile in hm.MINOR_PROFILES and not self.minors_open(inv.invited_by):
+            raise minors_not_enabled()  # autorisation retirée entre l'invitation et l'acceptation
         if self.store.hh_membership(actor, actor.account_id) is not None:
             raise TeamError(409, "already_in_household", "ce compte fait déjà partie d'un foyer (un foyer par compte)")
         if not self.tier(inv.tenant_id).active:  # locataire de l'invitation = celui du foyer, donc du payeur
@@ -397,6 +425,8 @@ class Household:
         if not isinstance(body, dict):
             raise TeamError(400, "bad_request", "corps attendu : {profile, attestation?}")
         profile = hm.clean_profile(body.get("profile"), minors=self.settings.minors or body.get("profile") == "adult")
+        if profile in hm.MINOR_PROFILES and not self.minors_open(actor.account_id):
+            raise minors_not_enabled()
         row = self._target(actor, p, account_id)
         if row.payer:
             raise TeamError(409, "payer_fixed", "le payeur est le représentant : jamais un profil mineur")
@@ -433,6 +463,8 @@ class Household:
         p, _ = self._payer(actor)
         if not self.settings.minors:
             raise TeamError(400, "minors_disabled", "les profils mineurs ne sont pas encore ouverts")
+        if not self.minors_open(actor.account_id):
+            raise minors_not_enabled()
         row = self._target(actor, p, account_id)
         if not row.minor:
             raise TeamError(409, "not_minor", "ce membre n'a pas de profil mineur")
@@ -534,7 +566,7 @@ class Household:
         policy = Policy()
         if found is not None:
             _, p, mrow = found
-            active = (self.settings.minors and mrow.household_id == row["household_id"] and mrow.minor
+            active = (self.minors_open(row["guardian_account"]) and mrow.household_id == row["household_id"] and mrow.minor
                       and mrow.status == "active")
             policy = Policy.of(p.household_policy)
         return MinorState(profile=row["profile"], active=active, guardian=row["guardian_account"],
@@ -556,4 +588,4 @@ class Household:
         return [r for r in self.store.hh_members(actor, p.id) if r.minor]
 
 
-__all__ = ["SUSPENDED_NOTICE", "Household", "MinorState", "no_household", "payer_only", "suspended"]
+__all__ = ["SUSPENDED_NOTICE", "Household", "MinorState", "minors_not_enabled", "no_household", "payer_only", "suspended"]

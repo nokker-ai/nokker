@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from nokker.core.ports import ToolSpec, call_effect
-from nokker.core.turn import Decision, Effect, Gate, ToolCall, Turn, Verdict
+from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, ToolCall, Turn, Verdict
 
 # accept_edits : écritures permises sans carte. checkpoint_create n'écrit que dans le dépôt fantôme des points de retour.
 FILE_EDIT_TOOLS = frozenset({"write_file", "patch", "checkpoint_create"})
@@ -40,6 +40,12 @@ FILE_EDIT_TOOLS = frozenset({"write_file", "patch", "checkpoint_create"})
 MEMORY_EDIT_TOOLS = frozenset({"memory_note", "memory"})
 # Verdict d'un appel à effet d'un connecteur relayé (X20) : une carte par appel, sans règle « session » ni « always ».
 RELAY_CARD_RULE = "permissions:relayed_connector"
+# Tour arrivé du WEB (canal `relay`) : destructif, envoi externe, dépense = carte forte signée au téléphone (X10).
+RELAYED_STRONG_RULE = "permissions:relayed_strong"
+# Destructif hors du bac à sable d'une session de code : le GO textuel du propriétaire n'y suffit pas.
+GO_SANDBOX_RULE = "permissions:go_sandbox_only"
+# Seuls outils dont l'exécution tient dans le bac à sable de la session (dossier monté seul, points de retour).
+SANDBOX_GO_TOOLS = frozenset({"terminal", "process_start"})
 LOCAL_STRONG_RULE = "permissions:local_connector_strong"  # boîte mail posée dans Lokkal : envoi, corbeille
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
@@ -217,12 +223,24 @@ class PermissionGates:
     # session de code : défaut None = vrai pour tout fil) et Lokkal (le registre des sessions de code, posé au
     # démarrage). Transmis aux portes du noyau : le drapeau de domaine y devient consultatif (qa/gates.py).
     code_session: Any = None
+    # Fil → le bac à sable de sa session de code est-il un vrai bac (docker, kubernetes) ? Posé par Lokkal : le GO
+    # textuel du propriétaire ne lève alors un destructif que pour `SANDBOX_GO_TOOLS` sur un tel fil ; ailleurs, carte
+    # forte. None (`nokker code`, bancs) : comportement inchangé.
+    go_sandbox: Any = None
+    # Outils qui n'existent que dans une session de code (Lokkal : `CODE_TOOLS`). Sur un fil sans session, refusés AVANT
+    # toute carte : le 26.10, une carte forte signée au téléphone a échoué à l'exécution (« pas de session de code »).
+    session_tools: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if hasattr(self.inner, "code_session") and getattr(self.inner, "code_session", None) is None:
             self.inner.code_session = self.code_session if self.code_session is not None else (lambda _tid: True)
 
     def action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> list[Verdict]:
+        if call.name in self.session_tools and self.code_session is not None \
+                and not self.code_session(getattr(turn, "thread_id", "") or ""):
+            return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:no_code_session",
+                            reason="pas de session de code sur ce fil : ouvre une session sur un dossier pour lancer des "
+                                   "commandes ou toucher des fichiers", subject=call.id)]
         if call.name in ("terminal", "process_start", "ssh_run"):
             from nokker.tools.code import hardline_reason
 
@@ -265,6 +283,26 @@ class PermissionGates:
             return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=LOCAL_STRONG_RULE,
                             reason="boîte mail de la machine : un envoi ou une mise à la corbeille passe par une carte "
                                    "forte", subject=call.id, strength="strong")]
+        if getattr(turn, "channel", None) == RELAY_CHANNEL and decision is not Decision.DENY \
+                and effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL, Effect.SPEND):
+            # Tour venu du web (relais `<nom>.nokker.app`, X10) : ni le mode (auto, accept_edits), ni une règle allow,
+            # ni un GO écrit ne dispensent de la carte FORTE, qui part au téléphone. Seuls deny et plan refusent encore.
+            v1 = self.inner.invariants.check_action(call, spec, turn)
+            if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
+                return [v1]
+            return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=RELAYED_STRONG_RULE,
+                            reason="action demandée depuis le web : carte forte à signer sur ton téléphone",
+                            subject=call.id, strength="strong")]
+        if decision is None and effect is Effect.DESTRUCTIVE and self.go_sandbox is not None \
+                and not (call.name in SANDBOX_GO_TOOLS and self.go_sandbox(getattr(turn, "thread_id", None) or "")):
+            # Le nom exact de la commande vaut accord dans le bac à sable de la session seulement (réversible par les
+            # points de retour) : ssh_run, connecteurs, outils MCP, fil hors session → carte forte, GO ou pas.
+            v1 = self.inner.invariants.check_action(call, spec, turn)
+            if v1.decision is Decision.DENY:
+                return [v1]
+            return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=GO_SANDBOX_RULE,
+                            reason="action destructive hors du bac à sable d'une session de code : un GO écrit ne "
+                                   "suffit pas", subject=call.id, strength="strong")]
         if decision is None:
             return self.inner.action(call, spec, turn)
         if decision is Decision.ALLOW:
@@ -282,5 +320,5 @@ class PermissionGates:
         return getattr(self.inner, name)
 
 
-__all__ = ["FILE_EDIT_TOOLS", "MEMORY_EDIT_TOOLS", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
+__all__ = ["FILE_EDIT_TOOLS", "GO_SANDBOX_RULE", "SANDBOX_GO_TOOLS", "MEMORY_EDIT_TOOLS", "RELAYED_STRONG_RULE", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
            "Rule"]

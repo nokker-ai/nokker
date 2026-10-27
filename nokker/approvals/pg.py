@@ -175,6 +175,29 @@ class PgApprovals(BaseApprovals):
     def _delete_device(self, device_id: str) -> None:
         with self._lock, self._auth.cursor() as cur:
             cur.execute("DELETE FROM devices WHERE id = %s", (device_id,))
+        with self._sign_lock:
+            self._sign_counts.pop(device_id, None)
+
+    # Dernier `signCount` WebAuthn : colonne `devices.sign_count` (même table hors RLS que le reste de l'authentification,
+    # même connexion `_auth`). Un appareil sans ligne ici (celui d'un compte lié, rendu par nokker.ai à `decide_remote`)
+    # retombe sur le dictionnaire de la base : tenu par processus seulement.
+    def _load_sign_count(self, device_id: str) -> int | None:
+        with self._lock, self._auth.cursor() as cur:
+            cur.execute("SELECT sign_count FROM devices WHERE id = %s", (device_id,))
+            row = cur.fetchone()
+        if row is None:
+            return super()._load_sign_count(device_id)
+        return int(row[0]) if row[0] is not None else None
+
+    def _advance_sign_count(self, device_id: str, count: int) -> bool:
+        with self._lock, self._auth.cursor() as cur:
+            cur.execute("UPDATE devices SET sign_count = %s WHERE id = %s AND (sign_count IS NULL OR sign_count < %s) "
+                        "RETURNING id", (count, device_id, count))
+            if cur.fetchone() is not None:
+                return True
+            cur.execute("SELECT 1 FROM devices WHERE id = %s", (device_id,))
+            known = cur.fetchone() is not None
+        return False if known else super()._advance_sign_count(device_id, count)
 
     # ─────────────────────── TOTP ───────────────────────
 

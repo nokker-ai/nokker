@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 from nokker.core.ports import Policy, RouteDecision, RouteState
 from nokker.core.turn import Decision, Gate, Tier, Verdict
-from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
+from nokker.tenancy.context import INTERNAL_TENANT, current_tenant, tenant_scope
 
 ZURICH = ZoneInfo("Europe/Zurich")
 DAY_RESET_UTC_HOUR = 12
@@ -134,12 +134,12 @@ class PgUsage:
         return kind  # colonne tirée de KINDS (liste fermée), jamais d'une entrée
 
     def _conn(self, tenant_id: str):
-        import psycopg
+        from nokker.store.conn import connect
 
-        # TODO intégration p1/t-rls : passer par nokker/store/conn.py::connect (pose déjà app.tenant_id).
-        conn = psycopg.connect(self.dsn, autocommit=True)
-        conn.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant_id,))
-        return conn
+        # Le locataire est un ARGUMENT (le compteur est appelé aussi hors d'un tenant_scope, ex. cloud/http.py avec le
+        # locataire de la machine) : on le fixe le temps d'ouvrir la connexion, puis connect() pose app.tenant_id.
+        with tenant_scope(tenant_id):
+            return connect(self.dsn, autocommit=True)
 
     def take(self, tenant_id: str, account: str, day: date, kind: str, cap: int) -> bool:
         k = self._kind(kind)

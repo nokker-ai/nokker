@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from nokker.approvals.crypto import (
     SignatureError, TelegramInitDataError, WebAuthnError, args_sha256, new_nonce, totp_matching_step,
@@ -58,6 +59,15 @@ def _default_authorized(user: str | None) -> bool:
     return GoAuthorizedSenders().authorized(user)
 
 
+def _rp_id_of(origin: str | None) -> str:
+    """rpId WebAuthn attendu : le nom d'hôte de l'origine configurée (même dérivation que `RemoteApprovals`/le relais).
+    Origine sans hôte : preuve refusée, jamais « on ne vérifie pas le rpIdHash »."""
+    host = urlsplit(origin or "").hostname
+    if not host:
+        raise ProofInvalid("vérification WebAuthn : rpId introuvable dans l'origine configurée")
+    return host
+
+
 @dataclass
 class BaseApprovals:
     notifier: ApprovalNotifier = field(default_factory=NullNotifier)
@@ -93,6 +103,10 @@ class BaseApprovals:
     # verrou : deux décisions concurrentes de la même carte (le propriétaire en local ET son téléphone, lot X10) n'en
     # appliquent qu'une, jamais les deux.
     _decision_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    # Dernier `signCount` WebAuthn vu par appareil (anti-clonage) pour un appareil SANS ligne locale : la mémoire, et
+    # l'appareil d'un compte lié que nokker.ai rend à la machine (`decide_remote`, jamais enrôlé ici).
+    _sign_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _sign_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     # ─────────────────────── primitives de stockage (sous-classe) ───────────────────────
 
@@ -131,6 +145,31 @@ class BaseApprovals:
 
     def _delete_device(self, device_id: str) -> None:
         raise NotImplementedError
+
+    def _load_sign_count(self, device_id: str) -> int | None:
+        """Dernier `signCount` WebAuthn accepté pour cet appareil, `None` s'il n'en a jamais présenté."""
+        with self._sign_lock:
+            return self._sign_counts.get(device_id)
+
+    def _advance_sign_count(self, device_id: str, count: int) -> bool:
+        """Pose `count` comme dernier `signCount` vu SI il est strictement supérieur au précédent (comparer-et-poser,
+        atomique) ; `False` sinon (une preuve concurrente est passée avant)."""
+        with self._sign_lock:
+            last = self._sign_counts.get(device_id)
+            if last is not None and count <= last:
+                return False
+            self._sign_counts[device_id] = count
+            return True
+
+    def _check_sign_count(self, device: Device, count: int) -> None:
+        """Anti-clonage (W3C WebAuthn §7.2, étape « signCount »). Un compteur à 0 EN PERMANENCE (passkeys synchronisés,
+        iCloud/Google) n'est pas un signal : accepté, sans protection. Dès qu'un compteur non nul a été vu, tout
+        compteur qui ne le dépasse pas strictement — y compris un retour à 0 — est refusé : la clé a pu être clonée."""
+        last = self._load_sign_count(device.id)
+        if count == 0 and not last:
+            return
+        if (last is not None and count <= last) or not self._advance_sign_count(device.id, count):
+            raise ProofInvalid("compteur de signature non croissant : clé possiblement clonée")
 
     def _load_totp(self, user: str) -> tuple[str, int | None] | None:
         """`(secret_b32, dernier_step_consommé_ou_None)`."""
@@ -428,6 +467,42 @@ class BaseApprovals:
         self._emit_decided(approval)
         return approval
 
+    def decide_attested(self, approval_id: str, decision: str, challenge: str, *, decided_by: str, account: str,
+                        device_id: str, jti: str) -> Approval:
+        """Décision par la Mini App Telegram, sur la foi d'une ATTESTATION de nokker.ai (lot X10, docs/LOKKAL.md §7.3).
+        La signature de l'attestation, son `aud`, son `sub`, son `approval_id`, son `challenge_sha256`, son âge et son
+        `jti` sont vérifiés par l'appelant (`RemoteApprovals`) ; ici, l'état de la carte et le défi, comme pour une preuve
+        d'appareil : carte forte en attente, défi sur CETTE carte et les arguments inchangés, nonce consommé. Ici la
+        machine croit nokker.ai pour cette carte : les cartes dont le plancher est la clé d'appareil (prod, publication
+        de page, profil mineur) et celles des connecteurs relayés (nokker.ai y veut la signature de l'appareil lui-même)
+        sont refusées. `decided_via` = `telegram-attested`."""
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, decision)
+            if approval.strength != "strong":
+                raise ProofInvalid("attestation : carte forte seulement")
+            self._require_device_key_free(approval)
+            nonce = self._check_challenge(approval, Proof(challenge=challenge))
+            if not self._consume_nonce(nonce, approval_id):
+                raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
+            approval = self._commit(approval, decision, decided_by, "telegram-attested",
+                                    {"remote": True, "device_id": device_id, "account": account, "attestation_jti": jti})
+        self._emit_decided(approval)
+        return approval
+
+    @staticmethod
+    def _require_device_key_free(approval: Approval) -> None:
+        from nokker.qa.permissions import RELAY_CARD_RULE
+
+        rule = approval.rule or ""
+        if rule == GUARDIAN_RULE:
+            raise ProofInvalid("carte d'un profil mineur : son représentant l'approuve depuis ses appareils")
+        if rule == "ops:prod" or rule.startswith("ops:prod:") or rule == "pages:publish":
+            raise ProofInvalid("carte prod ou publication de page : clé d'appareil exigée (passkey), pas une "
+                               "attestation de nokker.ai")
+        if rule == RELAY_CARD_RULE:
+            raise ProofInvalid("carte de connecteur relayé : nokker.ai exige la signature de l'appareil lui-même "
+                               "(passkey)")
+
     def verify_signed_decision(self, approval: Approval, decision: str, proof: Proof, device: Device, *,
                                origin: str, rp_id: str | None = None) -> tuple[str, str]:
         """Vérification PURE d'une décision signée par un appareil donné (sans état : rien n'est consommé ni écrit) :
@@ -488,13 +563,14 @@ class BaseApprovals:
                 raise ProofInvalid("vérification WebAuthn non configurée côté serveur (origine attendue absente)")
             expected_challenge = hashlib.sha256(f"{proof.challenge}.{decision}".encode("utf-8")).digest()
             try:
-                verify_webauthn_assertion(
+                sign_count = verify_webauthn_assertion(
                     device.public_key_spki, proof.webauthn_client_data_json or "",
                     proof.webauthn_authenticator_data or "", proof.webauthn_signature,
                     expected_challenge=expected_challenge, expected_origin=origin,
-                    require_uv=approval.strength == "strong", expected_rp_id=rp_id)
+                    require_uv=approval.strength == "strong", expected_rp_id=rp_id or _rp_id_of(origin))
             except (WebAuthnError, SignatureError) as e:
                 raise ProofInvalid(str(e)) from e
+            self._check_sign_count(device, sign_count)
             return "webauthn"
         if not proof.signature:
             raise ProofInvalid("aucune preuve exploitable (signature d'appareil, WebAuthn, ou TOTP)")
@@ -592,6 +668,22 @@ class BaseApprovals:
         self._store_device(device)
         return device
 
+    def confirm_device_by_telegram(self, device_id: str, telegram_user_id: str) -> Device:
+        """Confirme l'appareil que la Mini App vient d'enrôler, quand l'initData (vérifié par le jeton du bot) est celui
+        du compte Telegram RELIÉ à ce compte Nokker (décision produit du 26.10 : Telegram est l'ancre de confiance des
+        cartes signées au téléphone). La clé reste libérée par la biométrie ; l'appareil décide (pas LOGIN_ONLY_VIA)."""
+        device = self._load_device(device_id)
+        if device is None:
+            raise DeviceNotFound(device_id)
+        if device.status != "pending":
+            raise ProofInvalid(f"appareil {device_id!r} déjà {device.status}")
+        if not telegram_user_id or device.telegram_user_id != telegram_user_id:
+            raise ProofInvalid("appareil sans lien Telegram correspondant")
+        device.status, device.approved_at = "approved", self.clock()
+        device.approved_via = f"telegram:{telegram_user_id}"
+        self._store_device(device)
+        return device
+
     def confirm_device_by_email_code(self, device_id: str) -> Device:
         """Confirme un appareil après un code e-mail valide (nokker/onboarding/emailcode.py, qui a vérifié et brûlé le
         code). L'appareil sert à se connecter, jamais à décider : `approved_via` commence par « email-code »."""
@@ -639,7 +731,7 @@ class BaseApprovals:
         if device is None:
             raise DeviceNotFound(device_id)
         if device.status != "approved":
-            raise DeviceNotApproved(f"appareil non approuvé (statut={device.status!r})")
+            raise DeviceNotApproved(f"appareil non approuvé (statut={device.status!r})", status=device.status)
         self._require_live_account(device)
         now = self.clock()
         nonce = new_nonce()
@@ -658,7 +750,7 @@ class BaseApprovals:
         if device is None:
             raise DeviceNotFound(device_id)
         if device.status != "approved":
-            raise DeviceNotApproved(f"appareil non approuvé (statut={device.status!r})")
+            raise DeviceNotApproved(f"appareil non approuvé (statut={device.status!r})", status=device.status)
         self._require_live_account(device)
         try:
             challenge_obj = json.loads(challenge)
@@ -676,12 +768,14 @@ class BaseApprovals:
                 raise ProofInvalid("vérification WebAuthn non configurée côté serveur (origine attendue absente)")
             expected_challenge = hashlib.sha256(challenge.encode("utf-8")).digest()
             try:
-                verify_webauthn_assertion(
+                sign_count = verify_webauthn_assertion(
                     device.public_key_spki, webauthn.get("client_data_json", ""),
                     webauthn.get("authenticator_data", ""), webauthn.get("signature", ""),
-                    expected_challenge=expected_challenge, expected_origin=self.webauthn_origin, require_uv=False)
+                    expected_challenge=expected_challenge, expected_origin=self.webauthn_origin, require_uv=False,
+                    expected_rp_id=_rp_id_of(self.webauthn_origin))
             except WebAuthnError as e:
                 raise ProofInvalid(str(e)) from e
+            self._check_sign_count(device, sign_count)
         elif signature:
             message = f"{challenge}.login".encode("utf-8")
             try:

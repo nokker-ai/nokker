@@ -66,14 +66,36 @@ class PageMeta:
     # tant que nokker.ai la liste (`apply_moderation`).
     moderated_at: float | None = None
     moderated_key: str | None = None
+    # Exposé des motifs (DSA art. 17, décision du 25.10) : `{at, reason, appeal: {fr, en}}` tel que nokker.ai l'a dit
+    # (`moderation_notices`) : date du retrait, motif nettoyé (aucune adresse), comment contester. None hors retrait.
+    moderation: dict | None = None
 
     def state(self) -> dict:
         """`state` de la bulle `artifact` (§10) : jamais le contenu, jamais l'id public (il est dans `/link`).
         `moderated_at` non nul = « retirée par la modération » (§7.26, point 6)."""
-        return {"page_id": self.page_id, "path": self.path, "title": self.title, "mime": self.mime,
-                "version": self.version, "size": self.size, "public": self.public,
-                "public_version": self.public_version, "public_index": self.public_index,
-                "locality": self.locality, "updated_at": self.updated_at, "moderated_at": self.moderated_at}
+        out = {"page_id": self.page_id, "path": self.path, "title": self.title, "mime": self.mime,
+               "version": self.version, "size": self.size, "public": self.public,
+               "public_version": self.public_version, "public_index": self.public_index,
+               "locality": self.locality, "updated_at": self.updated_at, "moderated_at": self.moderated_at}
+        if self.moderated_at is not None and self.moderation is not None:
+            out["moderation"] = dict(self.moderation)  # `{at, reason, appeal}` ; absent hors retrait
+        return out
+
+
+def _moderation(meta: PageMeta, key: str, notices: list | None, known: dict | None) -> dict:
+    """`{at, reason, appeal}` d'une page retirée : la note de nokker.ai qui la désigne (par son `page_id`, ou par
+    l'empreinte de son ancienne adresse publique), sinon ce qu'on savait, sinon la date vue ici et la phrase fixe."""
+    from nokker.cloud.moderation import APPEAL
+
+    if notices is None:
+        return known or {"at": meta.moderated_at, "reason": None, "appeal": dict(APPEAL)}
+    sha = key[4:] if key.startswith("pub:") else None
+    note = next((n for n in notices if isinstance(n, dict) and n.get("page_id") == meta.page_id), None) \
+        or next((n for n in notices if isinstance(n, dict) and sha and n.get("public_sha256") == sha), None)
+    if note is None:
+        return {"at": meta.moderated_at, "reason": None, "appeal": dict(APPEAL)}
+    return {"at": note.get("at") if note.get("at") is not None else meta.moderated_at, "reason": note.get("reason"),
+            "appeal": note.get("appeal") or dict(APPEAL)}
 
 
 def is_page_id(value: str) -> bool:
@@ -245,6 +267,7 @@ class PageStore:
         Rend les pages changées (la bulle suit)."""
         ids = set(moderated.get("page_ids") or [])
         shas = set(moderated.get("public_sha256") or [])
+        notices = moderated.get("notices")  # None : nokker.ai d'avant l'exposé des motifs (on garde ce qu'on sait)
         at = self.clock() if now is None else now
         changed = []
         with self._mu:
@@ -261,8 +284,11 @@ class PageStore:
                 if key is not None and meta.moderated_at is None:
                     meta.public, meta.public_id, meta.public_version, meta.public_index = False, None, None, False
                     meta.moderated_at, meta.moderated_key = at, key
+                    meta.moderation = _moderation(meta, key, notices, None)
                 elif key is None and meta.moderated_at is not None:
-                    meta.moderated_at = meta.moderated_key = None
+                    meta.moderated_at = meta.moderated_key = meta.moderation = None
+                elif key is not None and (fresh := _moderation(meta, key, notices, meta.moderation)) != meta.moderation:
+                    meta.moderation = fresh  # motif précisé (ou appris d'un nokker.ai mis à jour) : la bulle suit
                 else:
                     continue
                 self._save(meta, None)

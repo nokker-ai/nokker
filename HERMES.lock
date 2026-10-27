@@ -1,0 +1,12 @@
+# Single pin of the upstream agent runtime (hermes-nokker, a patched fork of the Nous Research agent, MIT).
+# Format: key=value, one per line, '#' starts a comment. See docs/UPSTREAM.md for how to bump it.
+#   repo    public source of the fork (CI and image builds may override the source with a mirror; the TAG is the pin)
+#   tag     the pin everywhere: GitHub CI, image workflows, Dockerfile and pyproject comments all name this tag
+#   commit  commit of that tag in the PUBLIC repo only (a mirror may carry another sha for the same tag);
+#           verified by the GitHub CI clone, never compared elsewhere
+#   extras  pip extras installed with the editable install
+# tests/unit/test_hermes_lock.py fails when any of these files drifts from this one.
+repo=https://github.com/nokker-ai/hermes-nokker.git
+tag=nokker-hermes-v0.22.2-n1
+commit=a4ba9e76baf89ae026c2fa058e0853dc9a2fbf47
+extras=messaging,stt-whisper

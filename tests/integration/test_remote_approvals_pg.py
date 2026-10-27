@@ -78,3 +78,54 @@ def test_card_keeps_the_call_id_on_postgres(pg, pod_env):  # noqa: F811
             assert approvals.get(card.id).call_id == call.id
     finally:
         approvals.close()
+
+
+@requires_pg
+def test_webauthn_sign_count_is_persisted_in_devices_on_postgres(pg, pod_env):  # noqa: F811
+    """Anti-clonage (docs/APPROVALS.md §3.4) : `devices.sign_count` (BIGINT, ajouté par 0001_approvals.sql au démarrage de
+    `PgApprovals`) survit à un nouveau backend ; compteur égal/inférieur refusé, croissant accepté, 0 permanent accepté."""
+    import hashlib
+
+    import psycopg
+
+    from nokker.approvals.pg import PgApprovals
+    from tests.unit.approvals.test_webauthn import ORIGIN as WEB_ORIGIN
+    from tests.unit.approvals.test_webauthn import _assertion
+
+    def login(backend, priv, device, count: int) -> None:
+        ch = backend.login_challenge(device.id)
+        a = _assertion(priv, hashlib.sha256(ch.canonical().encode("utf-8")).digest(), sign_count=count)
+        backend.create_session(device.id, ch.canonical(), webauthn=a)
+
+    def stored(device) -> tuple:
+        with psycopg.connect(pg["su"]) as conn:
+            return conn.execute("SELECT sign_count FROM devices WHERE id = %s", (device.id,)).fetchone()
+
+    approvals = PgApprovals(dsn=pg["app"], webauthn_origin=WEB_ORIGIN)
+    try:
+        priv, spki = gen_keypair()
+        device = approvals.confirm_device_cli(approvals.enroll_device(user="alice", name="MacBook",
+                                                                      public_key_spki=spki).code)
+        login(approvals, priv, device, 7)
+        for stale in (7, 2):
+            with pytest.raises(ProofInvalid, match="compteur de signature non croissant"):
+                login(approvals, priv, device, stale)
+        assert stored(device) == (7,)
+
+        reopened = PgApprovals(dsn=pg["app"], webauthn_origin=WEB_ORIGIN)  # redémarrage : le compteur est en base
+        try:
+            with pytest.raises(ProofInvalid, match="compteur de signature non croissant"):
+                login(reopened, priv, device, 7)
+            login(reopened, priv, device, 8)
+        finally:
+            reopened.close()
+        assert stored(device) == (8,)
+
+        priv0, spki0 = gen_keypair()
+        synced = approvals.confirm_device_cli(approvals.enroll_device(user="alice", name="iCloud",
+                                                                      public_key_spki=spki0).code)
+        for _ in range(2):
+            login(approvals, priv0, synced, 0)  # passkey synchronisé : compteur toujours nul, accepté
+        assert stored(synced) == (None,)
+    finally:
+        approvals.close()
