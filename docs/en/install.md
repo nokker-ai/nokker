@@ -122,7 +122,8 @@ nokker update --check  # only compares your version with the latest release
 nokker logs -f         # follow the core logs
 ```
 
-`nokker update` runs `~/.nokker/install.sh --update` (your `.env` and data are kept), then replaces the `nokker`
+`nokker update` runs `~/.nokker/install.sh --update` (your `.env`, data and edited files in `config/` are kept: a
+new version of an edited file lands next to it as `<file>.new`), then replaces the `nokker`
 binary with the one from the same release. The new binary is accepted only if its `.sha256` matches and, when `cosign`
 is installed, its signature verifies. Details in [cli.md](cli.md).
 

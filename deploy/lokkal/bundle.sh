@@ -13,6 +13,7 @@ cp "$ROOT/deploy/postgres/roles.sql" "$D/sql/roles.sql"
 # Config du noyau : le modèle de Nokker dev (deploy/lokkal/core-config.yaml), statique (chemins et hôtes par l'env).
 [ -f "$HERE/core-config.yaml" ] || { echo "deploy/lokkal/core-config.yaml absent (branche p2/lokkal-dev pas intégrée ?)" >&2; exit 1; }
 mkdir -p "$D/config"; cp "$HERE/core-config.yaml" "$D/config/config.yaml"
+cp "$HERE/config-history.sha256" "$D/"   # config.yaml non modifiées des installations antérieures (install_config)
 printf 'NOKKER_VERSION=%s\n' "$VER" > "$D/VERSION"
 mkdir -p "$OUT"
 tar -C "$STAGE" --owner=0 --group=0 --sort=name --mtime='2026-01-01' -czf "$OUT/nokker-lokkal-$VER.tar.gz" nokker

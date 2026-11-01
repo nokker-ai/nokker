@@ -522,3 +522,16 @@ def test_mirror_routes_are_owner_only_and_report_a_failed_erase(tmp_path):
     assert status == 502 and "rien n'a changé" in body["error"]["message"]
     assert api.handle("POST", "/v1/local/mirror/resume", f"Bearer {api.token}", {}) == (200, {"enabled": True,
                                                                                             "paused": False})
+
+
+def test_network_name_env_prevails_over_network_name(monkeypatch):
+    from nokker.local.api import _network_name
+
+    code = {"network_name": "nokker-sandbox", "network_name_env": "NOKKER_SANDBOX_NETWORK"}
+    monkeypatch.delenv("NOKKER_SANDBOX_NETWORK", raising=False)
+    assert _network_name(code) == "nokker-sandbox"
+    monkeypatch.setenv("NOKKER_SANDBOX_NETWORK", "monprojet-sandbox")
+    assert _network_name(code) == "monprojet-sandbox"
+    monkeypatch.setenv("NOKKER_SANDBOX_NETWORK", "  ")
+    assert _network_name(code) == "nokker-sandbox"
+    assert _network_name({}) is None

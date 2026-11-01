@@ -79,6 +79,17 @@ def ensure_token(path: str | Path) -> str:
     return tok
 
 
+def _network_name(code: dict) -> str | None:
+    """Réseau docker des bacs à sable : `network_name_env` (variable d'environnement, ex. NOKKER_SANDBOX_NETWORK posée
+    par le compose, `<projet>-sandbox`) l'emporte sur `network_name` — plus de sed de l'installeur sur la config."""
+    env_name = code.get("network_name_env")
+    if env_name:
+        val = os.environ.get(str(env_name), "").strip()
+        if val:
+            return val
+    return code.get("network_name")
+
+
 def _project_skills(local: dict[str, Any], state_dir: Path) -> Any:
     """`ProjectSkills` si `local.project_skills` est allumé (confiance écrite dans les réglages de l'utilisateur)."""
     if not local.get("project_skills", False):
@@ -375,7 +386,7 @@ class LocalApi:
                    code=SessionCodeTools(backend=code.get("backend", "docker"),
                                          instance=local.get("instance") or _instance_id(state_dir),
                                          image=code.get("image") or DEFAULT_SANDBOX_IMAGE,
-                                         network_name=code.get("network_name"), host_roots=host_roots,
+                                         network_name=_network_name(code), host_roots=host_roots,
                                          background=bool(local.get("background_processes", False)),
                                          state_dir=str(state_dir)))
         if local.get("ops"):

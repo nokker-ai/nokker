@@ -180,7 +180,8 @@ class SokkanProvider:
         usage_raw = data.get("usage") or {}
         usage = _parse_usage(usage_raw)
         tool_calls = [_parse_tool_call(tc) for tc in (msg.get("tool_calls") or [])]
-        message = Message(role="assistant", content=msg.get("content") or "", tool_calls=tool_calls)
+        # Un amont qui retire le bloc de raisonnement laisse ses « \n\n » en tête de réponse (Lokkal, 28.10).
+        message = Message(role="assistant", content=(msg.get("content") or "").lstrip("\r\n"), tool_calls=tool_calls)
         return Completion(message=message, usage=usage, model=data.get("model", self.model),
                            latency_s=latency_s, finish_reason=choice.get("finish_reason"), raw=data,
                            attempts=attempts)
@@ -376,6 +377,8 @@ class _StreamAccumulator:
             if not isinstance(delta, dict):
                 continue
             text = delta.get("content")
+            if isinstance(text, str) and not self.content:
+                text = text.lstrip("\r\n")  # cf. complete() : sauts de ligne de tête, ni affichés ni gardés
             if isinstance(text, str) and text:
                 self.content += text
                 piece += text

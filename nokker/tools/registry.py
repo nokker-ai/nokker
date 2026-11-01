@@ -65,11 +65,11 @@ def builtin_core_source() -> StaticToolSource:
     """Les outils cœur qui ne viennent pas de CortHeXis (`memory_search`/`memory_get` sont exposés par
     `nokker.memory.corthexis.CorthexisMemory`, pas ici) — le préfixe de l'instance interne, §Outils cœur.
 
-    `recall_context` RETIRÉ de la surface (décision produit, P1-S1, 17.10.2026) : tant que le réservoir réel
-    (chantier A-1) n'existe pas, cet outil ne pouvait QUE répondre « indisponible » — mesuré en réel : un
-    outil qui répond toujours « indisponible » invite le modèle à réessayer (vu jusqu'à 2x sur la même
-    tâche), pour rien. Un appel au nom `recall_context` tombera maintenant sur « outil inconnu » (Registry
-    .call(), clairement un échec, pas une invite à réessayer) — à réintroduire avec A-1, pas avant."""
+    `recall_context` n'est PAS ici (décision produit, P1-S1, 17.10.2026) : sans réservoir réel il ne pouvait
+    que répondre « indisponible », ce qui invite le modèle à réessayer. Il est exposé par
+    `nokker.context.tools.RecallContextSource`, ajoutée seulement quand `context_enabled` (ContextManager :
+    réservoir, épisodes, résumés de jour réels — api/server.py). Sans `context_enabled` (ContextEngineV0),
+    un appel tombe sur « outil inconnu »."""
     clarify_spec = ToolSpec(name="clarify", description="Pose une seule question fermée quand il manque "
                              "une information qui change l'action.",
                              parameters={"type": "object", "properties": {

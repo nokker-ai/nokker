@@ -18,7 +18,7 @@ from typing import Any
 
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
-from nokker.qa.secrets import KnownSecrets, redact, redact_messages
+from nokker.qa.secrets import KnownSecrets, _type_name, redact, redact_messages
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
 # ─────────────────────────────── drapeaux de domaine ───────────────────────────────
@@ -430,11 +430,49 @@ class DeterministicInvariants:
           faire fuiter une valeur du coffre).
         """
         effect = spec.effect if spec is not None else Effect.WRITE
-        red = redact(result.content, self.known, weak=effect is Effect.SECRET)
+        if effect is Effect.SECRET:
+            return self._seal_secret_result(result)
+        red = redact(result.content, self.known, weak=False)
         if not red.names:
             return result
         handles = list(dict.fromkeys([*result.secret_handles, *red.names]))
         return ToolResult(call_id=result.call_id, name=result.name, content=red.text, is_error=result.is_error,
+                          reservoir_id=result.reservoir_id, secret_handles=handles)
+
+    def _seal_secret_result(self, result: ToolResult) -> ToolResult:
+        """Résultat d'un outil d'effet `SECRET` (01.11.2026, banc credentiels-pas-de-fuite) : le modèle n'en reçoit
+        JAMAIS le contenu, seulement une poignée, l'élément du coffre visé et la consigne de ne rien recopier.
+
+        Avant, le contenu passait caviardé par `redact` — mais une forme que les motifs ne reconnaissent pas
+        (« mot de passe Xk9!qpzT42Lm », sans « : » ni « est ») arrivait en clair au modèle quand la valeur n'était pas
+        dans le coffre du noyau, et tous les modèles la recopiaient. Trois verrous désormais :
+        (a) contenu remplacé en entier (déterministe, ne dépend ni des motifs ni du modèle) ;
+        (b) toute valeur reconnue, et le contenu entier, rejoignent les valeurs connues : `scrub_output` (réponse)
+            et `redact_context` (fil) les caviardent si un autre chemin les fait réapparaître ;
+        (c) `redact(..., secret_tool=True)` reconnaît aussi « mot de passe VALEUR » sans connecteur.
+        Une erreur d'outil garde son texte, caviardé (c'est un message d'erreur, pas la valeur).
+        """
+        red = redact(result.content, self.known, weak=True, secret_tool=True)
+        for name, value in red.values.items():
+            if len(value) >= 6:
+                self.known.add(name, value)
+        if result.is_error:
+            if not red.names:
+                return result
+            return ToolResult(call_id=result.call_id, name=result.name, content=red.text, is_error=True,
+                              reservoir_id=result.reservoir_id,
+                              secret_handles=list(dict.fromkeys([*result.secret_handles, *red.names])))
+        whole = _type_name(f"{result.name or 'outil'}-resultat", result.content or "")
+        if len((result.content or "").strip()) >= 16:  # bloc entier recopié tel quel ; jamais un « ok » court
+            self.known.add(whole, result.content.strip())
+        items = sorted({m for m in _VAULT_ITEM_RE.findall(red.text)})
+        where = f" Élément du coffre : {', '.join(items)}." if items else ""
+        caught = "".join(f" {_secret_handle(n)}" for n in red.names)
+        notice = (f"{_secret_handle(whole)}{caught} Résultat de l'outil secret « {result.name} » retiré par le noyau : la valeur "
+                  f"reste dans le coffre et ne passe jamais par le modèle.{where} Ne la recopie pas et ne "
+                  "l'invente pas : indique à l'utilisateur où la récupérer lui-même.")
+        handles = list(dict.fromkeys([*result.secret_handles, *red.names, whole]))
+        return ToolResult(call_id=result.call_id, name=result.name, content=notice, is_error=False,
                           reservoir_id=result.reservoir_id, secret_handles=handles)
 
     def scrub_output(self, text: str) -> str:
@@ -466,3 +504,13 @@ __all__ = [
     "Allowlist", "DOMAIN_PATTERNS", "DeterministicInvariants", "GoAuthorizedSenders", "domain_flags",
     "has_explicit_go",
 ]
+
+
+# Élément de coffre cité dans un résultat SECRET (`acme/grafana`) : chemin en minuscules, sans chiffre — une forme
+# qu'un mot de passe réel n'a pas (lettres + chiffre ou symbole exigés par `_looks_like_password`).
+_VAULT_ITEM_RE = re.compile(r"(?<![\w/.:-])([a-z][a-z._-]*(?:/[a-z][a-z._-]*)+)(?![\w/.:-])")
+
+
+def _secret_handle(name: str) -> str:
+    return f"[secret:{name}]"
+

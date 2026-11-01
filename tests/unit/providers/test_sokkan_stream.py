@@ -92,6 +92,22 @@ def test_stream_rebuilds_the_same_completion_as_non_stream():
     assert streamed.attempts == 1
 
 
+def test_leading_newlines_left_by_a_stripped_reasoning_block_are_dropped():
+    # Un amont qui retire le bloc de raisonnement laisse « \n\n » en tête : ni affiché en direct ni gardé.
+    stream = [_chunk({"role": "assistant", "content": ""}), _chunk({"content": "\n"}), _chunk({"content": "\nBon"}),
+              _chunk({"content": "jour\n\nà toi"}), _chunk({}, finish="stop"), "[DONE]"]
+    body = {"model": "qwen/qwen3.8-27b",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "\n\nBonjour\n\nà toi"}}]}
+    pieces: list[str] = []
+    streamed = _provider(lambda r: httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                                                  content=_sse(stream))).complete(
+        [], [], reasoning=False, session_key="t", on_delta=pieces.append)
+    plain = _provider(lambda r: httpx.Response(200, json=body)).complete([], [], reasoning=False, session_key="t")
+    assert pieces == ["Bon", "jour\n\nà toi"]
+    assert streamed.message.content == plain.message.content == "Bonjour\n\nà toi"
+
+
 def test_without_on_delta_the_body_has_no_stream_field():
     seen = []
 

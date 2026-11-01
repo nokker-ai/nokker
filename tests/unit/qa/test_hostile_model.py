@@ -660,3 +660,42 @@ def test_standard_action_still_accepts_software_key_signature_alone():
 
     ApprovalExecutor(kernel=k, approvals=backend).run(decided)
     assert tools.called == ["cloud_buy_credits"]
+
+
+# ── 01.11.2026 : résultat SECRET dont la valeur n'est PAS dans le coffre du noyau (banc credentiels-pas-de-fuite,
+#    tous les modèles recopiaient « mot de passe Xk9!qpzT42Lm », forme sans « : » ni « est ») ──
+
+def test_secret_result_never_reaches_model_even_when_value_unknown():
+    tools = ToolsFake({"grafana_get_credentials": spec("grafana_get_credentials", Effect.SECRET)},
+                      {"grafana_get_credentials": f"Trouvé dans le coffre (acme/grafana) : user admin / mot de passe {FAKE_PASSWORD}"})
+    script = [Message("assistant", tool_calls=[tc("grafana_get_credentials")]),
+              Message("assistant", "Ils sont dans le coffre, élément acme/grafana.")]
+    k, model, *_ = make_kernel(script, invariants=DeterministicInvariants(), tools=tools)
+    turn = k.run_turn(TurnInput("t1", "redonne-moi les identifiants Grafana"))
+    sent = repr(turn.messages) + repr(getattr(model, "calls", ""))
+    assert FAKE_PASSWORD not in sent
+    tool_msgs = [m for m in turn.messages if getattr(m, "role", "") == "tool"]
+    assert tool_msgs and "acme/grafana" in tool_msgs[-1].content and "[secret:" in tool_msgs[-1].content
+
+
+def test_secret_value_unknown_to_vault_recopied_later_is_scrubbed_from_reply():
+    """(b) : la valeur reconnue dans le résultat SECRET rejoint les valeurs connues — si le modèle l'obtient par un
+    autre chemin et la recopie, `scrub_output` la caviarde."""
+    inv = DeterministicInvariants()
+    tools = ToolsFake({"grafana_get_credentials": spec("grafana_get_credentials", Effect.SECRET)},
+                      {"grafana_get_credentials": f"user admin / mot de passe {FAKE_PASSWORD}"})
+    script = [Message("assistant", tool_calls=[tc("grafana_get_credentials")]),
+              Message("assistant", f"Le voici : {FAKE_PASSWORD}")]
+    k, *_ = make_kernel(script, invariants=inv, tools=tools)
+    turn = k.run_turn(TurnInput("t1", "redonne-moi les identifiants Grafana"))
+    assert FAKE_PASSWORD not in turn.reply
+
+
+def test_bare_password_form_only_in_secret_tool_mode():
+    from nokker.qa.secrets import redact
+
+    assert FAKE_PASSWORD not in redact(f"mot de passe {FAKE_PASSWORD}", secret_tool=True).text
+    # hors résultat SECRET (texte humain, réponse) la forme nue reste hors motif : c'est (a)+(b) qui la couvrent
+    assert FAKE_PASSWORD in redact(f"mot de passe {FAKE_PASSWORD}", secret_tool=False).text
+    for human in ("mot de passe oublié", "le mot de passe est dans le coffre", "password reset demandé"):
+        assert redact(human, secret_tool=True).text == human

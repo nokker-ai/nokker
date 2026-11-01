@@ -58,6 +58,8 @@ services:
       NOKKER_MEMORY_MODE: direct
       # Bac à sable : le CLI docker de l'image `-lokkal` parle au proxy filtrant, jamais au socket.
       DOCKER_HOST: tcp://dockerproxy:2375
+      # Réseau des bacs à sable de CETTE installation (config : code.network_name_env), le seul que le proxy accepte.
+      NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
       # local.allowed_hosts_env : Host acceptés (web relayé + API directe ; 127.0.0.1:8742 = sonde de santé dans le
       # container, un littéral de bouclage qu'un navigateur ne peut pas forger) ; plus tard <nom>.nokker.app

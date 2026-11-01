@@ -82,4 +82,5 @@ local:
     roots_env: NOKKER_HOST_WORKSPACE           # dossier(s) de l'utilisateur séparés par « : », montés au même chemin
     host_roots: {}                             # racine vue par le noyau -> vue par le démon, si différente
     backend: docker
-    network_name: nokker-sandbox
+    network_name_env: NOKKER_SANDBOX_NETWORK      # réseau de CETTE installation (.env), prioritaire
+    network_name: nokker-sandbox               # installation antérieure, ou variable vide

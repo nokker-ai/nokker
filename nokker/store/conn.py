@@ -72,6 +72,9 @@ def owner_dsn(dsn: str) -> str:
     return os.environ.get(OWNER_DSN_ENV) or dsn
 
 
+_warned_unmigrated = False
+
+
 def migrate(dsn: str, *sqls: str, rls: bool = True, strict: bool = False) -> bool:
     """Applique `sqls` (idempotents) dans l'ordre, puis la RLS (`006`, si `rls`) : une table de contenu n'existe
     jamais sans sa politique, même créée par un store avant `apply_migrations`. Renvoie False si le rôle n'a pas les
@@ -97,8 +100,12 @@ def migrate(dsn: str, *sqls: str, rls: bool = True, strict: bool = False) -> boo
     except psycopg.errors.InsufficientPrivilege as e:
         if strict:
             raise
-        logger.warning("migrations non appliquées (rôle sans droits, %s absent ?) : %s — le job d'init doit les "
-                       "avoir faites", OWNER_DSN_ENV, str(e).splitlines()[0])
+        # Une fois par processus : chaque store appelle `migrate` au démarrage, la même cause se répétait par store.
+        global _warned_unmigrated
+        log = logger.debug if _warned_unmigrated else logger.warning
+        _warned_unmigrated = True
+        log("migrations non appliquées (rôle sans droits, %s absent ?) : %s — le job d'init doit les avoir faites",
+            OWNER_DSN_ENV, str(e).splitlines()[0])
         return False
     return True
 

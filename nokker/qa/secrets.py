@@ -202,6 +202,11 @@ _PASSWORD_PHRASE_RE = re.compile(
     r"(?i)\b(mot de passe|mdp|password|passwort)((?:\s+(?:du|de la|de l'|de|des|pour|of|for|for the)\s+[^\s,;:]+){0,2})"
     r"\s+(c'est|c’est|est|is|ist)\s+(\S+)")
 
+# Sans connecteur du tout (banc credentiels-pas-de-fuite, 01.11.2026) : « user admin / mot de passe Xk9!qpzT42Lm ».
+# Réservé au résultat d'un outil SECRET (`secret_tool=True`) : dans du texte humain, « mot de passe oublié » ou
+# « mot de passe trop court » ne doivent pas bouger — et la valeur doit de toute façon AVOIR l'air d'un mot de passe.
+_PASSWORD_BARE_RE = re.compile(r"(?i)\b(mot de passe|mdp|password|passwort|pw)\s+(?!c'est|c’est|est\b|is\b|ist\b)(\S+)")
+
 
 def _looks_like_password(value: str) -> bool:
     return (len(value) >= 6 and any(c.isalpha() for c in value)
@@ -511,15 +516,20 @@ def _entropy_candidates(text: str) -> list[str]:
 class RedactResult:
     text: str
     names: list[str] = field(default_factory=list)  # noms des poignées, dans l'ordre d'apparition
+    # valeurs reconnues par MOTIF (nom → valeur), pour `qa/invariants.py::_seal_secret_result` ; jamais journalisé
+    values: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
 
-def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, wire: bool = False) -> RedactResult:
+def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, wire: bool = False,
+           secret_tool: bool = False) -> RedactResult:
     """Caviarde `text` : valeurs connues d'abord, puis motifs précis, puis (si `weak`) le repli
     « mot de passe : … » et le repli par entropie.
 
     `wire=True` : le filet du fil (`redact_messages`, ce qui part au modèle) ; les valeurs publiques selon le contexte
     (hash git après `token:`, clé Firebase web, `_protect_public`) y sont caviardées comme les autres, parce que le
     Router refuse le tour sur ces formes. Ailleurs (`wire=False`), elles restent en clair.
+
+    `secret_tool=True` (résultat d'un outil d'effet `SECRET` seulement) ajoute « mot de passe VALEUR » sans connecteur.
 
     `weak=False` désactive les deux motifs les moins sûrs (mot de passe sans coffre, entropie) —
     réservé aux résultats d'outils non déclarés `SECRET` (`qa/invariants.py::redact_result`),
@@ -532,10 +542,13 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
         return RedactResult(text=text, names=[])
 
     names: list[str] = []
+    values: dict[str, str] = {}
 
-    def _mark(name: str) -> None:
+    def _mark(name: str, value: str | None = None) -> None:
         if name not in names:
             names.append(name)
+        if value:
+            values[name] = value
 
     out = text
     if "[secret:" in out:
@@ -581,7 +594,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     #    casseraient des coupures de ligne si on les traitait token par token)
     def _pem_sub(m: re.Match[str]) -> str:
         name = _type_name("pem", m.group(0))
-        _mark(name)
+        _mark(name, m.group(0))
         return _handle(name)
 
     out = _PEM_RE.sub(_pem_sub, out)
@@ -590,7 +603,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     for kind, pattern in _PATTERNS:
         def _sub(m: re.Match[str], kind: str = kind) -> str:
             name = _type_name(kind, m.group(0))
-            _mark(name)
+            _mark(name, m.group(0))
             return _handle(name)
 
         out = pattern.sub(_sub, out)
@@ -601,7 +614,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
         if not _iban_valid(candidate):
             return candidate
         name = _type_name("iban", candidate)
-        _mark(name)
+        _mark(name, candidate)
         return _handle(name)
 
     out = _IBAN_RE.sub(_iban_sub, out)
@@ -612,7 +625,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
                                                           and re.search(r"\d", value)):
             return m.group(0)
         name = _type_name("aws-secret-key", value)
-        _mark(name)
+        _mark(name, value)
         return f"{m.group(1)}{m.group(2)}{_handle(name)}"
 
     out = _AWS_SECRET_RE.sub(_aws_secret_sub, out)
@@ -624,7 +637,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
             if check is not None and not check(value):
                 return m.group(0)
             name = _type_name(kind, value)
-            _mark(name)
+            _mark(name, value)
             start, end = m.span(m.lastindex or 0)
             return m.group(0)[:start - m.start()] + _handle(name) + m.group(0)[end - m.start():]
         return sub
@@ -648,7 +661,7 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
             if HANDLE_RE.fullmatch(value):
                 return m.group(0)  # déjà une poignée (ex. posée par une passe précédente)
             name = _type_name("password", value)
-            _mark(name)
+            _mark(name, value)
             return f"{keyword} {_handle(name)}"
 
         out = _PASSWORD_KEYWORD_RE.sub(_pw_sub, out)
@@ -659,10 +672,22 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
             if not _looks_like_password(value):
                 return m.group(0)
             name = _type_name("password", value)
-            _mark(name)
+            _mark(name, value)
             return f"{m.group(1)}{m.group(2)} {m.group(3)} {_handle(name)}{raw[len(value):]}"
 
         out = _PASSWORD_PHRASE_RE.sub(_pw_phrase_sub, out)
+
+        if secret_tool:
+            def _pw_bare_sub(m: re.Match[str]) -> str:
+                raw = m.group(2)
+                value = raw.rstrip(",.;)")
+                if HANDLE_RE.fullmatch(value) or not _looks_like_password(value):
+                    return m.group(0)
+                name = _type_name("password", value)
+                _mark(name, value)
+                return f"{m.group(1)} {_handle(name)}{raw[len(value):]}"
+
+            out = _PASSWORD_BARE_RE.sub(_pw_bare_sub, out)
 
         # 6. repli par entropie, uniquement HORS des poignées déjà posées (sinon on re-scanne le
         #    hash court d'une poignée et on la double-caviarde).
@@ -673,13 +698,13 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
             for token in _entropy_candidates(segment):
                 name = _type_name("entropy", token)
                 segment = segment.replace(token, _handle(name))
-                _mark(name)
+                _mark(name, token)
             rebuilt.append(segment)
             if i < len(handles):
                 rebuilt.append(handles[i])
         out = "".join(rebuilt)
 
-    return RedactResult(text=_restore(out, saved), names=names)
+    return RedactResult(text=_restore(out, saved), names=names, values=values)
 
 
 # ─────────────────────────────── filet du fil ───────────────────────────────

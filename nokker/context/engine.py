@@ -334,8 +334,8 @@ class ContextEngineV0:
         if len(result.content) <= self.reservoir_char_limit:
             return result
         truncated = result.content[:self.reservoir_char_limit]
-        # `recall_context` retiré de la surface tant que A-1 n'existe pas (décision produit, P1-S1,
-        # 17.10.2026) : ne JAMAIS promettre au modèle un outil qu'il ne peut pas appeler.
+        # V0 seulement (sans `context_enabled`) : pas de réservoir ni de `recall_context` exposé, donc ne JAMAIS
+        # promettre au modèle un outil qu'il ne peut pas appeler. V1 (ContextManager) a son propre réservoir.
         mention = (f"\n[...tronqué à {self.reservoir_char_limit} caractères sur {len(result.content)} — "
                    "le réservoir réel arrive avec le chantier A-1 ; pas de relecture possible pour l'instant]")
         return ToolResult(call_id=result.call_id, name=result.name, content=truncated + mention,

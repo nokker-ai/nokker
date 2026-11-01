@@ -185,8 +185,28 @@ if [ -f "$DIR/.env" ]; then guard_project; else guard_project new; fi
 umask 077
 mkdir -p "$DIR" "$DIR/state" "$DIR/bin" "$CONF_DIR"
 tar -xzf "$TMP/$PKG" -C "$TMP"
-# Fichiers du paquet remplacés ; .env et state/ jamais touchés
-for f in docker-compose.yml config initdb sql web VERSION install.sh; do rm -rf "${DIR:?}/$f"; cp -R "$TMP/nokker/$f" "$DIR/$f"; done
+# Fichiers du paquet remplacés ; .env et state/ jamais touchés. config/ est à l'utilisateur : voir install_config.
+for f in docker-compose.yml initdb sql web VERSION install.sh; do rm -rf "${DIR:?}/$f"; cp -R "$TMP/nokker/$f" "$DIR/$f"; done
+# config/ : un fichier que l'utilisateur n'a pas touché (identique à la version livrée précédente, gardée dans
+# .dist/config) suit la nouvelle version ; un fichier modifié reste tel quel, la nouvelle version est posée à côté
+# en <fichier>.new. Sans .dist (installation ≤ 0.1.0-rc.8.1), config.yaml est reconnu non modifié par son empreinte
+# dans config-history.sha256 (ligne network_name, réécrite par l'ancien installeur, ramenée au défaut).
+install_config() {
+  mkdir -p "$DIR/config" "$DIR/.dist/config"
+  for src in "$TMP/nokker/config"/*; do
+    [ -f "$src" ] || continue
+    n=${src##*/}; cur="$DIR/config/$n"; base="$DIR/.dist/config/$n"
+    if [ ! -f "$cur" ] || cmp -s "$cur" "$src"; then cp "$src" "$cur"
+    elif [ -f "$base" ] && cmp -s "$cur" "$base"; then cp "$src" "$cur"; say "config/$n mis à jour"
+    elif [ ! -f "$base" ] && [ "$n" = config.yaml ] && [ -f "$TMP/nokker/config-history.sha256" ] \
+      && grep -qx "$(sed 's/^    network_name: .*/    network_name: nokker-sandbox/' "$cur" | sha256 -)" \
+           "$TMP/nokker/config-history.sha256"; then cp "$src" "$cur"; say "config/$n mis à jour"
+    else cp "$src" "$cur.new"; warn "config/$n modifié localement : gardé ; nouvelle version livrée dans config/$n.new"
+    fi
+    cp "$src" "$base"
+  done
+}
+install_config
 chmod -R go-w "$DIR"; chmod 755 "$DIR/initdb" "$DIR/sql" "$DIR/web" "$DIR/config"
 chmod 644 "$DIR"/initdb/* "$DIR"/sql/* "$DIR"/web/* "$DIR"/config/*; chmod 700 "$DIR/install.sh"
 # Coffre (profil vault) : scripts remplacés, part et AppRole (vault/unseal, vault/approle) jamais touchés. Les deux
@@ -259,10 +279,6 @@ if [ "$LLM" = 1 ]; then
   add_profile local-llm
 fi
 chmod 600 "$DIR/.env"; chmod 700 "$DIR/state"
-# Réseau des bacs à sable de CETTE installation dans la config du noyau (le proxy docker n'accepte que lui).
-sed "s|^\(    network_name:\) nokker-sandbox\$|\1 $SANDBOX_NET|" "$DIR/config/config.yaml" > "$TMP/core-config.yaml"
-grep -q "^    network_name: $SANDBOX_NET\$" "$TMP/core-config.yaml" || die "config.yaml : network_name introuvable"
-cp "$TMP/core-config.yaml" "$DIR/config/config.yaml"; chmod 644 "$DIR/config/config.yaml"
 WEB_PORT=$(getv NOKKER_PORT); API_PORT=$(getv NOKKER_API_PORT)
 
 cat > "$CONF_DIR/lokkal.json" <<EOF
