@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -119,6 +120,9 @@ def test_member_calls_are_tagged_with_the_household_in_the_ledger(world):
     assert _post(w.port, _follow_up(), mt, "th_a")[0] == 200
     assert _post(w.port, _opens(), ot)[0] == 200
     pid = w.hh.view(w.pay)["id"]
+    deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and len(w.ledger.fetch_calls()) < 3:
+        time.sleep(0.02)
     rows = w.ledger.fetch_calls()
     mine = [r for r in rows if r.thread_id.endswith(f"lokkal-{w.links.machines_of(w.mem.account_id)[0].id}")]
     assert len(mine) == 2
@@ -139,6 +143,9 @@ def test_a_turn_is_counted_once_and_its_follow_ups_are_not(world):
     assert _post(w.port, _opens("deux"), mt, "th_b")[0] == 200
     assert _post(w.port, _follow_up(), mt, "th_b")[0] == 200
     assert _used(w) == 2
+    deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and len([r for r in w.ledger.fetch_calls() if r.household_id]) < 5:
+        time.sleep(0.02)
     rows = [r for r in w.ledger.fetch_calls() if r.household_id]
     by_turn: dict[int, int] = {}
     for r in rows:
@@ -174,6 +181,9 @@ def test_web_turns_and_relayed_turns_share_the_same_counter(world):
         w.ledger.record("th_web", 1, call)
     mt = _machine(w, w.mem)
     assert _post(w.port, _opens(), mt)[0] == 200
+    deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and _used(w) < 3:
+        time.sleep(0.02)
     assert _used(w) == 3
     assert _post(w.port, _opens(), mt)[0] == 403  # 2 tours web + 1 relayé = le quota de 3
 

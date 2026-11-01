@@ -76,6 +76,11 @@ class ToolContext:
     # Carte approuvée qui a déclenché CET appel (posée par `approvals/executor.py`), None sinon : un connecteur relayé
     # (lot X20) en envoie la preuve à nokker.ai.
     approval_id: str | None = None
+    # Noyau et tour qui font CET appel (posés par `core/loop.py` ; le noyau seul par `approvals/executor.py`), None
+    # ailleurs (appel direct, banc, relais). Seul `execute_code` s'en sert (nokker/tools/execute_code.py) : les appels
+    # d'outils de son script repassent par les portes de CE noyau, jamais par un registre de côté.
+    kernel: Any = field(default=None, compare=False, repr=False)
+    turn: Any = field(default=None, compare=False, repr=False)
 
 
 class ToolRegistry(Protocol):

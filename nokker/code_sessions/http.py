@@ -10,11 +10,14 @@ Identité vérifiée d'un COMPTE (`us_…` : session d'appareil, y compris celle
     GET    /v1/code/sessions                         → {sessions: [Session], limit, modes, default_mode, idle_ttl_s}
     POST   /v1/code/sessions {repo?: {url, credential?, ref?, depth?}, mode?}  → 201 Session
     GET    /v1/code/sessions/<cs_…>                  → Session
+    PATCH  /v1/code/sessions/<cs_…> {mode}           → {mode, modes, effective} ; 400 bad_mode (hors `modes`) ou
+           mode_above_project (plus large que le mode imposé par le dépôt ou une équipe) ; événement `session.mode`
     DELETE /v1/code/sessions/<cs_…>[?purge=1]        → {id, closed: true, purged}
     POST   /v1/code/sessions/<cs_…>/hooks/trust {sha256}   → {thread_id, root, sha256, trusted: true}
     POST   /v1/code/sessions/<cs_…>/skills/trust {sha256}  → {thread_id, root, sha256, trusted: true}  (code.project_skills)
     POST   /v1/code/sessions/<cs_…>/tools/call {name, arguments}  → 200 {content, is_error} | 202 {approval_id}
-           liste blanche TOOLS_CALL (points de retour, skills en lecture, état et arrêt des sous-agents) ; mêmes portes
+           liste blanche TOOLS_CALL (points de retour, skills en lecture, plan de travail `todo` en lecture seule,
+           état et arrêt des sous-agents) ; corps 200 : `{content, is_error, reason?, reason_codes?}` ; mêmes portes
            que la boucle (`kernel.direct_call`), 409 si un tour est en cours sur le fil ; une carte se décide par
            /v1/approvals/{id}/decision
     GET    /v1/code/credentials                      → {credentials: [{name, updated_at}]}  (jamais de valeur)
@@ -36,7 +39,7 @@ _RE_SESSION = re.compile(r"^/v1/code/sessions/([^/]+)(?:/(hooks/trust|skills/tru
 # Outils qu'un écran appelle hors tour sur SA session (§7.28) : les points de retour, les skills (lecture), l'état et
 # l'arrêt des sous-agents. Jamais terminal, write_file, patch, delegate : ceux-là restent au modèle, sous ses portes.
 TOOLS_CALL = frozenset({"checkpoint_list", "checkpoint_diff", "checkpoint_restore", "skill_list", "skill_view",
-                        "delegate_status", "delegate_cancel"})
+                        "delegate_status", "delegate_cancel", "todo"})
 _RE_CRED = re.compile(r"^/v1/code/credentials/([^/]+)$")
 
 _service: CodeSessions | None = None
@@ -64,7 +67,7 @@ def handle(h: Any, method: str, path: str) -> bool:
     svc = _service
     if svc is None or not is_path(path):
         return False
-    body = h._read_json_body() if method in ("POST", "PUT") else {}
+    body = h._read_json_body() if method in ("POST", "PUT", "PATCH") else {}
     body = body if isinstance(body, dict) else {}
     sender = h._resolve_identity(body)
     if sender is None:
@@ -110,6 +113,10 @@ def _dispatch(svc: CodeSessions, h: Any, method: str, path: str, body: dict[str,
             return None
         if method == "GET":
             return 200, svc.get(user, sid)
+        if method == "PATCH":
+            if set(body) != {"mode"}:
+                raise CodeError(400, "bad_body", "PATCH : {mode} seulement")
+            return 200, svc.set_mode(user, sid, body.get("mode"))
         if method == "DELETE":
             q = parse_qs(urlsplit(h.path).query)
             purge = (q.get("purge") or ["0"])[0] in ("1", "true")
@@ -136,12 +143,16 @@ def _tool_call(svc: CodeSessions, h: Any, sid: str, body: dict[str, Any], user: 
         raise CodeError(400, "bad_arguments", "arguments : objet attendu")
     if name == "delegate_status" and arguments.get("wait_s"):  # le verrou du fil serait tenu pendant l'attente
         raise CodeError(400, "bad_arguments", "delegate_status hors tour : sans wait_s")
+    if name == "todo" and arguments:  # lecture seule hors tour : écrire le plan reste au modèle
+        raise CodeError(400, "bad_arguments", "todo hors tour : lecture seule, sans argument")
     out = h._code_tool_call(s.thread_id, name, arguments, user)
     if out is None:
         raise CodeError(409, "turn_running", "un tour est en cours sur ce fil")
     if isinstance(out, str):
         return 202, {"approval_id": out}
-    return 200, {"content": out.content, "is_error": out.is_error}
+    from nokker.tools.checkpoints import direct_result_body
+
+    return 200, direct_result_body(name, out)
 
 
 __all__ = ["TOOLS_CALL", "configure", "handle", "is_path", "service"]

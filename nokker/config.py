@@ -39,6 +39,9 @@ class TierConfig:
     # `vision: auto` dans la config : `vision` reste faux et une sonde unique tranche au premier tour avec image
     # (nokker/providers/vision_probe.py).
     vision_auto: bool = False
+    # Fenêtre de contexte servie (jetons, prompt + réponse) ; 0 = inconnue, pas de contrôle. Palier `nina` (70B, KV FP8,
+    # 32 k) : un appel qui ne tient pas n'y part pas, il bascule sur Ship (`core/loop.py::_fit_context`).
+    max_context_tokens: int = 0
 
     def api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")
@@ -110,6 +113,10 @@ class NokkerConfig:
     # Aperçus de liens pour les bulles (nokker/previews/, P1 18.10.2026, docs/BUBBLES.md §5) :
     # OpenGraph/Twitter/oEmbed/Trafilatura, images re-servies par le noyau (cache disque borné).
     previews_enabled: bool = True
+    # Steer (POST /v1/threads/{id}/steer) et mention de reprise après une pause, vus par le modèle (docs/CLIENT-API.md
+    # §Pause et steer, docs/CONTEXT-FORMAT.md) : éteints par défaut tant que les traces d'entraînement ne les portent
+    # pas. Éteint, la route de steer répond 404 ; la pause et la reprise marchent, sans rien ajouter au contexte.
+    steer_enabled: bool = False
     previews_cache_dir: str = "/var/lib/nokker/previews"
     previews_ttl_s: float = 86400.0  # 24 h, aperçu JSON (pas l'image : voir ImageDiskCache, pas de TTL)
     previews_image_cache_max_bytes: int = 200 * 1024 * 1024  # 200 Mo, éviction la plus ancienne d'abord
@@ -122,6 +129,17 @@ class NokkerConfig:
     # Magasin des images jointes (X7, nokker/images/store.py). Vide : `<local.state_dir>/images` sur Lokkal, aucune image
     # acceptée ailleurs (400 sur la route de chat).
     images_dir: str = ""
+    # Pièces jointes texte, dossier et URL d'un message (`nokker/attachments.py`, docs/LOKKAL.md §7.6.1) : bloc
+    # `[Pièces jointes]` dans l'en-tête du tour. Éteint (défaut) : `attachments` reste au format images X7 seul, le
+    # modèle voit exactement ce qu'il voyait (contrat avec l'entraînement, docs/CONTEXT-FORMAT.md).
+    text_attachments_enabled: bool = False
+    # Réponses vocales Telegram (docs/VOICE.md, `nokker/voice/tts.py`) : `enabled` (défaut false : aucune voix, aucun
+    # fournisseur construit), `provider` (command | openai_compat), `reply_mode` (voice_in | always | off),
+    # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur.
+    tts: dict[str, Any] = field(default_factory=dict)
+    # Règles d'approbation suggérées (docs/APPROVALS.md §7) : `enabled` (défaut false : routes 404), `threshold`
+    # (cartes approuvées sans refus, défaut 5), `window_days` (défaut 30).
+    approval_suggestions: dict[str, Any] = field(default_factory=dict)
     host: str = "0.0.0.0"
     port: int = 8642
     tiers: dict[str, TierConfig] = field(default_factory=lambda: {
@@ -150,7 +168,9 @@ class NokkerConfig:
     judge_verdict_max_tokens: int = 1  # questions des portes : 1 jeton (logprobs) ; plus pour un juge qui raisonne
     # Routage par tour : `policy` v0 (défaut : Ship, Deep sur signaux) | v1 (trivial → `small`, conversation → Ship,
     # code → Deep) ; `classifier` rules (défaut, aucun appel) | model (petit palier, 1 jeton, tour ambigu seulement) ;
-    # `code_to_deep` (v1, défaut true) ; `classifier_max_tokens` (1 ; plus pour un petit modèle qui raisonne).
+    # `code_to_deep` (v1, défaut true) ; `classifier_max_tokens` (1 ; plus pour un petit modèle qui raisonne) ;
+    # `deep_tool_failures` (3) : échecs d'outil d'un tour avant Deep ; `nina` : palier maison à part
+    # (`{mode: off|shadow|route, shadow_fraction, kinds, max_tokens, max_in_flight}`, route/nina.py, défaut off).
     route: dict[str, Any] = field(default_factory=dict)
 
     # ─────────────────────── P1 : approbations fortes (docs/APPROVALS.md) ───────────────────────
@@ -182,6 +202,12 @@ class NokkerConfig:
     # `root_dir` (notes par fil), `database_url_env` (défaut CORTHEXIS_DATABASE_URL), `embed_urls`, `profile`
     # (leger|standard|gpu), `rerank_url`, `min_score`, `min_rerank`, `chunk_target`.
     context_corthexis: dict[str, Any] = field(default_factory=dict)
+    # Qui crée et migre la base CortHeXis (docs/MEMORY-TENANCY.md §5.1). `managed` (défaut : Lokkal, développement) : le
+    # pod, au premier usage, et `ensure` au démarrage. `external` (bêta) : le job `nokker migrate` avec
+    # CORTHEXIS_OWNER_DATABASE_URL (rôle propriétaire) ; le pod ne crée ni ne modifie rien et vérifie locataire, RLS
+    # forcée et propriété au démarrage. `context_corthexis` accepte aussi `owner_database_url_env` (défaut
+    # CORTHEXIS_OWNER_DATABASE_URL) et `app_role` (défaut nokker_app : rôle qui reçoit le DML).
+    corthexis_schema: str = "managed"
     # {sender: thread_id}. Une passerelle qui fait tourner l'identifiant de session à chaque `/new` (passerelle amont du
     # canari, vu le 19.10.2026 : « Session reset ») casserait le « never clear » : chaque session serait un fil neuf.
     # Pour ces identités, toutes les sessions tombent dans UN fil fixe ; un changement d'identifiant de session y
@@ -200,6 +226,14 @@ class NokkerConfig:
     # Locataire interne (opérateurs internes, canari). `false` sur la bêta OVH : aucun expéditeur n'y est interne (clés d'API,
     # `telegram_ids`, appareils de l'opérateur), et aucun appareil ne s'enrôle sans invitation. docs/TENANCY.md §2.
     internal_tenant: bool = True
+    # Traces d'entraînement / d'évaluation (docs/TRACES.md, nokker/traces/) : `traces_record: true` garde CHAQUE appel
+    # modèle (messages exacts envoyés au fournisseur, schémas d'outils, suite du tour) dans `trace_calls` (migration
+    # 045). Défaut false : rien n'est enregistré. `traces_retention_days` borne la table (purge par le noyau, au plus
+    # une fois par heure et par locataire, et par `nokker traces purge`). `traces_target` : beta | canary | lokkal
+    # (vide : lokkal si le bloc `local` est posé, sinon unknown).
+    traces_record: bool = False
+    traces_retention_days: int = 30
+    traces_target: str = ""
     # Nokker Lokkal (docs/LOKKAL.md §7, nokker/local/api.py) : None (bêta) = pas d'API locale ni d'outils de code.
     # {token_path, allowed_hosts, code: {roots, host_roots, backend, image, network_name},
     #  secrets: {provider: file|openbao (défaut file ; NOKKER_SECRETS_PROVIDER prime), file: {path, key_env, key_file},
@@ -212,6 +246,15 @@ class NokkerConfig:
     # forge: {allowed_hosts}, secrets: {provider, file, openbao}, hooks, state_dir, docker: {image, network,
     # network_name, host_root}, kubernetes: {…, transmis au module du bac à sable}}. Refusé dans Lokkal (local.code).
     code: dict[str, Any] | None = None
+    # `execute_code` (docs/LOKKAL.md §7.31, nokker/tools/execute_code.py) : un script Python du modèle, dans le bac à
+    # sable du fil, qui appelle plusieurs outils en un appel (mêmes portes que la boucle). Éteint = outil absent de la
+    # surface (ni schéma ni index, appel → « outil inconnu »). Bloc `execute_code` : {tools (liste blanche, lectures par
+    # défaut), timeout_s, max_timeout_s, max_calls, stdout_chars, return_chars, error_chars, python}.
+    execute_code_enabled: bool = False
+    execute_code: dict[str, Any] = field(default_factory=dict)
+    # `POST /v1/memory/search` (docs/MCP-SERVER.md) : recherche dans la mémoire longue du compte, sous la même
+    # identité et le même locataire que les autres routes. Éteint = 404. Sert le serveur MCP `nokker mcp serve`.
+    memory_search_api: bool = False
     # nokker.ai, côté cloud du lien Lokkal (docs/LOKKAL.md §7.2 révisé, §7.5, nokker/cloud/) : None (défaut) = aucune
     # route /v1/link/*, /v1/gateway/*, /v1/inference/*. {signing_key_env, base_url, gateway_domain}
     cloud_link: dict[str, Any] | None = None
@@ -247,6 +290,24 @@ class NokkerConfig:
     # compétences et les modèles d'agents d'un pack livré avec le noyau qui tournent au web (jamais les serveurs MCP ni
     # ce qui demande une machine). Éteint par défaut : aucune route /v1/packs*, aucun outil de pack pour les testeurs.
     packs_web: bool = False
+    # Apprentissage sous contrôle humain (docs/LEARNING.md, nokker/learning/) — comptes `us_…` de nokker.ai ; Lokkal lit
+    # les mêmes clés sous `local`. Éteints par défaut : aucun outil, aucune ligne, aucune route de plus.
+    # `learning` : skill_create/update/history/revert (carte obligatoire, versions, journal, /v1/learning/*) ;
+    # `learning_nudges` : une ligne fixe au tour qui suit un tour réussi riche en outils ; `memory_pending` : les
+    # écritures de mémoire durable attendent l'approbation (/v1/memory/pending*). `learning_settings` :
+    # {learning_nudge_min_tools: 8, learning_nudge_cooldown: 20}.
+    learning: bool = False
+    learning_nudges: bool = False
+    memory_pending: bool = False
+    learning_settings: dict[str, Any] | None = None
+    # Mémoire longue multi-locataire (docs/MEMORY-TENANCY.md, nokker/memory/tenant_long.py, migration 049) : mémoire de
+    # profil par compte et mémoire commune du foyer, sous RLS, plongements CortHeXis (pgvector de la base du noyau,
+    # service d'embed `CORTHEXIS_EMBED_URLS`), rappelées dans le `[Rappel mémoire]` des testeurs. Éteint par défaut :
+    # aucune route /v1/memory/long*, rien de rappelé de plus. `tenant_long_memory_settings` : {user_k: 3,
+    # household_k: 2, min_score: 0.35, relative_floor: 0.6, lexical_min_score: 0.3, vector_weight: 0.7,
+    # max_candidates: 500, tools: false}.
+    tenant_long_memory: bool = False
+    tenant_long_memory_settings: dict[str, Any] | None = None
     # Plan et incidents (lot X18, docs/LOKKAL.md §7.18). `plan` : cartes hiérarchiques, consignes héritées injectées,
     # avancement calculé, propositions de découpe, brief du matin (routes /v1/plan*, outils plan_*). `operate` : alertes
     # signées → incidents → agents `alert:<nom>` (routes /v1/alerts*, /v1/incidents*). Éteints par défaut : 404 comme
@@ -274,6 +335,17 @@ class NokkerConfig:
     telegram_webhook_secret_env: str = "NOKKER_TELEGRAM_WEBHOOK_SECRET"
     # Base de l'app web (liens des notifications : /approvals/<id>). Vide = pas de notification Telegram des testeurs.
     app_url: str = ""
+    # Base publique de l'API pour les liens de conversation partagés (`POST /v1/threads/{id}/shares` → `url`) : vide =
+    # chemin relatif `/v1/public/shares/<jeton>.html`, que le client préfixe par l'hôte de l'API.
+    share_base_url: str = ""
+    # Canaux Slack et WhatsApp (docs/CHANNELS.md, nokker/channels/) : None ou `enabled: false` (défaut) = aucune route
+    # /v1/slack/*, /v1/whatsapp/*, aucun appel au fournisseur. Secrets en RÉFÉRENCES `secret:NOM` seulement (une valeur
+    # en clair refuse le canal). slack : {enabled, team_id, app_id, bot_user_id, bot_token, signing_secret,
+    # channel_mentions, rate_per_minute, rate_burst, lang, voice: {enabled, model, max_bytes}, secrets, state_dir}.
+    # whatsapp : {enabled, phone_number_id, display_number, graph_version, access_token, app_secret, verify_token,
+    # card_template: {name, lang}, max_age_s, rate_per_minute, rate_burst, lang, voice, secrets, state_dir}.
+    slack: dict[str, Any] | None = None
+    whatsapp: dict[str, Any] | None = None
     admin_enabled: bool = False
     admin_host: str = "127.0.0.1"
     admin_port: int = 8744

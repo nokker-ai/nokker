@@ -90,6 +90,9 @@ class ContextEngineV1(ContextEngineV0):
                 parts.append(f"[Rappel mémoire]\n{rappel}\n[/Rappel]")
             if turn.injected:
                 parts.append(render_injected(turn.injected))
+            if turn.attached:
+                # Pièces jointes texte/dossier/url (docs/CONTEXT-FORMAT.md) : en dernier, juste avant le message.
+                parts.append(turn.attached)
             return parts
 
         head = self.turn_head(turn, head_parts)

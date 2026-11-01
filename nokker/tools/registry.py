@@ -33,7 +33,14 @@ class StaticToolSource:
         for spec, fn in self.entries:
             if spec.name == name:
                 return fn(arguments, ctx)
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+        return unknown_tool_result(name)
+
+
+def unknown_tool_result(name: str) -> ToolResult:
+    """Résultat d'un appel à un nom hors catalogue — texte FIXE (appris tel quel à l'entraînement, run6) : il renvoie
+    vers `tool_find` au lieu d'inviter à réessayer le même nom inventé (run4 : 30 noms hors catalogue)."""
+    return ToolResult(call_id="", name=name, is_error=True,
+                      content=f"outil inconnu : {name}. Utilise tool_find pour trouver l'outil réel.")
 
 
 def _native_stub(name: str, message: str, param: str, param_desc: str
@@ -152,7 +159,7 @@ class Registry:
         for src in self.sources:
             if any(s.name == name for s in src.specs()):
                 return src.call(name, arguments, ctx)
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+        return unknown_tool_result(name)
 
     def close(self) -> None:
         for src in self.sources:

@@ -62,7 +62,9 @@ content**.
    `skills` field says so (`project: "untrusted"`, with a `notice`), and a `skill.untrusted` event is sent. The
    fingerprint (`sha256`) covers every file of the folder: paths and contents.
 2. Read the skills. Then trust them, from the same machine:
-   - `POST /v1/local/skills/trust {"thread_id": "th_…", "sha256": "<fingerprint>"}` with the local token; or
+   - `POST /v1/local/skills/trust {"thread_id": "th_…", "sha256": "<fingerprint>"}` with the local token (409 if the folder changed since the fingerprint was read); or
+   - in the terminal client, answer the **Trust this repository's skills?** card with `y` (it shows the root, the number
+     of skills and the fingerprint; `/skills trust` reopens it, see [cli.md](cli.md#repository-skills-trust-card)); or
    - `python -m nokker.cli skills show`, then `python -m nokker.cli skills trust --sha256 <fingerprint>` in the
      folder.
 3. The trust is written to **your** settings (`trusted_project_skills: [{root, sha256}]`), never to the repository's.

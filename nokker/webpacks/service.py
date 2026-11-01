@@ -169,6 +169,9 @@ class WebPacks:
     handoffs: Any = None
     audit: Callable[[dict[str, Any]], None] | None = None
     clock: Callable[[], float] = time.time
+    # Skills appris du compte (docs/LEARNING.md, drapeau `learning`) : `skill_list` et `skill_view` les lisent aussi
+    # (`nokker.learning.skills.LearnedSkills`) ; None (défaut) : rien ne change.
+    learned: Any = None
 
     def _emit(self, **event: Any) -> None:
         try:

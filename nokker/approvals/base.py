@@ -297,6 +297,32 @@ class BaseApprovals:
             self._expire_if_needed(a)
         return [a for a in items if a.status == "pending"]
 
+    # ─────────────────────── règles suggérées (docs/APPROVALS.md §7) ───────────────────────
+    # Primitives optionnelles : un backend qui ne les a pas ne propose rien (liste vide), jamais une erreur de route.
+
+    def _list_history(self, since: float) -> list[Approval]:
+        return []
+
+    def _load_suggestion_marks(self, user: str) -> dict[str, dict]:
+        return {}
+
+    def _store_suggestion_mark(self, suggestion_id: str, user: str, state: str, rule: str,
+                               provenance: dict) -> None:
+        raise NotImplementedError
+
+    def history(self, since: float) -> list[Approval]:
+        """Cartes du locataire courant créées depuis `since`, tous statuts (lecture seule, pour les suggestions)."""
+        return [a for a in self._list_history(since) if self.visible(a)]
+
+    def suggestion_marks(self, user: str) -> dict[str, dict]:
+        """{id de suggestion: {state: accepted|dismissed, rule, provenance, at}} de `user` dans le locataire courant."""
+        return self._load_suggestion_marks(user)
+
+    def mark_suggestion(self, suggestion_id: str, user: str, state: str, rule: str, provenance: dict) -> None:
+        if state not in ("accepted", "dismissed"):
+            raise ValueError(f"état de suggestion inconnu : {state!r}")
+        self._store_suggestion_mark(suggestion_id, user, state, rule, provenance)
+
     def _expire_if_needed(self, approval: Approval) -> None:
         if approval.status == "pending" and self.clock() > approval.expires_at:
             approval.status = "expired"

@@ -144,8 +144,9 @@ def test_tester_model_calling_alice_tools_executes_nothing(rig):
     turn = _turn(kernel, TESTER)
     assert FakeMcp.calls == [] and memory.calls == []
     results = [m.content for m in turn.messages if m.role == "tool"]
-    assert results == ["outil inconnu : memory_search", "outil inconnu : browser_navigate",
-                       "outil inconnu : mail_search"]
+    hint = ". Utilise tool_find pour trouver l'outil réel."
+    assert results == ["outil inconnu : memory_search" + hint, "outil inconnu : browser_navigate" + hint,
+                       "outil inconnu : mail_search" + hint]
     for _, tools in provider.seen:
         assert not {t["function"]["name"] for t in tools} & FORBIDDEN
 

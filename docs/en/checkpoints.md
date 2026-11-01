@@ -50,9 +50,9 @@ created since are not deleted, and your edits are overwritten for the files cove
 ## In the terminal
 
 ```
-/checkpoints          list points, newest first (number 1 is the latest)
-/diff [hash|n]        coloured diff since a point, cut at 300 lines (the rest is counted)
-/rollback [hash|n]    go back to a point; shows an approval card, then lists restored and kept files
+/checkpoints          list points, newest first (number 1 is the latest), with the turn each point belongs to when known
+/diff [hash|n]        coloured diff since a point (default: the latest), cut at 300 lines (the rest is counted)
+/rollback [hash|n]    go back to a point (default: the latest), safe restore; shows an approval card, then lists restored and kept files
 ```
 
 These slash commands call the tools above directly, without a model turn (see [cli.md](cli.md#slash-commands)). You

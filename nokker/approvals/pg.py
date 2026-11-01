@@ -19,6 +19,9 @@ from nokker.core.ports import Approval
 from nokker.store.conn import TenantConn, connect_admin, migrate
 
 MIGRATION_SQL = (Path(__file__).parent / "migrations" / "0001_approvals.sql").read_text(encoding="utf-8")
+# Marques des règles suggérées (docs/APPROVALS.md §7) : migration du store, rejouée aussi ici (après la table approvals).
+SUGGESTIONS_SQL = (Path(__file__).parent.parent / "store" / "migrations"
+                   / "047_approval_suggestions.sql").read_text(encoding="utf-8")
 
 _ENC_KEY_ENV = "NOKKER_APPROVALS_ENC_KEY"
 
@@ -63,7 +66,7 @@ class PgApprovals(BaseApprovals):
     def __post_init__(self) -> None:
         if not self.dsn:
             raise ValueError("PgApprovals requiert un DSN Postgres")
-        migrate(self.dsn, MIGRATION_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
+        migrate(self.dsn, MIGRATION_SQL, SUGGESTIONS_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
         self._db = TenantConn(self.dsn)
         # Tables d'authentification (devices, sessions, totp_secrets, used_nonces) : hors RLS, lues AVANT de connaître
         # le locataire (verify_session, login_challenge, create_session). Même DSN, donc même rôle nokker_app, mais une
@@ -108,6 +111,29 @@ class PgApprovals(BaseApprovals):
             cur.execute(f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE status = 'pending'")
             rows = cur.fetchall()
         return [_row_to_approval(r) for r in rows]
+
+    def _list_history(self, since: float) -> list[Approval]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE created_at >= %s", (since,))
+            rows = cur.fetchall()
+        return [_row_to_approval(r) for r in rows]
+
+    def _load_suggestion_marks(self, user: str) -> dict[str, dict]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute('SELECT suggestion_id, state, rule, provenance, at FROM approval_suggestion_marks '
+                        'WHERE "user" = %s', (user,))
+            rows = cur.fetchall()
+        return {sid: {"state": state, "rule": rule, "provenance": dict(prov or {}), "at": at}
+                for sid, state, rule, prov, at in rows}
+
+    def _store_suggestion_mark(self, suggestion_id: str, user: str, state: str, rule: str,
+                               provenance: dict) -> None:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute('INSERT INTO approval_suggestion_marks ("user", suggestion_id, state, rule, provenance, at) '
+                        "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (tenant_id, \"user\", suggestion_id) "
+                        "DO UPDATE SET state = EXCLUDED.state, rule = EXCLUDED.rule, "
+                        "provenance = EXCLUDED.provenance, at = EXCLUDED.at",
+                        (user, suggestion_id, state, rule, Jsonb(provenance), self.clock()))
 
     def _append_event(self, approval_id: str, event_type: str, data: dict) -> None:
         with self._lock, self._conn.cursor() as cur:

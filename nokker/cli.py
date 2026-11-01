@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import uuid
+from typing import Any
 
 from nokker.api.server import build_approvals, build_kernel, build_ledger, serve
 from nokker.approvals.errors import ApprovalError, DeviceError
@@ -167,6 +169,14 @@ def _cmd_code(args: argparse.Namespace) -> int:
     return 1 if turn.error else 0
 
 
+def _cmd_import(args) -> int:
+    """`nokker import` (lot 30) : reprise d'une installation Claude Code ou Cursor."""
+    from nokker.importers.cli import run
+    from nokker.tools.packs import user_home
+
+    return run(args, nokker_home=user_home(None), user_settings=_user_settings_path())
+
+
 def _user_settings_path(local: dict | None = None):
     """Réglages de l'UTILISATEUR, là où `nokker skills trust` écrit la confiance : `local.settings_path`, sinon
     `$NOKKER_HOME/settings.json`, sinon `~/.config/nokker/settings.json`. Jamais un fichier du dépôt."""
@@ -289,12 +299,38 @@ def _cmd_costs(args: argparse.Namespace) -> int:
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    dsn = load_config(args.config).pg_dsn()
+    config = load_config(args.config)
+    dsn = config.pg_dsn()
     if not dsn:
         print("[erreur: aucun DSN Postgres configuré]", file=sys.stderr)
         return 1
     apply_migrations(dsn, strict=True)  # sans les droits : exception, le job d'init échoue franchement
     print("migrations appliquées.")
+    return _migrate_corthexis(config, dsn)
+
+
+def _migrate_corthexis(config: Any, dsn: str) -> int:
+    """Base CortHeXis en `corthexis_schema: external` (docs/MEMORY-TENANCY.md §5.1) : schéma du paquet, locataire et
+    RLS forcée, fonctions de génération, droits du rôle du noyau (DML) et de la sauvegarde — avec le DSN PROPRIÉTAIRE
+    (`CORTHEXIS_OWNER_DATABASE_URL`). Variable absente : rien (Lokkal, développement : le pod migre lui-même)."""
+    from nokker.context import corthexis_tenancy as ct
+
+    try:
+        mode = ct.set_mode(config.corthexis_schema)  # faute de frappe : le job échoue, comme le pod
+    except ValueError as e:
+        print(f"[erreur: {e}]", file=sys.stderr)
+        return 1
+    cx = config.context_corthexis or {}
+    owner = os.environ.get(str(cx.get("owner_database_url_env") or ct.OWNER_DSN_ENV), "")
+    if not owner:
+        if mode == ct.EXTERNAL and cx.get("enabled"):
+            print(f"[attention: corthexis_schema external sans {ct.OWNER_DSN_ENV} : base CortHeXis non migrée, le pod "
+                  "coupera l'index de session]", file=sys.stderr)
+        return 0
+    rep = ct.migrate_schema(owner, app_role=str(cx.get("app_role") or ct.APP_ROLE),
+                            project_tenants=ct.project_tenants_from(dsn))
+    print(f"base CortHeXis migrée ({len(rep['applied'])} migration(s) du paquet, droits de {rep['app_role']}"
+          f"{', sauvegarde' if rep['backup'] else ''}).")
     return 0
 
 
@@ -557,6 +593,14 @@ def build_parser() -> argparse.ArgumentParser:
     review_p = sub.add_parser("review", help="relecture d'un diff ou d'une PR par le juge, par ligne (lot X13)")
     add_review_arguments(review_p).set_defaults(func=_cmd_review, unscoped=True)
 
+    mcp_p = sub.add_parser("mcp", help="Nokker comme serveur MCP : `mcp serve` sur stdio (docs/MCP-SERVER.md)")
+    mcp_p.add_argument("mcp_args", nargs=argparse.REMAINDER)
+    mcp_p.set_defaults(func=_cmd_mcp, unscoped=True)
+
+    from nokker.importers.cli import add_import_subparser
+
+    add_import_subparser(sub).set_defaults(func=_cmd_import, unscoped=True)
+
     from nokker.secrets.cli import add_secret_subparsers
 
     add_secret_subparsers(sub)  # coffre local (X4) : secret set|list|rm, vault migrate|status
@@ -567,6 +611,10 @@ def build_parser() -> argparse.ArgumentParser:
     from nokker.ledger.audit import add_audit_subparser
 
     add_audit_subparser(sub)  # journal d'audit chaîné (X11) : audit export|verify
+
+    from nokker.traces.cli import add_traces_subparser
+
+    add_traces_subparser(sub)  # traces d'entraînement (docs/TRACES.md) : traces export|purge|verify
 
     devices_p = sub.add_parser("devices", help="appareils enrôlés (approbations fortes, docs/APPROVALS.md)")
     devices_sub = devices_p.add_subparsers(dest="devices_command", required=True)
@@ -628,6 +676,12 @@ def build_parser() -> argparse.ArgumentParser:
         mp.set_defaults(func=_cmd_household, unscoped=True)
 
     return p
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    from nokker.mcp_server import main as mcp_main
+
+    return mcp_main(list(args.mcp_args))
 
 
 def main(argv: list[str] | None = None) -> int:

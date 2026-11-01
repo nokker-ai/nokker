@@ -11,7 +11,12 @@ import time
 
 import pytest
 
-from tests.integration.test_rls import pg, pod_env, requires_pg  # noqa: F401 — fixtures (base neuve, rôles, migrations)
+from tests.integration.test_rls import (  # noqa: F401 — fixtures (base neuve, rôles, migrations)
+    pg,
+    pod_env,
+    requires_pg,
+    seed_accounts,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -46,6 +51,7 @@ def world(pg):  # noqa: F811
     from nokker.team.store import PgTeamStore
     from nokker.tenancy.context import tenant_scope
 
+    seed_accounts(pg["su"], OWNER, MEM, VIEW, OUT)
     store = PgTeamStore(pg["app"], migrate_now=False)  # migrations déjà faites en propriétaire par la fixture
     team = Team(store=store, tenancy=Accounts(OWNER, MEM, VIEW, OUT), mirror_allowed=lambda acc: True)
     with tenant_scope(OWNER.tenant_id):
@@ -183,6 +189,7 @@ def test_invitation_is_the_only_way_in_and_must_match_the_role(world):
     dsn, pid, t = world["pg"]["app"], world["pid"], world["team"]
     a, now = OWNER.tenant_id, time.time()
     late = Actor("tn_eeeeeeeeeeee", "us_latecomer01", "late@example.org")
+    seed_accounts(world["pg"]["su"], late)  # le compte existe quand il lit son invitation (inscription faite)
     with tenant_scope(a):
         inv = t.invite(OWNER, pid, {"email": late.email, "role": "viewer"})  # compte inconnu à l'invitation
     assert _raw(dsn, late, "SELECT project_name, role FROM team_invites") == [("Plateforme", "viewer")]

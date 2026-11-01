@@ -252,3 +252,47 @@ si le fichier existe sur disque.
   redémarre entre deux connexions (fenêtre de reprise bornée à `max_buffer`/`max_age_s`, pas un journal persistant).
 - `PgApprovals` est câblée et testée par construction (même logique que `InMemoryApprovals`, voir §4), mais son
   SQL réel n'a été exercé qu'ponctuellement contre un Postgres jetable, pas en continu par la CI de ce chantier.
+
+## 7. Règles suggérées (lot P2, `nokker/approvals/suggestions.py`)
+
+Quand le même type de carte a été approuvé `threshold` fois **sans aucun refus** dans la fenêtre, le noyau propose au
+propriétaire « toujours autoriser X » ; rien ne change tant qu'il n'accepte pas. Drapeau `approval_suggestions` de la
+config : `{enabled: false (défaut), threshold: 5 (≥ 2), window_days: 30}` ; éteint, les routes répondent `404`.
+
+- **Type de carte** = une règle candidate, celle que la décision locale proposait déjà (`suggested_rules`, docs/LOKKAL.md
+  §7.4.3 : `terminal(npm test)`, `terminal(npm test*)`, `patch(src/**)`…). Une carte approuvée (`approved`, `executed`,
+  `failed` après approbation) compte pour chacune de ses candidates ; une carte **refusée** bloque toutes les siennes.
+  Seules comptent les cartes du locataire courant, **décidées par l'appelant** (`decided_by`), visibles de lui (session
+  de code d'un autre : non). Une règle large n'est proposée que si elle couvre plus de cartes que la plus étroite déjà
+  retenue ; une règle déjà présente dans les `allow` n'est pas reproposée. 20 propositions au plus.
+- **Jamais proposées** (`suggestions.forbidden`) : carte `strong` (destructif), effet `destructive` ou `send_bulk`
+  (`SEND_BULK` reste `DENY`, il n'a pas de carte), plancher prod `ops:prod*`, `pages:publish`, `household:guardian`,
+  connecteurs relayés et tours venus du web (`permissions:relayed_*`), boîte mail locale
+  (`permissions:local_connector_strong`), premier contact `ssh_trust`. `suggested_rules` ne rend déjà rien pour la
+  plupart ; la liste est vérifiée en plus, carte par carte.
+- **Rien n'est visible par le modèle** : ni outil, ni bloc de contexte, ni événement de fil.
+
+Routes (identité résolue comme au §5 ; le jeton local vaut « propriétaire local ») :
+
+- `GET /v1/approvals/suggestions` → `200 {"suggestions": [{"id": "sg_…", "rule", "tool", "approved", "rejected": 0,
+  "approval_ids": [10 plus récentes], "first_at", "last_at"}], "rule_store": "user_settings" | null, "threshold",
+  "window_days"}`.
+- `POST /v1/approvals/suggestions/{id}/accept` → la règle est écrite par le **mécanisme existant** de la portée
+  `always` (docs/LOKKAL.md §7.4.3) : `allow` des réglages de l'UTILISATEUR (`local.settings_path`), jamais le
+  `.nokker/` du dépôt, et ajoutée tout de suite aux `allow` en vigueur. Provenance rangée à côté, hors de `permissions` :
+  `rule_provenance[<règle>] = {source: "approval_suggestion", suggestion_id, approved, approval_ids, accepted_by,
+  accepted_at}`, et dans la marque de la suggestion. `200 {id, state: "accepted", rule, provenance}`.
+  Réservé au propriétaire de la machine (Lokkal, `rule_store` non nul) : ailleurs `409 {"code": "no_rule_store"}`. Les
+  comptes multi-locataires n'ont pas de règles durables (docs/LOKKAL.md §7.28.7 : décision `once` seulement) ; ils
+  voient leurs propositions mais ne peuvent pas les accepter tant qu'un tel magasin n'existe pas.
+- `POST /v1/approvals/suggestions/{id}/dismiss` → masquée pour cet utilisateur (même id stable pour compte, utilisateur
+  et règle : elle ne revient pas), `200 {id, state: "dismissed", rule}`. Rien n'est écrit dans les réglages.
+- Id inconnu, plus valable (un refus est arrivé depuis, sortie de la fenêtre), ou d'un autre compte : `404`.
+
+Stockage des marques : `InMemoryApprovals` (dict par locataire) ou Postgres, table `approval_suggestion_marks`
+(migration `nokker/store/migrations/047_approval_suggestions.sql`,
+RLS par `tenant_id`, effacée avec le locataire). Les propositions elles-mêmes ne sont jamais stockées : elles se
+recalculent depuis `approvals` à chaque lecture (index `approvals_created_at_idx`).
+
+Limites : le calcul relit les cartes de la fenêtre à chaque `GET` (pas de cache) ; une règle acceptée puis retirée à
+la main des réglages n'est plus reproposée (sa marque `accepted` reste) ; la retirer aussi de la table, à la main.

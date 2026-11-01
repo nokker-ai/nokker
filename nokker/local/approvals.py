@@ -51,6 +51,10 @@ def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None, 
         if len(words) > 2:
             out.append(f"{tool}({' '.join(words[:2])}*)")
         return out
+    if tool == "delegate":
+        # Déléguer n'a ni fichier ni commande : seule une règle par outil a un sens (e2e du 1.11 : la carte proposait
+        # une règle que le client affichait « toujours ce fichier »). `rule_kind` le dit au client.
+        return [tool]
     if tool in FILE_TOOLS and arguments.get("path"):
         path = posixpath.normpath(str(arguments["path"]))
         parent = posixpath.dirname(path)
@@ -61,8 +65,24 @@ def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None, 
     return [tool]
 
 
-def append_user_rule(settings_path: str | Path, rule: str) -> bool:
-    """Ajoute `rule` aux `allow` des réglages de l'utilisateur (dédoublonné à l'identique). True si écrite."""
+def rule_kind(rule: str) -> str:
+    """Ce que couvre une règle proposée, pour le libellé du client : `tool` (tout appel de l'outil), `file` (ce
+    fichier), `dir` (ce dossier), `prefix` (commandes qui commencent ainsi), `exact` (cette commande, cet hôte:chemin)."""
+    if "(" not in rule:
+        return "tool"
+    tool, _, pattern = rule.partition("(")
+    pattern = pattern[:-1] if pattern.endswith(")") else pattern
+    if pattern.endswith("/**"):
+        return "dir"
+    if pattern.endswith("*"):
+        return "prefix"
+    return "file" if tool in FILE_TOOLS else "exact"
+
+
+def append_user_rule(settings_path: str | Path, rule: str, provenance: dict[str, Any] | None = None) -> bool:
+    """Ajoute `rule` aux `allow` des réglages de l'utilisateur (dédoublonné à l'identique). True si écrite.
+    `provenance` (règle née d'une suggestion, docs/APPROVALS.md §7) : rangée à part, sous `rule_provenance[rule]`,
+    hors de `permissions` (que seules les permissions lisent)."""
     p = Path(settings_path).expanduser()
     data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
     perms = data.setdefault("permissions", {})
@@ -70,6 +90,8 @@ def append_user_rule(settings_path: str | Path, rule: str) -> bool:
     if rule in allow:
         return False
     allow.append(rule)
+    if provenance:
+        data.setdefault("rule_provenance", {})[rule] = provenance
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -77,4 +99,4 @@ def append_user_rule(settings_path: str | Path, rule: str) -> bool:
     return True
 
 
-__all__ = ["append_user_rule", "suggested_rules"]
+__all__ = ["append_user_rule", "rule_kind", "suggested_rules"]

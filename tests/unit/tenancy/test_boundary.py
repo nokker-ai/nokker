@@ -359,3 +359,31 @@ def test_events_never_leave_their_tenant(w):
     assert "approval.requested" in seen_a and ta in seen_a
     assert "approval.requested" in seen_n and ta not in seen_n
     assert ta not in seen_b and "approval.requested" not in seen_b and "event:" not in seen_b
+
+
+# ─────────────────────────── export et liens partagés ───────────────────────────
+
+
+def test_export_and_shares_never_cross_tenants(w):
+    w.chat("contenu de A", "s-1", who="A")
+    w.chat("contenu de B", "s-1", who="B")
+    ta = f"{w.a.tenant_id}:s-1"
+    for who in ("B", "alice"):
+        assert w.call("GET", f"/v1/threads/{ta}/export", who=who)[0] == 404
+        assert w.call("POST", f"/v1/threads/{ta}/shares", {}, who=who)[0] == 404
+        assert w.call("GET", f"/v1/threads/{ta}/shares", who=who)[0] == 404
+    st, doc = w.call("GET", "/v1/threads/s-1/export", who="A")  # son propre fil, par son id client
+    assert st == 200 and [m["content"] for m in doc["messages"] if m["role"] == "user"] == ["contenu de A"]
+    st, out = w.call("POST", "/v1/threads/s-1/shares", {"include_tools": True}, who="A")
+    assert st == 201 and out["thread_id"] == ta
+    for who in ("B", "alice"):  # un partage d'un autre locataire : 404, jamais 403
+        assert w.call("DELETE", f"/v1/shares/{out['share_id']}", who=who)[0] == 404
+    st, lst = w.call("GET", "/v1/threads/s-1/shares", who="B")
+    assert st == 200 and lst == {"shares": []}
+    token = out["url"].rsplit("/", 1)[-1].removesuffix(".html")
+    st, pub = w.call("GET", f"/v1/public/shares/{token}", who="")
+    raw = json.dumps(pub, ensure_ascii=False)
+    assert st == 200 and "contenu de A" in raw and "contenu de B" not in raw
+    assert w.a.account_id not in raw and w.a.tenant_id not in raw  # ni compte ni locataire dans l'instantané
+    assert w.call("DELETE", f"/v1/shares/{out['share_id']}", who="A")[0] == 200
+    assert w.call("GET", f"/v1/public/shares/{token}", who="")[0] == 404

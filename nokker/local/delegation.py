@@ -6,7 +6,8 @@ de l'utilisateur : le noyau de nokker.ai arrive par la passerelle avec un **jeto
 
 - **le cloisonnement de la passerelle** (`allows`) : un jeton de délégation n'ouvre QUE trois routes —
   `POST /v1/local/sessions` (ouvrir la session de la demande), `POST /v1/chat/completions` et
-  `POST /v1/threads/{id}/cancel` sur un fil que CETTE délégation a ouvert (même compte, même session web). Tout le
+  `POST /v1/threads/{id}/cancel` (et `pause`, `resume`, `steer`) sur un fil que CETTE délégation a ouvert (même compte,
+  même session web). Tout le
   reste (fils, mémoire, coffre, réglages, pages, processus, approbations) est refusé (403) : nokker.ai ne lit rien de
   la machine au-delà de la réponse que la session Lokkal choisit de rendre ;
 - **le retour des résultats** (`wrap`) : chaque tour fini d'un fil délégué (réponse synchrone, ou suite du tour après
@@ -32,7 +33,7 @@ import httpx
 logger = logging.getLogger("nokker.local.delegation")
 
 SCOPE = "lokkal:session"
-_RE_CANCEL = re.compile(r"^/v1/threads/([^/]+)/cancel$")
+_RE_CANCEL = re.compile(r"^/v1/threads/([^/]+)/(?:cancel|pause|resume|steer)$")
 _RE_HANDOFF = re.compile(r"^ho_[0-9a-f]{16}$")
 
 

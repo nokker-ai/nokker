@@ -11,5 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pip sans --break-system-packages dans un container jetable ; pas de cache disque inutile
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     npm_config_update_notifier=false npm_config_fund=false
+# Outils de test et de langage tout prêts (le réseau du bac à sable peut être fermé) : pytest pour le Python courant
+# (pip et venv sont déjà là), serveurs LSP pour la fonction LSP du noyau (pyright, typescript-language-server).
+RUN pip install pytest \
+    && npm i -g pyright typescript typescript-language-server \
+    && npm cache clean --force && rm -rf /root/.npm /tmp/*
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

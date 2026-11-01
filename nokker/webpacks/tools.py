@@ -63,9 +63,19 @@ class WebPackTools:
             if name == "pack_remove":
                 return out(svc.remove(account, str(a.get("name") or ""), thread_id=ctx.thread_id))
             if name == "skill_list":
-                return out(svc.list_skills(account, a.get("category")))
+                listed = svc.list_skills(account, a.get("category"))
+                if svc.learned is not None and a.get("category") in (None, "", "learned"):
+                    # skills appris du compte (docs/LEARNING.md) : famille `learned`, après ceux des packs
+                    listed = {**listed, "skills": [*listed.get("skills", []), *(
+                        {k: s[k] for k in ("name", "category", "description", "source")}
+                        for s in map(svc.learned.skill_json, svc.learned.active(account)))]}
+                return out(listed)
             if name == "skill_view":
                 payload, err = svc.view_skill(account, str(a.get("name") or ""), a.get("file"))
+                if err and svc.learned is not None and not a.get("file"):
+                    v = svc.learned.current(account, str(a.get("name") or "").strip().removeprefix("learned/"))
+                    if v is not None and v.active:
+                        return out(svc.learned.skill_json(v))
                 return out(payload, err)
         except WebPackError as e:
             extra = f"\n{json.dumps(e.payload, ensure_ascii=False)}" if e.payload else ""

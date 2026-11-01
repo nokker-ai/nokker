@@ -36,7 +36,8 @@ from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, CodeToolSource
 LOCAL_OWNER = "local-owner"
 logger = logging.getLogger("nokker.local.api")
 # Champs ajoutés à chaque ligne de `GET /v1/local/sessions` (§7.4.1), avec leur valeur quand rien n'est connu.
-SESSION_DEFAULTS: dict[str, Any] = {"title": None, "last_turn_at": None, "working": False, "pending_approvals": 0}
+SESSION_DEFAULTS: dict[str, Any] = {"title": None, "last_turn_at": None, "working": False, "pending_approvals": 0,
+                                    "paused": False}
 
 
 def _chosen_thread(body: Any) -> tuple[str | None, str | None]:
@@ -112,6 +113,9 @@ class SessionCodeTools:
     # `state_dir/processes`.
     background: bool = False
     state_dir: str | None = None
+    # Diagnostics de langage (lot 13, `local.lsp.enabled`) : un `LspManager` pour toute l'instance (plafonds de
+    # serveurs partagés entre fils) ; None = éteint.
+    lsp: Any = None
     _by_thread: dict[str, CodeToolSource] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -121,7 +125,7 @@ class SessionCodeTools:
         host = os.path.normpath(os.path.join(host_root, rel)) if host_root else None
         src = CodeToolSource(root=cwd, backend=self.backend, image=self.image, network_name=self.network_name,
                              host_root=host, instance=self.instance, background=self.background,
-                             state_dir=self.state_dir)
+                             state_dir=self.state_dir, lsp=self.lsp)
         with self._lock:
             old = self._by_thread.pop(thread_id, None)
             self._by_thread[thread_id] = src
@@ -134,7 +138,7 @@ class SessionCodeTools:
 
     def specs(self) -> list[ToolSpec]:
         # Les schémas ne dépendent pas du dossier : ceux d'une source quelconque (dossier courant, jamais ouvert).
-        return CodeToolSource(root=os.getcwd(), backend="local", background=self.background).specs()
+        return CodeToolSource(root=os.getcwd(), backend="local", background=self.background, lsp=self.lsp).specs()
 
     def for_thread(self, thread_id: str) -> CodeToolSource | None:
         """La source du fil ; un fil de sous-agent `<fil>/sa-<id>` (delegate) a celle de son
@@ -196,6 +200,19 @@ class SessionCodeTools:
             self._by_thread.clear()
         for s in srcs:
             s.close()
+        if self.lsp is not None:
+            self.lsp.close()
+
+
+def _lsp_manager(local: dict[str, Any]) -> Any:
+    """`LspManager` si `local.lsp.enabled` est vrai (lot 13, docs/LOKKAL-LSP.md), sinon None ; `local.lsp.inline`
+    ajoute le bloc `[Diagnostics]` aux résultats d'édition. Éteints tous les deux par défaut."""
+    conf = local.get("lsp")
+    if not isinstance(conf, dict) or not conf.get("enabled", False):
+        return None
+    from nokker.tools.lsp import LspManager
+
+    return LspManager(inline=bool(conf.get("inline", False)))
 
 
 @dataclass
@@ -263,6 +280,9 @@ class LocalApi:
         return self._preview
     # Mémoire de projet (lot X1, docs/LOKKAL.md §7.11) : `local.project_memory` ; None = éteinte, rien ne change.
     project_memory: Any = None
+    # Apprentissage (docs/LEARNING.md) : `local.learning` (skills appris) et/ou `local.memory_pending` (quarantaine) ;
+    # None = éteint, rien ne change (ni outil, ni route).
+    learning: Any = None
     # Ops (lot X11, docs/LOKKAL.md §7.14) : `local.ops` ; None = éteint (ni outils ssh, ni bloc `ops`, ni journal).
     ssh: Any = None  # nokker.tools.ssh.SshToolSource
     audit: Any = None  # nokker.ledger.audit.AuditLog
@@ -281,6 +301,8 @@ class LocalApi:
     describe_session: Any = None
     # Bus d'événements (`EventBus.publish`), posé par serve : `checkpoint.created` des points de retour (§7.4.7).
     emit: Any = None
+    # `LocalPermissions` du noyau (posées par serve) : `GET|PUT /v1/local/sessions/{fil}/mode` (§7.4.10) ; None = 404.
+    permissions: Any = None
 
     def _emit(self, name: str, payload: dict[str, Any]) -> None:
         if self.emit is not None:
@@ -388,7 +410,12 @@ class LocalApi:
                                          image=code.get("image") or DEFAULT_SANDBOX_IMAGE,
                                          network_name=_network_name(code), host_roots=host_roots,
                                          background=bool(local.get("background_processes", False)),
-                                         state_dir=str(state_dir)))
+                                         state_dir=str(state_dir), lsp=_lsp_manager(local)))
+        if api.code.lsp is not None:
+            api.code.lsp.emit = api._emit  # `lsp.diagnostics` sur le bus, comme `checkpoint.created`
+        from nokker.learning.wiring import local_learning
+
+        api.learning = local_learning(local, state_dir, state_dir, api.project_memory)
         if local.get("ops"):
             api.enable_ops(local)
         from nokker.local.connectors import FILE_NAME, LocalConnectors
@@ -443,6 +470,12 @@ class LocalApi:
             # dossier, sans photo avant (limite connue) ; il passe au journal d'audit comme tout appel à effet.
             memory.append(self.ssh)
         skills = SkillToolSource(home=home, project=self.project_skills)
+        if self.learning is not None:  # skills appris (drapeau `local.learning`) : sous la racine de l'utilisateur
+            from nokker.learning.wiring import local_tool_source
+
+            learned = local_tool_source(self.learning, skills)
+            if learned is not None:
+                memory.append(learned)
         if not self.pages_enabled:
             return [wrapper, checkpoints, skills, *memory]
         # Pages (§10) : l'enveloppe des pages autour de celle des points de retour (photo avant, version de page après).
@@ -524,6 +557,31 @@ class LocalApi:
             row.update({k: v for k, v in extra.items() if k in SESSION_DEFAULTS})
         return row
 
+    def _session_mode(self, method: str, thread_id: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Mode d'une session locale (§7.4.10) : `{mode, modes, effective}` ; `effective` = le mode après restriction par
+        le dépôt et les équipes du fil (`LocalPermissions.mode_for`)."""
+        from nokker.qa.permissions import MODES
+
+        perms = self.permissions
+        if perms is None:
+            return 404, {"error": {"message": "permissions locales non configurées"}}
+        if thread_id not in self.code.sessions():
+            return 404, {"error": {"message": "pas de session locale sur ce fil"}}
+        if method == "PUT":
+            mode = body.get("mode") if isinstance(body, dict) else None
+            if not isinstance(mode, str) or mode not in MODES:
+                return 400, {"error": {"code": "bad_mode", "message": f"mode refusé : {mode!r} (parmi "
+                                                                       f"{', '.join(MODES)})"}}
+            try:
+                perms.set_thread_mode(thread_id, mode)
+            except ValueError as e:
+                return 400, {"error": {"code": "mode_above_project", "message": str(e)}}
+        out = {"mode": perms.chosen_mode(thread_id).value, "modes": list(MODES),
+               "effective": perms.mode_for(thread_id).value}
+        if method == "PUT":
+            self._emit("session.mode", {"thread_id": thread_id, "mode": out["mode"], "effective": out["effective"]})
+        return 200, out
+
     def _root_of(self, cwd: str) -> str | None:
         full = os.path.realpath(os.path.expanduser(cwd))
         for r in self.roots:
@@ -603,6 +661,8 @@ class LocalApi:
             if st is None:
                 return 404, {"error": {"message": "pas de session locale sur ce fil"}}
             return 200, {"thread_id": thread_id, "skills": st}
+        if path.startswith("/v1/local/sessions/") and path.endswith("/mode") and method in ("GET", "PUT"):
+            return self._session_mode(method, path[len("/v1/local/sessions/"):-len("/mode")], body)
         if path == "/v1/local/sessions" and method == "GET":
             # `roots` : où une session peut s'ouvrir (le web propose ces dossiers ; un `cwd` hors racine → 403).
             return 200, {"sessions": [self._session_row(t, c) for t, c in self.code.sessions().items()],
@@ -630,6 +690,10 @@ class LocalApi:
             return self._secrets(method, path, body, relayed)
         if path == "/v1/local/mcp-servers" or path.startswith("/v1/local/mcp-servers/"):
             return self._mcp_servers(method, path, body, relayed)
+        if path in ("/v1/local/import/scan", "/v1/local/import/apply") and method == "POST":
+            return self._import(path.rsplit("/", 1)[1], body, relayed)
+        if path.split("?", 1)[0] == "/v1/local/import/report" and method == "GET":
+            return self._import_report(path, relayed)
         if path == "/v1/local/packs" or path.startswith("/v1/local/packs/"):
             return self._packs(method, path, body, relayed)
         if path.split("?", 1)[0].rstrip("/") == "/v1/local/connectors" or path.startswith("/v1/local/connectors/"):
@@ -665,6 +729,73 @@ class LocalApi:
             return 200, self.packs.remove(rest[:-len("/remove")], ctx)
         except PackError as e:
             return 404, {"error": {"message": str(e), "code": "unknown_pack"}}
+
+    def _import(self, action: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]]:
+        """Import d'un autre agent (lot 30, nokker/importers), pour l'écran « Tu viens de X ? » du premier lancement :
+        `scan {source, project?}` → le rapport à blanc ; `apply` → refait le scan puis écrit ce qui est prévu. Sur la
+        machine seulement (jeton local) : la passerelle ne lit ni n'écrit les réglages de la machine. `project` doit
+        être sous une des racines déclarées. Les serveurs MCP ne sont JAMAIS ajoutés par cette route : le rapport les
+        propose, l'écran les fait ajouter dans une session (outil `mcp_server_add`, sa carte forte). Le dossier
+        personnel lu est celui du noyau (`NOKKER_IMPORT_HOME`, sinon le sien) : sous docker, seul ce qui y est monté."""
+        if relayed:
+            return 403, {"error": {"message": "import : sur la machine seulement (jeton local)"}}
+        from nokker.importers import claude_code, cursor, hermes, openclaw
+        from nokker.importers.apply import apply
+        from nokker.tools.packs import user_home
+
+        b = body if isinstance(body, dict) else {}
+        source = str(b.get("source") or "")
+        if source not in ("claude-code", "cursor", "hermes", "openclaw"):
+            return 400, {"error": {"message": "source ∈ claude-code, cursor, hermes, openclaw", "code": "bad_body"}}
+        project = None
+        if b.get("project"):
+            cwd = os.path.realpath(str(b["project"]))
+            if self._root_of(cwd) is None or not os.path.isdir(cwd):
+                return 403, {"error": {"message": "dossier hors des racines déclarées"}}
+            project = Path(cwd)
+        home = Path(os.environ.get("NOKKER_IMPORT_HOME") or Path.home()).expanduser()
+        nk = user_home(self.state_dir)
+        if source == "claude-code":
+            report = claude_code.scan(home, project, nokker_home=nk)
+        elif source == "cursor":
+            report = cursor.scan(home, project)
+        elif source == "hermes":
+            report = hermes.scan(home, nokker_home=nk)
+        else:
+            report = openclaw.scan(home, nokker_home=nk)
+        if action == "apply":
+            settings = self.settings_path or nk / "settings.json"
+            apply(report, user_settings=settings, backup_dir=nk / "imports" / f"{source}-{uuid.uuid4().hex[:8]}",
+                  memory=self.project_memory)
+            for it in report.items:  # MCP : jamais par ici (carte forte dans une session)
+                if it.kind == "mcp" and it.status == "skipped":
+                    it.reason = "à ajouter dans une session : Nina le propose, vous signez la carte forte"
+        return 200, report.to_json()
+
+    def _import_report(self, path: str, relayed: bool) -> tuple[int, dict[str, Any]]:
+        """Dernier rapport écrit par `nokker import <source> --state-dir <ce dossier>` lancé sur l'HÔTE (chemin
+        principal : les dossiers des autres agents portent des identifiants et ne sont jamais montés dans le
+        conteneur). `?source=` facultatif. 404 si aucun rapport. Lecture seule, sur la machine seulement."""
+        if relayed:
+            return 403, {"error": {"message": "import : sur la machine seulement (jeton local)"}}
+        import json
+        from urllib.parse import parse_qs
+
+        from nokker.tools.packs import user_home
+
+        q = parse_qs(path.split("?", 1)[1]) if "?" in path else {}
+        source = (q.get("source") or [""])[0]
+        if source and source not in ("claude-code", "cursor", "hermes", "openclaw"):
+            return 400, {"error": {"message": "source ∈ claude-code, cursor, hermes, openclaw", "code": "bad_body"}}
+        root = user_home(self.state_dir) / "imports"
+        found = sorted(root.glob(f"{source or '*'}-*/report.json"), key=lambda p: p.parent.name.rsplit("-", 2)[-2:])
+        if not found:
+            return 404, {"error": {"message": "aucun rapport d'import", "code": "not_found"}}
+        try:
+            report = json.loads(found[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return 500, {"error": {"message": "rapport illisible"}}
+        return 200, {**report, "dir": found[-1].parent.name}
 
     def _mcp_servers(self, method: str, path: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]] | None:
         """Serveurs MCP ajoutés depuis une session (lot X16) : `GET` → la liste (noms de secrets, outils déclarés en

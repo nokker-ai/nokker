@@ -90,6 +90,9 @@ def test_usage_is_recorded_inside_the_machine_tenant(guarded):
     port, links, usage, _ = guarded
     mt = _machine_token(links)
     assert _post(port, {"model": MODEL, "messages": _user()}, mt)[0] == 200
+    deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and not usage:
+        time.sleep(0.02)
     # `record_usage` lit le locataire courant (comme PostgresLedger) : il doit être celui de la machine.
     assert [(u[0], u[1]) for u in usage] == [("tn_pierre", "tn_pierre")]
 
@@ -197,6 +200,9 @@ def test_configure_cloud_link_wires_tenant_scope_caps_and_models(monkeypatch):
         port = httpd.server_address[1]
         mt = _machine_token(c.links)
         assert _post(port, {"model": "petit", "messages": _user()}, mt)[0] == 200
+        deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+        while time.monotonic() < deadline and not recorded:
+            time.sleep(0.02)
         assert recorded and recorded[0][0] == "tn_pierre" and recorded[0][2] == "petit"
         assert recorded[0][1].startswith("tn_pierre") and recorded[0][3] == 10
         assert _post(port, {"model": "autre", "messages": _user()}, mt)[0] == 400  # autre point d'accès

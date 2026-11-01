@@ -25,13 +25,20 @@ Commandes en arrière-plan (lot X6, `nokker/tools/processes.py`, drapeau `backgr
 SA commande, classée comme `terminal` (mêmes cartes, mêmes règles, « hardline » jamais) ; `process_list` et
 `process_logs` = READ ; `process_stop` = READ aussi : il n'arrête que ce que le fil a lui-même lancé (sans carte).
 
+Diagnostics de langage (lot 13, `nokker/tools/lsp.py`, drapeaux `local.lsp.enabled` et `local.lsp.inline`, éteints par
+défaut) : avec `lsp`, un `write_file`/`patch` réussi synchronise le serveur de langage du fil (dans son bac à sable) ;
+en `inline`, le bloc `[Diagnostics]` s'ajoute à la FIN du résultat, rien d'autre ne bouge. `lsp` à None : aucun
+chemin pris, schémas et résultats identiques au caractère près (tests/unit/tools/test_lsp.py).
+
 L'amont n'est importé qu'à la création d'un dossier de travail : sans lui (CI unitaire), le module se charge, les
 schémas existent, et `classify_command` retombe sur un classement prudent (jamais READ, DESTRUCTIVE au moindre
 doute).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import os
 import re
 import shlex
@@ -41,7 +48,10 @@ from typing import Any
 
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
+from nokker.tools.lsp import LSP_TOOL, language_of
 from nokker.tools.processes import SANDBOX_LOG_DIR, ProcessError, ProcessTable, reap_processes
+
+logger = logging.getLogger(__name__)
 
 WORKSPACE_MOUNT = "/workspace"
 # Python 3.14 + Node 22 : de quoi lancer les tests des dépôts Python et TypeScript du banc de code. Remplacée en L2
@@ -233,8 +243,14 @@ class Workspace:
     cwd: str  # le dossier tel que les outils le voient (/workspace en docker, le chemin hôte en local)
     reader: Any = None  # docker : lectures et recherches faites directement dans le dossier monté (voir local_reads)
     procs: Any = None  # nokker.tools.processes.ProcessTable, créée au premier process_start
+    lsp: Any = None  # nokker.tools.lsp.ThreadLsp, créé à la première édition suivie (lot 13)
 
     def close(self) -> None:
+        if self.lsp is not None:  # serveurs de langage d'abord : ils tournent dans le bac à sable fermé ci-dessous
+            try:
+                self.lsp.close()
+            except Exception:  # noqa: BLE001 — fermeture au mieux
+                pass
         if self.procs is not None:  # fin du fil : rien ne lui survit (docker : le container part aussi, ci-dessous)
             self.procs.stop_all()
         try:
@@ -326,6 +342,9 @@ class CodeToolSource:
     # Backend local : journaux des processus en arrière-plan sous `<state_dir>/processes/<fil>/` (et fiches de ménage,
     # `reap_processes`). None = dossier temporaire de l'utilisateur.
     state_dir: str | None = None
+    # Diagnostics de langage (lot 13, `local.lsp.enabled`) : le `nokker.tools.lsp.LspManager` de l'instance (plafonds
+    # partagés entre fils), ou None = fonction absente (outil absent, résultats intacts).
+    lsp: Any = None
     _spaces: dict[str, Workspace] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -387,10 +406,15 @@ class CodeToolSource:
 
     def specs(self) -> list[ToolSpec]:
         specs = (*_SPECS, *_PROCESS_SPECS) if self.background else _SPECS
-        return [ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core, source="builtin:code",
-                         effect_of=(lambda a: classify_command(str(a.get("command", "")))) if n in _CLASSIFIED
-                         else None, fresh=n in ("process_list", "process_logs"))
-                for n, d, e, p in specs]
+        out = [ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core, source="builtin:code",
+                        effect_of=(lambda a: classify_command(str(a.get("command", "")))) if n in _CLASSIFIED
+                        else None, fresh=n in ("process_list", "process_logs"))
+               for n, d, e, p in specs]
+        if self.lsp is not None:  # hors préfixe stable (index des outils) : seulement drapeau allumé
+            from nokker.tools.lsp import SPEC
+
+            out.append(SPEC)
+        return out
 
     # ── cycle de vie ──
     def workspace(self, thread_id: str) -> Workspace:
@@ -509,7 +533,8 @@ class CodeToolSource:
             text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
-        if name not in CODE_TOOLS and not (self.background and name in PROCESS_TOOLS):
+        if name not in CODE_TOOLS and not (self.background and name in PROCESS_TOOLS) \
+                and not (self.lsp is not None and name == LSP_TOOL):
             return out(f"outil inconnu : {name}", True)
         try:
             ws = self.workspace(ctx.thread_id)
@@ -534,9 +559,11 @@ class CodeToolSource:
             if name == "write_file":
                 path, content = self._inside(ws, str(a["path"])), str(a["content"])
                 r = ws.ops.write_file(path, content).to_dict()
-                return out(r, bool(r.get("error")))
+                return self._with_diagnostics(ws, ctx.thread_id, name, a, out(r, bool(r.get("error"))))
             if name == "patch":
-                return self._patch(ws, a, out)
+                return self._with_diagnostics(ws, ctx.thread_id, name, a, self._patch(ws, a, out))
+            if name == LSP_TOOL:
+                return self._lsp_tool(ws, ctx.thread_id, a, out)
             if name == "terminal":
                 return self._terminal(ws, a, out)
             if name in PROCESS_TOOLS:
@@ -580,6 +607,56 @@ class CodeToolSource:
             r["_hint"] = "passage introuvable : relis le fichier (read_file) ou cherche-le (search_files)"
         return out(r, bool(r.get("error")))
 
+    # ── diagnostics de langage (lot 13) ──
+    def _lsp_thread(self, ws: Workspace, thread_id: str) -> Any:
+        with self._lock:
+            if ws.lsp is None:
+                ws.lsp = self.lsp.thread(thread_id, ws.env, ws.cwd)
+            return ws.lsp
+
+    def _lsp_files(self, ws: Workspace, paths: list[str]) -> list[tuple[str, str]]:
+        """(chemin vu par le bac à sable, texte) des fichiers d'un langage suivi. Le texte est lu du côté du noyau (le
+        dossier monté : aucun `docker exec` de plus) ; un fichier absent, hors du dossier ou trop gros est laissé."""
+        from nokker.tools.lsp import MAX_FILE_BYTES
+
+        files = []
+        for p in paths:
+            inside = self._inside(ws, p)
+            if language_of(inside) is None:
+                continue
+            host = inside if self.backend == "local" else self._host_path(ws, p)
+            if host is None or not os.path.isfile(host) or os.path.getsize(host) > MAX_FILE_BYTES:
+                continue
+            with open(host, encoding="utf-8", errors="replace") as f:
+                files.append((inside, f.read()))
+        return files
+
+    def _with_diagnostics(self, ws: Workspace, thread_id: str, name: str, a: dict[str, Any],
+                          result: ToolResult) -> ToolResult:
+        """Après un `write_file`/`patch` réussi, drapeau allumé : le serveur du fil reçoit le texte ; en `inline`, le
+        bloc `[Diagnostics]` s'ajoute à la fin (ajout pur). Toute panne laisse le résultat tel quel."""
+        if self.lsp is None or result.is_error:
+            return result
+        try:
+            from nokker.tools.checkpoints import _written_paths
+
+            files = self._lsp_files(ws, _written_paths(name, a))
+            block = self.lsp.after_edit(self._lsp_thread(ws, thread_id), files) if files else ""
+        except Exception:  # noqa: BLE001 — les diagnostics ne font jamais échouer une édition
+            logger.debug("diagnostics après %s en échec", name, exc_info=True)
+            return result
+        return dataclasses.replace(result, content=result.content + block) if block else result
+
+    def _lsp_tool(self, ws: Workspace, thread_id: str, a: dict[str, Any], out: Any) -> ToolResult:
+        raw = a.get("paths")
+        if raw is not None and not (isinstance(raw, list) and all(isinstance(p, str) for p in raw)):
+            return out("paths : liste de chemins attendue", True)
+        severity = str(a.get("severity") or "error")
+        if severity not in ("error", "warning"):
+            return out(f"severity inconnue : {severity!r} (error | warning)", True)
+        files = self._lsp_files(ws, raw) if raw else None
+        return out(self.lsp.diagnostics(self._lsp_thread(ws, thread_id), files, severity))
+
     def workspace_path(self, thread_id: str, path: str) -> str:
         """Chemin, tel que le bac à sable le voit, d'une destination relative au dossier de travail (`ssh_copy`, lot
         X11) : borné au dossier (liens symboliques compris en local, au dossier monté en docker)."""
@@ -596,6 +673,30 @@ class CodeToolSource:
         ws = self.workspace(thread_id.split("/sa-", 1)[0])
         r = ws.env.execute(command, timeout=max(1, int(timeout)), stdin_data=stdin, bounded_capture=True)
         return r.get("returncode"), _clip(str(r.get("output") or ""))
+
+    def script_command(self, thread_id: str, argv: list[str]) -> list[str]:
+        """argv d'un processus INTERACTIF (stdin/stdout tenus ouverts par l'appelant) lancé DANS le bac à sable du fil,
+        dans son dossier courant : `execute_code` (nokker/tools/execute_code.py) y fait passer ses appels d'outils.
+        docker : `docker exec -i -w <dossier> <container> …` ; kubernetes : `kubectl exec -i <pod> -- sh -c 'cd … &&
+        exec "$@"' …`. Backend local : refusé (ce serait l'hôte du noyau). Un sous-agent `<fil>/sa-<id>` sans espace à
+        lui prend celui de son fil parent (même bac à sable, comme `run_hook`)."""
+        if self.backend == "local":
+            raise PermissionError("execute_code tourne dans un bac à sable (docker ou kubernetes), jamais sur l'hôte")
+        with self._lock:
+            ws = self._spaces.get(thread_id)
+        if ws is None:
+            ws = self.workspace(thread_id.split("/sa-", 1)[0])
+        env, cwd = ws.env, str(getattr(ws.env, "cwd", "") or ws.cwd)
+        if self.backend == "kubernetes":
+            before = getattr(env, "_before_execute", None)
+            if callable(before):
+                before()  # pod recréé s'il a été libéré pour inactivité
+            return env.kubectl.exec_argv(env.pod, ["sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", cwd, *argv],
+                                         stdin=True)
+        container = getattr(env, "_container_id", None)
+        if not container:
+            raise RuntimeError("bac à sable docker sans container")
+        return [getattr(env, "_docker_exe", None) or "docker", "exec", "-i", "-w", cwd, container, *argv]
 
     def _terminal(self, ws: Workspace, a: dict[str, Any], out: Any) -> ToolResult:
         command = str(a.get("command") or "").strip()

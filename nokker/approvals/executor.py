@@ -172,7 +172,7 @@ class ApprovalExecutor:
         kernel = self._k(approval.thread_id)
         spec = kernel.tools.spec(approval.tool_name)
         ctx = ToolContext(thread_id=approval.thread_id, turn_index=approval.turn_index, channel=approval.channel,
-                          sender=approval.decided_by, approval_id=approval.id)
+                          sender=approval.decided_by, approval_id=approval.id, kernel=kernel)
         t0 = time.monotonic()
         try:
             result = kernel.tools.call(approval.tool_name, approval.arguments, ctx)

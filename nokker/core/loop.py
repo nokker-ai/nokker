@@ -30,6 +30,7 @@ from nokker.core.ports import (
     RouteDecision, RouteState, Store, StreamInterrupted, ToolContext, ToolRegistry, ToolSpec, TurnObserver,
     TurnStream, call_effect,
 )
+from nokker.core.controls import STEER_MAX_CHARS, Steer, TurnControls
 from nokker.core.live_input import LiveToolInputs
 from nokker.core.stream import ScrubbedDeltas, holdback_for
 from nokker.core.turn_lock import TurnLocks
@@ -38,7 +39,7 @@ from nokker.core.turn import (
     Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
 )
 from nokker.ledger.attribution import merge_tags, spend_tag
-from nokker.tenancy.context import submit_in_context
+from nokker.tenancy.context import submit_in_context, tenant_of_thread
 
 if TYPE_CHECKING:
     from nokker.tenancy.limits import TenantLimits
@@ -57,6 +58,10 @@ WRAP_UP_NOTE = ("[Limite d'appels d'outils atteinte pour ce tour] Réponds maint
 BUDGET_NOTE = ("[noyau] Il te reste {left} appels sur {total} pour ce tour. Termine maintenant : supprime les fichiers "
                "temporaires que tu as créés (scripts d'essai, reproductions), lance les tests concernés une dernière "
                "fois, puis conclus.")
+# Pause et steer (docs/CLIENT-API.md §Pause et steer), derrière `Kernel.steer_enabled` : messages `user` ajoutés au tour
+# au point de contrôle qui précède un appel modèle, gardés dans l'historique (format : docs/CONTEXT-FORMAT.md).
+STEER_BLOCK = "[Message de l'utilisateur pendant le tour]\n{text}\n[/Message]"
+RESUME_NOTE = "[noyau] Le tour reprend après une pause demandée par l'utilisateur : des fichiers ont pu changer entre-temps."
 STALL_NOTE = ("[noyau] Tu viens de relancer `{name}` avec les mêmes arguments et le même résultat : ça ne fait pas "
               "avancer. Change d'approche (relis le code concerné, teste une autre hypothèse) ou conclus.")
 
@@ -66,6 +71,15 @@ logger = logging.getLogger("nokker.core.loop")
 # `sokkan-memory` répond en 1,4-1,5 s à chaud (dont ~1,1 s de reranker), 2,1 s session froide, pics à 8 s.
 _RECALL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="nokker-recall")
 
+
+class TurnCancelled(Exception):
+    """Annulation reçue PENDANT un appel modèle en flux (D6, e2e du 1.11) : levée par le relais des morceaux
+    (`Kernel._complete`) au premier morceau qui arrive après `cancel()`. Elle remonte à travers le provider — qui sort
+    de son `with client.stream(...)`, donc ferme la réponse HTTP de l'amont — jusqu'à la boucle, qui finit le tour sur
+    « Annulé à ta demande. ». Jamais prise pour une panne d'amont (pas de repli de palier, pas d'escalade)."""
+
+
+CANCEL_REPLY = "Annulé à ta demande."
 
 # Motif d'une conclusion forcée, tel qu'il s'affiche avec les remarques de la relecture (`_final_review`).
 _FORCED_WHY = {"loop:max_calls": "le tour a atteint sa limite d'appels", "loop:stalled": "le tour tournait en rond"}
@@ -176,6 +190,67 @@ class Kernel:
 
     def cancel(self, thread_id: str) -> None:
         self._cancelled.add(thread_id)
+        self.controls.poke()  # un tour en pause se réveille et finit sur « annulé »
+
+    # ─────────────── pause, reprise, steer (core/controls.py) ───────────────
+
+    def pause(self, thread_id: str) -> None:
+        self.controls.pause(thread_id)
+
+    def resume(self, thread_id: str) -> bool:
+        return self.controls.resume(thread_id)
+
+    def pause_account(self, tenant: str, account: str) -> None:
+        self.controls.pause_account(tenant, account)
+
+    def resume_account(self, tenant: str, account: str) -> bool:
+        return self.controls.resume_account(tenant, account)
+
+    def steer(self, thread_id: str, text: str) -> Steer | None:
+        """Un message pour le tour en cours du fil, consommé avant son prochain appel modèle. None : steer éteint
+        (`steer_enabled`), ou aucun tour ne tourne sur le fil. Caviardé comme un message (invariants d'entrée)."""
+        if not self.steer_enabled:
+            return None
+        return self.controls.steer(thread_id, self.invariants.check_input(text[:STEER_MAX_CHARS]).text)
+
+    def _observe_opt(self, method: str, *args) -> None:
+        """Méthode d'observateur OPTIONNELLE (événements de pause et de steer) : appelée seulement si elle existe."""
+        if self.observer is not None and hasattr(self.observer, method):
+            self._observe(method, *args)
+
+    def _pause_point(self, turn: Turn, at: str, tool: str | None = None) -> bool:
+        """Point de contrôle de la boucle : en pause, le tour attend ici (rien à moitié fait) jusqu'à la reprise ou
+        l'annulation. Rend vrai si le tour a attendu."""
+        tenant = tenant_of_thread(turn.thread_id)
+        if turn.thread_id in self._cancelled or not self.controls.is_paused(turn.thread_id, tenant, turn.sender):
+            return False
+        where = {"at": at, **({"tool": tool} if tool else {})}
+        self._observe_opt("turn_paused", turn, dict(where))
+        t0 = time.monotonic()
+        self.controls.wait(turn.thread_id, tenant, turn.sender, lambda: turn.thread_id in self._cancelled)
+        ms = int((time.monotonic() - t0) * 1000)
+        cancelled = turn.thread_id in self._cancelled
+        self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0, rule="loop:paused",
+                                          reason=f"pause avant {'l’outil ' + tool if tool else 'l’appel modèle'}, "
+                                                 f"{ms / 1000:.1f} s{' (annulé pendant la pause)' if cancelled else ''}")])
+        if not cancelled:
+            self._observe_opt("turn_resumed", turn, {**where, "paused_ms": ms})
+        return True
+
+    def _take_steers(self, turn: Turn, resumed: bool) -> None:
+        """Avant un appel modèle : mention de reprise (si le tour a déjà commencé) puis steers en attente, dans l'ordre
+        d'arrivée. Steer éteint : rien n'est ajouté (ce que voit le modèle ne change pas)."""
+        if not self.steer_enabled:
+            return
+        if resumed and turn.messages:
+            turn.messages.append(Message(role="user", content=RESUME_NOTE))
+        for s in self.controls.take_steers(turn.thread_id):
+            turn.messages.append(Message(role="user", content=STEER_BLOCK.format(text=s.text)))
+            self._observe_opt("turn_steered", turn, {"steer_id": s.id})
+
+    def cancel_requested(self, thread_id: str) -> bool:
+        """Le tour du fil doit s'arrêter (sans consommer la demande : la boucle la lira après l'outil en cours)."""
+        return thread_id in self._cancelled
 
     def note_owner_call(self, thread_id: str, name: str, arguments: dict, result: ToolResult) -> None:
         args = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
@@ -207,7 +282,53 @@ class Kernel:
             return result
         if decision is Decision.HITL and self.approvals is not None:
             return self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule)).id
-        return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"refusé par le noyau ({why})")
+        return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"refusé par le noyau ({why})",
+                          reason=rule.code if rule is not None and decision is Decision.DENY else None)
+
+    def script_turn(self, ctx: ToolContext) -> Turn:
+        """Le tour d'un appel d'outil fait par un script `execute_code` quand l'appel ne vient pas d'un tour (carte
+        d'`execute_code` approuvée puis exécutée par `approvals/executor.py`) : même fil, même index, même canal, le
+        décideur comme expéditeur — comme `direct_call`."""
+        if isinstance(ctx.turn, Turn):
+            return ctx.turn
+        return Turn(thread_id=ctx.thread_id, index=ctx.turn_index, input=InputCheck(text=""), channel=ctx.channel,
+                    sender=ctx.sender)
+
+    def script_tool_call(self, name: str, arguments: dict, turn: Turn, ctx: ToolContext) -> dict[str, Any]:
+        """Un appel d'outil venu du script d'`execute_code` (nokker/tools/execute_code.py) : les MÊMES portes que
+        `_tool_step` (effet de CET appel, règles, invariants, carte prouvée, escalade), le MÊME caviardage
+        (`redact_result`), sur le tour qui a lancé le script. Rend `{status, content[, approval_id]}` pour le script :
+        `ok` | `error` (l'outil a échoué) | `pending` (carte posée, rien d'exécuté : le script ne l'attend pas) |
+        `refused` (règle, mode plan, escalade). Ni cache de lecture, ni réservoir : le bloc d'`execute_code` est
+        borné par lui-même et passe ensuite par l'admission ordinaire du tour."""
+        spec = self.tools.spec(name)
+        if spec is None:
+            return {"status": "error", "content": f"outil inconnu : {name}"}
+        tc = ToolCall(id=f"xc-{time.monotonic_ns()}", name=name, arguments=arguments)
+        verdicts = self.gates.action(tc, spec, turn)
+        self._log_verdicts(turn, verdicts)
+        decision = worst(verdicts)
+        if decision is Decision.ALLOW:
+            inner = ToolContext(thread_id=ctx.thread_id, turn_index=ctx.turn_index, channel=ctx.channel,
+                                sender=ctx.sender, kernel=self, turn=turn)
+            result = self.invariants.redact_result(self.tools.call(name, arguments, inner), spec)
+            return {"status": "error" if result.is_error else "ok", "content": result.content or ""}
+        rule = next((v for v in verdicts if v.decision is decision), None)
+        why = f"{rule.rule}: {rule.reason}" if rule else decision.value
+        if decision is Decision.HITL:
+            turn.pending_approvals.append(tc)
+            if self.approvals is not None:
+                approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule))
+                return {"status": "pending", "approval_id": approval.id,
+                        "content": f"EN ATTENTE D'APPROBATION HUMAINE ({why}) [approval:{approval.id}]. "
+                                   "L'action n'a pas été exécutée."}
+            return {"status": "pending", "content": f"EN ATTENTE D'APPROBATION HUMAINE ({why}). "
+                                                    "L'action n'a pas été exécutée."}
+        if decision is Decision.ESCALATE:
+            text = self.escalator.escalate(turn, why)
+            turn.escalated = True
+            return {"status": "refused", "content": f"ESCALADÉ À UN HUMAIN ({why}). {text}"}
+        return {"status": "refused", "content": f"REFUSÉ par le noyau ({why})."}
 
     def _card_advice(self, turn: Turn, tc: ToolCall, rule: Verdict | None) -> str | None:
         """Avis du juge sur une carte (X8) : seulement si `advisor` est branché et que la carte est forte ; jamais une
@@ -326,6 +447,9 @@ class Kernel:
     # Magasin des images jointes (X7, `nokker/images/store.py::ImageStore`) : le noyau y lit les octets juste avant
     # l'appel modèle, pour un palier avec vision. `None` = aucune image ne peut être lue (note texte au modèle).
     images: Any = None
+    # Pièces jointes texte/dossier/url (`nokker/attachments.py::TextAttachments`), posé quand
+    # `text_attachments_enabled` est vrai. `None` = format X7 seul (images), comportement d'avant.
+    text_attachments: Any = None
     # Plafonds des testeurs (docs/TENANCY.md §5, `nokker/tenancy/limits.py::TenantLimits`) : vérifiés AVANT le tour,
     # jamais pour le locataire interne. `None` = aucun plafond (tests, bancs).
     limits: TenantLimits | None = None
@@ -346,6 +470,16 @@ class Kernel:
     # risque sur les cartes fortes. `None` = éteints (défaut).
     reviewer: Any = None
     advisor: Any = None
+    # Traces d'entraînement (docs/TRACES.md, `nokker/traces/recorder.py::TraceRecorder`) : chaque appel modèle (messages
+    # exacts envoyés, schémas, suite) gardé à part, écrit à la fin du tour. `None` = rien n'est enregistré (défaut ;
+    # `traces_record: false`). Jamais d'effet sur ce que voit le modèle : l'enregistreur copie, et une erreur est avalée.
+    traces: Any = None
+    # Palier « nina » en ombre (route/nina.py::NinaShadow, `route.nina.mode: shadow`) : le premier appel d'une fraction des
+    # tours du locataire interne est doublé en tâche de fond, après la réponse réelle ; rien ne revient dans la boucle.
+    nina_shadow: Any = None
+    # Invitation de fin de tour (drapeau `learning_nudges`, nokker/learning/nudge.py, docs/LEARNING.md §4) :
+    # `after_turn(turn)` → une ligne fixe ajoutée au contexte du PROCHAIN tour du fil, ou None. None = éteinte.
+    learning: Any = None
     # Dernier prompt rendu par fil (`prompt_text`), pour `LLMCall.reusable_tokens` ; borné aux fils récents.
     _last_prompts: OrderedDict = field(default_factory=OrderedDict, repr=False)
     _last_prompts_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -354,6 +488,11 @@ class Kernel:
     # Telegram, tour de fond, suite d'une décision, CLI, sous-agents). Le hub et l'exécuteur de cartes partagent ces
     # verrous (`BubbleHub.thread_lock`).
     turn_locks: TurnLocks = field(default_factory=TurnLocks, repr=False)
+    # Pause / reprise / steer (`core/controls.py`) : partagés par les copies du noyau (`dataclasses.replace`).
+    controls: TurnControls = field(default_factory=TurnControls, repr=False)
+    # Steer et mention de reprise vus par le modèle (STEER_BLOCK, RESUME_NOTE) : éteints par défaut, tant que les
+    # traces d'entraînement ne les portent pas (docs/CONTEXT-FORMAT.md). La pause, elle, ne change rien au contexte.
+    steer_enabled: bool = False
 
     def _observe(self, method: str, *args):
         if self.observer is None:
@@ -408,7 +547,24 @@ class Kernel:
                        reusable_tokens=reusable_tokens(previous, rendered, comp.usage.prompt))
         turn.calls.append(call)
         self.ledger.record(turn.thread_id, turn.index, call)
+        self._trace("answered", turn, comp, call)
+        # Une ligne par appel, sans contenu (le fil est haché) : la répartition par palier et par classe se lit dans les
+        # journaux du pod, sans accès à la base (mesure du routage du 01.11.2026, impossible avant cette ligne).
+        u = comp.usage
+        logger.info("route : fil %s tour %d appel %d palier %s modèle %s %d+%d jetons (cache %s) %.2f s — %s",
+                    hashlib.sha256(turn.thread_id.encode()).hexdigest()[:8], turn.index, len(turn.calls) - 1,
+                    route.tier.value, comp.model, u.prompt, u.completion,
+                    u.cached if u.cached_reported else "?", comp.latency_s or 0.0, route_reason[:160])
         return call
+
+    def _trace(self, hook: str, turn: Turn | None, *args) -> None:
+        """Crochet de l'enregistreur de traces (`traces`) : sans effet sur le tour, toute erreur journalisée et avalée."""
+        if self.traces is None or turn is None:
+            return
+        try:
+            getattr(self.traces, hook)(turn, *args)
+        except Exception:  # noqa: BLE001 — une trace manquée ne casse jamais un tour
+            logger.warning("traces : crochet %s en échec", hook, exc_info=True)
 
     def _conclude(self, turn: Turn, history: list, recall: list, state: RouteState, thread_id: str,
                   stream: TurnStream | None, rule: str, reason: str, reply: str = "") -> str:
@@ -424,6 +580,8 @@ class Kernel:
         why = _FORCED_WHY.get(rule, rule)
         if not reply:
             turn.error = "max_calls"  # échec : ni conclusion ni escalade motivée
+            if turn.failure is None:  # un amont en échec à la conclusion a déjà dit pourquoi (provider_error)
+                turn.failure = {"code": "max_calls", "message": reason}
             reply = self.escalator.escalate(turn, "boucle d'outils non terminée")
             turn.escalated = True
             if self.reviewer is not None and self._wrote(turn):
@@ -448,12 +606,17 @@ class Kernel:
         relance en Deep ; refus → escalade avec le motif de la porte. Chaîne vide seulement si l'amont échoue ou ne rend
         rien (l'appelant escalade alors)."""
         assembled = self.context.assemble(turn, history, recall, [], route.tier)
+        route, assembled = self._fit_context(turn, route, assembled,
+                                             lambda t: self.context.assemble(turn, history, recall, [], t))
         assembled.messages.append({"role": "user", "content": WRAP_UP_NOTE})
         assembled.tools = []
         try:
             comp, live = self._complete(self.providers[route.tier], assembled, route, thread_id, stream, turn)
-        except Exception:  # noqa: BLE001 — l'appelant escalade
+        except TurnCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001 — l'appelant escalade
             logger.warning("appel de conclusion en échec", exc_info=True)
+            turn.failure = {"code": "provider_error", "message": f"appel de conclusion en échec : {_short_error(e)}"}
             return ""
         self._record_call(turn, assembled, comp, route, f"conclusion (limite d'appels) : {route.reason}")
         candidate = comp.message.content or ""
@@ -530,6 +693,7 @@ class Kernel:
         with self._notes_lock:
             notes = self._owner_notes.pop(inp.thread_id, [])
         turn.injected = notes + [self.invariants.scrub_output(str(b)) for b in injected]
+        turn.attached = inp.attached  # déjà caviardé et borné par la frontière (API)
         self._observe("turn_started", turn)
         # Never clear (docs/NEVER-CLEAR.md) : crochets OPTIONNELS du Context Engine v1 — frontières d'entrée (`/new`,
         # silence), fenêtre calculée au lieu de tout le journal. Un engine v0 ne les porte pas : comportement inchangé.
@@ -549,7 +713,8 @@ class Kernel:
             return turn
         window = getattr(self.context, "history_window", None)
         history = window(inp.thread_id) if window is not None else self.store.history(inp.thread_id)
-        ctx = ToolContext(thread_id=inp.thread_id, turn_index=turn.index, channel=inp.channel, sender=inp.sender)
+        ctx = ToolContext(thread_id=inp.thread_id, turn_index=turn.index, channel=inp.channel, sender=inp.sender,
+                          kernel=self, turn=turn)
 
         # 2. Rappel du tour (bloc 5) : calculé une fois, par le noyau, sans attendre que le modèle y pense (A2).
         recall = self._await_recall(turn, recall_future, recall_started)
@@ -571,6 +736,9 @@ class Kernel:
         notice_at = (max(1, int(self.max_calls * self.budget_notice_at))
                      if self.budget_notice_at and self.max_calls > 4 else None)
 
+        resumed = False  # le tour a été en pause depuis le dernier appel modèle (mention de reprise)
+        dropped: list[Steer] = []
+        self.controls.begin(inp.thread_id)
         try:
             self._cancelled.discard(inp.thread_id)  # une annulation d'avant ce tour ne le vise pas
             for call_index in range(self.max_calls):
@@ -578,8 +746,10 @@ class Kernel:
                 if call_index == notice_at:
                     turn.messages.append(Message(role="user", content=BUDGET_NOTE.format(
                         left=self.max_calls - call_index, total=self.max_calls)))
+                # Point de contrôle avant l'appel modèle : pause, puis annulation (aussi pendant la pause), puis steer.
+                resumed = self._pause_point(turn, "model") or resumed
                 if self._take_cancel(inp.thread_id):
-                    reply = "Annulé à ta demande."
+                    reply = CANCEL_REPLY
                     turn.error = "cancelled"
                     turn.messages.append(Message(role="assistant", content=reply))
                     break
@@ -587,14 +757,20 @@ class Kernel:
                 if stop:
                     reply = f"Arrêté par le noyau : {stop}."
                     turn.error = "stopped"
+                    turn.failure = {"code": "stopped", "message": str(stop)}
                     self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
                                                       rule="loop:stopped", reason=stop)])
                     turn.messages.append(Message(role="assistant", content=reply))
                     break
+                self._take_steers(turn, resumed)
+                resumed = False
                 # 3. Palier pour CET appel.
                 route = self.policy.choose(state)
                 state.current_tier = route.tier
                 assembled = self.context.assemble(turn, history, recall, loaded, route.tier)
+                route, assembled = self._fit_context(turn, route, assembled,
+                                                     lambda t: self.context.assemble(turn, history, recall, loaded, t))
+                state.current_tier = route.tier
                 # 4. Appel modèle, clé de session = fil (affinité de cache, F5).
                 # P1-S1 (diag latence, 17.10.2026) : un amont Ship qui n'a pas de repli (catalogue Router,
                 # un seul amont servable pour qwen/qwen3.8-27b) peut échouer malgré les réessais internes
@@ -622,10 +798,13 @@ class Kernel:
                         comp, live = self._complete(self.providers[route.tier], assembled, route, inp.thread_id,
                                                     stream, turn)
                         break
+                    except TurnCancelled:
+                        raise  # l'utilisateur a annulé : ni repli de palier ni escalade
                     except Exception as e:  # noqa: BLE001 — un amont indisponible n'est pas un bug du noyau
                         failure = e
                 if comp is None:
                     reason = f"palier {route.tier.value} indisponible : {_short_error(failure)}"
+                    turn.failure = {"code": "tier_unavailable", "message": reason}
                     self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=0,
                                                       rule="router:unavailable", reason=reason)])
                     reply = self.escalator.escalate(turn, reason)
@@ -650,6 +829,8 @@ class Kernel:
                     terminal_text = None
                     stall_note: str | None = None
                     for tc in msg.tool_calls:
+                        # Point de contrôle avant chaque outil : une pause arrête ici, l'outil part à la reprise.
+                        resumed = self._pause_point(turn, "tool", tc.name) or resumed
                         if inp.thread_id in self._cancelled:  # annulé : les appels restants ne partent pas
                             turn.messages.append(Message(role="tool", content="annulé par l'utilisateur",
                                                          tool_call_id=tc.id, name=tc.name))
@@ -740,8 +921,25 @@ class Kernel:
                 state.call_index = self.max_calls
                 reply = self._conclude(turn, history, recall, state, inp.thread_id, stream, "loop:max_calls",
                                        f"{self.max_calls} appels, conclusion sans outils", reply)
+        except TurnCancelled:
+            # Annulé pendant un appel modèle en flux (D6) : la réponse HTTP de l'amont est déjà fermée. Le texte partiel
+            # de cet appel n'est PAS gardé (ni dans `messages`, ni dans la réponse) : il n'a pas passé la porte bascule,
+            # sa retenue de caviardage n'est pas sortie, et des arguments d'outil à moitié écrits ne font pas un appel.
+            # Le client a reçu un reset (`ScrubbedDeltas.discard`), puis la réponse finale « Annulé à ta demande. ».
+            self._take_cancel(inp.thread_id)
+            reply = CANCEL_REPLY
+            turn.error = "cancelled"
+            self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0,
+                                              rule="loop:cancelled_stream",
+                                              reason="annulé pendant un appel modèle en flux, réponse amont fermée")])
+            turn.messages.append(Message(role="assistant", content=reply))
         except Exception as e:  # noqa: BLE001 — le tour est enregistré même en échec
             turn.error = f"{type(e).__name__}: {e}"
+            turn.failure = {"code": "internal_error", "message": turn.error}
+        finally:
+            dropped = self.controls.end(inp.thread_id)
+        for s in dropped:  # arrivés trop tard (réponse finale déjà en cours) : le client les renvoie en message normal
+            self._observe_opt("turn_steer_dropped", turn, {"steer_id": s.id, "text": s.text})
 
         # 8. Sortie : scrubber sur tout ce qui part.
         turn.reply = self.invariants.scrub_output(reply)
@@ -767,6 +965,7 @@ class Kernel:
                 turn.reply = f"{turn.reply}\n\n{project_notice}"
         # 9. Fin de tour : append-only. L'extraction de faits → quarantaine arrive avec A-3 (memory.propose).
         self.store.append(turn)
+        self._trace("finish", turn)  # traces d'entraînement du tour (docs/TRACES.md), après le tour qui fait foi
         self._after_turn(turn)
         self._observe("turn_done", turn)
         # 10. Ressources tenues pendant le tour (onglets du navigateur…) rendues par les sources qui le déclarent.
@@ -784,6 +983,15 @@ class Kernel:
                 ended(turn)
             except Exception:  # noqa: BLE001 — un hook en panne ne casse jamais un tour
                 logger.warning("hooks turn_end en échec", exc_info=True)
+        # 12. Apprentissage (drapeau `learning_nudges`) : tour réussi et riche en outils → une ligne fixe au tour suivant.
+        if self.learning is not None:
+            try:
+                line = self.learning.after_turn(turn)
+            except Exception:  # jamais bloquant
+                logger.warning("invitation d'apprentissage en échec", exc_info=True)
+                line = None
+            if line:
+                self.add_owner_note(turn.thread_id, line)
         return turn
 
     def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict, *, reply: str | None = None) -> Turn:
@@ -895,6 +1103,7 @@ class Kernel:
                 # `pending_approvals`. `advice` : avis du juge sur une carte forte (X8, `advisor`), None sinon
                 # (accompagne, ne bloque rien).
                 approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule))
+                turn.approval_ids.append(approval.id)
                 return ToolResult(call_id=tc.id, name=tc.name,
                                   content=f"EN ATTENTE D'APPROBATION HUMAINE ({why}) [approval:{approval.id}]. "
                                           "L'action n'a pas été exécutée. L'utilisateur décide sur la carte : ne "
@@ -907,7 +1116,7 @@ class Kernel:
             turn.escalated = True
             return ToolResult(call_id=tc.id, name=tc.name, content=f"ESCALADÉ À UN HUMAIN ({why}). {text}")
         return ToolResult(call_id=tc.id, name=tc.name, content=f"REFUSÉ par le noyau ({why}). "
-                          "Ne pas réessayer autrement.", is_error=False)
+                          "Ne pas réessayer autrement.", is_error=False, reason=rule.code if rule else None)
 
     def _routes_with_fallback(self, route: RouteDecision) -> list[RouteDecision]:
         """Le palier choisi, puis Ship en repli s'il est différent et configuré (jamais l'inverse : Ship est le
@@ -950,6 +1159,32 @@ class Kernel:
             messages = redact_context(messages)
         return messages
 
+    def _fit_context(self, turn: Turn, route: RouteDecision, assembled, reassemble: Callable[[Tier], Any]):
+        """Un palier qui déclare sa fenêtre (`max_context_tokens`, palier `nina` 32 k) ne reçoit jamais un appel qui n'y
+        tient pas : bascule sur Ship (verdict `router:context`), le prompt est réassemblé pour Ship."""
+        provider = self.providers.get(route.tier)
+        if provider is None or route.tier is Tier.SHIP or Tier.SHIP not in self.providers:
+            return route, assembled
+        from nokker.route.nina import fits
+
+        ok, need, limit = fits(provider, assembled.messages, assembled.tools, self.max_tokens)
+        if ok:
+            return route, assembled
+        reason = f"{route.reason} ; contexte ~{need} jetons > {limit} ({route.tier.value}) → ship"
+        self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=0, rule="router:context",
+                                          reason=reason)])
+        ship = RouteDecision(tier=Tier.SHIP, reasoning=False, reason=reason)
+        return ship, reassemble(Tier.SHIP)
+
+    def _shadow(self, turn: Turn | None, route: RouteDecision, messages, tools, comp) -> None:
+        """Ombre de Nina (route/nina.py) : premier appel du tour seulement, jamais quand Nina répond déjà ; sans effet."""
+        if self.nina_shadow is None or turn is None or turn.calls or route.tier is Tier.NINA:
+            return
+        try:
+            self.nina_shadow.maybe_run(turn, messages, tools, comp, route.tier.value, getattr(comp, "model", ""))
+        except Exception:  # noqa: BLE001 — l'ombre ne casse jamais un tour
+            logger.warning("nina ombre : en échec", exc_info=True)
+
     def _complete(self, provider: Provider, assembled, route: RouteDecision, thread_id: str,
                   stream: TurnStream | None, turn: Turn | None = None):
         """Un appel modèle (en streaming si le client l'a demandé et que le provider sait le faire). Un flux
@@ -961,11 +1196,12 @@ class Kernel:
         kwargs = {}
         if stream is not None and accepts_on_delta(provider):
             live = ScrubbedDeltas(self.invariants.scrub_output, stream, holdback_for(self.invariants))
-            kwargs["on_delta"] = live.feed
+            kwargs["on_delta"] = self._cancellable(live.feed, thread_id)
             tools_live = self._live_tool_inputs(provider, assembled, turn)
             if tools_live is not None:
-                kwargs["on_tool_delta"] = tools_live.feed
+                kwargs["on_tool_delta"] = self._cancellable(tools_live.feed, thread_id)
         budget = {"max_tokens": self.max_tokens} if self.max_tokens else {}
+        self._trace("sent", turn, messages, assembled.tools)
         try:
             comp = provider.complete(messages, assembled.tools, reasoning=route.reasoning,
                                      session_key=thread_id, **budget, **kwargs)
@@ -985,7 +1221,20 @@ class Kernel:
             raise
         if tools_live is not None:
             tools_live.finish()  # arguments complets : la retenue du caviardage sort (le texte caviardé en entier)
+        self._shadow(turn, route, messages, assembled.tools, comp)
         return comp, live
+
+    def _cancellable(self, feed: Callable[..., None], thread_id: str) -> Callable[..., None]:
+        """Relais d'un morceau en flux qui vérifie l'annulation AVANT de le remettre (D6) : annulé, il lève
+        `TurnCancelled`, ce qui coupe le flux de l'amont au prochain morceau (texte ou arguments d'outil)."""
+        cancelled = self._cancelled
+
+        def fed(*args: Any) -> None:
+            if thread_id in cancelled:
+                raise TurnCancelled(thread_id)
+            feed(*args)
+
+        return fed
 
     def _live_tool_inputs(self, provider: Provider, assembled, turn: Turn | None) -> LiveToolInputs | None:
         """Écriture en direct (X22, docs/BUBBLES.md §6) : seulement pour un tour streamé, un provider qui remet les
@@ -1007,4 +1256,4 @@ class Kernel:
             self.ledger.record_verdict(turn.thread_id, turn.index, v)
 
 
-__all__ = ["ESCALATE_TOOL", "FIND_TOOL", "Gate", "Kernel", "worst"]
+__all__ = ["CANCEL_REPLY", "ESCALATE_TOOL", "FIND_TOOL", "Gate", "Kernel", "TurnCancelled", "worst"]

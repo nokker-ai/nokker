@@ -52,7 +52,8 @@ def test_a_point_taken_before_a_write_is_linked_to_its_turn_and_announced(tmp_pa
     w.call("write_file", {"path": "a.py"}, ctx(3))
     h = m.tip(tmp_path)
     assert links.get(h) == {"thread_id": "th_1", "turn_index": 3, "tool": "write_file"}
-    assert events == [("checkpoint.created", {"thread_id": "th_1", "turn_index": 3, "hash": h, "tool": "write_file"})]
+    assert events == [("checkpoint.created", {"thread_id": "th_1", "turn_index": 3, "hash": h, "tool": "write_file",
+                                               "reason_code": "before_write_file"})]
     m.take = False  # même tour : pas de nouveau point, pas d'événement
     w.call("patch", {"path": "a.py"}, ctx(3))
     assert len(events) == 1
@@ -95,7 +96,8 @@ def test_explicit_create_is_linked_and_announced(tmp_path):
     tools = CheckpointToolSource(lambda t: tmp_path, manager=m, links=links, emit=lambda n, p: events.append((n, p)))
     out = json.loads(tools.call("checkpoint_create", {"reason": "avant refonte"}, ctx(7)).content)
     assert out["created"] and out["turn_index"] == 7 and out["thread_id"] == "th_1"
-    assert events[0][1] == {"thread_id": "th_1", "turn_index": 7, "hash": out["hash"], "tool": "checkpoint_create"}
+    assert events[0][1] == {"thread_id": "th_1", "turn_index": 7, "hash": out["hash"], "tool": "checkpoint_create",
+                         "reason_code": "manual"}
 
 
 def test_restore_keeps_its_strong_effect():

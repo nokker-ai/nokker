@@ -270,6 +270,28 @@ class CodeSessions:
                 "limit": self.cfg.max_sessions_per_user, "modes": list(self.cfg.modes),
                 "default_mode": self.cfg.default_mode, "idle_ttl_s": self.cfg.idle_ttl_s}
 
+    def set_mode(self, user: str, session_id: str, mode: Any) -> dict[str, Any]:
+        """`PATCH /v1/code/sessions/{cs} {mode}` : change le mode de la session en cours de route. 400 `bad_mode` hors
+        `modes`, `mode_above_project` plus large que le mode imposé par le dépôt ou une équipe (la restriction le
+        reprendrait). Rend `{mode, modes, effective}` et publie `session.mode {thread_id, mode, effective}`."""
+        s = self._own(user, session_id)
+        if not isinstance(mode, str) or mode not in self.cfg.modes:
+            raise CodeError(400, "bad_mode", f"mode refusé : {mode!r} (parmi {', '.join(self.cfg.modes)})")
+        perms = self.permissions_for(s.thread_id)
+        if perms is not None:
+            proj = perms.project_mode(s.thread_id)
+            try:
+                perms.set_thread_mode(s.thread_id, mode)
+            except ValueError:
+                raise CodeError(400, "mode_above_project",
+                                f"mode {mode} plus permissif que celui du projet ({proj.value if proj else '?'})") from None
+            perms.mode = perms.thread_mode.pop(s.thread_id)  # une session = un fil : son mode est celui des permissions
+        self.store.update(s.id, mode=mode)
+        effective = perms.mode_for(s.thread_id).value if perms is not None else mode
+        out = {"mode": mode, "modes": list(self.cfg.modes), "effective": effective}
+        self._emitter(s)("session.mode", {"thread_id": s.thread_id, "mode": mode, "effective": effective})
+        return out
+
     def get(self, user: str, session_id: str) -> dict[str, Any]:
         return self.view(self._own(user, session_id))
 
@@ -761,6 +783,23 @@ class TenantCodeTools:
             return src.call(name, arguments, ctx)
         finally:
             self.sessions.touch(s.id)  # dernier usage : l'inactivité se compte depuis la fin de l'appel
+
+    def script_source(self, ctx: ToolContext) -> Any:
+        """La source de code du fil pour `execute_code` (nokker/tools/execute_code.py) : mêmes contrôles que `call`
+        (locataire courant, propriétaire de la session, dossier du sous-agent) ; None hors session ; refus levé."""
+        try:
+            found = self.sessions.source_for_thread(ctx.thread_id)
+        except NoTenant:
+            return None
+        if found is None:
+            return None
+        s, src = found
+        if ctx.sender is not None and is_account(ctx.sender) and ctx.sender != s.user_id:
+            raise PermissionError("cette session de code appartient à un autre utilisateur")
+        if SUBAGENT_MARK in ctx.thread_id:
+            src.share_workspace(s.thread_id, ctx.thread_id, self.sessions.child_dir(ctx.thread_id))
+        self.sessions.touch(s.id)
+        return src
 
     def for_thread(self, thread_id: str) -> Any:
         """La source de code d'une session pour `DelegateToolSource` (git dans son bac à sable, enfant sur son

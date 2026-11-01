@@ -1,7 +1,8 @@
 """Comptes et identités. Un compte = un locataire pendant la bêta (`create_account` crée les deux).
 
 Identités : `device` (id d'appareil enrôlé, docs/APPROVALS.md), `telegram` (id numérique Telegram, appairage), `email`
-(adresse d'invitation, posée à la création). Une identité ne désigne jamais deux comptes (`IdentityTaken`) : c'est la
+(adresse d'invitation, posée à la création), `slack` (`<équipe>:<utilisateur>`) et `whatsapp` (wa_id), appairés
+comme Telegram (docs/CHANNELS.md). Une identité ne désigne jamais deux comptes (`IdentityTaken`) : c'est la
 première ligne de l'isolation — un message Telegram, une session web ou un appareil n'arrivent que dans UN locataire.
 """
 from __future__ import annotations
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 
-KINDS = ("device", "telegram", "email")
+KINDS = ("device", "telegram", "email", "slack", "whatsapp")
 
 
 class IdentityTaken(Exception):

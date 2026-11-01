@@ -535,3 +535,14 @@ def test_network_name_env_prevails_over_network_name(monkeypatch):
     monkeypatch.setenv("NOKKER_SANDBOX_NETWORK", "  ")
     assert _network_name(code) == "nokker-sandbox"
     assert _network_name({}) is None
+
+
+def test_delegate_card_only_offers_a_tool_wide_rule_and_kinds_label_rules():
+    """e2e du 1.11 : la carte de `delegate` ne propose qu'une règle par outil ; `rule_kind` donne au client le bon
+    libellé (avant, il affichait « toujours ce fichier »)."""
+    from nokker.local.approvals import rule_kind, suggested_rules
+
+    assert suggested_rules("delegate", {"tasks": [{"goal": "g", "path": "src/a.py"}]}, "standard") == ["delegate"]
+    assert rule_kind("delegate") == "tool"
+    assert rule_kind("write_file(src/a.py)") == "file" and rule_kind("write_file(src/**)") == "dir"
+    assert rule_kind("terminal(npm test*)") == "prefix" and rule_kind("terminal(npm test)") == "exact"

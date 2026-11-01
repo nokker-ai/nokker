@@ -17,6 +17,7 @@ class Tier(str, enum.Enum):
     SMALL = "small"  # petit palier (X8, docs/LOKKAL.md §7.17) : le trivial (politesses), par le Router ou un modèle local
     SHIP = "ship"  # route par défaut (-eu ; -swiss si le fil exige la zone CH)
     DEEP = "deep"  # 397B OVH en débordement transitoire (D11, 17.10), 122B dès qu'il est servi
+    NINA = "nina"  # modèle maison, À PART (docs/LOKKAL.md §7.17 point 13) : éteint par défaut, ombre puis types de tour
 
 
 class Effect(str, enum.Enum):
@@ -97,6 +98,9 @@ class ToolResult:
     is_error: bool = False
     reservoir_id: str | None = None  # résultat long rangé hors fenêtre (pilier a)
     secret_handles: list[str] = field(default_factory=list)
+    # Motif stable d'un refus, pour les clients seulement (`Verdict.code` : `plan_mode`…) : `tool.result` et réponse de
+    # `tools/call` le portent en `reason`. Jamais dans `content` (le texte vu par le modèle ne change pas).
+    reason: str | None = None
 
 
 @dataclass
@@ -147,6 +151,9 @@ class Verdict:
     # `qa/invariants.py::DeterministicInvariants.check_action`, lu par `Kernel` (core/loop.py) pour
     # savoir quel niveau de preuve exiger via le port `Approvals` (core/ports.py).
     strength: str | None = None
+    # Code stable pour les clients (`plan_mode`, `deny_rule`, `hardline`, `no_code_session` ; None ailleurs) : porté par
+    # le `tool.result` d'un refus (docs/LOKKAL.md §7.4.2). Jamais dans le texte vu par le modèle (qui garde rule/reason).
+    code: str | None = None
 
 
 @dataclass
@@ -193,6 +200,9 @@ class TurnInput:
     attachments: list[dict[str, Any]] = field(default_factory=list)
     # Images déjà validées et rangées au magasin (X7) : le noyau ne reçoit jamais d'octets dans le tour.
     images: list[ImageRef] = field(default_factory=list)
+    # Bloc `[Pièces jointes]` (texte, dossier, url ; `nokker/attachments.py`) déjà caviardé et borné par la frontière ;
+    # vide = aucune (drapeau `text_attachments_enabled` éteint, ou message sans pièce texte).
+    attached: str = ""
 
 
 @dataclass
@@ -222,3 +232,10 @@ class Turn:
     # Images jointes au message humain (X7) : références seulement, persistées avec le tour (append-only) ; les octets
     # restent au magasin d'images et partent avec l'effacement du fil ou du compte.
     images: list[ImageRef] = field(default_factory=list)
+    # Bloc `[Pièces jointes]` du message (TurnInput.attached) : entre dans l'en-tête figé (`head`), rejoué avec lui.
+    # Non persisté à part (`head` le porte) : un en-tête délesté par le never clear emporte les pièces jointes.
+    attached: str = ""
+    # Pour les clients seulement (`turn.done`, docs/CLIENT-API.md §Fin de tour), jamais persistés ni vus par le modèle :
+    # échec du tour `{code, message}` (palier indisponible, erreur d'amont, exception…) et cartes posées pendant le tour.
+    failure: dict[str, str] | None = None
+    approval_ids: list[str] = field(default_factory=list)

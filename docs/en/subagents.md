@@ -31,7 +31,7 @@ parent's turn ends; you can go on talking to the parent meanwhile, since each ch
 - Cancelling the parent thread (`POST /v1/threads/{id}/cancel`, `Esc` in the terminal) also stops its sub-agents,
   background and blocking ones; the response carries `subagents_cancelled`. A stopped child ends as
   `interrupted / cancelled`; its worktree is inspected and kept, never deleted.
-- `delegate_status` can be called outside a turn through `POST /v1/local/tools/call` (without `wait_s`).
+- `delegate_status` (without `wait_s`) and `delegate_cancel` can be called outside a turn through `POST /v1/local/tools/call`; a call made while a turn is running on the thread is answered 409. This is what the terminal's `/agents` and `/agents cancel` use.
 - Background children count against the same concurrency limit as blocking ones. At most 10 background children
   can be unfinished at once; a `delegate` beyond that is refused.
 - Same gates, rules, approvals, tool filters and inactivity limit as a blocking child. A child that needs a card
@@ -98,6 +98,7 @@ child's thread (`<thread>/sa-<id>`) and the child stops (`interrupted / approval
 
 ## In the terminal
 
-`/agents` lists the sub-agents of the thread (goal, state, last tool, duration); children also appear as indented lines
-under their `delegate` call. Events are `subagent.started`, `subagent.progress` and `subagent.finished`; for a
+`/agents` lists the sub-agents of the thread, background ones included (goal, state, last tool, duration, commits, result);
+`/agents <id>` shows one in full, and `/agents cancel <id|all>` stops one background child or all of them (`all` also cancels
+the turn in progress; worktrees are kept). Children also appear as indented lines under their `delegate` call. Events are `subagent.started`, `subagent.progress` and `subagent.finished`; for a
 background child, `started` and `finished` carry `background: true`, and `finished` carries `exit_reason`.

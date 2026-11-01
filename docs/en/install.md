@@ -115,7 +115,7 @@ cosign verify ghcr.io/nokker-ai/nokker:<version>-lokkal \
 ## Check, update, logs
 
 ```sh
-nokker doctor          # Docker, Lokkal compose, web page, server, authentication, client version, git
+nokker doctor          # Docker, Lokkal compose, web page, server, authentication, memory, client version, git
 nokker doctor --fix    # also runs `docker compose up -d` when that can help
 nokker update          # new core images, then replaces the nokker binary
 nokker update --check  # only compares your version with the latest release
@@ -127,6 +127,26 @@ new version of an edited file lands next to it as `<file>.new`), then replaces t
 binary with the one from the same release. The new binary is accepted only if its `.sha256` matches and, when `cosign`
 is installed, its signature verifies. Details in [cli.md](cli.md).
 
+### Backup and restore
+
+```sh
+~/.nokker/backup.sh backup                      # to ~/nokker-backups (outside ~/.nokker: --purge keeps it)
+~/.nokker/backup.sh backup --to /mnt/nas/nokker --encrypt --keep 7
+~/.nokker/backup.sh backup --to s3://my-bucket/nokker   # always encrypted
+~/.nokker/backup.sh list [--to …]
+~/.nokker/backup.sh restore <file>|s3://my-bucket/nokker/<file>
+```
+
+A backup holds the databases, `.env`, `config/`, `state/`, `vault/` and, with the vault profile, the OpenBao volume.
+Your work folders and downloaded models are not included. It contains the secrets of your install: it is written
+`0600`, and encrypted (`openssl`, AES-256, passphrase from `NOKKER_BACKUP_PASSPHRASE` or asked on the terminal) with
+`--encrypt`, whenever `NOKKER_BACKUP_PASSPHRASE` is set, and always for S3; a plain folder backup without a passphrase
+is written unencrypted with a warning. `--keep N` keeps the N newest backups, in a folder or on S3. `list` works without
+an install (to browse a bucket from a new machine). Under WSL, Windows paths (`C:\…`) are accepted. S3 works with any compatible service through `curl`: set `NOKKER_BACKUP_S3_ENDPOINT`,
+`NOKKER_BACKUP_S3_REGION`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, in the environment or in
+`~/.nokker/backup.env`. A restore replaces the data of the install after a confirmation; a backup made by a newer
+version than the one installed is refused until you update.
+
 ## Uninstall
 
 ```sh
@@ -135,10 +155,3 @@ sh ~/.nokker/install.sh --uninstall --purge   # also erase database, memory and 
 ```
 
 On Windows: re-run the installer with `-Uninstall` (and `-Purge`). Your work folders are never touched.
-
-## Known issues
-
-- On macOS and Windows, the installer writes `lokkal.json` under `~/.config/nokker` (Windows: `%USERPROFILE%\.config\nokker`),
-  while the client looks for its config in `~/Library/Application Support/nokker` (Windows: `%APPDATA%\nokker`). Until
-  this is aligned, if `nokker doctor` says no Lokkal is installed, set
-  `NOKKER_CONFIG_DIR_OVERRIDE` to the folder the installer used (for example `~/.config/nokker`).

@@ -8,7 +8,7 @@ import threading
 
 import pytest
 
-from tests.integration.test_rls import A, B, pg, requires_pg  # noqa: F401 — fixture (base neuve, rôles, migrations)
+from tests.integration.test_rls import A, B, pg, requires_pg, seed_accounts  # noqa: F401 — fixture (base neuve, rôles, migrations)
 from tests.integration.test_team_rls import MEM, OUT, OWNER, VIEW, Accounts
 
 pytestmark = pytest.mark.integration
@@ -20,6 +20,7 @@ def team(pg):  # noqa: F811
     from nokker.team.store import PgTeamStore
     from nokker.tenancy.context import tenant_scope
 
+    seed_accounts(pg["su"], OWNER, MEM, VIEW, OUT)
     t = Team(store=PgTeamStore(pg["app"], migrate_now=False), tenancy=Accounts(OWNER, MEM, VIEW, OUT),
              mirror_allowed=lambda acc: True)
     with tenant_scope(OWNER.tenant_id):

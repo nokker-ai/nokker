@@ -294,6 +294,9 @@ class ContextEngineV0:
             if turn.injected:
                 # Contexte reçu d'un autre fil (docs/BUBBLES.md §3-§4, docs/CONTEXT-FORMAT.md) : après le rappel.
                 parts.append(render_injected(turn.injected))
+            if turn.attached:
+                # Pièces jointes texte/dossier/url (docs/CONTEXT-FORMAT.md) : en dernier, juste avant le message.
+                parts.append(turn.attached)
             return parts
 
         head = self.turn_head(turn, head_parts)

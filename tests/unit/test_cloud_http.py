@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -102,6 +103,9 @@ def test_link_gateway_and_inference_end_to_end(cloud):
     status, sse = _call(port, "/v1/inference/chat/completions", {"model": "m", "messages": [], "stream": True},
                         token=mt, raw=True)
     assert status == 200 and b"bon" in sse and b"[DONE]" in sse
+    deadline = time.monotonic() + 3  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and len(usage) < 2:
+        time.sleep(0.02)
     assert [(u[0], u[2]) for u in usage] == [("tn_pierre", {"prompt_tokens": 10, "completion_tokens": 3}),
                                              ("tn_pierre", {"prompt_tokens": 7, "completion_tokens": 2})]
 

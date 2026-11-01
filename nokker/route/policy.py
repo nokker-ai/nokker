@@ -20,7 +20,12 @@ appel et tient pour tout le tour (le cache de préfixe d'un palier ne sert qu'à
     texte gardent leur palier (et leur coût) ; aucun palier avec vision : routage inchangé, image signalée non lue.
 
 Un palier absent de la config (clé de l'utilisateur, modèle local : un seul modèle) se replie sans erreur sur le
-palier présent le plus proche (`resolve`) : petit → Ship → Deep, Deep → Ship → petit.
+palier présent le plus proche (`resolve`) : petit → Ship → Deep, Deep → Ship → petit, nina → Ship.
+
+Palier `nina` (modèle maison, route/nina.py) : présent dans les paliers servis seulement en mode `route` ; il prend
+les tours dont le type (`turn_kind`) est dans `nina_kinds` — jamais le code (classe code ou écriture de fichier),
+jamais un tour qui a reçu un signal d'escalade (Deep). Un appel trop long pour sa fenêtre bascule sur Ship dans le
+noyau (`core/loop.py::_fit_context`).
 """
 from __future__ import annotations
 
@@ -31,7 +36,7 @@ from dataclasses import dataclass, field
 
 from nokker.core.ports import RouteDecision, RouteState
 from nokker.core.turn import Decision, Tier
-from nokker.route.classify import Classified, ModelClassifier, TaskClass, classify
+from nokker.route.classify import Classified, ModelClassifier, TaskClass, classify, turn_kind
 
 # Outils dont l'appel fait d'un tour de conversation un tour de code (écrire dans le dossier de travail).
 CODE_WRITE_TOOLS = frozenset({"write_file", "patch"})
@@ -41,6 +46,7 @@ _FALLBACK = {
     Tier.SHIP: (Tier.SHIP, Tier.DEEP, Tier.SMALL),
     Tier.DEEP: (Tier.DEEP, Tier.SHIP, Tier.SMALL),
     Tier.LOCAL: (Tier.LOCAL, Tier.SMALL, Tier.SHIP, Tier.DEEP),
+    Tier.NINA: (Tier.NINA, Tier.SHIP, Tier.DEEP, Tier.SMALL),
 }
 
 
@@ -83,6 +89,8 @@ class PolicyV1(PolicyV0):
     classifier: ModelClassifier | None = None  # étage 2 (modèle) ; None = règles seules
     code_to_deep: bool = True  # False : le code reste en Ship (Deep sur signaux seulement, comme V0)
     small_reasoning: bool = False
+    # Types de tour confiés au palier `nina` quand il est servi (mode `route`) ; vide = jamais.
+    nina_kinds: frozenset = frozenset()
     max_threads: int = 2048  # classes gardées (dernier tour par fil), éviction la plus ancienne d'abord
     _turns: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)  # (fil, tour) -> Classified
     _last: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)  # fil -> TaskClass
@@ -121,7 +129,8 @@ class PolicyV1(PolicyV0):
                 sees = resolve(actual, seeing)
                 reason = f"{reason} ; image jointe, {actual.value} sans vision → {sees.value}"
                 actual = sees
-        reasoning = {Tier.DEEP: self.deep_reasoning, Tier.SMALL: self.small_reasoning}.get(actual, self.ship_reasoning)
+        reasoning = {Tier.DEEP: self.deep_reasoning, Tier.SMALL: self.small_reasoning,
+                     Tier.NINA: False}.get(actual, self.ship_reasoning)
         return RouteDecision(tier=actual, reasoning=reasoning, reason=reason)
 
     def choose(self, state: RouteState) -> RouteDecision:
@@ -137,6 +146,10 @@ class PolicyV1(PolicyV0):
             return self._decision(Tier.DEEP, f"classe code : {why}", state)
         if c.task is TaskClass.TRIVIAL and state.call_index == 0:
             return self._decision(Tier.SMALL, f"classe trivial : {c.reason}", state)
+        if self.nina_kinds and Tier.NINA in self._have():
+            kind = turn_kind(state.turn.input.text, c.task, getattr(state.turn, "channel", ""))
+            if kind in self.nina_kinds:
+                return self._decision(Tier.NINA, f"type {kind} → nina", state)
         if c.task is TaskClass.TRIVIAL:
             return self._decision(Tier.SHIP, "trivial qui a appelé un outil : suite en Ship", state)
         return self._decision(Tier.SHIP, f"classe conversation : {c.reason}", state)

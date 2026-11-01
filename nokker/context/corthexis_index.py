@@ -21,6 +21,7 @@ from pathlib import Path
 
 from nokker.context.semantic import SemanticHit
 from nokker.context.types import Episode
+from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_of_thread, tenant_scope
 
 logger = logging.getLogger("nokker.context.corthexis_index")
 
@@ -77,6 +78,9 @@ class CorthexisSemanticIndex:
         self._worker: threading.Thread | None = None
         self._failures = 0
         self._disabled_until = 0.0
+        # Locataire de chaque projet en file (docs/MEMORY-TENANCY.md §5) : l'indexation tourne dans SON tenant_scope,
+        # la base CortHeXis est sous RLS (nokker/context/corthexis_tenancy.py).
+        self._tenant_of: dict[str, str] = {}
 
     # ───────────── écriture ─────────────
 
@@ -88,11 +92,17 @@ class CorthexisSemanticIndex:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(render_note(ep, body), encoding="utf-8")
         tmp.replace(path)  # atomique : l'indexeur ne lit jamais un fichier à moitié écrit
+        self._remember_tenant(project, tenant_of_thread(ep.thread_id))
         self._enqueue(project)
 
     def enqueue_project(self, project: str) -> None:
         """Réindexe en fond le dossier `root/<projet>` (notes écrites par l'appelant : mémoire de projet, X1)."""
+        self._remember_tenant(project, current_tenant_or_none() or INTERNAL_TENANT)
         self._enqueue(project)
+
+    def _remember_tenant(self, project: str, tenant: str) -> None:
+        with self._lock:
+            self._tenant_of[project] = tenant
 
     def _enqueue(self, project: str) -> None:
         with self._lock:
@@ -128,10 +138,14 @@ class CorthexisSemanticIndex:
         from corthexis import service as cx_service
         from corthexis.indexer import IndexConfig, Indexer
 
+        from nokker.context.corthexis_tenancy import guarded_store
+
         cfg = IndexConfig.from_env(memory_dir=self.root / project, project=project, normalize=False,
                                    write_index=False, chunk_target=self.chunk_target)
-        with _INDEX_LOCK:
-            rep = Indexer(cx_service.get_store(), cx_service.embedder(), cfg).run()
+        with self._lock:
+            tenant = self._tenant_of.get(project) or INTERNAL_TENANT
+        with _INDEX_LOCK, tenant_scope(tenant):
+            rep = Indexer(guarded_store(), cx_service.embedder(), cfg).run()
         for w in getattr(rep, "warnings", []) or []:
             logger.warning("corthexis(session %s): %s", project, w)
 
@@ -149,6 +163,9 @@ class CorthexisSemanticIndex:
         try:
             from corthexis import service as cx_service
 
+            from nokker.context.corthexis_tenancy import guarded_store
+
+            guarded_store()  # app.tenant_id = locataire du tour sur chaque connexion
             rows = cx_service.search(query, top_k=max(k, 8), deep=self.deep, projects=(project,))
             self._failures = 0
         except Exception:
@@ -198,6 +215,9 @@ class CorthexisSemanticIndex:
         try:
             from corthexis import service as cx_service
 
+            from nokker.context.corthexis_tenancy import guarded_store
+
+            guarded_store()
             rows = cx_service.search(query, top_k=k, deep=self.deep, projects=projects)
             self._failures = 0
         except Exception:

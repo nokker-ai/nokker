@@ -22,12 +22,14 @@
 #   --vault-manual      idem, mais la part de descellement est affichée une fois et redemandée à chaque redémarrage
 #   --local-llm         moteur d'inférence local (Ollama, CPU, profil compose local-llm), proposé dans /setup
 #   --local-llm-model M modèle Ollama à tirer (défaut : qwen3:4b) ; implique --local-llm
-# Variables (tests) : NOKKER_RELEASE_BASE (URL des pièces de release), NOKKER_SKIP_PULL=1, NOKKER_NO_CLI=1.
+# Variables : NOKKER_VERSION (comme --version, qui prime). Tests : NOKKER_RELEASE_BASE (URL des pièces de release), NOKKER_SKIP_PULL=1, NOKKER_NO_CLI=1.
 set -eu
 
 REPO=nokker-ai/nokker
-VERSION=""; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""; LLM=0; LLM_MODEL=""
+VERSION="${NOKKER_VERSION:-}"; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""; LLM=0; LLM_MODEL=""
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nokker"
+# Arguments d'origine, quotés pour sh -c (relance sous le groupe docker juste après son installation)
+ARGS=""; for a in "$@"; do ARGS="$ARGS '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"; done
 
 say()  { printf '\033[1m›\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
@@ -136,6 +138,19 @@ if ! docker_ok; then
   sudo sh /tmp/get-docker.sh; rm -f /tmp/get-docker.sh
   sudo usermod -aG docker "$(id -un)" 2>/dev/null || true
   if ! docker info >/dev/null 2>&1; then
+    # Le groupe docker ne vaut qu'aux sessions suivantes : on se relance sous ce groupe (sg) au lieu de demander de
+    # se reconnecter. Lancé par `curl … | sh`, l'installeur n'a pas de fichier : il est retéléchargé.
+    self="$0"; tmpself=""
+    if [ ! -f "$self" ]; then
+      self=$(mktemp); tmpself=$self; u="https://nokker.ai/install.sh"
+      [ -n "$VERSION" ] && u="https://github.com/$REPO/releases/download/lokkal-v$VERSION/install.sh"
+      curl -fsSL "$u" -o "$self" || self=""
+    fi
+    if [ -n "$self" ] && need sg && sg docker -c "docker info" >/dev/null 2>&1; then
+      say "Docker installé : suite de l'installation sous le groupe docker"
+      [ -n "$tmpself" ] && exec sg docker -c "sh '$self' $ARGS; rc=\$?; rm -f '$self'; exit \$rc"
+      exec sg docker -c "sh '$self' $ARGS"
+    fi
     die "Docker installé : reconnectez-vous (groupe docker), puis relancez cette commande."
   fi
 fi
@@ -149,9 +164,13 @@ BASE=${NOKKER_RELEASE_BASE:-}
 if [ -z "$VERSION" ]; then
   if [ -n "$BASE" ] && [ -f "${BASE#file://}/LATEST" ]; then VERSION=$(cat "${BASE#file://}/LATEST")
   else
-    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-      | grep -o '"tag_name": *"lokkal-v[^"]*"' | head -1 | sed 's/.*lokkal-v//; s/"//') \
-      || die "impossible de trouver la dernière version (--version X.Y.Z)"
+    # La plus HAUTE version (semver, préversions comprises : 0.1.0 > 0.1.0-rc.10 > 0.1.0-rc.9), pas la première de
+    # l'API (ordre de création). Clé de tri portable (sans sort -V) : X Y Z puis n° de rc (sans rc = au-dessus).
+    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100" \
+      | grep -o '"tag_name": *"lokkal-v[^"]*"' | sed 's/.*lokkal-v//; s/"//' \
+      | awk -F'[.-]' '{rc = ($4 == "rc") ? $5 : 999999; printf "%d %d %d %d %d %s\n", $1, $2, $3, rc, $6, $0}' \
+      | sort -n -k1,1 -k2,2 -k3,3 -k4,4 -k5,5 | tail -1 | cut -d' ' -f6) || true
+    [ -n "$VERSION" ] || die "impossible de trouver la dernière version (--version X.Y.Z)"
   fi
 fi
 [ -n "$VERSION" ] || die "version introuvable"
@@ -185,8 +204,22 @@ if [ -f "$DIR/.env" ]; then guard_project; else guard_project new; fi
 umask 077
 mkdir -p "$DIR" "$DIR/state" "$DIR/bin" "$CONF_DIR"
 tar -xzf "$TMP/$PKG" -C "$TMP"
+# Mise à jour : la pose des fichiers suit l'installeur de la version CIBLE, pas celui déjà installé (qui peut ignorer
+# un fichier nouveau ou écraser config/). Relancé une seule fois, avec les mêmes choix ; il retélécharge et revérifie.
+if [ "$MODE" = update ] && [ -z "${NOKKER_INSTALL_REEXEC:-}" ] && ! cmp -s "$0" "$TMP/nokker/install.sh"; then
+  cp "$TMP/nokker/install.sh" "$TMP.install.sh"; rm -rf "$TMP"; trap - EXIT
+  say "installeur de la version $VERSION"
+  set -- --update --version "$VERSION" --dir "$DIR" --no-open
+  [ "$YES" = 1 ] && set -- "$@" --yes
+  [ "$VAULT" = auto ] && set -- "$@" --vault
+  [ "$VAULT" = manual ] && set -- "$@" --vault-manual
+  [ -n "$LLM_MODEL" ] && set -- "$@" --local-llm-model "$LLM_MODEL"
+  [ "$LLM" = 1 ] && [ -z "$LLM_MODEL" ] && set -- "$@" --local-llm
+  NOKKER_INSTALL_REEXEC="$TMP.install.sh" exec sh "$TMP.install.sh" "$@"
+fi
+[ -n "${NOKKER_INSTALL_REEXEC:-}" ] && rm -f "$NOKKER_INSTALL_REEXEC"
 # Fichiers du paquet remplacés ; .env et state/ jamais touchés. config/ est à l'utilisateur : voir install_config.
-for f in docker-compose.yml initdb sql web VERSION install.sh; do rm -rf "${DIR:?}/$f"; cp -R "$TMP/nokker/$f" "$DIR/$f"; done
+for f in docker-compose.yml initdb sql web VERSION install.sh backup.sh; do rm -rf "${DIR:?}/$f"; cp -R "$TMP/nokker/$f" "$DIR/$f"; done
 # config/ : un fichier que l'utilisateur n'a pas touché (identique à la version livrée précédente, gardée dans
 # .dist/config) suit la nouvelle version ; un fichier modifié reste tel quel, la nouvelle version est posée à côté
 # en <fichier>.new. Sans .dist (installation ≤ 0.1.0-rc.8.1), config.yaml est reconnu non modifié par son empreinte
@@ -208,7 +241,7 @@ install_config() {
 }
 install_config
 chmod -R go-w "$DIR"; chmod 755 "$DIR/initdb" "$DIR/sql" "$DIR/web" "$DIR/config"
-chmod 644 "$DIR"/initdb/* "$DIR"/sql/* "$DIR"/web/* "$DIR"/config/*; chmod 700 "$DIR/install.sh"
+chmod 644 "$DIR"/initdb/* "$DIR"/sql/* "$DIR"/web/* "$DIR"/config/*; chmod 700 "$DIR/install.sh" "$DIR/backup.sh"
 # Coffre (profil vault) : scripts remplacés, part et AppRole (vault/unseal, vault/approle) jamais touchés. Les deux
 # dossiers existent toujours : core monte vault/approle (vide sans le profil), docker le créerait sinon en root.
 mkdir -p "$DIR/vault/unseal" "$DIR/vault/approle"; chmod 700 "$DIR/vault" "$DIR/vault/unseal" "$DIR/vault/approle"

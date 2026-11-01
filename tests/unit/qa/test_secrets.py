@@ -156,6 +156,24 @@ def test_invalid_checksum_iban_not_redacted():
     assert r.names == []
 
 
+def test_spaced_iban_redacted_like_the_compact_one():
+    """Banc bench/keys S5 (01.11.2026) : l'IBAN imprimé par groupes de 4 restait en clair partout."""
+    compact = redact("IBAN CH9300762011623852957 pour le virement")
+    for text, tail in (("IBAN CH93 0076 2011 6238 5295 7 pour le virement", " pour le virement"),
+                       ("IBAN CH93 0076 2011 6238 5295 7 ABCD fin", " ABCD fin"),  # mot collé : la fin valide
+                       ("virement sur CH93 0076 2011 6238 5295 7.", ".")):
+        r = redact(text)
+        assert "CH93" not in r.text and "5295" not in r.text and r.text.endswith(tail)
+        assert r.names == compact.names  # même poignée quelle que soit l'écriture
+        assert redact(text, weak=False, wire=True).text == r.text  # aussi sur le fil
+
+
+def test_spaced_iban_with_a_wrong_checksum_and_plain_groups_stay():
+    for clear in ("CH00 0000 0000 0000 0000 0 n'est pas un IBAN", "réf. AB12 3456 7890 du dossier",
+                  "commande FR76 3000 6000 0112 3456 7890 188 du 3 mai"):  # FR76…188 : clé fausse
+        assert redact(clear).text == clear
+
+
 # ───────────────────────── mot de passe après mot-clé ─────────────────────────
 
 
@@ -255,6 +273,22 @@ def test_words_plus_year_joined_by_underscores_are_still_flagged():
 def test_base64_with_slashes_and_digits_is_still_flagged():
     token = "aB3dE9xYz/Qw7Rt2Uv8/Kp4Ln6Mh"
     assert token not in redact(f"clé {token} fin").text
+
+
+def test_password_keyword_with_a_complement_then_colon_is_redacted():
+    """Banc bench/keys S5 (01.11.2026) : « le mot de passe du wifi : VALEUR » restait en clair partout (journal,
+    épisodes, index de session, export, fenêtre des tours suivants)."""
+    for text, value in (("le mot de passe du wifi : Vx9#qLm2-Tr7!pZ, merci", "Vx9#qLm2-Tr7!pZ,"),
+                        ("password for the router: hunter2X!", "hunter2X!"),
+                        ("mdp de la box = Zt7-uu91", "Zt7-uu91")):
+        r = redact(text)
+        assert value not in r.text and r.names, r.text
+    r = redact("le mot de passe du wifi : Vx9#qLm2-Tr7!pZ")
+    assert r.text == "le mot de passe du wifi " + HANDLE_RE.findall(r.text)[0]
+    # forme d'avant inchangée, et une phrase sans « : » ne bouge pas
+    assert HANDLE_RE.fullmatch(redact("mot de passe : Sx1!rr").text.removeprefix("mot de passe "))
+    for clear in ("le mot de passe du wifi est dans le coffre", "le mot de passe de la box a changé"):
+        assert redact(clear).text == clear
 
 
 def test_password_in_a_sentence_is_redacted_but_not_plain_words():

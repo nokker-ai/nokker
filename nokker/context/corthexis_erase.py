@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from nokker.context.corthexis_index import project_of
+from nokker.tenancy.context import tenant_of_thread
 
 logger = logging.getLogger("nokker.context.corthexis_erase")
 
@@ -47,15 +48,23 @@ def _database_url(settings: Mapping[str, Any], environ: Mapping[str, str]) -> st
     return str(environ.get(str(settings.get("database_url_env") or "CORTHEXIS_DATABASE_URL"), "") or "")
 
 
-def _erase_db(dsn: str, projects: list[str], apply: bool) -> dict[str, int]:
+def _erase_db(dsn: str, projects: list[str], apply: bool, tenant: str | None = None) -> dict[str, int]:
     import psycopg
 
     counts: dict[str, int] = {}
     with psycopg.connect(dsn, connect_timeout=10) as conn:
+        # Base sous RLS (nokker/context/corthexis_tenancy.py) : le locataire effacé, pour cette transaction ; ses lignes
+        # partent par projet ET par locataire (une note rattachée au locataire hors de ses fils connus aussi).
+        conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant or "",))
+        tenanted = bool(tenant) and conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('notes') AND attname = 'tenant_id' "
+            "AND NOT attisdropped)").fetchone()[0]
+        mine = "(project = ANY(%s) OR tenant_id = current_setting('app.tenant_id', true))" if tenanted \
+            else "project = ANY(%s)"
         present = {t for t in ("notes", "chunks", "lex_df", "index_generations", *PROJECT_TABLES)
                    if conn.execute("SELECT to_regclass(%s)", (t,)).fetchone()[0]}
         if "notes" in present:
-            notes = conn.execute("SELECT id, lex_tokens FROM notes WHERE project = ANY(%s) FOR UPDATE",
+            notes = conn.execute(f"SELECT id, lex_tokens FROM notes WHERE {mine} FOR UPDATE",
                                  (projects,)).fetchall()
             ids = [r[0] for r in notes]
             if "chunks" in present:
@@ -76,8 +85,7 @@ def _erase_db(dsn: str, projects: list[str], apply: bool) -> dict[str, int]:
                 conn.execute("DELETE FROM lex_df WHERE token = ANY(%s) AND df <= 0", (toks,))
         for t in PROJECT_TABLES:
             if t in present:
-                counts[f"corthexis: {t}"] = conn.execute(f"DELETE FROM {t} WHERE project = ANY(%s)",
-                                                         (projects,)).rowcount
+                counts[f"corthexis: {t}"] = conn.execute(f"DELETE FROM {t} WHERE {mine}", (projects,)).rowcount
         if apply:
             conn.commit()
         else:
@@ -111,13 +119,16 @@ def erase_session_memory(settings: Mapping[str, Any] | None, thread_ids: Iterabl
     éteint (`enabled: false`) : des notes restent peut-être d'avant, elles partent aussi."""
     if not settings or not isinstance(settings, Mapping):
         return {}
+    thread_ids = [t for t in thread_ids if t]
     projects = session_projects(thread_ids)
     root = Path(os.path.realpath(str(settings.get("root_dir") or DEFAULT_ROOT)))
     counts: dict[str, int] = {}
     dsn = _database_url(settings, os.environ if environ is None else environ)
+    tenants = {tenant_of_thread(t) for t in thread_ids}
+    tenant = next(iter(tenants)) if len(tenants) == 1 else None
     if dsn and projects:
         try:
-            counts.update(_erase_db(dsn, projects, apply))
+            counts.update(_erase_db(dsn, projects, apply, tenant))
         except Exception as e:  # noqa: BLE001 — le message ne reprend pas l'exception : elle peut citer le DSN
             logger.warning("effacement de l'index de session CortHeXis en échec (%s)", type(e).__name__)
             raise SessionMemoryEraseError(f"base de l'index de session CortHeXis injoignable ou en erreur "

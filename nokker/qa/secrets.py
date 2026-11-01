@@ -190,10 +190,17 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 _IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{9,30}\b")
+# Le même IBAN écrit comme on l'imprime, par groupes de 4 séparés d'une espace (« CH93 0076 2011 6238 5295 7 ») : le
+# motif contigu ne le voyait pas (banc bench/keys S5, 01.11.2026 : IBAN en clair dans le journal, les épisodes, l'index
+# de session et l'export). Validé par la même clé mod-97 ; la fin la plus longue qui valide est retenue.
+_IBAN_SPACED_RE = re.compile(r"\b[A-Z]{2}\d{2}(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,4})?\b")
 
 # « mot de passe / password / mdp / pw / passwort : VALEUR » — VALEUR = un seul « mot » (pas
-# d'espace), ce qui évite de caviarder toute la phrase qui suit.
-_PASSWORD_KEYWORD_RE = re.compile(r"(?i)\b(mot de passe|mdp|password|pw|passwort)\s*[:=]\s*(\S+)")
+# d'espace), ce qui évite de caviarder toute la phrase qui suit. Le mot-clé peut porter le même complément que la forme
+# en phrase (« le mot de passe du wifi : VALEUR », banc bench/keys S5, 01.11.2026 : resté en clair partout).
+_PASSWORD_KEYWORD_RE = re.compile(
+    r"(?i)\b(mot de passe|mdp|password|pw|passwort)((?:\s+(?:du|de la|de l'|de|des|pour|of|for|for the)\s+[^\s,;:=]+)"
+    r"{0,2})\s*[:=]\s*(\S+)")
 
 # Même chose en phrase (carnet d'incidents D2, 24.10) : « le mot de passe du portail c'est VALEUR ». Sans « : », la
 # valeur doit AVOIR l'air d'un mot de passe (lettre + chiffre ou symbole, 6 caractères ou plus) : « le mot de passe est
@@ -619,6 +626,19 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
 
     out = _IBAN_RE.sub(_iban_sub, out)
 
+    def _iban_spaced_sub(m: re.Match[str]) -> str:
+        groups = m.group(0).split(" ")
+        for end in range(len(groups), 2, -1):  # la fin la plus longue qui valide (un mot collé derrière ne compte pas)
+            candidate = " ".join(groups[:end])
+            if _iban_valid(candidate):
+                compact = candidate.replace(" ", "")
+                name = _type_name("iban", compact)
+                _mark(name, candidate)
+                return _handle(name) + m.group(0)[len(candidate):]
+        return m.group(0)
+
+    out = _IBAN_SPACED_RE.sub(_iban_spaced_sub, out)
+
     def _aws_secret_sub(m: re.Match[str]) -> str:
         value = m.group(3)
         if re.fullmatch(r"[0-9a-fA-F]{40}", value) or not (re.search(r"[a-z]", value) and re.search(r"[A-Z]", value)
@@ -657,12 +677,12 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     if weak:
         # 5. « mot de passe / password / mdp / pw : VALEUR »
         def _pw_sub(m: re.Match[str]) -> str:
-            keyword, value = m.group(1), m.group(2)
+            keyword, qualifier, value = m.group(1), m.group(2), m.group(3)
             if HANDLE_RE.fullmatch(value):
                 return m.group(0)  # déjà une poignée (ex. posée par une passe précédente)
             name = _type_name("password", value)
             _mark(name, value)
-            return f"{keyword} {_handle(name)}"
+            return f"{keyword}{qualifier} {_handle(name)}"
 
         out = _PASSWORD_KEYWORD_RE.sub(_pw_sub, out)
 

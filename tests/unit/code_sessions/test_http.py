@@ -161,15 +161,54 @@ def test_tools_call_checkpoints_only_on_own_session(api_tools):
     assert s == 200 and out == {"content": "[]", "is_error": False}
     internal = f"{accs['ana'].tenant_id}:{a['id']}"  # le fil interne du noyau, préfixé du locataire
     assert calls == [(internal, "checkpoint_list", {}, accs["ana"].account_id)]
-    for name in ("terminal", "write_file", "patch", "checkpoint_create", "todo", "memory"):
+    for name in ("terminal", "write_file", "patch", "checkpoint_create", "memory"):
         s, err = call("POST", url, {"name": name, "arguments": {}}, who="ana")
         assert s == 403 and err["error"]["code"] == "tool_not_allowed", name
     assert call("POST", url, {"name": "checkpoint_diff", "arguments": "x"}, who="ana")[0] == 400
+    s, err = call("POST", url, {"name": "todo", "arguments": {"todos": []}}, who="ana")  # écrire : au modèle seul
+    assert s == 400 and err["error"]["code"] == "bad_arguments"
     for who in ("ben", "cam"):  # même locataire autre utilisateur, autre locataire : la session n'existe pas
         assert call("POST", url, {"name": "checkpoint_list", "arguments": {}}, who=who)[0] == 404
     assert len(calls) == 1
+    s, out = call("POST", url, {"name": "todo", "arguments": {}}, who="ana")  # lecture seule (§7.4.8)
+    assert s == 200 and calls[-1][1:3] == ("todo", {})
+    calls.pop()
+    answer["out"] = ToolResult(call_id="c", name="checkpoint_create", is_error=True, reason="plan_mode",
+                               content="refusé par le noyau (permissions:plan: mode plan : lecture seule)")
+    s, out = call("POST", url, {"name": "checkpoint_restore", "arguments": {"hash": "abc"}}, who="ana")
+    assert s == 200 and out["reason"] == "plan_mode" and out["content"].startswith("refusé par le noyau")
+    calls.pop()
     answer["out"] = "ap_0123"  # restauration qui attend une carte : 202, décidée par /v1/approvals/{id}/decision
     s, out = call("POST", url, {"name": "checkpoint_restore", "arguments": {"hash": "abc"}}, who="ana")
     assert s == 202 and out == {"approval_id": "ap_0123"}
     call("DELETE", f"/v1/code/sessions/{a['id']}", who="ana")
     assert call("POST", url, {"name": "checkpoint_list", "arguments": {}}, who="ana")[0] == 404
+
+
+def test_patch_session_mode(api):
+    """`PATCH /v1/code/sessions/{cs} {mode}` (front n°5) : `{mode, modes, effective}`, `session.mode`, 400 hors `modes`
+    ou plus permissif que ce que le dépôt ou une équipe impose ; le mode change aussi les portes de la session."""
+    call, accs, svc = api
+    events: list = []
+    svc.emit = lambda name, data: events.append((name, data))
+    a = call("POST", "/v1/code/sessions", {"mode": "accept_edits"}, who="ana")[1]
+    url = f"/v1/code/sessions/{a['id']}"
+    s, out = call("PATCH", url, {"mode": "plan"}, who="ana")
+    assert s == 200 and out == {"mode": "plan", "modes": ["default", "accept_edits", "plan"], "effective": "plan"}
+    from nokker.tenancy.context import tenant_scope
+
+    with tenant_scope(accs["ana"].tenant_id):  # lecture directe du magasin (hors route)
+        sess = svc.store.get(a["id"])
+        assert sess.mode == "plan" and call("GET", url, who="ana")[1]["mode"] == "plan"
+        assert svc.permissions_for(sess.thread_id).mode_for(sess.thread_id).value == "plan"
+        name, data = events[-1]
+        assert name == "session.mode" and data["thread_id"] == sess.thread_id and data["effective"] == "plan"
+        assert data["_audience"] == [accs["ana"].account_id]
+        s, err = call("PATCH", url, {"mode": "auto"}, who="ana")
+        assert s == 400 and err["error"]["code"] == "bad_mode"
+        assert call("PATCH", url, {"mode": "plan", "x": 1}, who="ana")[0] == 400
+        assert call("PATCH", url, {"mode": "default"}, who="ben")[0] == 404  # la session d'un autre n'existe pas
+        svc.permissions_for(sess.thread_id).restrict_with(sess.thread_id, {"mode": "default"})
+        s, err = call("PATCH", url, {"mode": "accept_edits"}, who="ana")
+        assert s == 400 and err["error"]["code"] == "mode_above_project" and svc.store.get(a["id"]).mode == "plan"
+        assert call("PATCH", url, {"mode": "default"}, who="ana")[1]["effective"] == "default"

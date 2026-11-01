@@ -82,5 +82,8 @@ local:
     roots_env: NOKKER_HOST_WORKSPACE           # dossier(s) de l'utilisateur séparés par « : », montés au même chemin
     host_roots: {}                             # racine vue par le noyau -> vue par le démon, si différente
     backend: docker
-    network_name_env: NOKKER_SANDBOX_NETWORK      # réseau de CETTE installation (.env), prioritaire
-    network_name: nokker-sandbox               # installation antérieure, ou variable vide
+    # Réseau de CETTE installation (NOKKER_SANDBOX_NETWORK du .env), prioritaire ; network_name sinon. La ligne
+    # network_name reste SANS commentaire : l'installeur ≤ rc.8.1, qui fait la mise à jour vers celle-ci, la réécrit
+    # avec un sed exact et s'arrête s'il ne la trouve pas.
+    network_name_env: NOKKER_SANDBOX_NETWORK
+    network_name: nokker-sandbox

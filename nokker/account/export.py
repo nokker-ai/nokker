@@ -113,6 +113,9 @@ class AccountExports:
     acceptances: Callable[[str], list[dict[str, Any]]] | None = None
     consents: Callable[[str], list[dict[str, Any]]] | None = None
     usage: Callable[[str], dict[str, Any]] | None = None
+    # Mémoire longue du compte (docs/MEMORY-TENANCY.md, drapeau `tenant_long_memory`) : sa mémoire de profil et ses
+    # contributions au foyer ; None (drapeau éteint) : la clé n'apparaît pas.
+    long_memory: Callable[[str], dict[str, Any]] | None = None
     clock: Callable[[], float] = time.time
 
     def request(self, account: Any, tenant_id: str) -> ExportMeta:
@@ -145,6 +148,7 @@ class AccountExports:
             "consents": _plain(self.consents(account.account_id)) if self.consents else [],
             "usage": self.usage(account.account_id) if self.usage else None,
             "conversations": [{"thread": t, "turns": turns} for t, turns in sorted(threads.items())],
+            **({"long_memory": self.long_memory(account.account_id)} if self.long_memory else {}),
             "not_included": ["connector credentials (secrets, never exported)", "internal decision logs"],
         }
 

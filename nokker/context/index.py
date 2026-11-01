@@ -16,9 +16,11 @@ from nokker.context.types import Episode
 _LINE_SPLIT = re.compile(r"\s*;\s*|(?<=[.!?])\s+|\s*\|\s*")
 
 
-def query_terms(query: str) -> list[str]:
-    q = [w for w in content_words(query)]
-    q += [w for w in distinctive_words(query) if any(c.isdigit() for c in w)]
+def query_terms(query: str, extra_stop: frozenset[str] = frozenset()) -> list[str]:
+    """Termes d'une requête ; `extra_stop` en retire d'autres (les mots outils, `text.FUNCTION_WORDS`, drapeau
+    `never_clear_fixes_enabled`) : vide par défaut, sélection d'avant."""
+    q = [w for w in content_words(query) if w not in extra_stop]
+    q += [w for w in distinctive_words(query) if any(c.isdigit() for c in w) and w not in extra_stop]
     return list(dict.fromkeys(q))
 
 
@@ -37,9 +39,10 @@ def _doc_counts(ep: Episode) -> Counter[str]:
     return c
 
 
-def best_lines(ep: Episode, query: str, n: int = 2) -> list[tuple[str, float]]:
+def best_lines(ep: Episode, query: str, n: int = 2,
+               extra_stop: frozenset[str] = frozenset()) -> list[tuple[str, float]]:
     """Les `n` phrases du résumé qui recoupent le mieux la requête (part des termes retrouvés)."""
-    q = query_terms(query)
+    q = query_terms(query, extra_stop)
     if not q:
         return []
     out: list[tuple[str, float]] = []
@@ -56,8 +59,8 @@ MIN_MASS = 0.9  # idf cumulé minimal retrouvé : un seul terme banal (présent 
 
 
 def search(episodes: list[Episode], query: str, k: int = 3, min_score: float = 0.15,
-           exclude: set[str] | None = None) -> list[tuple[Episode, float]]:
-    q = query_terms(query)
+           exclude: set[str] | None = None, extra_stop: frozenset[str] = frozenset()) -> list[tuple[Episode, float]]:
+    q = query_terms(query, extra_stop)
     pool = [e for e in episodes if e.closed_at is not None]
     if not q or not pool:
         return []

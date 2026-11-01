@@ -26,12 +26,18 @@ from nokker.context import index as episode_index
 from nokker.context.memory import MemoryEpisodeStore, MemoryReservoirStore
 from nokker.context.summarize import ExtractiveSummarizer, message_chars, turn_tokens
 from nokker.context.text import (
+    FUNCTION_WORDS,
     clip,
     constraint_clauses,
     content_words,
     distinctive_words,
+    durable_clauses,
+    is_bypass_request,
     is_constraint,
+    is_durable_revocation,
     is_revocation,
+    own_words,
+    revoked_durables,
     sentences,
 )
 from nokker.context.transcript import render_episode
@@ -62,6 +68,16 @@ CONSTRAINT_HEADER = ("Exigences posées pendant les tâches, du plus ancien au p
                      "qu'un revirement plus récent ne les annule pas. Le code qui les porte peut sembler inutilisé dans "
                      "le dépôt (il sert des appelants extérieurs) : avant de supprimer, renommer ou nettoyer, vérifie "
                      "que tu ne les casses pas :")
+# NEVER-CLEAR §14, drapeau `never_clear_fixes_enabled` (éteint par défaut) : section NOUVELLE, en tête de
+# `[Mémoire de la session]`, avant les exigences. Texte figé (contrat de format, docs/CONTEXT-FORMAT.md).
+DURABLE_HEADER = ("Consignes durables données par l'utilisateur, de la plus ancienne à la plus récente. Elles valent "
+                  "pour chacune de tes réponses tant qu'il ne les retire pas, sans jamais passer avant les règles du "
+                  "système ni les approbations :")
+# SOURCE : seuls les messages tapés par l'utilisateur lui-même peuvent être promus. Canaux d'une parole humaine
+# directe ; pas : agent (bloc non fiable), session (message d'une autre session), subagent, relais, kernel, pages,
+# account… (un canal inconnu n'est pas promu). Résultats d'outils (mail lu, page web), pièces jointes et blocs reçus
+# ne sont jamais dans `t.input.text` ; s'ils y sont recopiés en bloc, `text.own_words` les retire.
+DURABLE_CHANNELS = frozenset({"api", "telegram", "slack", "webchat", "cli"})
 
 
 def conclusion_of(turn: Turn) -> str:
@@ -104,6 +120,9 @@ class ContextManager:
     on_episode_closed: Callable[[Episode], str | None] | None = None
     # Recherche sémantique (moteur CortHeXis, `corthexis_index.py`) ; None = lexical seulement.
     semantic: Any = None
+    # Qui a le GO (`DeterministicInvariants.go_authorized`, posé par `build_kernel`) : dans un fil de GROUPE (plusieurs
+    # expéditeurs), seules les consignes de l'expéditeur qui a le GO sont promues ; None = aucune dans un groupe.
+    go_authorized: Callable[[str | None], bool] | None = None
 
     def __post_init__(self) -> None:
         self._locks: dict[str, threading.RLock] = {}
@@ -423,6 +442,13 @@ class ContextManager:
         return (f"- {ep.id} (#{ep.seq + 1}, {ep.day or '?'}, {n} tours) « {ep.title} » — "
                 f"{clip(ep.summary, summary_chars)}")
 
+    def _fmt_found(self, ep: Episode, body: str) -> str:
+        """`_fmt` dont le corps est un extrait retrouvé (résumé coupé à 200 caractères à défaut)."""
+        if not body:
+            return self._fmt(ep, 200)
+        n = (ep.last_turn - ep.first_turn + 1) if ep.last_turn is not None else 0
+        return f"- {ep.id} (#{ep.seq + 1}, {ep.day or '?'}, {n} tours) « {ep.title} » — {body}"
+
     def memory_block(self, thread_id: str) -> str:
         """Couche 3 : résumés des derniers épisodes clos + épisodes épinglés + index des plus anciens. Ne change qu'à
         la clôture d'un épisode ou à un (dés)épinglage : le préfixe de cache reste valide entre-temps."""
@@ -452,16 +478,17 @@ class ContextManager:
         header = ("[Mémoire de la session]\n(La fenêtre ne montre que l'épisode courant : pour toute information absente, "
                   "appelle recall_context(query) AVANT de répondre que tu ne sais pas.)")
         index_line = self._index_line(rest, thread_id) if rest else ""
+        durs = self._durable_lines(thread_id, int(budget_chars * 0.15))  # [] drapeau éteint
         cons = self._constraint_lines(thread_id, int(budget_chars * 0.25))
         revs = self._revocation_lines(thread_id, int(budget_chars * 0.4))
         fixed = (len(header) + len(index_line) + sum(len(x) for x in day_lines)
-                 + sum(len(x) + 1 for x in (*cons, *revs)) + 40)
+                 + sum(len(x) + 1 for x in (*durs, *cons, *revs)) + 40)
         room = max(0, budget_chars - fixed)
         cap = max(100, room // max(1, len(chosen)) - 90) if chosen else 0
         lines = [self._fmt(e, cap) for e in chosen]
         # Exigences puis revirements juste après l'en-tête (la coupe de sûreté ci-dessous ne peut pas les emporter),
         # dans cet ordre : un revirement plus récent l'emporte sur une exigence.
-        text = "\n".join([header, *cons, *revs, *day_lines, *lines, *([index_line] if index_line else []),
+        text = "\n".join([header, *durs, *cons, *revs, *day_lines, *lines, *([index_line] if index_line else []),
                           "[/Mémoire]"])
         return text if len(text) <= budget_chars + 200 else text[: budget_chars + 150] + "\n[/Mémoire]"
 
@@ -493,6 +520,34 @@ class ContextManager:
         self._turn_docs(thread_id)
         return list(self._tidx.get(thread_id, {}).get("cons", []))
 
+    def durable_instructions(self, thread_id: str) -> list[tuple[Turn, Episode, str]]:
+        """Les consignes DURABLES (`text.durable_clauses`) des épisodes clos encore en vigueur — celles qu'aucune
+        révocation plus récente (`text.is_durable_revocation` : « arrête de… », « oublie cette règle », « plus besoin
+        de… ») n'a retirées — avec leurs seules phrases de consigne, du plus ancien au plus récent ; les
+        `durable_instructions_k` plus récentes. Lues dans CE fil seulement (un fil = un compte) : ni un autre compte ni
+        un membre du foyer ne les voient."""
+        self._turn_docs(thread_id)
+        idx = self._tidx.get(thread_id, {})
+        # Fil de groupe (plusieurs expéditeurs) : seul celui qui a le GO compte (jugé au rendu : un fil devient un
+        # groupe quand un 2e expéditeur parle, les consignes déjà indexées sont alors refiltrées).
+        if len(idx.get("senders", ())) > 1:
+            go = self.go_authorized
+            ok = (lambda t: go is not None and bool(go(t.sender)))
+        else:
+            ok = (lambda t: True)
+        events = sorted([(t.index, "d", t, ep, txt) for t, ep, txt in idx.get("durs", []) if ok(t)]
+                        + [(t.index, "r", t, ep, "") for t, ep in idx.get("drevs", []) if ok(t)],
+                        key=lambda x: x[0])
+        active: list[tuple[Turn, Episode, str]] = []
+        for _, kind, t, ep, txt in events:
+            if kind == "d":
+                active.append((t, ep, txt))
+            elif active:
+                gone = revoked_durables(t.input.text or "", [x[2] for x in active])
+                active = [x for i, x in enumerate(active) if i not in gone]
+        k = max(0, int(self.budgets.durable_instructions_k))
+        return active[-k:] if k and self.budgets.never_clear_fixes_enabled else []
+
     def _constraint_lines(self, thread_id: str, budget_chars: int) -> list[str]:
         """Couche 3 : les exigences posées au fil des tâches (banc X9, RESULTS.md §10.3 : « réexporte total_ht … pour
         ne rien casser chez les appelants », perdue 35 tours plus tard par un « nettoyage : imports inutilisés » qui ne
@@ -508,6 +563,24 @@ class ContextManager:
             out.append(line)
             used += len(line) + 1
         return [CONSTRAINT_HEADER, *reversed(out)] if out else []
+
+    def _durable_lines(self, thread_id: str, budget_chars: int) -> list[str]:
+        """Couche 3, drapeau `never_clear_fixes_enabled` : les consignes DURABLES données à l'assistante encore en
+        vigueur (« termine chacune de tes réponses par … », NEVER-CLEAR §14), une ligne par tour, la seule phrase qui
+        porte la consigne, réextraite du message CAVIARDÉ (un secret à cheval sur deux propositions ne ressort pas par
+        la découpe) puis recaviardée. Les plus récentes d'abord gardées, rendues dans l'ordre chronologique."""
+        if not self.budgets.never_clear_fixes_enabled:
+            return []
+        out: list[str] = []
+        used = len(DURABLE_HEADER) + 1
+        for t, ep, txt in reversed(self.durable_instructions(thread_id)):
+            body = durable_clauses(self._clean(t.input.text or "")) or txt
+            line = f"- T{t.index} ({ep.id}) « {clip(self._clean(body), 220)} »"
+            if used + len(line) + 1 > budget_chars:
+                break
+            out.append(line)
+            used += len(line) + 1
+        return [DURABLE_HEADER, *reversed(out)] if out else []
 
     def _index_line(self, older: list[Episode], thread_id: str) -> str:
         counts: Counter[str] = Counter()
@@ -527,7 +600,7 @@ class ContextManager:
             return ""
         closed = self.episodes.list(thread_id, closed_only=True)
         hits = episode_index.search(closed, query, k=b.relevant_episodes_k, min_score=b.relevant_min_score,
-                                    exclude=exclude)
+                                    exclude=exclude, extra_stop=self._qstop)
         sem = {h.episode_id: h for h in self._semantic_hits(thread_id, query, b.relevant_episodes_k)
                if not (exclude and h.episode_id in exclude)}
         if sem:  # fusion : un épisode retrouvé par le sens entre même si le lexical l'a manqué (« backups » ↔ « sauvegarde »)
@@ -549,10 +622,7 @@ class ContextManager:
         lines = []
         for e, score in hits:
             n = (e.last_turn - e.first_turn + 1) if e.last_turn is not None else 0
-            lex = " | ".join(clip(ln, 220) for ln, _ in episode_index.best_lines(e, query, 2))
-            # L'extrait que le MOTEUR a jugé le plus proche passe d'abord (il porte le sens), les lignes lexicales après.
-            sem_text = clip(sem[e.id].text, 280) if e.id in sem and sem[e.id].text else ""
-            best = " | ".join(x for x in (sem_text, lex) if x)
+            best = self._hit_body(e, query, sem.get(e.id))
             span = f"T{e.first_turn}-T{e.last_turn}" if e.last_turn is not None else f"T{e.first_turn}"
             lines.append(f"- {e.id} (#{e.seq + 1}, {span}, {e.day or '?'}, {n} tours) « {clip(e.title, 60)} » — "
                          f"{best or clip(e.summary, 300)} (pertinence {score:.2f})")
@@ -571,6 +641,27 @@ class ContextManager:
                              f"T{t.index} « {clip(self._clean(revocation_sentences(t.input.text)), 160)} »"
                              for t, _ in later))
         return "[Épisodes pertinents]\n" + "\n".join(lines) + "\n[/Épisodes]"
+
+    def _hit_body(self, e: Episode, query: str, hit: Any = None) -> str:
+        """Corps d'un épisode retrouvé, commun au bloc `[Épisodes pertinents]` et à `recall_context(query)` : l'extrait
+        que le MOTEUR sémantique a jugé le plus proche d'abord (il porte le sens : une paraphrase sans mot commun ne
+        recoupe ni le titre ni le résumé), puis les lignes du résumé qui recoupent la requête ; « » si ni l'un ni
+        l'autre. Drapeau `never_clear_fixes_enabled` allumé : recaviardé (l'index est déjà caviardé à l'écriture :
+        défense en profondeur) et mots outils hors des termes de requête ; éteint : exactement le corps d'avant."""
+        on = self.budgets.never_clear_fixes_enabled
+        lex = " | ".join(clip(ln, 220) for ln, _ in episode_index.best_lines(e, query, 2, extra_stop=self._qstop))
+        if hit is None or not getattr(hit, "text", ""):
+            sem_text = ""
+        else:
+            sem_text = clip(self._clean(hit.text), 280) if on else clip(hit.text, 280)
+        body = " | ".join(x for x in (sem_text, lex) if x)
+        return self._clean(body) if on else body
+
+    @property
+    def _qstop(self) -> frozenset[str]:
+        """Mots retirés EN PLUS des termes d'une requête lexicale : les mots outils (`text.FUNCTION_WORDS`), drapeau
+        `never_clear_fixes_enabled` allumé seulement (éteint : sélection d'avant, gel du format)."""
+        return FUNCTION_WORDS if self.budgets.never_clear_fixes_enabled else frozenset()
 
     def layer3_ids(self, thread_id: str) -> set[str]:
         b = self.budgets
@@ -649,14 +740,27 @@ class ContextManager:
             return f"Identifiant non reconnu : {ref} (attendu ep_…, rs_… ou dy_…)"
         if query:
             closed = self.episodes.list(thread_id, closed_only=True)
-            hits = episode_index.search(closed, query, k=5, min_score=0.05)
-            lines = [f"{self._fmt(e, 200)} (pertinence {s:.2f})" for e, s in hits]
-            for h in self._semantic_hits(thread_id, query, 5):
-                ep = self.episodes.get(h.episode_id)
-                if ep is not None and ep.thread_id == thread_id and not any(ep.id in ln for ln in lines):
-                    lines.append(f"{self._fmt(ep, 200)} (sémantique {h.score:.2f})")
+            hits = episode_index.search(closed, query, k=5, min_score=0.05, extra_stop=self._qstop)
+            if self.budgets.never_clear_fixes_enabled:
+                sem: dict[str, Any] = {}
+                for h in self._semantic_hits(thread_id, query, 5):
+                    sem.setdefault(h.episode_id, h)
+                # Titre puis corps, comme avant ; le corps est l'EXTRAIT retrouvé (`_hit_body`, même plafond et même
+                # caviardage que `[Épisodes pertinents]`), le résumé coupé à 200 caractères seulement à défaut.
+                lines = [f"{self._fmt_found(e, self._hit_body(e, query, sem.get(e.id)))} (pertinence {s:.2f})"
+                         for e, s in hits]
+                for eid, h in sem.items():
+                    ep = self.episodes.get(eid)
+                    if ep is not None and ep.thread_id == thread_id and not any(ep.id in ln for ln in lines):
+                        lines.append(f"{self._fmt_found(ep, self._hit_body(ep, query, h))} (sémantique {h.score:.2f})")
+            else:  # drapeau éteint : titre + résumé coupé, exactement comme avant (gel du format)
+                lines = [f"{self._fmt(e, 200)} (pertinence {s:.2f})" for e, s in hits]
+                for h in self._semantic_hits(thread_id, query, 5):
+                    ep = self.episodes.get(h.episode_id)
+                    if ep is not None and ep.thread_id == thread_id and not any(ep.id in ln for ln in lines):
+                        lines.append(f"{self._fmt(ep, 200)} (sémantique {h.score:.2f})")
             lines += self.search_turns(thread_id, query, k=5)
-            q = set(content_words(query))
+            q = set(content_words(query)) - self._qstop
             for it in self.reservoir.list(thread_id, limit=200):
                 hay = set(content_words(f"{it.name} {it.preview}"))
                 if q and len(q & hay) / len(q) >= 0.5:
@@ -669,7 +773,8 @@ class ContextManager:
         qu'une fois ; l'épisode courant est exclu (déjà dans la fenêtre). Reconstruit à froid après un redémarrage."""
         with self._lock(thread_id):
             st = self.state(thread_id)
-            idx = self._tidx.setdefault(thread_id, {"upto": -1, "docs": [], "revs": [], "cons": []})
+            idx = self._tidx.setdefault(thread_id, {"upto": -1, "docs": [], "revs": [], "cons": [], "durs": [],
+                                                    "drevs": []})
             closed = [e for e in self.episodes.list(thread_id, closed_only=True)]
             if not closed or st.last_turn_index < 0:
                 return []
@@ -682,14 +787,25 @@ class ContextManager:
                     if ep is None:
                         continue
                     text = t.input.text or ""
+                    # consigne durable donnée à l'assistante (NEVER-CLEAR §14), drapeau allumé seulement ; gardée
+                    # caviardée (la ligne de couche 3 est réextraite du message caviardé au rendu)
+                    nc = self.budgets.never_clear_fixes_enabled
+                    human = nc and t.channel in DURABLE_CHANNELS and not is_bypass_request(own_words(text))
+                    if human and t.sender:
+                        idx.setdefault("senders", set()).add(t.sender)
+                    durable = durable_clauses(text) if human else ""
+                    if durable:
+                        idx["durs"].append((t, ep, self._clean(durable)))
+                    elif human and is_durable_revocation(text):
+                        idx["drevs"].append((t, ep))
                     if is_revocation(text):
                         # Un revirement s'exprime par référence (« reviens au point-virgule », « annule ce
                         # changement-là ») : la conclusion du modèle, qui nomme ce qui a été annulé, porte le
                         # vocabulaire qui manque au message pour qu'une question sur le sujet le retrouve.
                         text = f"{text}\n{self._clean(conclusion_of(t))}"
                         idx["revs"].append((t, ep))
-                    elif is_constraint(text):  # le « … doit rester » d'un revirement est déjà dans sa section
-                        idx["cons"].append((t, ep))
+                    elif is_constraint(text) and not durable:  # le « … doit rester » d'un revirement est déjà
+                        idx["cons"].append((t, ep))                   # dans sa section, une consigne durable aussi
                     toks = set(content_words(text)) | set(distinctive_words(text))
                     idx["docs"].append((t, toks, ep))
                 idx["upto"] = top
@@ -705,7 +821,7 @@ class ContextManager:
         return f"- T{t.index} ({ep.id}, {ep.day or '?'}) « {clip(t.input.text, 220)} » (pertinence {score:.2f})"
 
     def _scored_turns(self, thread_id: str, query: str, k: int, min_score: float) -> list[tuple[float, Turn, Episode]]:
-        terms = episode_index.query_terms(query)
+        terms = episode_index.query_terms(query, extra_stop=self._qstop)
         docs = self._turn_docs(thread_id) if terms else []
         if not docs:
             return []

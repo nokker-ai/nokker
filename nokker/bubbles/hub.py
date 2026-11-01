@@ -33,7 +33,7 @@ from nokker.bubbles.types import (
     KINDS, MODES, Bubble, BubbleError, BubbleForbidden, BubbleNotFound, bubble_to_json,
 )
 from nokker.core.ports import ToolSpec, call_effect
-from nokker.core.turn import ToolCall, ToolResult, Turn, TurnInput
+from nokker.core.turn import Decision, Gate, ToolCall, ToolResult, Turn, TurnInput
 from nokker.core.turn_lock import TurnLock, TurnLocks
 from nokker.ledger.prices import load as load_prices
 from nokker.ledger.turn_cost import is_subagent_thread, root_thread, row_from_call, turn_cost
@@ -738,6 +738,25 @@ class BubbleHub:
                                  "args": args},
                    self.thread_audience(turn.thread_id))
 
+    # Pause et steer (docs/CLIENT-API.md §Pause et steer) : `turn.paused {at: model|tool, tool?}` quand le tour s'arrête
+    # VRAIMENT à un point de contrôle, `turn.resumed {at, tool?, paused_ms}` quand il repart, `turn.steered {steer_id}`
+    # quand un steer entre dans le contexte, `turn.steer_dropped {steer_id, text}` quand le tour a fini avant.
+    def turn_paused(self, turn: Turn, data: dict[str, Any]) -> None:
+        self._turn_event("turn.paused", turn, data)
+
+    def turn_resumed(self, turn: Turn, data: dict[str, Any]) -> None:
+        self._turn_event("turn.resumed", turn, data)
+
+    def turn_steered(self, turn: Turn, data: dict[str, Any]) -> None:
+        self._turn_event("turn.steered", turn, data)
+
+    def turn_steer_dropped(self, turn: Turn, data: dict[str, Any]) -> None:
+        self._turn_event("turn.steer_dropped", turn, data)
+
+    def _turn_event(self, event_type: str, turn: Turn, data: dict[str, Any]) -> None:
+        self._emit(event_type, {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), **data},
+                   self.thread_audience(turn.thread_id))
+
     def tool_input_delta(self, turn: Turn, data: dict[str, Any]) -> None:
         """Écriture en direct (X22, docs/BUBBLES.md §6 et §10.7) : ce que le modèle est en train d'écrire dans les
         arguments de `write_file`/`patch`/`page_create`, texte déjà caviardé avec retenue par le noyau
@@ -798,11 +817,12 @@ class BubbleHub:
     def tool_result(self, turn: Turn, call: ToolCall, result: ToolResult, ms: int) -> None:
         self._tool_t0.pop((turn.thread_id, call.id), None)
         self._clear_live(turn.thread_id, call.id)
-        self._emit("tool.result", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), "call_id": call.id,
-                                   "name": call.name, "ok": not result.is_error, "ms": ms,
-                                   "is_error": result.is_error,
-                                   "preview": self._scrub(result.content or "")[:TOOL_PREVIEW_CHARS]},
-                   self.thread_audience(turn.thread_id))
+        data: dict[str, Any] = {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), "call_id": call.id,
+                                "name": call.name, "ok": not result.is_error, "ms": ms, "is_error": result.is_error,
+                                "preview": self._scrub(result.content or "")[:TOOL_PREVIEW_CHARS]}
+        if getattr(result, "reason", None):  # refus d'office : motif stable (`plan_mode`…), hors du texte du modèle
+            data["reason"] = result.reason
+        self._emit("tool.result", data, self.thread_audience(turn.thread_id))
 
     def direct_result(self, thread_id: str, approval_id: str, name: str, content: str, is_error: bool,
                       owner: str | None = None) -> None:
@@ -831,6 +851,8 @@ class BubbleHub:
         self._emit("tool.result", data, self.thread_audience(thread_id) or ({owner} if owner else set()))
 
     def tool_executed(self, turn: Turn, call: ToolCall, spec: ToolSpec | None, result: ToolResult) -> str | None:
+        if call.name == "todo" and call.arguments.get("todos") is not None and not result.is_error:
+            self._emit_todo(turn.thread_id, result.content)
         t0 = self._tool_t0.get((turn.thread_id, call.id))
         took_ms = int((time.monotonic() - t0) * 1000) if t0 is not None else None
         produced = self.producers.produce(call, spec, result, took_ms)
@@ -871,6 +893,34 @@ class BubbleHub:
             logger.exception("request_previews a levé")
         return f"\n[bulle {b.id} ({b.kind}) affichée dans le fil — bubble_update pour la modifier]"
 
+    def _emit_todo(self, thread_id: str, content: str) -> None:
+        """`todo.updated {thread_id, items}` (docs/LOKKAL.md §7.4.8) quand le modèle ÉCRIT le plan de travail : la liste
+        complète après l'écriture (déjà caviardée par la boucle), comme la rend `todo` en lecture."""
+        try:
+            items = json.loads(content or "{}").get("todos")
+        except (ValueError, AttributeError):
+            return
+        if isinstance(items, list):
+            self._emit("todo.updated", {"thread_id": thread_id, "items": items}, self.thread_audience(thread_id))
+
+    def _refused(self, turn: Turn) -> bool:
+        """Au moins un effet refusé d'office pendant le tour : refus d'une porte (règle deny, mode plan, hardline,
+        invariant), ou carte du tour déjà rejetée (client sans surveillance `-p`, qui refuse toute carte)."""
+        if any(v.gate is Gate.ACTION and v.decision is Decision.DENY for v in turn.verdicts):
+            return True
+        approvals = getattr(self.kernel, "approvals", None) if self.kernel is not None else None
+        if approvals is None or not turn.approval_ids:
+            return False
+        for aid in turn.approval_ids:
+            try:
+                a = approvals.get(aid)
+            except Exception:  # noqa: BLE001 — un magasin de cartes en panne ne casse pas la fin du tour
+                logger.debug("carte %s illisible", aid, exc_info=True)
+                continue
+            if a is not None and a.status == "rejected":
+                return True
+        return False
+
     def turn_done(self, turn: Turn) -> None:
         audience = self.thread_audience(turn.thread_id)
         tid = _turn_id(turn)
@@ -896,6 +946,13 @@ class BubbleHub:
             data["tier"] = turn.calls[-1].tier.value
         if chf:
             data["cost_chf"] = round(sum(chf), 6)
+        if turn.failure:  # le tour a échoué (D7) : code stable + message caviardé
+            data["error"] = {"code": str(turn.failure.get("code") or "internal_error"),
+                             "message": self._scrub(str(turn.failure.get("message") or ""))[:500]}
+        if turn.error == "cancelled":
+            data["cancelled"] = True
+        if self._refused(turn):
+            data["refused"] = True
         # Le coût part AVANT `turn.done` : un client qui cesse d'écouter à `turn.done` (mode non interactif) l'a déjà.
         self._emit_turn_cost(turn, tid, audience)
         self._emit("turn.done", data, audience)

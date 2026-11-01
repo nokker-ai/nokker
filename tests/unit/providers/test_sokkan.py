@@ -158,7 +158,8 @@ def test_raises_after_retries_exhausted():
 
 
 def test_tier_enum_has_no_frontier():
-    assert {t.value for t in Tier} == {"local", "small", "ship", "deep"}  # X8 : petit palier, jamais « frontier »
+    # X8 : petit palier ; palier maison « nina » à part (LOKKAL §7.17 point 13) ; jamais « frontier »
+    assert {t.value for t in Tier} == {"local", "small", "ship", "deep", "nina"}
 
 
 def test_attempts_is_one_on_first_try_success():

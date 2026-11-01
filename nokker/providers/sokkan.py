@@ -48,6 +48,16 @@ délai de lecture n'est donc plus rejoué (le tour se dégrade proprement) ; un 
 Écriture en direct (X22, 25.10.2026) : avec `on_tool_delta(index, call_id, name, morceau)`, chaque morceau BRUT des
 `arguments` d'un appel d'outil est aussi remis dès réception (le noyau en lit le JSON partiel, `core/live_input.py`).
 Un morceau d'arguments remis compte comme un morceau émis : même règle de réessai que pour `on_delta`.
+
+Connexion (e2e du 1.11, D5) : trois appels sont tombés après 180 s sur « _ssl.c:1064: The handshake operation timed
+out », sans nouvel essai, alors que le journal annonçait « tentative 1/3 » — le délai de connexion (poignée de main TLS
+comprise) était celui de lecture (180 s), qui épuisait à lui seul le budget de l'appel. Désormais : délai de connexion
+court et distinct (`connect_timeout_s`, 10 s ; lecture, écriture et attente d'une place du pool gardent `timeout_s`), et
+une erreur de CONNEXION (`httpx.ConnectError`, `httpx.ConnectTimeout` : refus, DNS, TLS, poignée de main trop longue)
+est rejouée jusqu'à `max_retries` fois tant qu'il reste `MIN_RETRY_S` dans le budget de l'appel, sans compter dans
+`total_budget_s` (qui borne l'attente d'une RÉPONSE de l'amont) ni dans les autres réessais. Une erreur de connexion
+précède par nature tout octet de réponse : rien n'a pu être généré ni facturé. Le journal dit ce qui suit vraiment
+(« nouvel essai n dans x s » ou « abandon : raison »), plus de « tentative 1/3 » suivie d'un abandon.
 """
 from __future__ import annotations
 
@@ -68,6 +78,7 @@ logger = logging.getLogger("nokker.providers.sokkan")
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 MIN_RETRY_S = 15.0  # un essai de plus ne part que s'il reste au moins ce temps dans le budget de l'appel
+CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)  # avant tout octet de réponse (TCP, DNS, TLS)
 
 
 class _UpstreamStatus(Exception):
@@ -87,6 +98,8 @@ class SokkanProvider:
     reasoning_off_body: dict[str, Any] = field(default_factory=lambda: {"reasoning_effort": "none"})
     reasoning_on_body: dict[str, Any] = field(default_factory=dict)  # défaut amont = raisonnement actif
     timeout_s: float = 180.0
+    # Délai de connexion, poignée de main TLS comprise (D5) : court et distinct du délai de lecture.
+    connect_timeout_s: float = 10.0
     max_retries: int = 2  # tentatives SUPPLÉMENTAIRES après l'échec initial (3 appels au total)
     retry_backoff_s: float = 1.0
     # Budget total (tous essais confondus) avant d'abandonner — voir docstring du module. 80 s laisse
@@ -112,8 +125,12 @@ class SokkanProvider:
     vision_probe: Any = None
 
     def __post_init__(self) -> None:
-        self._client = httpx.Client(timeout=self.timeout_s)
+        self._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
         self._closed = False
+
+    def _httpx_timeout(self, t: float) -> httpx.Timeout:
+        """Lecture, écriture, pool : `t` ; connexion (TLS compris) : `connect_timeout_s`, jamais plus que `t`."""
+        return httpx.Timeout(t, connect=min(self.connect_timeout_s, t))
 
     def detached(self) -> SokkanProvider:
         """Même palier, client HTTP propre : le fermer (`close()`) empêche tout réessai sans toucher aux autres
@@ -121,7 +138,7 @@ class SokkanProvider:
         côté amont : un `recv` bloqué ne se réveille pas d'un autre thread, et le Router ne libère la place qu'à la
         fin de la réponse."""
         twin = copy.copy(self)
-        twin._client = httpx.Client(timeout=self.timeout_s)
+        twin._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
         twin._closed = False
         return twin
 
@@ -132,9 +149,41 @@ class SokkanProvider:
         """Reste-t-il de quoi lancer un essai de plus (après `wait` s d'attente) dans le budget de l'appel ?"""
         return deadline - time.monotonic() - wait >= MIN_RETRY_S
 
-    def _timeout(self, deadline: float) -> float:
-        """Délai d'attente d'un essai : le sien, réduit à ce qui reste du budget de l'appel."""
-        return max(0.001, min(self.timeout_s, deadline - time.monotonic()))
+    def _timeout(self, deadline: float) -> httpx.Timeout:
+        """Délai d'attente d'un essai : le sien, réduit à ce qui reste du budget de l'appel (connexion : la sienne)."""
+        return self._httpx_timeout(max(0.001, min(self.timeout_s, deadline - time.monotonic())))
+
+    def _transport_plan(self, e: Exception, n: dict[str, int], t_budget0: float, deadline: float
+                        ) -> tuple[str | None, float, str]:
+        """Que faire après une erreur réseau survenue AVANT tout morceau remis : (genre de réessai, attente, motif).
+        Genre None = abandon (le motif dit pourquoi). `n` compte les réessais déjà faits par genre."""
+        normal = n["attempt"] - n["connect"] - n["timeout"]
+        wait = self.retry_backoff_s * (n["attempt"] + 1)
+        if isinstance(e, CONNECT_ERRORS):
+            if n["connect"] >= self.max_retries:
+                return None, 0.0, f"{n['connect'] + 1} échecs de connexion"
+            if not self._room(deadline, wait):
+                return None, 0.0, "budget de l'appel épuisé"
+            return "connect", wait, ""
+        if normal < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
+            return "retry", wait, ""
+        if isinstance(e, httpx.TimeoutException) and n["timeout"] < self.timeout_retries and self._room(deadline):
+            return "timeout", 0.0, ""
+        if normal >= self.max_retries:
+            return None, 0.0, "réessais épuisés"
+        return None, 0.0, "budget de l'appel épuisé"
+
+    def _log_transport(self, what: str, e: Exception, kind: str | None, wait: float, why: str, attempt: int,
+                       deadline: float) -> None:
+        """Journal juste (D5) : l'essai qui a échoué, puis ce qui suit VRAIMENT."""
+        nature = "connexion" if isinstance(e, CONNECT_ERRORS) else "réseau"
+        if kind is None:
+            logger.warning("sokkan provider: %s — erreur de %s à l'essai %d %s: %s — abandon (%s)",
+                           what, nature, attempt + 1, self.model, e, why)
+        else:
+            logger.warning("sokkan provider: %s — erreur de %s à l'essai %d %s: %s — nouvel essai %d dans %.0f s "
+                           "(%.0f s restantes dans le budget de l'appel)", what, nature, attempt + 1, self.model, e,
+                           attempt + 2, wait, deadline - time.monotonic())
 
     def _busy_wait(self, status: int, busy: int, t_budget0: float, deadline: float | None = None) -> bool:
         """Vrai (après avoir attendu) si un 429 doit être rejoué sans compter comme un réessai."""
@@ -190,33 +239,31 @@ class SokkanProvider:
         last_exc: Exception | None = None
         t_budget0 = time.monotonic()
         deadline = self._deadline()
-        attempt, busy, timeouts = 0, 0, 0
-        while attempt <= self.max_retries + timeouts:
+        attempt, busy = 0, 0
+        n = {"attempt": 0, "connect": 0, "timeout": 0}
+        while attempt <= self.max_retries + n["timeout"] + n["connect"]:
             self._check_open()
             try:
                 resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=body,
                                           headers=headers, timeout=self._timeout(deadline))
             except httpx.TransportError as e:
                 last_exc = e
-                logger.warning("sokkan provider: erreur réseau (tentative %d/%d) %s: %s",
-                                attempt + 1, self.max_retries + 1, self.model, e)
-                wait = self.retry_backoff_s * (attempt + 1)
-                if attempt < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
+                n["attempt"] = attempt
+                kind, wait, why = self._transport_plan(e, n, t_budget0, deadline)
+                self._log_transport("appel", e, kind, wait, why, attempt, deadline)
+                if kind is None:
+                    raise RuntimeError(f"échec réseau après {attempt + 1} tentative(s) : {e}") from e
+                if kind in ("connect", "timeout"):
+                    n[kind] += 1
+                if wait:
                     time.sleep(wait)
-                    attempt += 1
-                    continue
-                if isinstance(e, httpx.TimeoutException) and timeouts < self.timeout_retries and self._room(deadline):
-                    timeouts += 1
-                    logger.warning("sokkan provider: délai d'attente dépassé %s — un essai de plus, %.0f s restantes "
-                                   "dans le budget de l'appel", self.model, deadline - time.monotonic())
-                    attempt += 1
-                    continue
-                raise RuntimeError(f"échec réseau après {attempt + 1} tentative(s) : {e}") from e
+                attempt += 1
+                continue
 
             if self._busy_wait(resp.status_code, busy, t_budget0, deadline):
                 busy += 1
                 continue
-            if resp.status_code in _RETRYABLE_STATUS and attempt < self.max_retries:
+            if resp.status_code in _RETRYABLE_STATUS and attempt - n["connect"] - n["timeout"] < self.max_retries:
                 # Un 504 précisément = le broker a déjà attendu tout SON budget (first_token_timeout_s,
                 # 60 s par défaut) sans qu'aucun amont ne réponde (voir docstring du module) : ne réessaie
                 # que s'il reste du budget CÔTÉ NOUS pour un essai de plus, sinon un 2e 504 d'affilée
@@ -258,8 +305,9 @@ class SokkanProvider:
 
         t_budget0 = time.monotonic()
         deadline = self._deadline()
-        attempt, busy, timeouts = 0, 0, 0
-        while attempt <= self.max_retries + timeouts:
+        attempt, busy = 0, 0
+        n = {"attempt": 0, "connect": 0, "timeout": 0}
+        while attempt <= self.max_retries + n["timeout"] + n["connect"]:
             self._check_open()
             try:
                 return (self._stream_once(body, headers, _relay, _relay_tool if on_tool_delta is not None else None,
@@ -270,7 +318,7 @@ class SokkanProvider:
                 if self._busy_wait(e.status, busy, t_budget0, deadline):
                     busy += 1
                     continue
-                if e.status in _RETRYABLE_STATUS and attempt < self.max_retries:
+                if e.status in _RETRYABLE_STATUS and attempt - n["connect"] - n["timeout"] < self.max_retries:
                     if not self._budget_left(t_budget0) or not self._room(deadline,
                                                                           self.retry_backoff_s * (attempt + 1)):
                         raise RuntimeError(f"HTTP {e.status} de {self.base_url} après {attempt + 1} tentative(s) "
@@ -285,17 +333,14 @@ class SokkanProvider:
             except (httpx.TransportError, _StreamError) as e:
                 if emitted[0]:
                     raise StreamInterrupted(f"flux amont interrompu après le premier morceau : {e}") from e
-                logger.warning("sokkan provider: flux en échec avant tout morceau (tentative %d/%d) %s: %s",
-                                attempt + 1, self.max_retries + 1, self.model, e)
-                wait = self.retry_backoff_s * (attempt + 1)
-                if attempt < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
-                    time.sleep(wait)
-                    attempt += 1
-                    continue
-                if isinstance(e, httpx.TimeoutException) and timeouts < self.timeout_retries and self._room(deadline):
-                    timeouts += 1  # rien n'a été émis (vérifié ci-dessus) : un essai de plus, dans le budget de l'appel
-                    logger.warning("sokkan provider: délai d'attente avant tout morceau %s — un essai de plus, %.0f s "
-                                   "restantes", self.model, deadline - time.monotonic())
+                n["attempt"] = attempt
+                kind, wait, why = self._transport_plan(e, n, t_budget0, deadline)
+                self._log_transport("flux en échec avant tout morceau", e, kind, wait, why, attempt, deadline)
+                if kind is not None:
+                    if kind in ("connect", "timeout"):
+                        n[kind] += 1
+                    if wait:
+                        time.sleep(wait)
                     attempt += 1
                     continue
                 raise RuntimeError(f"échec du flux après {attempt + 1} tentative(s) : {e}") from e

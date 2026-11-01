@@ -44,7 +44,9 @@ from nokker.tenancy.context import INTERNAL_TENANT
 UNSCOPED_OK = {"operators", "admin_audit", "beta_applications", "used_nonces", "schema_migrations",
                "lokkal_link_requests",  # flux d'appareil Lokkal : 10 min, aucune donnée de compte
                "billing_events",  # idempotence des webhooks Stripe : identifiant et type d'événement, aucune donnée de compte
-               "lokkal_relay_used_jti"}  # jti des jetons de pages (035) : empreintes, 10 min au plus, aucun compte
+               "lokkal_relay_used_jti",  # jti des jetons de pages (035) : empreintes, 10 min au plus, aucun compte
+               # canaux Slack/WhatsApp (048) : identifiants d'événements du fournisseur ; fenêtre de 24 h sous empreinte
+               "channel_events", "channel_windows"}
 _LAST = ("accounts", "tenants")  # supprimées après tout le reste, dans cet ordre
 # Équipe (X17, migration 023) : un compte membre d'un projet d'un AUTRE locataire y a des lignes au locataire du projet.
 # Elles partent avec lui : la transaction pose aussi `app.account_id` / `app.account_email`, que les politiques d'équipe
@@ -61,6 +63,10 @@ _CROSS_TENANT = {
     # `household_minor_erase`). Son profil mineur (`account_minors`, hors RLS) part par `account_id`.
     "household_members": ("tenant_id = %s OR account_id = %s", "acc"),
     "parental_consents": ("tenant_id = %s OR (minor_email <> '' AND minor_email = %s)", "mail"),
+    # Mémoire longue (049, docs/MEMORY-TENANCY.md) : ses contributions à la mémoire d'un foyer d'un autre locataire, et
+    # ses propositions encore en attente chez le payeur (politiques `long_memory_author_*`, pendant l'effacement).
+    "nokker_long_memory": ("tenant_id = %s OR author_account = %s", "acc"),
+    "nokker_memory_pending": ("tenant_id = %s OR author_account = %s", "acc"),
 }
 
 

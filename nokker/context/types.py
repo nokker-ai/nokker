@@ -187,6 +187,11 @@ class ContextBudgets:
     topic_shift_threshold: float = 0.08  # similarité lexicale en dessous de laquelle le sujet a changé
     topic_shift_min_turns: int = 4
     export_max_chars: int = 20000  # transcription d'un épisode exportée vers un autre fil
+    # Correctifs NEVER-CLEAR §14 (bench/keys, défauts 2-4) : consignes durables en couche 3, extrait retrouvé dans
+    # `recall_context(query)`, mots outils hors des requêtes lexicales. ÉTEINT par défaut (gel des textes vus par le
+    # modèle, contrat de format, docs/CONTEXT-FORMAT.md) : éteint, le modèle voit exactement ce qu'il voyait.
+    never_clear_fixes_enabled: bool = False
+    durable_instructions_k: int = 5  # consignes durables gardées en couche 3 (les plus récentes encore en vigueur)
 
     @property
     def soft_budget(self) -> int:

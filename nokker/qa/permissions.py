@@ -49,6 +49,9 @@ SANDBOX_GO_TOOLS = frozenset({"terminal", "process_start"})
 LOCAL_STRONG_RULE = "permissions:local_connector_strong"  # boîte mail posée dans Lokkal : envoi, corbeille
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
+MODES = ("default", "accept_edits", "auto", "plan")
+# Codes stables des refus (`Verdict.code`, puis `reason` du `tool.result`) : pour les clients, jamais vus par le modèle.
+PLAN_MODE, DENY_RULE, HARDLINE, NO_CODE_SESSION = "plan_mode", "deny_rule", "hardline", "no_code_session"
 
 
 class Mode(str, enum.Enum):
@@ -108,6 +111,31 @@ class LocalPermissions:
     # `.nokker/settings.json` du dépôt de chaque session locale (lu à l'ouverture) : mode plus strict, `ask`, `deny`
     # pour CE fil. Un dépôt restreint, il n'élargit jamais (ses `allow` sont ignorés).
     thread_project: dict[str, tuple[Mode | None, list[Rule], list[Rule]]] = field(default_factory=dict)
+    # Mode choisi pour UNE session en cours de route (`PUT /v1/local/sessions/{fil}/mode`, docs/LOKKAL.md §7.4.10) :
+    # remplace `mode` pour ce fil (et ses sous-agents), toujours restreint par le dépôt et les équipes. En mémoire.
+    thread_mode: dict[str, Mode] = field(default_factory=dict)
+
+    def chosen_mode(self, thread_id: str | None = None) -> Mode:
+        """Le mode choisi pour ce fil (celui de la session, sinon celui de l'utilisateur), AVANT restriction."""
+        tid = thread_id or ""
+        while tid not in self.thread_mode and "/sa-" in tid:
+            tid = tid.rsplit("/sa-", 1)[0]
+        return self.thread_mode.get(tid, self.mode)
+
+    def project_mode(self, thread_id: str | None = None) -> Mode | None:
+        """Le mode imposé par le dépôt ou les équipes du fil (le plus strict), ou None."""
+        return self._project(thread_id)[0]
+
+    def set_thread_mode(self, thread_id: str, mode: str) -> Mode:
+        """Change le mode d'une session. `ValueError` si le mode est inconnu ou plus permissif que celui que le dépôt ou
+        une équipe impose au fil (on ne fait pas semblant d'accorder ce que la restriction reprendrait)."""
+        if mode not in _STRICTNESS:
+            raise ValueError(f"mode inconnu : {mode!r} (parmi {', '.join(MODES)})")
+        proj = self.project_mode(thread_id)
+        if proj is not None and _STRICTNESS[proj.value] > _STRICTNESS[mode]:
+            raise ValueError(f"mode {mode} plus permissif que celui du projet ({proj.value})")
+        self.thread_mode[thread_id] = Mode(mode)
+        return self.mode_for(thread_id)
 
     def restrict_for_thread(self, thread_id: str, project_settings: str | Path) -> None:
         try:
@@ -156,17 +184,29 @@ class LocalPermissions:
     def mode_for(self, thread_id: str | None = None) -> Mode:
         """Le mode en vigueur sur ce fil : celui de l'utilisateur, ou celui du dépôt s'il est plus strict."""
         proj_mode = self._project(thread_id)[0]
-        return proj_mode if proj_mode and _STRICTNESS[proj_mode.value] > _STRICTNESS[self.mode.value] else self.mode
+        mine = self.chosen_mode(thread_id)
+        return proj_mode if proj_mode and _STRICTNESS[proj_mode.value] > _STRICTNESS[mine.value] else mine
 
     def decide(self, call: ToolCall, effect: Effect, thread_id: str | None = None) -> tuple[Decision | None, str]:
         """(décision, motif). None = rien à dire : les portes du noyau décident seules (ex. destructif en mode auto)."""
+        decision, why, _ = self.decide_coded(call, effect, thread_id)
+        return decision, why
+
+    def decide_coded(self, call: ToolCall, effect: Effect, thread_id: str | None = None
+                     ) -> tuple[Decision | None, str, str | None]:
+        """`decide` plus le code stable d'un refus (`deny_rule`, `plan_mode`), None ailleurs."""
         _, proj_ask, proj_deny = self._project(thread_id)
         mode = self.mode_for(thread_id)
         for r in [*self.deny, *proj_deny]:
             if r.matches(call):
-                return Decision.DENY, f"règle deny {r.tool}({r.pattern or ''})"
+                return Decision.DENY, f"règle deny {r.tool}({r.pattern or ''})", DENY_RULE
         if effect is not Effect.READ and mode is Mode.PLAN:
-            return Decision.DENY, "mode plan : lecture seule"
+            return Decision.DENY, "mode plan : lecture seule", PLAN_MODE
+        decision, why = self._decide_rest(call, effect, thread_id, mode, proj_ask)
+        return decision, why, None
+
+    def _decide_rest(self, call: ToolCall, effect: Effect, thread_id: str | None, mode: Mode,
+                     proj_ask: list[Rule]) -> tuple[Decision | None, str]:
         for r in [*self.ask, *proj_ask]:
             if r.matches(call):
                 return Decision.HITL, f"règle ask {r.tool}({r.pattern or ''})"
@@ -240,26 +280,27 @@ class PermissionGates:
                 and not self.code_session(getattr(turn, "thread_id", "") or ""):
             return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:no_code_session",
                             reason="pas de session de code sur ce fil : ouvre une session sur un dossier pour lancer des "
-                                   "commandes ou toucher des fichiers", subject=call.id)]
+                                   "commandes ou toucher des fichiers", subject=call.id, code=NO_CODE_SESSION)]
         if call.name in ("terminal", "process_start", "ssh_run"):
             from nokker.tools.code import hardline_reason
 
             why = hardline_reason(str(call.arguments.get("command", "")))
             if why:  # jamais exécutable, même approuvé : pas de carte, refus direct
                 return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:hardline",
-                                reason=why, subject=call.id)]
+                                reason=why, subject=call.id, code=HARDLINE)]
         effect = call_effect(spec, call.arguments)
         for floor in self.floors:
             imposed = floor(call, spec, turn)
             if imposed is None:
                 continue
             if imposed.decision is Decision.HITL:
-                decision, why = self.permissions.decide(call, effect, getattr(turn, "thread_id", None))
+                decision, why, code = self.permissions.decide_coded(call, effect, getattr(turn, "thread_id", None))
                 if decision is Decision.DENY:
                     return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1,
-                                    rule=f"permissions:{self.permissions.mode.value}", reason=why, subject=call.id)]
+                                    rule=f"permissions:{self.permissions.mode.value}", reason=why, subject=call.id,
+                                    code=code)]
             return [imposed]
-        decision, why = self.permissions.decide(call, effect, getattr(turn, "thread_id", None))
+        decision, why, code = self.permissions.decide_coded(call, effect, getattr(turn, "thread_id", None))
         if getattr(spec, "locality", None) == "cloud" and effect is not Effect.READ and decision is not Decision.DENY:
             # Connecteur relayé (lot X20) : la ressource est au compte nokker.ai, qui exige la preuve d'une carte pour
             # tout appel à effet. Ni le mode (auto, accept_edits), ni une règle allow, ni un GO écrit n'en dispensent.
@@ -311,7 +352,8 @@ class PermissionGates:
                 return [v1]
         strength = "strong" if effect is Effect.DESTRUCTIVE and decision is Decision.HITL else None
         return [Verdict(gate=Gate.ACTION, decision=decision, layer=1, rule=f"permissions:{self.permissions.mode.value}",
-                        reason=why, subject=call.id, strength=strength)]
+                        reason=why, subject=call.id, strength=strength,
+                        code=code if decision is Decision.DENY else None)]
 
     def switch(self, reply: str, turn: Turn, tier: Any) -> list[Verdict]:
         return self.inner.switch(reply, turn, tier)
@@ -320,5 +362,5 @@ class PermissionGates:
         return getattr(self.inner, name)
 
 
-__all__ = ["FILE_EDIT_TOOLS", "GO_SANDBOX_RULE", "SANDBOX_GO_TOOLS", "MEMORY_EDIT_TOOLS", "RELAYED_STRONG_RULE", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
+__all__ = ["MODES", "PLAN_MODE", "FILE_EDIT_TOOLS", "GO_SANDBOX_RULE", "SANDBOX_GO_TOOLS", "MEMORY_EDIT_TOOLS", "RELAYED_STRONG_RULE", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
            "Rule"]

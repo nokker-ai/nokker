@@ -56,6 +56,9 @@ CONTENT_TABLES = [
     "household_members", "parental_consents",
     "nokker_code_sessions",  # sessions de code multi-utilisateur (038, §7.28) : écrites dans le locataire du compte
     "nokker_pack_installs",  # packs installés par un compte chez nokker.ai (036) : locataire du compte
+    "thread_shares",  # instantanés des liens de conversation partagés (044) : locataire du fil
+    # apprentissage (046, docs/LEARNING.md) : skills appris, notes en attente, journal — locataire du compte
+    "nokker_learned_skills", "nokker_memory_pending", "nokker_learning_journal",
 ]
 OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
@@ -73,6 +76,12 @@ OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "
               # modération des pages publiques (040) : registre lu par le relais avant le locataire, et par
               # l'opérateur pour tous les locataires ; audit en ajout seul
               "lokkal_public_pages", "lokkal_page_moderation",
+              # liens de conversation partagés (044) : empreinte du jeton → partage et locataire, lue sans locataire
+              # par la route publique ; ni contenu ni jeton en clair
+              "thread_share_tokens",
+              # canaux Slack/WhatsApp (048) : codes d'appairage (comme telegram_pairing), événements déjà vus,
+              # fenêtre de 24 h WhatsApp sous empreinte — lus avant de connaître le locataire
+              "channel_pairing", "channel_events", "channel_windows",
               "account_deletions"}  # file d'effacement (017) : lue par l'outil d'opérateur pour tous les locataires
 
 
@@ -121,6 +130,9 @@ def pg():
 def pod_env(monkeypatch):
     """Le pod applicatif de la bêta : seulement le DSN nokker_app (pas de NOKKER_PG_OWNER_DSN)."""
     monkeypatch.delenv("NOKKER_PG_OWNER_DSN", raising=False)
+    from nokker.store import conn
+
+    monkeypatch.setattr(conn, "_warned_unmigrated", False)  # avertissement unique par processus : un test précédent l'a pu consommer
 
 
 def _dummy_row(conn, table: str) -> tuple[list[str], list]:
@@ -637,12 +649,25 @@ class _Accounts:
         return next((a for a in self.by_id.values() if a.email == email), None)
 
 
+def seed_accounts(su_dsn: str, *actors) -> None:
+    """Comptes réels (`tenants`, `accounts`) des acteurs d'un test : les politiques d'équipe et de foyer n'ouvrent un
+    compte que s'il appartient au locataire posé (`nokker_actor()`, migration 050), comme en production."""
+    import psycopg
+
+    with psycopg.connect(su_dsn, autocommit=True) as su:
+        for a in actors:
+            su.execute("INSERT INTO tenants (id) VALUES (%s) ON CONFLICT DO NOTHING", (a.tenant_id,))
+            su.execute("INSERT INTO accounts (id, tenant_id, email) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                       (a.account_id, a.tenant_id, a.email))
+
+
 @pytest.fixture(scope="module")
 def team037(pg):
     from nokker.team.service import Team
     from nokker.team.store import PgTeamStore
     from nokker.tenancy.context import tenant_scope
 
+    seed_accounts(pg["su"], OWN, MAINT, MEM, OUT, VIEW)
     team = Team(store=PgTeamStore(pg["app"], migrate_now=False), tenancy=_Accounts(OWN, MAINT, MEM, OUT, VIEW),
                 mirror_allowed=lambda acc: True)
     with tenant_scope(E):

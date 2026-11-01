@@ -22,7 +22,11 @@ CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connecto
            "household_minor_grant_audit": {"action": "allow"},
            # modération des pages publiques (040) : une page désignée par son page_id ou son empreinte ; un motif
            "lokkal_public_pages": {"page_id": "pg_0123456789abcdef"},
-           "lokkal_page_moderation": {"action": "unpublish", "reason": "signalement"}}
+           "lokkal_page_moderation": {"action": "unpublish", "reason": "signalement"},
+           # canaux (048) : un code d'appairage est d'un canal connu
+           "channel_pairing": {"channel": "slack"},
+           # suggestions de règles d'approbation (047) : une marque est acceptée ou écartée
+           "approval_suggestion_marks": {"state": "accepted"}}
 
 
 def _dummy_row(conn, table: str) -> tuple[list[str], list]:
@@ -88,6 +92,8 @@ def _seed(su: str) -> list[str]:
                 if "user" in cols[t]:
                     row["user"] = ACC[tenant]
                 row.update(CHECKED.get(t, {}))
+                if t == "nokker_long_memory":  # mémoire longue (049) : une note de profil est écrite par son compte
+                    row["author_account"] = ACC[tenant]
                 if t == "accounts":
                     row.update(id=ACC[tenant], email=f"{tenant}@recette.test")
                 if t == "account_identities":

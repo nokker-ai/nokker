@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from nokker.approvals.base import BaseApprovals
 from nokker.approvals.types import Device, Session
 from nokker.core.ports import Approval
+from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
 
 @dataclass
@@ -21,6 +22,7 @@ class InMemoryApprovals(BaseApprovals):
     _devices_by_code: dict[str, str] = field(default_factory=dict)  # code -> device_id
     _totp: dict[str, tuple[str, int | None]] = field(default_factory=dict)  # user -> (secret, last_step)
     _sessions: dict[str, Session] = field(default_factory=dict)
+    _suggestion_marks: dict[tuple[str, str, str], dict] = field(default_factory=dict)  # (locataire, user, id) -> marque
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _load_approval(self, approval_id: str) -> Approval | None:
@@ -36,6 +38,22 @@ class InMemoryApprovals(BaseApprovals):
         with self._lock:
             items = [copy.deepcopy(a) for a in self._approvals.values() if a.status == "pending"]
         return items
+
+    def _list_history(self, since: float) -> list[Approval]:
+        with self._lock:
+            return [copy.deepcopy(a) for a in self._approvals.values() if a.created_at >= since]
+
+    def _load_suggestion_marks(self, user: str) -> dict[str, dict]:
+        tid = current_tenant_or_none() or INTERNAL_TENANT
+        with self._lock:
+            return {k[2]: dict(v) for k, v in self._suggestion_marks.items() if k[0] == tid and k[1] == user}
+
+    def _store_suggestion_mark(self, suggestion_id: str, user: str, state: str, rule: str,
+                               provenance: dict) -> None:
+        tid = current_tenant_or_none() or INTERNAL_TENANT
+        with self._lock:
+            self._suggestion_marks[(tid, user, suggestion_id)] = {
+                "state": state, "rule": rule, "provenance": dict(provenance), "at": self.clock()}
 
     def _append_event(self, approval_id: str, event_type: str, data: dict) -> None:
         with self._lock:

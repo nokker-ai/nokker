@@ -11,6 +11,12 @@ if __name__ == "__main__":
         from nokker.review.cli import main as review_main
 
         raise SystemExit(review_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["mcp"]:
+        # `python -m nokker mcp serve` : serveur MCP sur stdio (docs/MCP-SERVER.md), sans charger le noyau ; stdout est
+        # le protocole, rien d'autre n'y écrit.
+        from nokker.mcp_server import main as mcp_main
+
+        raise SystemExit(mcp_main(sys.argv[2:]))
     from nokker.cli import main
 
     raise SystemExit(main())

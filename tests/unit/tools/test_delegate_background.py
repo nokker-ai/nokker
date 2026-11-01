@@ -271,3 +271,38 @@ def test_wait_borne():
     assert src.call("delegate_status", {"wait_s": "x"}, ctx()).is_error
     release.set()
     status(src, wait_s=5)
+
+
+def test_enfant_fini_duree_figee_et_dernier_outil_pour_le_client():
+    """e2e du 1.11 : la durée d'un enfant fini ne grimpe plus à chaque lecture ; `last_tool` reste dans la vue finale
+    rendue au propriétaire (appel direct, hors tour), jamais dans celle que lit le modèle (texte inchangé)."""
+    from nokker.core.loop import DIRECT_CHANNEL
+
+    release, running, behave = gate()
+    src, *_ = bg_source(Factory(behave=behave))
+    _, out = start(src, [{"goal": "g"}])
+    cid = out["children"][0]["child_id"]
+    running.wait(2)
+    src._by_parent["t1"][cid].last_tool = "read_file"
+    assert status(src)["children"][0]["last_tool"] == "read_file"  # en cours : comme avant
+    release.set()
+    first = status(src, wait_s=5)["children"][0]
+    time.sleep(0.3)
+    again = status(src)["children"][0]
+    assert first["status"] == "completed" and again["elapsed_s"] == first["elapsed_s"]
+    assert "last_tool" not in again  # vue du modèle : inchangée
+    direct = ToolContext(thread_id="t1", turn_index=0, channel=DIRECT_CHANNEL)
+    view = json.loads(src.call("delegate_status", {}, direct).content)["children"][0]
+    assert view["last_tool"] == "read_file" and view["elapsed_s"] == first["elapsed_s"]
+
+
+def test_duree_figee_survit_au_redemarrage(tmp_path):
+    state = tmp_path / "subagents.json"
+    src, *_ = bg_source(Factory(["ok"]), state_path=str(state))
+    start(src, [{"goal": "g"}])
+    done = status(src, wait_s=5)["children"][0]
+    rec = json.loads(state.read_text())["children"][0]
+    assert rec["elapsed_s"] == done["elapsed_s"]
+    again, *_ = bg_source(Factory([]), state_path=str(state))
+    time.sleep(0.2)
+    assert status(again)["children"][0]["elapsed_s"] == done["elapsed_s"]

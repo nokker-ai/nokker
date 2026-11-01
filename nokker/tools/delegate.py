@@ -388,6 +388,8 @@ class _Child:
     kernel: Any = None  # le noyau de l'enfant (son `cancel` vise SON fil)
     last_tool: str | None = None
     created: float = field(default_factory=time.monotonic)
+    # Durée figée à la finalisation (e2e du 1.11) : un enfant fini ne « vieillit » plus dans `delegate_status`.
+    elapsed_final: float | None = None
     final: dict[str, Any] | None = None  # résultat finalisé (worktree inspecté) ; None tant qu'il tourne
     finalized: threading.Event = field(default_factory=threading.Event)
     parked: bool = False  # arrêté sur une carte : noyau, registre et source gardés pour l'exécution différée
@@ -400,6 +402,16 @@ class _Child:
     def touch(self) -> None:
         self.last_activity = time.monotonic()
 
+    def elapsed(self) -> float:
+        """Durée depuis le lancement (heure murale pour un enfant relu après un redémarrage)."""
+        e = time.time() - self.created_at if self.restored else time.monotonic() - self.created
+        return round(max(0.0, e), 1)
+
+    def freeze(self) -> None:
+        """Fige la durée à la finalisation (une fois)."""
+        if self.elapsed_final is None:
+            self.elapsed_final = self.elapsed()
+
     def cancel(self, reason: str = "cancelled", summary: str = "annulé à la demande : le sous-agent a été arrêté")\
             -> bool:
         """Arrête l'enfant (une fois) : résultat `interrupted`, outils muets, noyau prévenu. False s'il avait fini."""
@@ -409,6 +421,7 @@ class _Child:
                            "summary": summary + " (sa carte en attente ne sera pas exécutée)"}
             if self.final is not None:
                 self.final = {**self.final, **self.result}
+            self.freeze()
             return True
         if self.done.is_set() or self.cancelled or self.final is not None:
             return False
@@ -759,6 +772,7 @@ class DelegateToolSource:
         except Exception:  # noqa: BLE001 — la finalisation a lieu quand même
             logger.exception("sous-agents de fond : attente")
         for ch in children:
+            ch.freeze()  # la durée s'arrête quand l'enfant a fini, pas quand on le lit
             try:
                 ch.final = self._finish(ch, run)
             except Exception as e:  # noqa: BLE001
@@ -787,12 +801,18 @@ class DelegateToolSource:
             for cid in done[:max(0, len(done) - KEEP_FINISHED)]:
                 table.pop(cid, None)
 
-    def _view(self, ch: _Child) -> dict[str, Any]:
-        elapsed = time.time() - ch.created_at if ch.restored else time.monotonic() - ch.created
+    def _view(self, ch: _Child, client: bool = False) -> dict[str, Any]:
+        """Vue d'un enfant. Fini : durée FIGÉE à la finalisation (avant : recalculée à chaque lecture, elle grimpait).
+        `client` (appel direct du propriétaire, hors tour) : `last_tool` gardé aussi dans la vue finale — jamais dans
+        celle que lit le modèle, dont le texte ne change pas."""
+        elapsed = ch.elapsed_final if ch.final is not None and ch.elapsed_final is not None else ch.elapsed()
         base = {"child_id": ch.id, "thread_id": ch.thread_id, "task_index": ch.index,
-                "goal": str(ch.task.get("goal") or "")[:300], "elapsed_s": round(max(0.0, elapsed), 1)}
+                "goal": str(ch.task.get("goal") or "")[:300], "elapsed_s": elapsed}
         if ch.final is not None:
-            return {**ch.final, **base}
+            view = {**ch.final, **base}
+            if client and ch.last_tool:
+                view["last_tool"] = ch.last_tool
+            return view
         view = {**base, "status": "running" if ch.started else "queued"}
         if ch.cancelled:
             view["status"] = "stopping"
@@ -831,7 +851,10 @@ class DelegateToolSource:
             if left <= 0:
                 break
             ch.finalized.wait(left)
-        views = [self._view(ch) for ch in kids]
+        from nokker.core.loop import DIRECT_CHANNEL
+
+        client = getattr(ctx, "channel", None) == DIRECT_CHANNEL  # appel du propriétaire hors tour : pas le modèle
+        views = [self._view(ch, client=client) for ch in kids]
         payload: dict[str, Any] = {"children": views,
                                    "running": sum(1 for v in views if v["status"] in ("queued", "running",
                                                                                       "stopping")),
@@ -901,6 +924,10 @@ class DelegateToolSource:
                     rec["worktree"] = {"path": ch.info["path"], "branch": ch.info["branch"]}
                 if ch.final is not None and not ch.parked:
                     rec["final"] = ch.final
+                    if ch.elapsed_final is not None:
+                        rec["elapsed_s"] = ch.elapsed_final
+                if ch.last_tool:
+                    rec["last_tool"] = ch.last_tool
                 out.append(rec)
         return out
 
@@ -961,6 +988,11 @@ class DelegateToolSource:
                     final["worktree"] = {"path": wt.get("path"), "branch": wt.get("branch"), "kept": True,
                                          "note": "conservé au redémarrage, non inspecté"}
             ch.final, ch.result, ch.cancelled = final, dict(final), True
+            ch.last_tool = rec.get("last_tool") if isinstance(rec.get("last_tool"), str) else None
+            try:  # durée figée gardée ; un état d'avant ce champ : figée au redémarrage (borne haute)
+                ch.elapsed_final = float(rec["elapsed_s"])
+            except (KeyError, TypeError, ValueError):
+                ch.freeze()
             ch.done.set()
             ch.finalized.set()
             with self._table_lock:
@@ -1011,6 +1043,7 @@ class DelegateToolSource:
             return
         self._unpark(ch)
         ch.result = self._status(ch, turn) if not ch.cancelled else ch.result
+        ch.freeze()
         res = self._finish(ch, ch.run, resumed=True)
         if ch.background:
             ch.final = res

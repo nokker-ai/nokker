@@ -7,7 +7,7 @@ VER=${1:?version}; OUT=${2:-dist}
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
 D="$STAGE/nokker"; mkdir -p "$D"
-cp -r "$HERE/docker-compose.yml" "$HERE/initdb" "$HERE/sql" "$HERE/web" "$HERE/install.sh" "$D/"
+cp -r "$HERE/docker-compose.yml" "$HERE/initdb" "$HERE/sql" "$HERE/web" "$HERE/install.sh" "$HERE/backup.sh" "$D/"
 mkdir -p "$D/vault"; cp "$HERE/vault/init.sh" "$HERE/vault/unseal.sh" "$D/vault/"   # profil vault (X4)
 cp "$ROOT/deploy/postgres/roles.sql" "$D/sql/roles.sql"
 # Config du noyau : le modèle de Nokker dev (deploy/lokkal/core-config.yaml), statique (chemins et hôtes par l'env).

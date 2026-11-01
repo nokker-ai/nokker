@@ -304,6 +304,10 @@ class DirectCorthexisMemory:
         started = time.monotonic()
         try:
             from corthexis import service as cx_service
+
+            from nokker.context.corthexis_tenancy import guarded_store
+
+            guarded_store()  # app.tenant_id = locataire du tour (docs/MEMORY-TENANCY.md §5)
             rows = cx_service.search(query, top_k=max(k, 10), deep=self.deep, projects=self.projects)
         except Exception as e:  # noqa: BLE001 — la mémoire en panne ne casse jamais un tour, mais se voit
             self._failed(f"recherche indisponible : {e}", exc_info=True)
@@ -373,7 +377,11 @@ class DirectCorthexisMemory:
             out["error"] = f"paquet corthexis absent de l'image ({e})"
             return out
         try:
-            stats = cx_service.get_store().stats()
+            from nokker.context.corthexis_tenancy import guarded_store
+            from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
+
+            with tenant_scope(INTERNAL_TENANT):  # la mémoire longue directe est celle du locataire interne
+                stats = guarded_store().stats()
             out["store"] = {"ok": True, "notes": stats.get("notes"), "chunks": stats.get("chunks"),
                             "generation": stats.get("generation"), "model": stats.get("model")}
         except Exception as e:  # noqa: BLE001
@@ -440,6 +448,10 @@ class DirectCorthexisMemory:
     def call(self, name: str, arguments: dict[str, Any], _ctx: ToolContext) -> ToolResult:
         try:
             from corthexis import service as cx_service
+
+            from nokker.context.corthexis_tenancy import guarded_store
+
+            guarded_store()
             if name == "memory_search":
                 rows = cx_service.search(arguments.get("query", "") or "",
                                          int(arguments.get("top_k") or 8),

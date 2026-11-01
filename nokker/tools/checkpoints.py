@@ -272,7 +272,8 @@ def _tip(manager: Any, root: Path) -> str | None:
 
 def _announce(links: TurnLinks | None, emit: Callable[[str, dict[str, Any]], Any] | None, commit: str | None,
               ctx: ToolContext, tool: str) -> None:
-    """Point nouveau : lien au tour (état local) et `checkpoint.created {thread_id, turn_index, hash, tool}`."""
+    """Point nouveau : lien au tour (état local) et `checkpoint.created {thread_id, turn_index, hash, tool,
+    reason_code}`."""
     if not commit:
         return
     if links is not None:
@@ -280,7 +281,7 @@ def _announce(links: TurnLinks | None, emit: Callable[[str, dict[str, Any]], Any
     if emit is not None:
         try:
             emit("checkpoint.created", {"thread_id": ctx.thread_id, "turn_index": ctx.turn_index, "hash": commit,
-                                        "tool": tool})
+                                        "tool": tool, "reason_code": reason_code("", tool)})
         except Exception:  # noqa: BLE001 — un abonné en panne ne casse jamais un outil
             logger.debug("emit checkpoint.created a levé", exc_info=True)
 
@@ -502,6 +503,67 @@ def fr_reason(reason: str) -> str:
     return {"auto": "automatique", "manual": "manuel", "session start": "début de session"}.get(r, r)
 
 
+_REASON_BEFORE = re.compile(r"^avant ([a-z][a-z0-9_]*)$")
+_REASON_CODES = {"automatique": "auto", "auto": "auto", "manuel": "manual", "manual": "manual",
+                 "début de session": "session_start", "session start": "session_start"}
+
+
+def reason_code(reason: str, tool: str | None = None) -> str:
+    """Code STABLE d'une raison de point de retour, à côté du texte (qui ne change pas) : `before_<outil>` (photo prise
+    avant un outil à effet : `before_terminal`, `before_write_file`, `before_patch`…), `before_rollback` (photo « avant
+    retour » d'une restauration), `manual` (`checkpoint_create`), `auto`, `session_start` ; `other` sinon. `tool` : celui
+    du lien point ↔ tour quand il est connu (il prime : une raison libre de `checkpoint_create` n'est pas un outil)."""
+    if tool == "checkpoint_restore":
+        return "before_rollback"
+    if tool == "checkpoint_create":
+        return "manual"
+    if tool:
+        return f"before_{tool}"
+    r = (reason or "").strip()
+    if _REASON_PRE_ROLLBACK.match(r) or r.startswith("avant retour à "):
+        return "before_rollback"
+    if r in _REASON_CODES:
+        return _REASON_CODES[r]
+    m = _REASON_BEFORE.match(r)
+    return f"before_{m.group(1)}" if m else "other"
+
+
+def reason_codes(name: str, content: str) -> dict[str, str] | None:
+    """`{hash: reason_code}` des points nommés dans le résultat d'un outil de points de retour (réponse d'un appel
+    direct, D8) ; None si le résultat n'en nomme aucun. Le contenu (texte vu par le modèle) n'est pas modifié."""
+    if name not in CHECKPOINT_TOOLS:
+        return None
+    try:
+        data = json.loads(content or "")
+    except ValueError:
+        return None
+    entries = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    out: dict[str, str] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        h = e.get("hash") or e.get("restored_to")
+        if isinstance(h, str) and h and isinstance(e.get("reason"), str):
+            out[h] = reason_code(e["reason"], e.get("tool") if isinstance(e.get("tool"), str) else None)
+        snap = e.get("snapshot")
+        if isinstance(snap, str) and snap:
+            out[snap] = "before_rollback"
+    return out or None
+
+
+def direct_result_body(name: str, result: ToolResult) -> dict[str, Any]:
+    """Corps `200` d'un appel d'outil direct (`/v1/local/tools/call`, `/v1/code/sessions/{cs}/tools/call`) :
+    `{content, is_error}` d'avant, plus deux champs côté client seulement — `reason` (refus d'office : `plan_mode`…)
+    et `reason_codes` (`{hash: code}` des points de retour nommés, D8). `content` reste le texte de l'outil."""
+    body: dict[str, Any] = {"content": result.content, "is_error": result.is_error}
+    if getattr(result, "reason", None):
+        body["reason"] = result.reason
+    codes = reason_codes(name, result.content) if not result.is_error else None
+    if codes:
+        body["reason_codes"] = codes
+    return body
+
+
 def _fr_entries(entries: list[dict]) -> list[dict]:
     return [{**c, "reason": fr_reason(str(c.get("reason", "")))} for c in entries]
 
@@ -518,4 +580,5 @@ def checkpoint_sources(inner: ToolSource, root_of: Callable[[str], Path | None],
 
 
 __all__ = ["CHECKPOINT_TOOLS", "CheckpointToolSource", "CheckpointingToolSource", "TurnLinks", "auto_prune",
-           "checkpoint_sources", "code_root_of", "host_path", "links_path", "make_manager", "nokker_home"]
+           "checkpoint_sources", "code_root_of", "direct_result_body", "host_path", "links_path", "make_manager",
+           "nokker_home", "reason_code", "reason_codes"]
