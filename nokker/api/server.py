@@ -5101,6 +5101,30 @@ def link_endpoint(state: dict[str, Any], get_secret: Any) -> tuple[str, str] | N
     return (str(state.get("inference_base") or ROUTER_URL), key) if key else None
 
 
+def setup_guard(kernel: Kernel, setup: Any, port: int, run_turn: Any, tier_keys: Any = lambda: False) -> Any:
+    """Lokkal sans AUCUN modèle utilisable (ni compte relié, ni byok avec modèle, ni palier de config avec clé ; `done`
+    seul ne bloque pas : un Lokkal mis à jour reste servi) : le tour s'arrête AVANT
+    l'appel au modèle, avec une phrase pour la personne (pas l'erreur brute du palier). Rien n'est enregistré dans le
+    fil : le message ne doit pas entrer dans l'historique que le modèle relira. Message destiné à la personne."""
+    message = (f"Aucun modèle n'est configuré. Termine la configuration : http://127.0.0.1:{port}/setup")
+
+    def guarded(inp: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            ready = setup.has_model(bool(tier_keys()))
+        except Exception:  # noqa: BLE001 — état illisible : on ne bloque pas sur une panne du garde
+            ready = True
+        if ready:
+            return run_turn(inp, *args, **kwargs)
+        from nokker.core.turn import Message
+
+        turn = Turn(thread_id=inp.thread_id, index=0, input=kernel.invariants.check_input(inp.user_text),
+                    channel=inp.channel, sender=inp.sender, reply=message)
+        turn.messages.append(Message(role="assistant", content=message))
+        return turn
+
+    return guarded
+
+
 def default_model_applier(config: NokkerConfig, kernel: Kernel, link_endpoint_fn: Any) -> Any:
     """Rend `use_default_model(base_url, clé, modèle)` : branche à chaud le modèle par défaut de Lokkal sur le noyau.
     Appelée au démarrage (Lokkal déjà lié) ET à l'approbation du lien : la clé reçue sert tout de suite. Les paliers et
@@ -5630,6 +5654,9 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         active = ActiveTurns()
         kernel.run_turn = active.wrap(kernel.run_turn)  # fils dont un tour est en cours (API, Telegram)
         setup = local_api.setup
+        if setup is not None:
+            kernel.run_turn = setup_guard(kernel, setup, config.port, kernel.run_turn,
+                                         lambda: any(t.api_key() for t in config.tiers.values()))
 
         def machine_token() -> str | None:
             try:

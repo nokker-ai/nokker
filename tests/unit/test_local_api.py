@@ -546,3 +546,102 @@ def test_delegate_card_only_offers_a_tool_wide_rule_and_kinds_label_rules():
     assert rule_kind("delegate") == "tool"
     assert rule_kind("write_file(src/a.py)") == "file" and rule_kind("write_file(src/**)") == "dir"
     assert rule_kind("terminal(npm test*)") == "prefix" and rule_kind("terminal(npm test)") == "exact"
+
+
+def _setup(tmp_path, monkeypatch, tested=None):
+    from cryptography.fernet import Fernet
+
+    from nokker.local.setup import LocalSetup, LocalVault
+
+    monkeypatch.setenv("NOKKER_LOCAL_SECRET_KEY", Fernet.generate_key().decode())
+    api = _api(tmp_path)
+    api.setup = LocalSetup(state_path=tmp_path / "setup.json", vault=LocalVault(tmp_path / "vault.bin"),
+                           detect=lambda: [], test=lambda base, key: tested or {"ok": True, "models": ["m1", "m2"]})
+    return api, f"Bearer {api.token}"
+
+
+def _put(api, auth, body):
+    return api.handle("PUT", "/v1/local/setup/models", auth, body)
+
+
+ENTRY = {"name": "perso", "base_url": "https://ex.test/v1", "api_key": "sk-k"}
+
+
+def test_put_refuses_a_default_without_model_or_missing(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    status, body = _put(api, auth, {"byok": [ENTRY], "default": "byok:perso"})
+    assert status == 400 and "pas de modèle" in body["error"]["message"]
+    status, body = _put(api, auth, {"byok": [ENTRY], "default": "byok:absent"})
+    assert status == 400 and "aucune entrée" in body["error"]["message"]
+    assert api.setup.state["byok"] == [] and api.setup.state["default"] is None  # rien d'écrit
+    assert api.setup.vault.get("byok:perso") is None
+
+
+def test_put_single_tested_entry_takes_its_first_tested_model(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    seen = []
+    api.on_default_model = lambda *a: seen.append(a)
+    status, view = _put(api, auth, {"byok": [ENTRY]})
+    assert status == 200 and view["default"] == "byok:perso"
+    assert view["models"]["byok"][0]["model"] == "m1" and view["models"]["byok"][0]["ok"] is True
+    assert seen == [("https://ex.test/v1", "sk-k", "m1")]
+    # un modèle donné par la personne prime sur le premier testé
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m2"}], "default": "byok:perso"})
+    assert status == 200 and view["models"]["byok"][0]["model"] == "m2"
+
+
+def test_put_does_not_guess_a_default_when_the_test_fails_or_entries_are_many(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch, tested={"ok": False, "models": [], "error": "HTTP 401"})
+    status, view = _put(api, auth, {"byok": [ENTRY]})
+    assert status == 200 and view["default"] is None and view["models"]["byok"][0]["ok"] is False
+    (tmp_path / "b").mkdir()
+    api, auth = _setup(tmp_path / "b", monkeypatch)
+    status, view = _put(api, auth, {"byok": [ENTRY, {**ENTRY, "name": "autre"}]})
+    assert status == 200 and view["default"] is None
+
+
+def test_removing_the_default_entry_clears_it_and_invalidates_setup(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})
+    api.handle("POST", "/v1/local/setup/done", auth, {})
+    assert api.setup.has_model() is True
+    status, view = _put(api, auth, {"byok": []})
+    assert status == 200 and view["default"] is None and view["done"] is False
+    assert api.setup.vault.get("byok:perso") is None
+    # avec un autre modèle restant, setup reste valide si le défaut est ailleurs
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}, {**ENTRY, "name": "b", "model": "m2"}], "default": "byok:b"})
+    api.handle("POST", "/v1/local/setup/done", auth, {})
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}]})
+    assert view["default"] is None  # le défaut retiré est vidé, pas remplacé en silence
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})
+    assert view["default"] == "byok:perso"
+
+
+def test_turn_stops_before_the_model_only_when_no_model_is_usable(tmp_path, monkeypatch):
+    from nokker.api.server import setup_guard
+    from nokker.core.turn import TurnInput
+
+    api, auth = _setup(tmp_path, monkeypatch)
+    kernel = make_kernel()
+    calls = []
+
+    def run_turn(inp, *a, **k):
+        calls.append(inp)
+        return "model"
+
+    cfg_key = {"on": False}
+    guarded = setup_guard(kernel, api.setup, 8742, run_turn, lambda: cfg_key["on"])
+    inp = TurnInput(thread_id="t1", user_text="salut", channel="api", sender=None)
+    turn = guarded(inp)  # rien du tout
+    assert calls == [] and turn.reply == ("Aucun modèle n'est configuré. Termine la configuration : "
+                                          "http://127.0.0.1:8742/setup")
+    cfg_key["on"] = True  # done faux, palier de config avec clé
+    assert guarded(inp) == "model"
+    cfg_key["on"] = False
+    assert api.setup.state["done"] is False
+    api.setup.vault.put("router", "sk-r")  # done faux, compte relié
+    assert guarded(inp) == "model"
+    api.setup.vault.delete("router")
+    assert guarded(inp) != "model"
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})  # byok avec modèle, done faux
+    assert guarded(inp) == "model" and len(calls) == 3

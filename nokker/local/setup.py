@@ -136,7 +136,7 @@ class LocalSetup:
                 "models": {"router": {"linked": "router" in names, "account": self.state.get("account"),
                                       "model": self.state.get("router_model") or "qwen/qwen3.5-397b-a17b"},
                            "byok": [{"name": b["name"], "base_url": b["base_url"], "model": b.get("model"),
-                                     "ok": b.get("ok"), "has_key": f"byok:{b['name']}" in names}
+                                     "ok": b.get("ok"), "models": b.get("models") or [], "has_key": f"byok:{b['name']}" in names}
                                     for b in self.state["byok"]],
                            "local": self.detect()},
                 "default": self.state["default"],
@@ -150,27 +150,86 @@ class LocalSetup:
         return self.test(base, body.get("api_key") or None)
 
     def put_models(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Enregistre les BYOK (clé au coffre, jamais dans l'état) et le modèle par défaut."""
+        """Enregistre les BYOK (clé au coffre, jamais dans l'état) et le modèle par défaut. Tout est validé avant
+        d'écrire : un refus (ValueError, 400) ne touche ni l'état ni le coffre."""
+        entries = self.state["byok"]
+        keys: dict[str, str] = {}
         if "byok" in body:
-            kept = []
+            entries = []
             for b in body.get("byok") or []:
                 name, base = str(b.get("name") or "").strip(), str(b.get("base_url") or "").strip()
                 if not name or not base.startswith(("http://", "https://")):
                     raise ValueError("byok : name et base_url http(s) requis")
                 if b.get("api_key"):
-                    self.vault.put(f"byok:{name}", str(b["api_key"]))
-                kept.append({"name": name, "base_url": base, "model": b.get("model"), "ok": b.get("ok")})
-            for old in self.state["byok"]:  # une entrée retirée de la liste emporte sa clé du coffre
-                if old["name"] not in {k["name"] for k in kept}:
-                    self.vault.delete(f"byok:{old['name']}")
-            self.state["byok"] = kept
+                    keys[name] = str(b["api_key"])
+                model = str(b["model"]).strip() if isinstance(b.get("model"), str) and b["model"].strip() else None
+                ok, models = b.get("ok") if isinstance(b.get("ok"), bool) else None, None
+                if ok is None:  # pas de verdict du client : le point d'accès est testé ici (jamais la clé renvoyée)
+                    prev = next((x for x in self.state["byok"] if x["name"] == name), None)
+                    key = keys.get(name) or self.vault.get(f"byok:{name}") or None
+                    if prev is not None and prev["base_url"] == base and prev.get("ok") is not None and not keys.get(name):
+                        ok, models = prev["ok"], prev.get("models")
+                    else:
+                        t = self.test(base, key)
+                        ok, models = bool(t.get("ok")), list(t.get("models") or [])
+                elif isinstance(b.get("models"), list):
+                    models = [str(m) for m in b["models"]]
+                entry = {"name": name, "base_url": base, "model": model, "ok": ok}
+                if models:
+                    entry["models"] = models
+                entries.append(entry)
+        by_name = {e["name"]: e for e in entries}
+        default = self.state["default"]
         if "default" in body:
-            d = str(body["default"])
-            if not (d == "router" or d.startswith(("byok:", "local:"))):
+            default = str(body["default"])
+            if not (default == "router" or default.startswith(("byok:", "local:"))):
                 raise ValueError("default : router | byok:<nom> | local:<url>|<modèle>")
-            self.state["default"] = d
+        if default and default.startswith("byok:"):
+            entry = by_name.get(default[5:])
+            if entry is None:
+                if "default" in body:
+                    raise ValueError(f"default : aucune entrée byok « {default[5:]} »")
+                default = None  # l'entrée par défaut a été retirée : le défaut est vidé
+            elif not entry.get("model"):
+                if "default" in body:
+                    raise ValueError(f"default : l'entrée byok « {default[5:]} » n'a pas de modèle")
+                default = None
+        if default is None and self.state["default"] is None and "default" not in body:
+            tested = [e for e in entries if e.get("ok") and (e.get("model") or e.get("models"))]
+            if len(entries) == 1 and len(tested) == 1:  # une seule entrée testée, pas de défaut donné : la sienne
+                e = tested[0]
+                e["model"] = e.get("model") or e["models"][0]
+                default = f"byok:{e['name']}"
+        # Écriture.
+        for name, key in keys.items():
+            self.vault.put(f"byok:{name}", key)
+        for old in self.state["byok"]:  # une entrée retirée de la liste emporte sa clé du coffre
+            if old["name"] not in by_name:
+                self.vault.delete(f"byok:{old['name']}")
+        self.state["byok"] = entries
+        self.state["default"] = default
+        if self.state["done"] and not self.usable():
+            self.state["done"] = False  # plus aucun modèle : la configuration est à refaire
         self._save()
         return self.view()
+
+    def usable(self) -> bool:
+        """Un modèle par défaut utilisable existe (clé du Router au coffre, ou entrée byok / modèle local avec modèle)."""
+        try:
+            chosen = self.provider_for_default()
+        except SecretsError:
+            return False
+        return chosen is not None and bool(chosen[2])
+
+    def has_model(self, tier_keys: bool = False) -> bool:
+        """Au moins un modèle joignable en principe : compte relié au Router, entrée byok avec modèle, modèle par défaut
+        utilisable, ou (`tier_keys`) palier de la config dont la clé est dans l'environnement. `done` n'y compte pas."""
+        try:
+            if "router" in self.vault.names() or self.usable():
+                return True
+        except SecretsError:
+            pass
+        return tier_keys or any(b.get("model") for b in self.state["byok"])
 
     def done(self) -> dict[str, Any]:
         self.state["done"] = True

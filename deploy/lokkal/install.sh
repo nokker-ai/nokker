@@ -409,10 +409,31 @@ if [ "${NOKKER_NO_CLI:-0}" != 1 ]; then
 fi
 
 URL="http://127.0.0.1:$WEB_PORT/"
+# Premier lancement : la racine du web sert la connexion du cloud ; le setup local s'ouvre avec le jeton local dans le
+# FRAGMENT (/setup#token=…, lu puis effacé par la page, jamais envoyé au serveur ; docs/LOKKAL.md §7.1). Le jeton ne
+# s'affiche que sur un terminal (jamais dans un journal ni un fichier : sortie redirigée → la commande qui le lit).
+SETUP_TODO=0
+grep -Eq '"done": *true' "$DIR/state/setup.json" 2>/dev/null || SETUP_TODO=1
+TOKF="$DIR/state/local-token"
+if [ "$SETUP_TODO" = 1 ]; then
+  i=0; while [ ! -s "$TOKF" ] && [ $i -lt 20 ]; do i=$((i + 1)); sleep 1; done
+fi
 say "Nokker Lokkal $VERSION est prêt : $URL"
 say "dossier(s) de travail : $(getv NOKKER_HOST_WORKSPACE)"
 [ -x "$DIR/bin/nokker" ] && say "terminal : nokker   (nouveau shell, ou export PATH=\"$DIR/bin:\$PATH\")"
-if [ "$OPEN" = 1 ] && [ "$MODE" = install ]; then
-  if [ "$os" = darwin ]; then open "$URL" 2>/dev/null || true
-  elif need xdg-open && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then xdg-open "$URL" >/dev/null 2>&1 || true; fi
+OPEN_URL=$URL
+if [ "$SETUP_TODO" = 1 ]; then
+  if [ ! -r "$TOKF" ]; then
+    warn "premier réglage (modèle) : jeton local introuvable ($TOKF) ; relance l'installeur une fois le noyau démarré"
+  elif [ -t 1 ]; then
+    OPEN_URL="${URL}setup#token=$(cat "$TOKF")"
+    say "premier réglage (choisir un modèle) : $OPEN_URL"
+    say "  ce lien contient le jeton local de cette machine : ne le partage pas"
+  else
+    say "premier réglage (choisir un modèle) : ouvre ${URL}setup#token=\$(cat $TOKF)"
+  fi
+fi
+if [ "$OPEN" = 1 ] && { [ "$MODE" = install ] || [ "$SETUP_TODO" = 1 ]; }; then
+  if [ "$os" = darwin ]; then open "$OPEN_URL" 2>/dev/null || true
+  elif need xdg-open && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then xdg-open "$OPEN_URL" >/dev/null 2>&1 || true; fi
 fi

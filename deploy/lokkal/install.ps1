@@ -178,4 +178,18 @@ try {
 
 Say "Nokker Lokkal $v est prêt : $($conf.web_url)/"
 Say "dossiers de travail dans $Distro, visibles dans l'Explorateur : $unc\home\$($user.Trim())"
-if (-not $NoOpen -and -not $Update) { Start-Process "$($conf.web_url)/" }
+# Premier lancement : le setup local s'ouvre avec le jeton local dans le FRAGMENT (/setup#token=…, docs/LOKKAL.md §7.1) ;
+# la racine sert la connexion du cloud. Le jeton n'est passé qu'au navigateur, jamais écrit dans un journal.
+$setupDone = [bool](& wsl.exe -d $Distro -- sh -c "grep -Eq 'done.: *true' '$($conf.install_dir)/state/setup.json' 2>/dev/null && echo 1")
+$openUrl = "$($conf.web_url)/"
+if (-not $setupDone) {
+  $tok = ((& wsl.exe -d $Distro -- sh -c "cat '$($conf.install_dir)/state/local-token' 2>/dev/null") -join "").Trim()
+  if ($tok) {
+    $openUrl = "$($conf.web_url)/setup#token=$tok"
+    if ($NoOpen) { Say "premier réglage (choisir un modèle) : ouvrez $($conf.web_url)/setup#token=<contenu de $($conf.token_path)>" }
+    else { Say "premier réglage (choisir un modèle) : la page s'ouvre dans le navigateur" }
+  } else {
+    Warn "premier réglage : jeton local introuvable ($($conf.install_dir)/state/local-token) ; relancez l'installeur une fois le noyau démarré"
+  }
+}
+if (-not $NoOpen -and (-not $Update -or -not $setupDone)) { Start-Process $openUrl }
