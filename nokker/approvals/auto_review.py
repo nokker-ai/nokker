@@ -40,6 +40,8 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.tools.code import EXCLUDED_COMMAND
+
 logger = logging.getLogger("nokker.approvals.auto_review")
 
 DECIDED_VIA = "auto-review"
@@ -74,19 +76,15 @@ EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_b
                             "skill_create", "skill_update", "skill_revert",
                             # script arbitraire (ses appels internes passent les portes, mais le lancement reste humain)
                             # et préparation d'un paiement (argent) : jamais décidés par le relecteur.
-                            "execute_code", "paper_payment_prepare", "pay_request"})
+                            "execute_code", "paper_payment_prepare", "pay_request",
+                            # commandes : toujours décidées par l'humain (mitigation du classement amont)
+                            "terminal", "process_start", "ssh_run"})
 # Règle du noyau qui escalade une carte d'auto-amélioration sans appeler le modèle (défense en profondeur : la liste
 # fermée l'écarte déjà du relecteur).
 IMPROVE_ESCALATION = "carte d'auto-amélioration : décidée par l'humain, jamais par le relecteur automatique"
 # Commandes qui suppriment, publient ou envoient vers l'extérieur : jamais relues, même classées `write`.
 _COMMAND_TOOLS = ("terminal", "process_start", "ssh_run")
-_EXCLUDED_COMMAND = re.compile(
-    r"(?:^|[\s;&|(`$])(?:rm|rmdir|shred|unlink|truncate|dd|mkfs(?:\.\w+)?|wipefs|scp|rsync|sftp|ftp|nc|ncat|ssh|"
-    r"curl|wget|sendmail|mail|mutt)(?=\s|$)"
-    r"|git\s+(?:push|reset\s+--hard|clean|branch\s+-[dD]|tag\s+-d|filter-branch|update-ref\s+-d)"
-    r"|(?:npm|pnpm|yarn|cargo|gem|twine|poetry)\s+publish|docker\s+(?:push|rm|rmi|system\s+prune)|"
-    r"kubectl\s+(?:delete|apply|replace|scale)|helm\s+(?:install|upgrade|uninstall|delete)|"
-    r"gh\s+(?:pr\s+merge|release|repo\s+delete)|terraform\s+(?:apply|destroy)")
+_EXCLUDED_COMMAND = EXCLUDED_COMMAND  # une seule source : nokker/tools/code.py (classement de l'effet)
 
 
 def is_improve_card(card: Any) -> bool:

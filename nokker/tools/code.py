@@ -132,12 +132,31 @@ def _read_only(command: str) -> bool:
     return True
 
 
+# Règle du NOYAU : ces commandes sont DESTRUCTIVE quoi que dise l'amont (l'amont peut relever l'effet, jamais l'abaisser).
+EXCLUDED_COMMAND = re.compile(
+    r"(?:^|[\s;&|(`$])(?:rm|rmdir|shred|unlink|truncate|dd|mkfs(?:\.\w+)?|wipefs|scp|rsync|sftp|ftp|nc|ncat|ssh|"
+    r"curl|wget|sendmail|mail|mutt)(?=\s|$)"
+    r"|git\s+(?:push|reset\s+--hard|clean|branch\s+-[dD]|tag\s+-d|filter-branch|update-ref\s+-d)"
+    r"|(?:npm|pnpm|yarn|cargo|gem|twine|poetry)\s+publish|docker\s+(?:push|rm|rmi|system\s+prune)|"
+    r"kubectl\s+(?:delete|apply|replace|scale)|helm\s+(?:install|upgrade|uninstall|delete)|"
+    r"gh\s+(?:pr\s+merge|release|repo\s+delete)|terraform\s+(?:apply|destroy)")
+# Lecture d'un secret combinée à un tube ou une redirection : la valeur sort de son fichier.
+_SECRET_READ = re.compile(r"(?:\.ssh\b|id_rsa|id_ed25519|(?:^|[\s/])\.env\b|/etc/shadow|credentials|\.pem\b)")
+_PIPE_OR_REDIRECT = re.compile(r"[|<>]")
+
+
+def _kernel_destructive(command: str) -> bool:
+    return bool(EXCLUDED_COMMAND.search(command) or (_SECRET_READ.search(command) and _PIPE_OR_REDIRECT.search(command)))
+
+
 def classify_command(command: str) -> Effect:
     """Effet d'une commande `terminal`. Sans la détection de l'amont : WRITE si la commande est de lecture pure
     (on ne parie pas sur READ sans la détection), DESTRUCTIVE sinon."""
     det = _upstream_detection()
     if det is None:
         return Effect.WRITE if _read_only(command) else Effect.DESTRUCTIVE
+    if _kernel_destructive(command):  # nos motifs priment sur l'amont
+        return Effect.DESTRUCTIVE
     if det.detect_hardline_command(command)[0] or det.detect_dangerous_command(command)[0]:
         return Effect.DESTRUCTIVE
     return Effect.READ if _read_only(command) else Effect.WRITE

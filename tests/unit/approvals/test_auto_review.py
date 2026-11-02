@@ -81,8 +81,7 @@ def test_closed_list_never_reviewed(kw, effect):
 
 
 @pytest.mark.parametrize("kw, effect", [
-    ({}, "write"),
-    ({"arguments": {"command": "pytest -q"}}, "write"),
+    ({"tool_name": "write_file", "arguments": {"path": "a.py", "content": "x"}}, "write"),
     ({"tool_name": "patch", "arguments": {"path": "src/a.py"}}, "write"),
     ({"tool_name": "read_file", "arguments": {"path": "a"}}, "read"),
 ])
@@ -470,7 +469,7 @@ def test_provenance_send_card_stays_pending_and_the_reviewer_never_sees_it():
 
 
 def test_standard_card_outside_provenance_stays_reviewable():
-    assert excluded(card(rule="permissions:default"), "write") is None
+    assert excluded(card(rule="permissions:default", tool_name="write_file", arguments={"path": "a.py"}), "write") is None
     assert excluded(card(rule="permissions:default", tool_name="patch", arguments={"path": "a.py"}), "write") is None
 
 
@@ -480,3 +479,8 @@ def test_script_and_payment_preparation_are_never_reviewed():
 
     assert {"execute_code", "paper_payment_prepare", "pay_request"} <= ar.EXCLUDED_TOOLS
     assert "payments:to_pay" in ar.EXCLUDED_RULES
+
+
+def test_commands_are_always_decided_by_the_human():
+    for tool in ("terminal", "process_start", "ssh_run"):
+        assert excluded(card(rule="permissions:default", tool_name=tool, arguments={"command": "pytest -q"}), "write")
