@@ -13,6 +13,14 @@ Session du compte (`us_…`) ; erreurs `{"error": {"code", "message"}}` ; 60 éc
     GET    /v1/payments/mandates[?member=us_…]           → {mandates: [carte]}
     GET    /v1/payments/mandates/{md}[?member=us_…]      → carte + mandate + envelope
     GET    /v1/payments/mandates/{md}/verify[?member=…]  → {mandate_id, status, valid, expired, checks, errors}
+
+Agent de paiement (drapeau `pay_agent`, docs/PAY-AGENT.md §7) — absentes (404) sinon :
+    GET    /v1/payments/method                       → {publishable_key, method: {kind, brand, last4, …} | null}
+    POST   /v1/payments/method/challenge {payment_method}  → {challenge}  (à signer par la passkey, tel quel)
+    PUT    /v1/payments/method {payment_method, proof}      → {method}     (preuve vérifiée par l'agent)
+    DELETE /v1/payments/method                       → {removed}       (révoque aussi les jetons vivants)
+    POST   /v1/payments/mandates/{md}/revoke         → carte + agent  (approbateur du mandat)
+    POST   /v1/payments/agent/events                 (rappels de l'agent, HMAC ; aucune session)
 """
 from __future__ import annotations
 
@@ -29,6 +37,7 @@ PREFIX = "/v1/payments"
 RATE_MAX, RATE_WINDOW_S = 60, 60.0
 
 _svc: Payments | None = None
+_callback_secret: str = ""
 _device_key: Callable[[str], str | None] | None = None
 _origin: str | None = None
 _hits: dict[str, deque[float]] = defaultdict(deque)
@@ -44,6 +53,43 @@ def configure(svc: Payments | None, *, device_key: Callable[[str], str | None] |
 
 def service() -> Payments | None:
     return _svc
+
+
+def configure_agent(callback_secret: str) -> None:
+    global _callback_secret
+    _callback_secret = callback_secret
+
+
+def _agent_on() -> bool:
+    return _svc is not None and _svc.agent is not None
+
+
+def is_payments_post_path(path: str) -> bool:
+    """POST des paiements : seulement les routes de l'agent de paiement, drapeau `pay_agent` allumé."""
+    route = path.split("?", 1)[0].rstrip("/")
+    return _agent_on() and (route == PREFIX + "/method/challenge"
+                            or (route.startswith(PREFIX + "/mandates/") and route.endswith("/revoke")))
+
+
+def handle_agent_callback(h: Any, method: str, path: str) -> bool:
+    """Rappel de l'agent de paiement (HMAC `X-Nokker-PayAgent-Signature`) : sans session, avant les routes de compte."""
+    from nokker.payments.agent import CALLBACK_PATH, verify_callback
+
+    if method != "POST" or path.split("?", 1)[0].rstrip("/") != CALLBACK_PATH or not _agent_on():
+        return False
+    n = int(h.headers.get("Content-Length", 0) or 0)
+    if n <= 0 or n > 64 * 1024:
+        h._json(400, {"error": {"code": "bad_length", "message": "corps attendu"}})
+        return True
+    body = h.rfile.read(n)
+    try:
+        data = verify_callback(body, h.headers.get("X-Nokker-PayAgent-Signature", ""), _callback_secret)
+    except ValueError:
+        h._json(401, {"error": {"code": "signature", "message": "rappel non signé"}})
+        return True
+    ok = _svc.on_agent_callback(data) if _svc is not None else False
+    h._json(200 if ok else 404, {"received": ok})
+    return True
 
 
 def is_payments_path(path: str) -> bool:
@@ -98,6 +144,10 @@ def dispatch(svc: Payments, method: str, parts: list[str], me: str, member: str 
         if n == 2 and method == "DELETE":
             return 200, svc.reset_budget(me, parts[1])
         return None
+    if n >= 1 and parts[0] == "method" and svc.agent is not None:
+        return _method_route(svc, method, parts, me, body)
+    if n == 3 and parts[0] == "mandates" and parts[2] == "revoke" and method == "POST" and svc.agent is not None:
+        return 200, svc.agent_revoke(me, parts[1])
     if n >= 1 and parts[0] == "mandates" and method == "GET":
         if n == 1:
             return 200, {"mandates": svc.mandates(me, member)}
@@ -108,4 +158,35 @@ def dispatch(svc: Payments, method: str, parts: list[str], me: str, member: str 
     return None
 
 
-__all__ = ["PREFIX", "configure", "dispatch", "handle", "is_payments_path", "service"]
+def _method_route(svc: Payments, method: str, parts: list[str], me: str,
+                  body: Callable[[], Any]) -> tuple[int, Any] | None:
+    from nokker.payments.agent import AgentUnavailable, method_challenge
+
+    def agent_error(e: AgentUnavailable) -> PaymentError:
+        status = e.status if e.status in (400, 403, 409) else 502
+        return PaymentError(status, e.code, "moyen de paiement refusé" if status < 500 else
+                            "agent de paiement indisponible")
+
+    try:
+        if len(parts) == 1 and method == "GET":
+            return 200, {"publishable_key": svc.agent_settings.publishable_key or None, "method": svc.agent.method(me)}
+        if len(parts) == 2 and parts[1] == "challenge" and method == "POST":
+            b = body()
+            pm = b.get("payment_method") if isinstance(b, dict) else None
+            if not isinstance(pm, str) or not pm.startswith("pm_"):
+                raise PaymentError(400, "invalid", "payment_method pm_… attendue")
+            return 200, {"challenge": method_challenge(me, pm, int(svc.clock()))}
+        if len(parts) == 1 and method == "PUT":
+            b = body()
+            if not isinstance(b, dict) or not isinstance(b.get("proof"), dict):
+                raise PaymentError(400, "invalid", "payment_method et proof attendus")
+            return 200, {"method": svc.agent.register(me, str(b.get("payment_method") or ""), b["proof"])}
+        if len(parts) == 1 and method == "DELETE":
+            return 200, {"removed": svc.agent.remove(me)}
+    except AgentUnavailable as e:
+        raise agent_error(e) from None
+    return None
+
+
+__all__ = ["PREFIX", "configure", "configure_agent", "dispatch", "handle", "handle_agent_callback",
+           "is_payments_path", "is_payments_post_path", "service"]

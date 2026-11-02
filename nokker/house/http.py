@@ -73,7 +73,9 @@ def handle(h: Any, method: str, path: str, account: Any) -> bool:
             h._json(200, room.view(account.account_id))
         elif route == PREFIX + "/messages" and method == "GET":
             q = parse_qs(urlsplit(getattr(h, "path", "") or "").query)
-            one = lambda k: (q.get(k) or [None])[0]
+            def one(k):
+                return (q.get(k) or [None])[0]
+
             h._json(200, room.messages(account.account_id, after=_int(one("after")) or 0, before=_int(one("before")),
                                        limit=_int(one("limit"))))
         elif route == PREFIX + "/messages" and method == "POST":

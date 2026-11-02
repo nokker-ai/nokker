@@ -97,7 +97,7 @@ from nokker.qa.calibrate import DEFAULT_THRESHOLDS, load_thresholds_file
 from nokker.qa.escalate import EscalatorV0
 from nokker.qa.gates import GatesV0, GatesV1
 from nokker.qa.invariants import Allowlist, DeterministicInvariants, GoAuthorizedSenders
-from nokker.qa.judge import HttpJudgeTransport, OpenAICompatJudge
+from nokker.qa.judge import HedgedJudgeTransport, HttpJudgeTransport, OpenAICompatJudge
 from nokker.qa.provenance import build_provenance
 from nokker.qa.review import CardAdvisor, DiffReviewer, parse_advice
 from nokker.qa.secrets import KnownSecrets
@@ -327,16 +327,23 @@ def build_agents(config: NokkerConfig, events: EventBus | None = None) -> Agents
     return AgentsHub(store=store, publish=events.publish if events is not None else None)
 
 
-def judge_transport(config: NokkerConfig, timeout_s: float = 30.0, known: Any = None) -> HttpJudgeTransport:
+def judge_transport(config: NokkerConfig, timeout_s: float = 30.0, known: Any = None) -> Any:
     """Transport du juge (`config.judge_config()` : `judge:` du YAML, sinon le palier Ship). Raisonnement coupé par
     `reasoning_off_body` du juge s'il est posé, sinon `reasoning_effort: "none"` (SEULE variante qui coupe vraiment le
     raisonnement sur le Router SOKKAN, cf `providers/sokkan.py`) ; un amont qui le refuse (gpt-oss, clé de
     l'utilisateur) est repris sans (`HttpJudgeTransport`, X8). `top_logprobs=1` (plafond mesuré du Router). `known` :
-    coffre des invariants, pour le caviardage de tout ce que le juge envoie (motifs seuls sans lui)."""
+    coffre des invariants, pour le caviardage de tout ce que le juge envoie (motifs seuls sans lui). Avec
+    `fallback_model` (même amont et même clé), le transport est un `HedgedJudgeTransport` : repli après
+    `hedge_after_s` ou en cas d'échec ; `data["model"]` y dit le modèle qui a réellement répondu."""
     j = config.judge_config()
     extra = j.reasoning_off_body if j.reasoning_off_body is not None else {"reasoning_effort": "none"}
-    return HttpJudgeTransport(base_url=j.base_url, model=j.model, api_key=j.api_key(), extra_body=dict(extra),
-                              top_logprobs=1, timeout_s=timeout_s, known=known)
+    primary = HttpJudgeTransport(base_url=j.base_url, model=j.model, api_key=j.api_key(), extra_body=dict(extra),
+                                 top_logprobs=1, timeout_s=timeout_s, known=known)
+    if not j.fallback_model or j.fallback_model == j.model:
+        return primary
+    fallback = HttpJudgeTransport(base_url=j.base_url, model=j.fallback_model, api_key=j.api_key(),
+                                  extra_body=dict(extra), top_logprobs=1, timeout_s=timeout_s, known=known)
+    return HedgedJudgeTransport(primary, fallback, hedge_after_s=j.hedge_after_s)
 
 
 def build_judge(config: NokkerConfig, known: Any = None) -> OpenAICompatJudge:
@@ -1084,6 +1091,18 @@ def configure_payments(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, a
         return dev.public_key_spki if dev is not None and dev.status == "approved" else None
 
     payments_http.configure(svc, device_key=device_key, origin=config.webauthn_origin)
+    if getattr(config, "pay_agent", False):
+        from nokker.payments.agent import CALLBACK_SECRET_ENV, TOKEN_ENV, AgentSettings, PayAgentClient
+
+        agent_cfg = AgentSettings.from_config(config.pay_agent_settings)
+        token, secret = os.environ.get(TOKEN_ENV, ""), os.environ.get(CALLBACK_SECRET_ENV, "")
+        if not (agent_cfg.url and token and secret):
+            logger.warning("drapeau pay_agent sans url, %s ou %s : agent de paiement éteint", TOKEN_ENV,
+                           CALLBACK_SECRET_ENV)
+        else:
+            svc.agent, svc.agent_settings = PayAgentClient(agent_cfg.url, token), agent_cfg
+            payments_http.configure_agent(secret)
+            kernel.tools.refresh()  # description de pay_request : celle de l'agent
 
 
 def house_room_on(config: NokkerConfig) -> bool:
@@ -1573,6 +1592,7 @@ def configure_code_sessions(config: NokkerConfig, kernel: Kernel, *, hub: Any = 
     svc.skills_fallback = packs_source
     svc.kernel_factory = child_kernel
     svc.delegate_fork = bool(getattr(config, "delegate_fork", False))
+    svc.delegate_tier = bool(getattr(config, "delegate_tier", False))
     svc.parent_registry = lambda: kernel.tools.current()  # le jeu du locataire courant (TenantRegistry)
     svc.emit = events.publish if events is not None else None
     svc.parent_observer = hub
@@ -1969,6 +1989,7 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     `secrets` : le coffre de Lokkal (`nokker.secrets.Vault`, lot X4) — ses valeurs entrent au caviardage des
     invariants, et les références `secret:NOM` des serveurs MCP (`token`, `headers`) sont résolues à chaque
     connexion. None : ni l'un ni l'autre (une référence échoue à l'usage)."""
+    config.check_judge_explicit()
     # Politique réseau des clients sortants (bloc `ssrf:`, mode strict ÉTEINT par défaut : nokker/previews/ssrf.py).
     from nokker.previews.ssrf import configure as _ssrf_configure
 
@@ -2028,8 +2049,23 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         from nokker.goals.tools import GoalToolSource
 
         goal_sources = [GoalToolSource(service=goals)]
+    # `delegate_tenants` : `delegate` offert en conversation aux locataires nommés (canari de Nina), sans dossier de
+    # travail ni worktree. Vide (défaut) : aucune source, rien ne change.
+    delegate_holder: dict[str, Any] = {}
+    delegate_conv = None
+    if config.delegate_tenants:
+        import dataclasses as _dcd
+
+        from nokker.tools.delegate import DelegateToolSource
+
+        delegate_conv = DelegateToolSource(
+            lambda registry, thread_id, observer: _dcd.replace(delegate_holder["k"], tools=registry, observer=observer),
+            None, fork=bool(getattr(config, "delegate_fork", False)), tier=bool(getattr(config, "delegate_tier", False)),
+            tenants=frozenset(config.delegate_tenants))
+    delegate_internal = [delegate_conv] if delegate_conv is not None and INTERNAL_TENANT in config.delegate_tenants \
+        else []
     internal_tools = Registry(sources=[core_source, *advise_sources, *context_sources, *memory_sources, *mcp_sources,
-                                       *web_sources, *bubble_sources, *goal_sources, *(extra_sources or [])])
+                                       *web_sources, *bubble_sources, *goal_sources, *(extra_sources or []), *delegate_internal])
     # Pool de navigateurs de la bêta (docs/BROWSER-POOL.md) : un Chrome isolé par testeur, seulement si l'adresse du
     # gestionnaire est posée (secret du déploiement) ; l'interne garde son navigateur partagé.
     browser_sources = []
@@ -2041,7 +2077,9 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         browser_sources.append(BrowserPoolSource(base_url=pool_url, api_token=lambda: os.environ.get(token_env, "")))
     # Testeur : JAMAIS mcp_sources (workspace, navigateur partagé de l'opérateur) ni memory_sources (sokkan-memory).
     tools = TenantRegistry(internal=internal_tools, tester_sources=[core_source, *context_sources, *web_sources,
-                                                                    *bubble_sources, *goal_sources, *browser_sources],
+                                                                    *bubble_sources, *goal_sources, *browser_sources,
+                                                                    *([delegate_conv] if delegate_conv is not None
+                                                                      else [])],
                            connectors=connectors)
 
     inv = invariants or build_invariants(config)
@@ -2129,6 +2167,9 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
                     auto_reviewer=build_auto_reviewer(config, known=getattr(inv, "known", None)) if appr is not None
                     else None,
                     traces=build_recorder(config, inv))
+    if delegate_conv is not None:
+        delegate_holder["k"] = kernel
+        delegate_conv.bind(kernel.tools)
     if nina_provider is not None:
         from nokker.route.nina import build_shadow
 
@@ -4280,6 +4321,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if path != "/v1/chat/completions":
                 if billing_http.handle_webhook(self, "POST", path):  # public : authentifié par la signature Stripe
                     return
+                if payments_http.handle_agent_callback(self, "POST", path):  # agent de paiement : HMAC, drapeau pay_agent
+                    return
                 if onboarding_http.handle(self, "POST", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                     return
                 if sso_http.handle_public(self, "POST", path):  # SSO OIDC (drapeau `sso`) : pas encore de session
@@ -4303,6 +4346,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         or (house_http.enabled() and house_http.is_house_path(path)) \
                         or (presence_http.enabled() and presence_http.is_presence_path(path)) \
                         or account_http.matches(path) \
+                        or payments_http.is_payments_post_path(path) \
                         or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                     self._account_route("POST", path)
                     return
@@ -5257,7 +5301,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                 background=True, note=note_parent,
                 # état des enfants dans l'état local : au redémarrage, `interrupted / restart` et worktree conservé
                 state_path=(local_api.state_dir / "subagents.json") if local_api.state_dir is not None else None,
-                fork=bool(getattr(config, "delegate_fork", False)))
+                fork=bool(getattr(config, "delegate_fork", False)),
+                tier=bool(getattr(config, "delegate_tier", False)))
             local_api.subagents = delegate  # annulation d'un fil → ses sous-agents ; `delegate_status` hors tour
             local_api.emit = events.publish if events is not None else None  # `checkpoint.created` (§7.4.7)
             if getattr(local_api.code, "lsp", None) is not None and hub is not None:

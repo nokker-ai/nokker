@@ -76,6 +76,7 @@ du fil parent, `delegate_cancel` ou éviction (au plus `MAX_PARKED`) : plus de n
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 import fnmatch
 import json
 import logging
@@ -131,6 +132,91 @@ _BACKGROUND_PARAM = {"type": "boolean", "default": False,
 _FORK_PARAM = {"type": "boolean", "default": False,
                "description": "true : chaque sous-agent part de ta conversation actuelle (même contexte, cache "
                               "réutilisé) ; un but court suffit, inutile de réexpliquer"}
+# Palier de l'enfant (drapeau `delegate_tier`, éteint par défaut) : textes vus par le modèle, ajoutés seulement allumé.
+TIERS = ("ship", "deep")
+_TIER_PARAM = {"type": "string", "enum": list(TIERS),
+               "description": "palier du modèle des sous-agents : ship (code, DevOps, build, opérations ; rapide) ou "
+                              "deep (architecture, analyse longue, problème difficile ; plus coûteux, réservé aux "
+                              "comptes qui y ont droit) ; absent : le palier habituel"}
+# Lecture seule (même drapeau `delegate_tier`) : le noyau contraint l'enfant, textes vus par le modèle.
+_READONLY_PARAM = {"type": "boolean", "default": False,
+                   "description": "true : les sous-agents ne pourront que lire et rendre un rapport ou un diagnostic ; "
+                                  "aucune écriture, aucune action"}
+READONLY_REFUSED = ("sous-agent en lecture seule (readonly=true) : {name} écrit ou agit, il ne peut que lire ; rends "
+                    "ton rapport ou ton diagnostic")
+READONLY_RULE = "readonly"
+
+
+def read_only_ok(spec: Any, arguments: dict[str, Any] | None = None) -> bool:
+    """Enfant en lecture seule : seul un effet READ explicite passe, déclaré ET (si les arguments sont connus) classé
+    READ pour CET appel. Spec absente, effet inconnu ou non déclaré, classement qui lève : refusé (fail closed)."""
+    try:
+        if spec is None or spec.effect is not Effect.READ:
+            return False
+        if arguments is None or spec.effect_of is None:
+            return True
+        return spec.effect_of(arguments) is Effect.READ  # classement qui lève : refusé (pas le repli du noyau)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def readonly_refusal(name: str) -> str:
+    return f"REFUSÉ par le noyau ({READONLY_RULE}: {READONLY_REFUSED.format(name=name)})."
+
+
+class _ReadonlyProvenance:
+    """Provenance d'un enfant en lecture seule : le registre est celui du fil racine (l'enfant hérite de ce que le parent
+    a lu), mais une décision « carte » devient le REFUS de la même règle, avec le texte de refus de la provenance : un
+    enfant ne pose jamais de carte et rien ne passe en silence."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def check(self, call: Any, spec: Any, turn: Any) -> list[Any]:
+        from nokker.core.turn import Decision
+        from nokker.qa import provenance as pv
+
+        out = []
+        for v in self._inner.check(call, spec, turn):
+            if v.decision is Decision.HITL:
+                fam = v.rule.partition(":")[2]
+                tail = pv.TAIL["refus"][pv.RULE_SUBJECT.get(fam, ("", "f"))[1]]
+                reason = v.reason[:-len(pv.TAIL["carte"])] + tail if v.reason.endswith(pv.TAIL["carte"]) \
+                    else v.reason + tail
+                v = dataclasses.replace(v, decision=Decision.DENY, reason=reason, strength=None, code="provenance")
+            out.append(v)
+        return out
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _ReadonlyGates:
+    """Portes d'un enfant en lecture seule : tout appel non READ est refusé (DENY, jamais de carte), avant même le
+    registre. Couvre la boucle, `script_tool_call` (execute_code) et l'appel direct ; le reste passe aux portes du parent."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def action(self, call: Any, spec: Any, turn: Any) -> list[Any]:
+        if not read_only_ok(spec, call.arguments):
+            from nokker.core.turn import Decision, Gate, Verdict
+
+            return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule=READONLY_RULE,
+                            reason=READONLY_REFUSED.format(name=call.name), subject=call.id)]
+        from nokker.core.turn import Decision
+
+        # Aucune carte depuis un enfant en lecture seule : toute décision HITL des portes (règles de l'utilisateur,
+        # invariants, autre) devient un DENY de la même règle, avec son motif.
+        return [dataclasses.replace(v, decision=Decision.DENY, strength=None) if v.decision is Decision.HITL else v
+                for v in self._inner.action(call, spec, turn)]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+TIER_INVALID = "tier : ship ou deep attendu"
+TIER_NOT_SERVED = "tier={tier} refusé : ce palier n'est pas servi ici ; relance sans tier ou avec l'autre palier"
+TIER_NO_DEEP = ("tier=deep refusé : ton compte n'a pas (ou plus) droit au palier deep ; relance sans tier ou avec "
+                "tier=ship")
 FORK_NOTE = ("[Sous-agent fork] Tu es un sous-agent lancé depuis la conversation ci-dessus : tu en as tout le contexte. "
              "Ne poursuis pas le tour de l'agent principal : fais seulement la tâche ci-dessous, puis réponds par un "
              "résumé de ce que tu as fait et trouvé ; ce résumé revient à l'agent principal. Tu ne peux ni déléguer, ni "
@@ -408,6 +494,8 @@ class _Child:
     created_at: float = field(default_factory=time.time)  # heure murale (gardée dans l'état local)
     restored: bool = False  # relu de l'état local après un redémarrage : fini, jamais repris
     registry: Any = None  # registre du parent résolu à l'appel (`bind` d'une fonction : multi-locataire)
+    tier: str = ""  # palier imposé par `delegate(tier=…)` ; vide = politique habituelle
+    readonly: bool = False  # `delegate(readonly=true)` : le noyau ne laisse passer que les outils READ
     fork_base: Any = None  # fork : contexte du dernier appel du parent (`Kernel.fork_base`), None = fenêtre neuve
 
     def touch(self) -> None:
@@ -510,7 +598,8 @@ class _ChildSource:
         return any(fnmatch.fnmatchcase(name, p) for p in self._denied)
 
     def specs(self) -> list[ToolSpec]:
-        return [s for s in self._inner.specs() if not self._is_denied(s.name)]
+        return [s for s in self._inner.specs()
+                if not self._is_denied(s.name) and (not self._child.readonly or read_only_ok(s))]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if self._child.cancelled:
@@ -520,6 +609,10 @@ class _ChildSource:
                               "plus exécuté.", is_error=True)
         if self._is_denied(name):
             return ToolResult(call_id="", name=name, content=f"outil interdit à un sous-agent : {name}", is_error=True)
+        if self._child.readonly:  # le noyau, pas le prompt : tout chemin (boucle, execute_code, appel direct) passe ici
+            spec = next((s for s in self._inner.specs() if s.name == name), None)
+            if not read_only_ok(spec, arguments or {}):
+                return ToolResult(call_id="", name=name, content=readonly_refusal(name), is_error=True)
         self._child.touch()
         return self._inner.call(name, arguments, ctx)
 
@@ -553,7 +646,8 @@ class DelegateToolSource:
                  = None, parent_observer: Any | None = None, poll_s: float = 0.05, background: bool = False,
                  max_background: int = MAX_TASKS, note: Callable[[str, str], None] | None = None,
                  state_path: str | os.PathLike[str] | None = None, max_live: int | None = None,
-                 require_isolation: bool = False, fork: bool = False) -> None:
+                 require_isolation: bool = False, fork: bool = False, tier: bool = False,
+                 tenants: frozenset[str] | None = None) -> None:
         self.kernel_factory, self.code_source = kernel_factory, code_source
         self.max_children, self.max_depth, self.idle_timeout_s = max(1, max_children), max_depth, idle_timeout_s
         self._emit_fn, self.parent_observer, self.poll_s = emit, parent_observer, poll_s
@@ -565,6 +659,11 @@ class DelegateToolSource:
         # Mode fork (drapeau `delegate_fork`, défaut éteint) : paramètre `fork` au schéma, enfant sur le contexte du
         # parent. Éteint : schéma et comportement d'avant, un `fork` envoyé quand même est ignoré.
         self.fork = fork
+        # Palier imposé (drapeau `delegate_tier`, défaut éteint) : paramètre `tier` au schéma. Éteint : schéma et
+        # comportement d'avant, un `tier` envoyé quand même est ignoré.
+        self.tier = tier
+        # `tenants` (config `delegate_tenants`) : locataires à qui la source est offerte ; None = tous (inchangé).
+        self.tenants = tenants
         self._registry: Any = None
         self._slots = threading.BoundedSemaphore(self.max_children)
         # Enfants par fil parent : ceux de fond (lus par delegate_status) et ceux de premier plan en cours (pour
@@ -588,6 +687,9 @@ class DelegateToolSource:
             reg = reg()
         return reg if reg is not None and hasattr(reg, "sources") else None
 
+    def available_for(self, tenant_id: str) -> bool:
+        return self.tenants is None or tenant_id in self.tenants
+
     def _live_locked(self) -> int:
         kids = [c for table in self._by_parent.values() for c in table.values()]
         kids += [c for c in self._parked.values() if c not in kids]
@@ -604,6 +706,9 @@ class DelegateToolSource:
         extra = {"background": _BACKGROUND_PARAM} if background else {}
         if self.fork:
             extra["fork"] = _FORK_PARAM
+        if self.tier:
+            extra["tier"] = _TIER_PARAM
+            extra["readonly"] = _READONLY_PARAM
         return {**_SPECS_PARAMS, "properties": {**_SPECS_PARAMS["properties"], **extra}} if extra else _SPECS_PARAMS
 
     def specs(self) -> list[ToolSpec]:
@@ -645,7 +750,11 @@ class DelegateToolSource:
         return list(sessions().values()) if callable(sessions) else []
 
     def _effect_of(self, args: dict[str, Any]) -> Effect:
-        """WRITE seulement si l'enfant est confiné à un worktree jetable ; DESTRUCTIVE sinon (voir le docstring)."""
+        """WRITE seulement si l'enfant est confiné à un worktree jetable ; DESTRUCTIVE sinon (voir le docstring).
+        `readonly=true` (drapeau `delegate_tier`) : READ, car le noyau filtre ses outils aux READ et refuse tout autre
+        appel (`_ChildSource`)."""
+        if self.tier and args.get("readonly") is True:
+            return Effect.READ
         if args.get("isolate", True) is False or self.code_source is None:
             return Effect.DESTRUCTIVE
         roots = self._roots()  # l'effet ne voit pas le fil : avec une source par fil, TOUTES les racines doivent être git
@@ -690,6 +799,12 @@ class DelegateToolSource:
         tasks = arguments.get("tasks")
         if not isinstance(tasks, list) or not tasks or len(tasks) > MAX_TASKS:
             return out(f"tasks : 1 à {MAX_TASKS} tâches requises", True)
+        tier = ""
+        if self.tier and arguments.get("tier") is not None:
+            tier, refusal = self._check_tier(arguments.get("tier"), ctx)
+            if refusal:
+                return out(refusal, True)
+        readonly = self.tier and arguments.get("readonly") is True
         base = None
         if self.fork and arguments.get("fork", False) is True:
             # Le contexte EXACT du dernier appel du parent dans CE tour (et pour CE locataire) ; sinon, refus clair :
@@ -711,7 +826,7 @@ class DelegateToolSource:
             cid = uuid.uuid4().hex[:8]
             children.append(_Child(index=i, id=cid, thread_id=f"{ctx.thread_id}/sa-{cid}", task=t, schema=schema,
                                    parent_thread_id=ctx.thread_id, code=code, background=background,
-                                   registry=registry, fork_base=base))
+                                   registry=registry, fork_base=base, tier=tier, readonly=readonly))
         with self._table_lock:
             if self.max_live is not None:
                 live = self._live_locked()
@@ -791,6 +906,24 @@ class DelegateToolSource:
                     self._by_parent.pop(ctx.thread_id, None)
             self._persist()  # premier plan rendu : seuls ses enfants en attente d'une carte restent dans l'état
         return out(results)
+
+    @staticmethod
+    def _check_tier(value: Any, ctx: ToolContext) -> tuple[str, str]:
+        """(palier, refus). Un enfant ne dépasse pas les droits du parent : palier servi, et pour deep le plafond du
+        compte (`deep_per_day`) du locataire courant."""
+        from nokker.core.turn import Tier
+
+        if value not in TIERS:
+            return "", TIER_INVALID
+        kernel = ctx.kernel
+        providers = getattr(kernel, "providers", None)
+        if providers is not None and Tier(value) not in providers:
+            return "", TIER_NOT_SERVED.format(tier=value)
+        limits = getattr(kernel, "limits", None)
+        if value == "deep" and limits is not None and hasattr(limits, "deep_available") \
+                and not limits.deep_available(ctx.sender):
+            return "", TIER_NO_DEEP
+        return value, ""
 
     # ── arrière-plan ──
     def _watch(self, children: list[_Child], run: Run | None) -> None:
@@ -1124,7 +1257,7 @@ class DelegateToolSource:
         sources: list[Any] = []
         for src in (ch.registry if ch.registry is not None else self._registry).sources:
             if src is self or getattr(src, "is_delegate_source", False):
-                if parent_depth + 1 < self.max_depth:  # un enfant peut déléguer seulement sous la profondeur max
+                if parent_depth + 1 < self.max_depth and not ch.readonly:  # sous la profondeur max, jamais en lecture seule
                     sources.append(src)
                 continue
             if self.code_source is not None and (src is self.code_source
@@ -1163,6 +1296,15 @@ class DelegateToolSource:
             if ch.fork_base is not None:
                 # Fork : même contexte que le dernier appel du parent, même affinité de cache (fil parent).
                 kernel = kernel.forked(ch.fork_base, session_key=ch.parent_thread_id, child_thread=ch.thread_id)
+            if ch.tier:
+                from nokker.core.turn import Tier
+                from nokker.route.forced import force_tier
+
+                kernel = dataclasses.replace(kernel, policy=force_tier(kernel.policy, Tier(ch.tier)))
+            if ch.readonly and hasattr(kernel, "gates"):  # le noyau de l'enfant refuse tout appel non READ
+                kernel = dataclasses.replace(kernel, gates=_ReadonlyGates(kernel.gates))
+                if getattr(kernel, "provenance", None) is not None:
+                    kernel = dataclasses.replace(kernel, provenance=_ReadonlyProvenance(kernel.provenance))
             ch.kernel = kernel
             if ch.cancelled:  # annulé pendant la construction : rien ne part
                 return dict(ch.result)
@@ -1218,6 +1360,8 @@ class DelegateToolSource:
                                            "summary": ""})}
         res["child_id"] = ch.id
         res["thread_id"] = ch.thread_id
+        if ch.tier:
+            res["tier"] = ch.tier
         commits, dirty, kept = 0, False, False
         ch.run = run
         if ch.info is not None and run is not None:

@@ -205,9 +205,11 @@ class HomeAssistantSource:
         if ref:
             if resolve is None:
                 raise HomeError("home_assistant.bridge_token : pas de coffre sur cette instance", "no_token")
-            token = (lambda r=str(ref): resolve(r))
+            def token(r=str(ref)):
+                return resolve(r)
         else:
-            token = (lambda: env.get(TOKEN_ENV, ""))
+            def token():
+                return env.get(TOKEN_ENV, "")
         bridge = HomeBridge(url=url, token=token, timeout_s=float(raw.get("timeout_s", 10.0)))
         if opener is not None:
             bridge.opener = opener

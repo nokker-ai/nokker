@@ -62,7 +62,9 @@ def test_month_cap_counts_earlier_days(world):
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    day = lambda d: datetime(2026, 11, d, 12, tzinfo=ZoneInfo("Europe/Zurich")).timestamp()
+    def day(d):
+        return datetime(2026, 11, d, 12, tzinfo=ZoneInfo("Europe/Zurich")).timestamp()
+
     world.backend.clock = world.svc.clock = lambda: day(10)
     put(world, ALICE, ALICE, per_purchase=200, per_day=200, per_month=300)
     world.approve(ALICE, world.request(ALICE, amount="190").id)  # signée : compte pour le mois entier

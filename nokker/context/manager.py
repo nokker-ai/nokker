@@ -532,9 +532,11 @@ class ContextManager:
         # groupe quand un 2e expéditeur parle, les consignes déjà indexées sont alors refiltrées).
         if len(idx.get("senders", ())) > 1:
             go = self.go_authorized
-            ok = (lambda t: go is not None and bool(go(t.sender)))
+            def ok(t):
+                return go is not None and bool(go(t.sender))
         else:
-            ok = (lambda t: True)
+            def ok(t):
+                return True
         events = sorted([(t.index, "d", t, ep, txt) for t, ep, txt in idx.get("durs", []) if ok(t)]
                         + [(t.index, "r", t, ep, "") for t, ep in idx.get("drevs", []) if ok(t)],
                         key=lambda x: x[0])

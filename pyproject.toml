@@ -96,6 +96,11 @@ target-version = "py314"
 "tests/unit/test_live_input.py" = ["F811"]
 "tests/unit/test_pages.py" = ["F811"]
 "deploy/gateway/tests/*.py" = ["E702"]
+# numpy/scipy absents : `importorskip` avant les imports du module testé (E402) ; `O` = le « voisin » des recettes RLS.
+"tests/unit/knock/*.py" = ["E402"]
+"tests/integration/test_payments_pg.py" = ["F811"]
+"tests/integration/test_*_rls.py" = ["E741"]
+"tests/unit/memory/test_tenant_long_memory.py" = ["E741"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

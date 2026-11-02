@@ -300,7 +300,9 @@ def test_knx_bus_write_is_refused_by_default_and_strong_when_listed(tmp_path):
     from nokker.home.policy import HomePolicy
 
     p = HomePolicy.from_config({"entities": ["*"]})
-    attrs = lambda e: {}
+    def attrs(e):
+        return {}
+
     assert p.classify("knx", "send", ["knx.x"], {}, attrs).klass == "deny"
     p = HomePolicy.from_config({"entities": ["*"], "direct_domains": ["light", "knx"]})
     assert p.classify("knx", "send", ["knx.x"], {}, attrs).klass == "strong"

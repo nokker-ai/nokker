@@ -93,7 +93,9 @@ OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", 
               "account_minors",
               # canaux Slack/WhatsApp (048) : codes d'appairage (comme telegram_pairing), événements déjà vus,
               # fenêtre de 24 h WhatsApp sous empreinte — lus avant de connaître le locataire
-              "channel_pairing", "channel_events", "channel_windows"}
+              "channel_pairing", "channel_events", "channel_windows",
+              # agent de paiement (063) : sans locataire, rôle nokker_pay_agent seul (test_pay_agent_role_*)
+              "pay_agent_methods", "pay_agent_tokens", "pay_agent_events"}
 
 
 @pytest.fixture(scope="module")
@@ -960,3 +962,36 @@ def test_web_packs_and_agent_origin_roundtrip_under_rls(pg, pod_env):
             assert agents.get(a.id) is None
     finally:
         agents.close()
+
+
+@requires_pg
+def test_pay_agent_role_reads_four_device_columns_and_its_tables_only(pg):
+    """Agent de paiement (063, docs/PAY-AGENT.md §6) : `nokker_pay_agent` lit id, user, public_key_spki, status de
+    `devices` et rien d'autre (ni `code`, ni écriture, ni table du noyau) ; il écrit dans ses tables pay_agent_*, où
+    `nokker_app` n'a aucun droit."""
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    pw = secrets.token_hex(12)
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        su.execute(f"ALTER ROLE nokker_pay_agent PASSWORD '{pw}'")
+        su.execute("INSERT INTO devices (id, code, \"user\", name, public_key_spki, status, created_at) "
+                   "VALUES ('dev_alice', 'c-alice', 'us_alice', 'alice', 'spki', 'approved', 1.0)")
+    agent = make_conninfo(pg["su"], user="nokker_pay_agent", password=pw)
+    with psycopg.connect(agent, autocommit=True) as conn:
+        assert conn.execute('SELECT id, "user", public_key_spki, status FROM devices WHERE id = %s',
+                            ("dev_alice",)).fetchone() == ("dev_alice", "us_alice", "spki", "approved")
+        conn.execute("INSERT INTO pay_agent_events (id) VALUES ('evt_1')")
+        assert conn.execute("SELECT count(*) FROM pay_agent_events").fetchone()[0] == 1
+        for sql in ("SELECT code FROM devices", "SELECT * FROM devices",
+                    "UPDATE devices SET status = 'revoked' WHERE id = 'dev_alice'",
+                    "SELECT * FROM pay_mandates", "SELECT * FROM accounts", "SELECT * FROM sessions"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(sql)
+    with psycopg.connect(pg["app"], autocommit=True) as conn:
+        for t in ("pay_agent_methods", "pay_agent_tokens", "pay_agent_events"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(f"SELECT * FROM {t}")
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        attrs = su.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'nokker_pay_agent'").fetchone()
+    assert attrs == (False, False)

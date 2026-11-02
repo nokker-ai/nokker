@@ -372,7 +372,7 @@ class DirectCorthexisMemory:
                                "profile": os.environ.get("CORTHEXIS_MEMORY_PROFILE") or self.memory_profile}
         try:
             from corthexis import embed as cx_embed
-            from corthexis import service as cx_service
+            from corthexis import service as cx_service  # noqa: F401 — sonde de présence
         except Exception as e:  # noqa: BLE001
             out["error"] = f"paquet corthexis absent de l'image ({e})"
             return out

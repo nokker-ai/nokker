@@ -17,6 +17,9 @@ DEFAULT_CONFIG_PATH = os.environ.get("NOKKER_CONFIG", "/etc/nokker/config.yaml")
 PRODUCT_PREFIX_PATH = Path(__file__).parent / "prompts" / "prefix-nokker.md"
 
 
+_JUDGE_FALLBACK_WARNED: set[str] = set()  # modèles déjà signalés (un WARNING par modèle et par processus)
+
+
 @dataclass
 class TierConfig:
     base_url: str
@@ -180,6 +183,9 @@ class NokkerConfig:
     # `qa.calibrate.DEFAULT_THRESHOLDS`, 0,3/0,7).
     judge: TierConfig = field(default_factory=lambda: TierConfig(base_url="https://router.sokkan.ch/v1",
                                                                   model="qwen/qwen3.8-27b"))
+    # Vrai : refuse de démarrer si le juge, le relecteur de cartes (`auto_review`, tier judge) ou un correcteur
+    # (`outcomes_grader: judge`) est allumé sans bloc `judge:` explicite (sinon repli silencieux sur le palier Ship).
+    judge_require_explicit: bool = False
     judge_explicit: bool = False  # posé par `load_config` quand le YAML porte `judge:` (sinon `judge_config()` = Ship)
     judge_thresholds_path: str | None = None
     # ─────────────────────── X8 : juge allumé, multi-modèle (docs/LOKKAL.md §7.17) ───────────────────────
@@ -224,6 +230,12 @@ class NokkerConfig:
     # Fork de sous-agent (veille 01.11 §3.1, `nokker/context/fork.py`) : `delegate(fork=true)` part du contexte exact du
     # dernier appel du parent (même préfixe, cache réutilisé). Défaut false : schéma de `delegate` et noyau inchangés.
     delegate_fork: bool = False
+    # Palier du sous-agent : `delegate(tier=ship|deep)`. Défaut false : schéma et description de `delegate` inchangés ;
+    # un enfant ne dépasse jamais les droits du parent (deep refusé à un compte sans deep).
+    delegate_tier: bool = False
+    # Locataires (ids, ex. `tn_nina`) à qui `delegate` est offert en conversation (hors sessions de code, Lokkal et
+    # CLI qui l'ont déjà). Vide par défaut : rien n'est ouvert.
+    delegate_tenants: list[str] = field(default_factory=list)
 
     # ─────────────────────── P1 : approbations fortes (docs/APPROVALS.md) ───────────────────────
     # Doctrine produit (17.10) : jamais d'action à effet HITL exécutée sans preuve — donc câblé par défaut
@@ -371,6 +383,14 @@ class NokkerConfig:
     # mandate_ttl_s: 86400, timezone: Europe/Zurich, handoff: true}
     payments: bool = False
     payments_settings: dict[str, Any] | None = None
+    # Agent de paiement (docs/PAY-AGENT.md, service SÉPARÉ `python -m payagent`) : avec `payments` allumé, un mandat
+    # signé peut confier le paiement à l'agent (Stripe Shared Payment Tokens) quand le vendeur a un profil Stripe connu
+    # et que l'approbateur a enregistré un moyen de paiement ; sinon la personne paie elle-même, comme sans ce drapeau.
+    # Éteint par défaut : aucune route /v1/payments/method*, description de `pay_request` et mandats inchangés.
+    # pay_agent_settings : {url: http://pay-agent:8790, publishable_key: pk_…, sellers: {shop.example.ch: profile_…}}
+    # Secrets hors YAML : NOKKER_PAY_AGENT_TOKEN, NOKKER_PAY_AGENT_CALLBACK_SECRET.
+    pay_agent: bool = False
+    pay_agent_settings: dict[str, Any] | None = None
     # Salle Maison (chantier p2/house-room, docs/HOUSE-ROOM.md, nokker/house/) : une salle persistante par foyer, où les
     # membres parlent aux agents de la maison (intendant par défaut, @mention pour un agent) avec les droits de CHAQUE
     # membre ; outil `ask_house` dans les sessions des membres. Demande `household`. Éteint par défaut : aucune route
@@ -598,6 +618,36 @@ class NokkerConfig:
             return self.judge
         return self.tiers.get("ship") or next(iter(self.tiers.values()), None) or self.judge
 
+    def judge_is_explicit(self) -> bool:
+        return bool(self.judge_explicit or self.judge != TierConfig(base_url="https://router.sokkan.ch/v1",
+                                                                     model="qwen/qwen3.8-27b"))
+
+    def judge_consumers(self) -> list[str]:
+        """Fonctions allumées qui s'appuient sur `judge_config()` (donc sur Ship si `judge:` n'est pas posé)."""
+        out = [n for n in ("judge_enabled", "judge_review", "judge_advice") if getattr(self, n, False)]
+        ar = self.auto_review if isinstance(self.auto_review, dict) else {}
+        if ar.get("enabled") and str(ar.get("tier") or "judge") == "judge":
+            out.append("auto_review")
+        if (self.outcomes_enabled or self.goals_enabled) and str(self.outcomes_grader or "judge") == "judge":
+            out.append("outcomes_grader")
+        return out
+
+    def check_judge_explicit(self) -> None:
+        """Au démarrage : un juge qui retombe sur Ship est dit (WARNING, une fois par modèle) ou, avec
+        `judge_require_explicit`, refusé."""
+        users = self.judge_consumers()
+        if not users or self.judge_is_explicit():
+            return
+        model = self.judge_config().model
+        if self.judge_require_explicit:
+            raise ValueError(f"judge_require_explicit : {', '.join(users)} allumé sans bloc `judge:` explicite "
+                             f"(il retomberait sur le palier Ship, {model}) ; poser `judge:` dans la config")
+        if model not in _JUDGE_FALLBACK_WARNED:
+            _JUDGE_FALLBACK_WARNED.add(model)
+            logging.getLogger("nokker.config").warning(
+                "`judge:` n'est pas posé : %s retombe sur le palier Ship, modèle retenu %s ; poser `judge:` "
+                "(ou judge_require_explicit: true pour refuser ce repli)", ", ".join(users), model)
+
     def go_senders(self) -> frozenset[str]:
         from nokker.qa.invariants import GoAuthorizedSenders
 
@@ -636,7 +686,9 @@ def load_config(path: str | None = None) -> NokkerConfig:
     judge_raw = raw.get("judge")
     judge = TierConfig(base_url=judge_raw["base_url"], model=judge_raw["model"],
                        api_key_env=judge_raw.get("api_key_env", "ROUTER_KEY"),
-                       reasoning_off_body=judge_raw.get("reasoning_off_body")) if judge_raw else None
+                       reasoning_off_body=judge_raw.get("reasoning_off_body"),
+                       fallback_model=judge_raw.get("fallback_model", ""),
+                       hedge_after_s=float(judge_raw.get("hedge_after_s", 8.0))) if judge_raw else None
     kwargs: dict[str, Any] = {k: v for k, v in raw.items() if k not in ("tiers", "api_keys", "judge")}
     if tiers:
         kwargs["tiers"] = tiers

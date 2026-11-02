@@ -54,7 +54,6 @@ EXCLUDED_RULES = frozenset({
     "effect:destructive", "effect:destructive:unauthorized_sender",
     "effect:send_external", "effect:send_bulk", "effect:spend",
     "pages:publish",                       # sortie vers le public
-    "payments:to_pay",                     # arrêt au paiement : carte forte, la personne décide
     "household:guardian",                  # profil mineur : son représentant décide
     "permissions:relayed_connector",       # connecteur d'un compte nokker.ai
     "permissions:relayed_strong",          # tour venu du web
@@ -67,6 +66,7 @@ EXCLUDED_RULES = frozenset({
     "learning:card",                       # skill appris (skill_create|update|revert) : escalade par règle, jamais seul
     "family:calendar",                     # calendrier familial : la relecture des lignes extraites EST la carte
     "provenance:envoi", "provenance:exec", "provenance:recherche",  # valeur lue dans une source non fiable : l humain seul
+    "payments:to_pay",                     # carte « à payer » (et paiement par l'agent de paiement) : passkey seule
 })
 EXCLUDED_RULE_PREFIXES = ("ops:prod",)  # `ops:prod` et `ops:prod:*`
 EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_bulk_email", "agent_arm",

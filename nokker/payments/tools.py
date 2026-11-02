@@ -17,7 +17,7 @@ from typing import Any
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.payments.detect import checkout_page, refs_of
-from nokker.payments.mandate import format_minor
+from nokker.payments.mandate import agent_pay_of, format_minor
 from nokker.payments.service import PAY_TOOL, Payments
 from nokker.qa.untrusted import fence, inline
 
@@ -64,7 +64,10 @@ class PayTools:
     source_name: str = "builtin:payments"
 
     def specs(self) -> list[ToolSpec]:
-        return [ToolSpec(name=PAY_TOOL, description=PAY_DESCRIPTION, parameters=PAY_PARAMETERS, effect=Effect.SPEND,
+        desc = PAY_DESCRIPTION
+        if self.payments.agent is not None:  # drapeau `pay_agent` : texte nouveau, sinon octet pour octet l'ancien
+            from nokker.payments.agent import PAY_DESCRIPTION_AGENT as desc
+        return [ToolSpec(name=PAY_TOOL, description=desc, parameters=PAY_PARAMETERS, effect=Effect.SPEND,
                          source=self.source_name)]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -76,10 +79,34 @@ class PayTools:
         source = (rec.mandate.get("cart") or {}).get("source") or "browser"
         how = HOW.get(source, HOW["browser_nohandoff"])
         amount = format_minor(rec.amount_minor, rec.currency)
+        if self.payments.agent is not None and agent_pay_of(rec.mandate) is not None:
+            return self._agent_pays(name, rec, amount, ctx)
         if source == "browser" and not (self.payments.settings.handoff and self._handoff(ctx, amount, rec)):
             how = HOW["browser_nohandoff"]
         return ToolResult(call_id="", name=name, content=DONE_TEXT.format(
             mid=rec.id, amount=amount, merchant=rec.merchant, until=rec.mandate.get("valid_until"), how=how))
+
+    def _agent_pays(self, name: str, rec: Any, amount: str, ctx: ToolContext) -> ToolResult:
+        """Mandat qui confie le paiement à l'agent de paiement (drapeau `pay_agent`). Le résultat ne dit jamais
+        « payé » : l'agent émet un jeton borné, la remise au vendeur n'est pas faite par ce lot."""
+        from nokker.payments.agent import (AGENT_ACTION_TEXT, AGENT_FAILED_TEXT, AGENT_FAILED_WHY,
+                                           AGENT_ISSUED_TEXT)
+
+        state, err = self.payments.agent_execute(rec)
+        # Le marchand vient d'une carte que le modèle a préparée depuis une page : une ligne, neutralisé, 60 car. au plus.
+        # `{why}` ne vient jamais de Stripe : libellé fixe d'AGENT_FAILED_WHY, choisi par le code d'erreur.
+        from nokker.payments.agent import MERCHANT_MAX
+
+        merchant = inline(rec.merchant, MERCHANT_MAX)
+        fields = {"mid": rec.id, "amount": amount, "merchant": merchant, "until": rec.mandate.get("valid_until")}
+        if state is not None and state.get("status") in ("active", "requires_action"):
+            text = AGENT_ACTION_TEXT if state["status"] == "requires_action" else AGENT_ISSUED_TEXT
+            return ToolResult(call_id="", name=name, content=text.format(**fields))
+        how = HOW["browser_nohandoff"]
+        if self.payments.settings.handoff and self._handoff(ctx, amount, rec):
+            how = HOW["browser"]
+        why = AGENT_FAILED_WHY.get(err or "", AGENT_FAILED_WHY["unreachable"])
+        return ToolResult(call_id="", name=name, content=AGENT_FAILED_TEXT.format(mid=rec.id, why=why, how=how))
 
     @staticmethod
     def _handoff(ctx: ToolContext, amount: str, rec: Any) -> bool:

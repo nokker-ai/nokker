@@ -292,6 +292,17 @@ class TenantLimits:
         (day, _), _ = self._keys()
         return self.counter.take(tid, sender or "", day.date(), "deep", self.deep_per_day)
 
+    def deep_available(self, sender: str | None) -> bool:
+        """Le compte courant peut-il encore appeler Deep aujourd'hui ? Lecture seule : ne compte rien."""
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.deep_available(sender)
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT:
+            return True
+        (day, _), _ = self._keys()
+        return self.deep_per_day > 0 and self.counter.read(tid, sender or "", day.date(), "deep") < self.deep_per_day
+
     # ── lecture (GET /v1/account/usage, docs/CLIENT-API.md) ───────────────────────────────────────────────────────
     def usage(self, sender: str) -> dict[str, Any]:
         tid = current_tenant()

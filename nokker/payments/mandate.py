@@ -35,6 +35,10 @@ from urllib.parse import urlsplit
 FORMAT = "nokker.mandate.v1"
 AP2_VCT = "mandate.payment.open.1"  # vct d'un Open Payment Mandate AP2 v0.2
 SOURCES = ("browser", "qr_bill", "pain001")
+# Paiement par l'agent de paiement (drapeau `pay_agent`, docs/PAY-AGENT.md) : seul rail accepté dans un mandat.
+AGENT_PAY_VIA = "stripe_spt"
+AGENT_PAY_EXECUTOR = "nokker-pay-agent"
+_PROFILE = re.compile(r"^profile_[A-Za-z0-9_]{6,120}$")
 # Devises à 0 décimale (ISO 4217) parmi celles qu'un foyer CH/UE croise ; toutes les autres : 2.
 _ZERO_DECIMALS = {"JPY", "KRW", "ISK", "CLP", "VND"}
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
@@ -175,13 +179,38 @@ def principal_handle(mandate_id: str, account: str | None) -> str | None:
     return "pr_" + hashlib.sha256(f"{mandate_id}\x00{account}".encode()).hexdigest()[:16]
 
 
+def agent_pay_block(seller_profile: str) -> dict[str, Any]:
+    """Bloc `agent_pay` d'un mandat payé par l'agent de paiement : rail, exécutant et profil Stripe du vendeur.
+    Lève `MandateError` si le profil n'a pas la forme d'un profil Stripe."""
+    if not isinstance(seller_profile, str) or not _PROFILE.match(seller_profile):
+        raise MandateError("profil Stripe du vendeur illisible")
+    return {"via": AGENT_PAY_VIA, "executor": AGENT_PAY_EXECUTOR, "seller_profile": seller_profile}
+
+
+def agent_pay_of(mandate: dict[str, Any]) -> dict[str, Any] | None:
+    """Le bloc `agent_pay` d'un mandat s'il est bien formé et cohérent (`human_pays` faux), sinon None."""
+    block = mandate.get("agent_pay") if isinstance(mandate, dict) else None
+    if not isinstance(block, dict) or mandate.get("human_pays") is not False:
+        return None
+    if block.get("via") != AGENT_PAY_VIA or block.get("executor") != AGENT_PAY_EXECUTOR:
+        return None
+    if not isinstance(block.get("seller_profile"), str) or not _PROFILE.match(block["seller_profile"]):
+        return None
+    return block
+
+
 def build_mandate(cart: Cart, *, mandate_id: str, approval_id: str, args_sha256: str,
-                  account: str | None, approver: str | None, created_at: float, valid_until: float) -> dict[str, Any]:
+                  account: str | None, approver: str | None, created_at: float, valid_until: float,
+                  agent_pay: dict[str, Any] | None = None) -> dict[str, Any]:
     """Le mandat (non signé). Tout ce qu'il contient est couvert par la signature de la passkey. Ni locataire ni
-    identifiant de compte : `principal` porte des identifiants opaques (`principal_handle`)."""
+    identifiant de compte : `principal` porte des identifiants opaques (`principal_handle`).
+
+    `agent_pay` (drapeau `pay_agent`, bloc de `agent_pay_block`) : l'agent de paiement paie avec le moyen enregistré
+    de la personne ; `human_pays` devient faux. Sans lui, le mandat est identique à l'octet près à celui du lot
+    p2/pay-mandates."""
     iat, exp = int(created_at), int(valid_until)
     payee = {"id": merchant_id(cart), "name": cart.merchant, **({"website": cart.url} if cart.url else {})}
-    return {
+    out = {
         "format": FORMAT,
         "mandate_id": mandate_id,
         "approval_id": approval_id,
@@ -212,6 +241,10 @@ def build_mandate(cart: Cart, *, mandate_id: str, approval_id: str, args_sha256:
             "exp": exp,
         },
     }
+    if agent_pay is not None:
+        out["human_pays"] = False  # l'agent de paiement paie, dans les limites de ce mandat
+        out["agent_pay"] = dict(agent_pay)
+    return out
 
 
 def mandate_sha256(mandate: dict[str, Any]) -> str:
@@ -268,7 +301,9 @@ def verify_envelope(env: Any, *, now: float | None = None, trusted_spki: str | N
                 and (cons.get("payment.amount_range") or {}).get("currency") == cart.currency
                 and (cons.get("payment.reference") or {}).get("conditional_transaction_id") == m.get("cart_sha256")
                 and (m.get("merchant") or {}).get("name") == cart.merchant
-                and ap2.get("payee") == m.get("merchant") and ap2.get("vct") == AP2_VCT)
+                and ap2.get("payee") == m.get("merchant") and ap2.get("vct") == AP2_VCT
+                and ((m.get("human_pays") is True and "agent_pay" not in m)
+                     or (m.get("human_pays") is False and agent_pay_of(m) is not None)))
     if not coherent:
         return fail("coherence", "montant, devise, marchand ou référence ne correspondent pas au panier")
     c["coherence"] = True
@@ -300,7 +335,7 @@ def verify_envelope(env: Any, *, now: float | None = None, trusted_spki: str | N
     return out
 
 
-__all__ = ["AP2_VCT", "FORMAT", "SOURCES", "Cart", "MandateError", "Verification", "build_mandate", "canonical_json",
+__all__ = ["AGENT_PAY_EXECUTOR", "AGENT_PAY_VIA", "AP2_VCT", "FORMAT", "agent_pay_block", "agent_pay_of", "SOURCES", "Cart", "MandateError", "Verification", "build_mandate", "canonical_json",
            "principal_handle",
            "format_minor", "mandate_sha256", "merchant_id", "new_mandate_id", "parse_cart", "sha256_hex", "to_minor",
            "verify_envelope"]

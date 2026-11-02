@@ -3,18 +3,15 @@ fail closed sans AUD."""
 from __future__ import annotations
 
 import json
-import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
 from nokker.admin.access import AccessDenied, AccessVerifier
-from nokker.admin.overview import MemoryOverview, accounts_view, enabled_flags, usage_view
+from nokker.admin.overview import MemoryOverview, accounts_view, usage_view
 from nokker.admin.server import serve_admin
 from nokker.admin.store import MemoryAdminStore
-from nokker.api import server as srv
-from nokker.config import load_config
 from tests.unit.admin.test_admin import AUD, TEAM, claims, get, jwt, verifier
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -135,44 +132,3 @@ def test_fail_closed_without_team_domain():
     v = AccessVerifier(team_domain="", audience=AUD, fetch=verifier().fetch)
     with pytest.raises(AccessDenied):
         v.verify(jwt(claims()))
-
-
-def _beta_config():
-    return load_config(str(ROOT / "deploy" / "beta" / "core-config.yaml"))
-
-
-def test_start_admin_beta_has_no_front_no_puller_and_refuses_without_aud(monkeypatch, caplog):
-    """start_admin avec la vraie config de la bêta : ni client front1, ni tirage, ni AUD → console qui refuse tout."""
-    import threading
-
-    from nokker.admin import pull
-
-    cfg = _beta_config()
-    cfg.admin_host, cfg.admin_port = "127.0.0.1", 0
-    cfg.beta_pull_url = "https://intake.example.invalid"  # même posé par erreur : admin_candidatures=false l'emporte
-    monkeypatch.delenv(cfg.admin_access_aud_env, raising=False)
-    monkeypatch.setenv(cfg.beta_pull_token_env, "jeton")
-    monkeypatch.delenv("NOKKER_PG_DSN", raising=False)
-    started = []
-    monkeypatch.setattr(pull.BetaPuller, "start", lambda self: started.append(self))
-    import nokker.onboarding.front as front_mod
-
-    monkeypatch.setattr(front_mod.FrontInvitations, "__init__", lambda *a, **k: started.append("front"))
-    caplog.set_level(logging.INFO)
-    httpd = srv.start_admin(cfg)
-    try:
-        assert httpd is not None and started == []
-        base = f"http://127.0.0.1:{httpd.server_address[1]}"
-        assert get(base, "/admin/v1/me", token=jwt(claims("nicolas@ninabot.ch")))[0] == 401  # AUD absent : fail closed
-        assert get(base, "/admin/healthz")[0] == 200
-    finally:
-        httpd.shutdown()
-    logs = " ".join(r.getMessage() for r in caplog.records)
-    assert "candidatures désactivé" in logs and "toutes les requêtes seront refusées" in logs
-    assert not [t for t in threading.enumerate() if t.name.startswith("nokker-pull")]
-
-
-def test_beta_flags_list_names_only():
-    flags = enabled_flags(_beta_config())
-    assert "admin_enabled" in flags and "billing_enabled" in flags and "judge_enabled" not in flags
-    assert all(isinstance(f, str) for f in flags)

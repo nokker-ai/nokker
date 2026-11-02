@@ -8,8 +8,8 @@ from typing import Any
 # Drapeaux booléens de premier niveau (nom = clé de `NokkerConfig`).
 BOOL_FLAGS = (
     "steer_enabled", "text_attachments_enabled", "judge_enabled", "judge_review", "judge_advice", "outcomes_enabled",
-    "goals_enabled", "delegate_fork", "context_enabled", "execute_code_enabled", "memory_search_api", "mcp_modern",
-    "mcp_apps", "team", "household", "household_minors", "household_paper", "family_calendar", "payments",
+    "goals_enabled", "delegate_fork", "delegate_tier", "context_enabled", "execute_code_enabled", "memory_search_api", "mcp_modern",
+    "mcp_apps", "team", "household", "household_minors", "household_paper", "family_calendar", "payments", "pay_agent",
     "house_room", "show_me", "who_does_what", "sso", "packs_web", "learning", "learning_nudges", "memory_pending",
     "tenant_long_memory", "self_improve", "memory_consolidation", "plan", "operate", "traces_record", "billing_enabled",
 )

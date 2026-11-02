@@ -149,6 +149,7 @@ def session_block(kind: str, room_label: str, speaker: str | None = None, means:
             f"Déclencheur : {TRIGGER_TEXT.get(kind, 'déclencheur physique')}\n"
             f"Pièce : {clean_label(room_label)}\n"
             + who +
+            "Langue : celle de la personne qui parle (pas celle de ce bloc).\n"
             "Sortie : voix dans la pièce. Réponds en une phrase courte, à l'oral, sans mise en forme, ni liste, ni lien : "
             "la personne va parler.\n"
             "[/Session vocale]")

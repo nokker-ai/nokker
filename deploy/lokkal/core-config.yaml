@@ -40,6 +40,7 @@ judge_enabled: false                 # portes action/bascule du juge (couche 2) 
 judge_review: true                   # le juge relit le diff du tour avant « terminé » (renvoi à l'auteur, 1 fois)
 show_me: true                       # outil point_at, bulle pointer (web Lokkal compilé avec VITE_NOKKER_SHOW_ME=1)
 guide: true                          # sur-agent Guide (docs/GUIDE.md), palier small par défaut, repli ship
+judge_require_explicit: true         # démarrage refusé si juge/relecteur/correcteur allumé sans `judge:` (pas de repli silencieux sur Ship)
 judge_review_rounds: 1
 judge_advice: true                   # avis court + niveau de risque sur les cartes fortes (format de X10)
 judge:                               # D1 (25.10) : 397B, raisonnement coupé (reasoning_effort: none, défaut)
