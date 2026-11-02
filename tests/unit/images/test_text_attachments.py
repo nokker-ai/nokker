@@ -290,3 +290,15 @@ def test_config_flag_defaults_off():
     from nokker.config import NokkerConfig
 
     assert NokkerConfig().text_attachments_enabled is False
+
+
+def test_web_notice_precedes_only_a_web_page_never_a_file_or_a_folder():
+    """UNTRUSTED_NOTICE (« Contenu récupéré sur le web… ») ne précède que [Page web] ; un [Fichier] ou un [Dossier]
+    joint n'en porte aucune (ni celle-ci : elle serait fausse pour un fichier local)."""
+    f = att.TextAttachment(kind="text", name="f.py", body="def f():\n    return 1", note="21 caractères")
+    d = att.TextAttachment(kind="dir", name="a", body="├── x.py", note="profondeur 1")
+    u = att.TextAttachment(kind="url", name="https://exemple.ch/p", body="texte de la page", note="16 caractères")
+    assert "Contenu récupéré" not in render_block([f]) and "untrusted-data" not in render_block([f])
+    assert "Contenu récupéré" not in render_block([d]) and "untrusted-data" not in render_block([d])
+    assert render_block([u]).count(UNTRUSTED_NOTICE) == 1
+    assert render_block([f, d, u]).count(UNTRUSTED_NOTICE) == 1  # une seule fois, pour la page web

@@ -12,7 +12,7 @@
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; }
-header b { font-size:15px; } header .me { margin-left:auto; color:var(--mute); font-size:12px; }
+header b { font-size:15px; } header nav { display:flex; gap:12px; flex-wrap:wrap; } header nav .off { color:var(--mute); font-size:12px; } header .me { margin-left:auto; color:var(--mute); font-size:12px; }
 main { padding:12px 16px; max-width:1200px; margin:0 auto; }
 .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
 .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
@@ -33,7 +33,7 @@ td.task { color:var(--mute); max-width:420px; }
 </style>
 </head>
 <body>
-<header><b>Nokker · console</b><a href="#/">Candidatures</a><span class="me" id="me"></span></header>
+<header><b>Nokker · console</b><nav id="nav"></nav><span class="me" id="me"></span></header>
 <main id="view"></main>
 <script>
 "use strict";
@@ -52,7 +52,7 @@ async function api(path, opts = {}) {
   }
   return r.json();
 }
-let ME = { role: "" };
+let ME = { role: "", candidatures: true, candidatures_note: "" };
 const INVITE_ERRORS = {
   template_not_approved: "Le modèle de mail n'est pas encore approuvé (INVITE_TEMPLATE_SHA sur front1).",
   onboarding_url_missing: "ONBOARDING_URL manque sur front1.", send_failed: "L'envoi du mail a échoué.",
@@ -95,6 +95,54 @@ async function list() {
     $("th", { class: "hide-sm" }, "Statut"))), $("tbody", {}, ...rows));
   view.replaceChildren(head, $("div", { class: "bar" }, q, st), table,
     $("p", { class: "l" }, `${data.total} candidature(s)`));
+}
+
+const num = (v) => (v === null || v === undefined ? "∞" : String(v));
+function table(heads, rows) {
+  return $("table", {}, $("thead", {}, $("tr", {}, ...heads.map((h) => $("th", {}, h)))),
+    $("tbody", {}, ...rows.map((r) => $("tr", {}, ...r.map((c) => $("td", {}, c))))));
+}
+
+async function comptes() {
+  const d = await api("/admin/v1/accounts");
+  view.replaceChildren(
+    $("div", { class: "stats" }, $("div", { class: "card" }, $("div", { class: "n" }, String(d.total)), $("div", { class: "l" }, "comptes")),
+      $("div", { class: "card" }, $("div", { class: "l" }, "statut"), chips(d.by_status)),
+      $("div", { class: "card" }, $("div", { class: "l" }, "palier"), chips(d.by_plan))),
+    table(["Compte", "Locataire", "E-mail", "Langue", "Statut", "Palier", "Créé"],
+      d.items.map((a) => [a.id, a.tenant_id, a.email, a.lang, a.status === a.tenant_status ? a.status : `${a.status} / ${a.tenant_status}`,
+        a.plan || "bêta", day(a.created_at)])));
+}
+
+async function usage() {
+  const d = await api("/admin/v1/usage?days=14");
+  const lim = d.limits;
+  view.replaceChildren(
+    $("div", { class: "stats" },
+      $("div", { class: "card" }, $("div", { class: "n" }, String(d.totals.turns_today)), $("div", { class: "l" }, `tours aujourd'hui (${d.totals.accounts} comptes actifs)`)),
+      $("div", { class: "card" }, $("div", { class: "l" }, `tenant_limits (${d.mode})`),
+        chips({ "tours/jour": num(lim.turns_per_day), "tours/semaine": num(lim.turns_per_week), "plafond dur": num(lim.hard_turns_per_day), "Deep/jour": num(lim.deep_per_day) })),
+      $("div", { class: "card" }, $("div", { class: "l" }, "au-dessus du plafond"), chips({ jour: d.totals.over_day, semaine: d.totals.over_week }))),
+    $("h3", {}, `Comptes — jour ${d.day} (reprend ${day(d.resets_at)}), semaine du ${d.week_start}`),
+    table(["Compte", "Locataire", "Palier", "Tours jour", "Plafond", "Tours semaine", "Plafond", "Deep"],
+      d.items.map((i) => [i.account, i.tenant_id, i.plan || "bêta", String(i.turns_today) + (i.over_day ? " ⚠" : ""), num(i.cap_day),
+        String(i.turns_week) + (i.over_week ? " ⚠" : ""), num(i.cap_week), String(i.deep_today)])),
+    $("h3", {}, "Tours par jour"),
+    table(["Jour", "Tours", "Deep", "Comptes"], Object.entries(d.by_day).reverse().map(([k, v]) => [k, String(v.turns), String(v.deep), String(v.accounts)])));
+}
+
+async function drapeaux() {
+  const d = await api("/admin/v1/flags");
+  view.replaceChildren($("h3", {}, `Drapeaux allumés (${d.items.length})`), chips(Object.fromEntries(d.items.map((k) => [k, ""]))));
+}
+
+async function audit() {
+  const d = await api("/admin/v1/audit?limit=200");
+  view.replaceChildren(table(["Quand", "Opérateur", "Action", "Objet"], d.items.map((a) => [day(a.at), a.actor, a.action, a.object])));
+}
+
+function candidaturesOff() {
+  view.replaceChildren($("div", { class: "card" }, $("p", {}, ME.candidatures_note || "candidatures : console Suisse")));
 }
 
 async function fiche(id) {
@@ -150,14 +198,27 @@ async function inviteBox(a, box) {
   box.append($("div", { class: "bar" }, lang, show, send), preview);
 }
 
+const ROUTES = { "#/comptes": comptes, "#/usage": usage, "#/drapeaux": drapeaux, "#/audit": audit };
+
+function nav() {
+  const n = document.getElementById("nav");
+  const items = ME.candidatures ? [$("a", { href: "#/" }, "Candidatures")] : [$("span", { class: "off" }, ME.candidatures_note)];
+  if (ME.role !== "lecteur") items.push($("a", { href: "#/comptes" }, "Comptes"), $("a", { href: "#/usage" }, "Usage"), $("a", { href: "#/drapeaux" }, "Drapeaux"));
+  if (ME.role === "owner") items.push($("a", { href: "#/audit" }, "Audit"));
+  n.replaceChildren(...items);
+}
+
 async function render() {
   try {
     const m = location.hash.match(/^#\/a\/(\d+)$/);
-    await (m ? fiche(m[1]) : list());
+    const page = ROUTES[location.hash];
+    if (page) await page();
+    else if (!ME.candidatures) location.hash = "#/comptes";
+    else await (m ? fiche(m[1]) : list());
   } catch (e) { view.replaceChildren($("div", { class: "err" }, e.message)); }
 }
 window.addEventListener("hashchange", render);
-api("/admin/v1/me").then((me) => { ME = me; document.getElementById("me").textContent = `${me.email} · ${me.role}`; })
+api("/admin/v1/me").then((me) => { ME = me; nav(); document.getElementById("me").textContent = `${me.email} · ${me.role}`; })
   .catch(() => {}).finally(render);
 </script>
 </body>

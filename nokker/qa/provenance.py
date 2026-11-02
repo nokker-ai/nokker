@@ -76,11 +76,15 @@ _NETWORK_CMD = re.compile(r"(?i)\b(?:curl|wget|http|https?://|lynx|links|aria2c)
 SEND_TOOLS = frozenset({"mail_send"})
 FETCH_TOOLS = frozenset({"web_fetch", "browser_navigate"})
 EXEC_TOOLS = frozenset({"terminal", "process_start", "ssh_run"})
+SEARCH_TOOLS = frozenset({"web_search"})
+# Sources dont une valeur ne doit pas sortir dans la requête d'une recherche web : tout ce qui est lu, sauf ce que
+# l'utilisateur a écrit, la liste autorisée, la consigne d'un parent et le web lui-même (déjà public).
+_PUBLIC_SOURCES = frozenset({"utilisateur", "liste-autorisée", "délégation", "web"})
 RECIPIENT_KEYS = ("to", "cc", "bcc", "recipient", "recipients", "email", "address", "destinataire", "destinataires",
                   "attendees")
 
 # Une décision par famille : « carte » (HITL, carte forte) ou « refus » (DENY). Défauts du prototype.
-DEFAULT_DECISIONS = {"envoi": "carte", "fetch": "refus", "exec": "carte"}
+DEFAULT_DECISIONS = {"envoi": "carte", "fetch": "refus", "exec": "carte", "recherche": "carte"}
 
 # ─────────────────────────────── atomes ───────────────────────────────
 
@@ -343,6 +347,8 @@ class ProvenanceGuard:
             return "fetch"
         if name in EXEC_TOOLS:
             return "exec"
+        if name in SEARCH_TOOLS:
+            return "recherche"
         return None
 
     def check(self, call: Any, spec: Any, turn: Any) -> list[Verdict]:
@@ -363,6 +369,8 @@ class ProvenanceGuard:
             findings = self._check_send(args, segments)
         elif fam == "fetch":
             findings = self._check_fetch(args, segments)
+        elif fam == "recherche":
+            findings = self._check_search(args, segments)
         else:
             findings = self._check_exec(args, segments)
         if not findings:
@@ -442,6 +450,33 @@ class ProvenanceGuard:
                 out.append(Finding(arg="urls", kind="url", value=url, origins=[]))
         return out
 
+    def _check_search(self, args: dict[str, Any], segments: list[Segment]) -> list[Finding]:
+        """La requête d'une recherche web sort de la machine : un mot qu'on ne trouve QUE dans une source lue (mail,
+        mémoire, fichier, résultat d'outil), jamais dans une demande de l'utilisateur, est une valeur qui s'en va.
+        Limite : recopie littérale seulement (paraphrase, encodage, fragment passent)."""
+        query = norm(str(args.get("query", "") or ""))
+        words = [t for t in dict.fromkeys(_TOKEN.findall(query)) if t not in URL_WORDS]
+        said: set[str] = set()
+        for s in segments:
+            if s.trust is Trust.FIABLE:
+                said.update(_TOKEN.findall(s.text))
+        words = [t for t in words if t not in said]
+        if not words:
+            return []
+        bad: list[Segment] = []
+        taint: list[str] = []
+        for s in segments:
+            if s.source in _PUBLIC_SOURCES or s.trust is Trust.FIABLE:
+                continue
+            have = set(_TOKEN.findall(s.text))
+            hit = [t for t in words if t in have]
+            if hit:
+                bad.append(s)
+                taint.extend(t for t in hit if t not in taint)
+        if not bad:
+            return []
+        return [Finding(arg="query", kind="value", value=" ".join(taint), origins=bad)]
+
     def _check_exec(self, args: dict[str, Any], segments: list[Segment]) -> list[Finding]:
         out: list[Finding] = []
         command = norm(str(args.get("command", "") or ""))
@@ -512,11 +547,13 @@ RULE_SUBJECT = {
     "envoi": ("Un destinataire d'origine non fiable", "m"),
     "fetch": ("Une adresse web composée vers un hôte d'origine non fiable", "f"),
     "exec": ("Une commande dont un élément vient d'une source non fiable", "f"),
+    "recherche": ("Une requête de recherche web contenant une valeur lue ailleurs", "f"),
 }
 RULE_SUBJECT_STRICT = {
     "envoi": ("Un destinataire d'origine inconnue", "m"),
     "fetch": ("Une adresse web d'origine inconnue", "f"),
     "exec": ("Une commande vers un hôte d'origine inconnue", "f"),
+    "recherche": ("Une requête de recherche web d'origine inconnue", "f"),
 }
 TAIL = {"carte": " passe par une carte forte.", "refus": {"m": " est refusé.", "f": " est refusée."}}
 MAX_FINDINGS = 3

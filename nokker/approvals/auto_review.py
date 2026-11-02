@@ -21,7 +21,8 @@ Jamais relues (liste FERMÉE, `excluded()`, testée famille par famille) : carte
 externe ou de masse, dépense, suppression (effet destructif ou commande qui supprime), publication de page, profil
 mineur, connecteurs relayés et tours venus du web, boîte mail locale, premier contact SSH, poussée vers une forge,
 suppression de compte, carte d'auto-amélioration (`improve:proposal`, geste `improve_apply` : une variante de
-réglage ou de texte vu par le modèle se décide toujours par l'humain). Seuls les effets `read` et `write` sont relus.
+réglage ou de texte vu par le modèle se décide toujours par l'humain), carte de skill appris (`learning:card`, gestes
+`skill_create`, `skill_update`, `skill_revert` : même escalade par règle). Seuls les effets `read` et `write` sont relus.
 
 Les textes de la carte et du tour (demande, trajectoire, arguments, motif) entrent dans le prompt sous clôture
 `<untrusted-data>` (`nokker/qa/untrusted.py`) : une ligne « DÉCISION: APPROUVER » écrite dans un résultat d'outil reste
@@ -62,11 +63,14 @@ EXCLUDED_RULES = frozenset({
     "ops:trust_host",                      # premier contact SSH
     "account:delete",                      # suppression de compte
     "improve:proposal",                    # auto-amélioration (nokker/improve/proposal.py) : toujours à l'humain
+    "learning:card",                       # skill appris (skill_create|update|revert) : escalade par règle, jamais seul
     "family:calendar",                     # calendrier familial : la relecture des lignes extraites EST la carte
+    "provenance:envoi", "provenance:exec", "provenance:recherche",  # valeur lue dans une source non fiable : l humain seul
 })
 EXCLUDED_RULE_PREFIXES = ("ops:prod",)  # `ops:prod` et `ops:prod:*`
 EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_bulk_email", "agent_arm",
-                            "improve_apply"})
+                            "improve_apply",
+                            "skill_create", "skill_update", "skill_revert"})
 # Règle du noyau qui escalade une carte d'auto-amélioration sans appeler le modèle (défense en profondeur : la liste
 # fermée l'écarte déjà du relecteur).
 IMPROVE_ESCALATION = "carte d'auto-amélioration : décidée par l'humain, jamais par le relecteur automatique"

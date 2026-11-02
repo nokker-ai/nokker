@@ -531,3 +531,51 @@ def test_export_marks_kernel_replies_grader_and_goal_cmd(tmp_path):
     assert marked == [cmd.reply, chk.reply]  # repérées par le verdict de leur tour, pas par leur texte
     first = min(model_lines, key=lambda ln: ln["meta"]["turn"])
     assert [first["prompt"][i]["content"] for i in first["meta"]["synthetic_in_prompt"]] == [cmd.reply]
+
+
+# ───────────────────────────── meta.flags : drapeaux allumés (condition de l'équipe format) ─────────────────────────────
+
+
+def test_enabled_flags_is_the_sorted_list_of_lit_flags():
+    from nokker.traces.flags import enabled_flags
+
+    assert enabled_flags(NokkerConfig()) == []  # tout éteint par défaut : rien
+    cfg = NokkerConfig(traces_record=True, show_me=True, learning=True, payments=True, family_calendar=True,
+                       ssrf={"strict": True}, provenance={"enabled": True}, auto_review={"enabled": False},
+                       ambient={"glance": {"enabled": True}, "eink": {"enabled": False}},
+                       code={"enabled": True, "forge_triggers": False, "egress_secrets": {"enabled": False}},
+                       speak_lexicon={"enabled": True, "eighty": "huitante"})
+    got = enabled_flags(cfg)
+    assert got == sorted(got)
+    assert got == ["ambient.glance", "code", "family_calendar", "learning", "payments", "provenance", "show_me",
+                   "speak_lexicon", "ssrf.strict", "traces_record"]
+
+
+def test_every_recorded_line_and_every_exported_line_carries_meta_flags(tmp_path):
+    flags = ("family_calendar", "show_me", "traces_record")
+    rec = TraceRecorder(sink=MemoryTraceSink(), seal=None, kernel_sha="abc1234", target="canary", flags=flags)
+    run(list(THREE_CALLS), rec=rec)
+    assert [r["meta"]["flags"] for r in rec.sink.rows] == [list(flags)] * 3
+    lines = read_lines(export(source_from(rec.sink.rows), tmp_path, opts(), exporter_sha="abc1234").path)
+    assert [ln["meta"]["flags"] for ln in lines] == [list(flags)] * 3
+    # Lignes d'avant le champ : `null` à l'export, rien d'autre ne change.
+    old = [{**r, "meta": {k: v for k, v in r["meta"].items() if k != "flags"}} for r in rec.sink.rows]
+    lines = read_lines(export(source_from(old), tmp_path / "old", opts(), exporter_sha="abc1234").path)
+    assert [ln["meta"]["flags"] for ln in lines] == [None] * 3
+
+
+def test_build_recorder_records_the_flags_of_the_config(monkeypatch):
+    monkeypatch.setenv("NOKKER_PG_DSN", "postgresql://example.invalid/x")
+    on = build_recorder(NokkerConfig(traces_record=True, traces_target="beta", show_me=True))
+    assert on is not None and on.flags == ("show_me", "traces_record")
+
+
+def test_flags_do_not_change_what_the_model_sees():
+    off, on = recorder(), TraceRecorder(sink=MemoryTraceSink(), seal=None, kernel_sha="abc1234", target="canary",
+                                        flags=("show_me",))
+    _, p0, _ = run(list(THREE_CALLS), rec=off)
+    _, p1, _ = run(list(THREE_CALLS), rec=on)
+    assert p0.seen == p1.seen
+    strip = lambda rows: [{**r, "meta": {k: v for k, v in r["meta"].items() if k not in ("flags", "latency_s")},
+                           "recorded_at": ""} for r in rows]
+    assert strip(off.sink.rows) == strip(on.sink.rows)

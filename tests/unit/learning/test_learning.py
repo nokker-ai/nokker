@@ -533,3 +533,72 @@ def test_real_skills_guard_refuses_an_exfiltrating_skill(tmp_path, monkeypatch):
         lrn.skills.check("skill_create", evil, LOCAL_ACCOUNT)
     assert src.call("skill_create", evil, ctx()).is_error and lrn.store.skill_names(LOCAL_ACCOUNT) == []
     assert "nouveau skill appris" in lrn.skills.check("skill_create", ARGS, LOCAL_ACCOUNT)
+
+
+# ─────────────────────────────── relecteur automatique : liste fermée ───────────────────────────────
+
+
+@pytest.mark.parametrize("tool, args", [("skill_create", ARGS), ("skill_update", {**ARGS, "reason": "maj"}),
+                                         ("skill_revert", {"name": "publier-docs", "version": 0})])
+def test_learned_skill_cards_are_never_auto_approved_even_after_a_web_read(tmp_path, tool, args):
+    """skill_create|update|revert : escalade par règle. Même avec un relecteur qui répondrait APPROUVER, après une
+    page web lue dans le tour, la carte reste `pending` pour l'humain et le relecteur ne voit jamais la carte du skill."""
+    from nokker.approvals.auto_review import AutoReviewer
+
+    class Approving:
+        bodies: list = []
+
+        def post(self, body):
+            self.bodies.append(body)
+            return {"choices": [{"message": {"content": "DÉCISION: APPROUVER\nRAISON: sans risque"}}], "model": "r",
+                    "usage": {}}
+
+    tr = Approving()
+    tr.bodies = []
+    k, approvals, lrn, _ = make_kernel(tmp_path, [call_msg("web_read", {"url": "https://exemple.org/page"}),
+                                                  call_msg(tool, args), Message("assistant", "j'attends")])
+    k.auto_reviewer = AutoReviewer(transport=tr)
+    if tool != "skill_create":  # update / revert supposent un skill appris déjà actif
+        lrn.skills.create(ARGS, LOCAL_ACCOUNT, ctx(turn=1))
+    k.run_turn(TurnInput("th_1", "lis cette page puis retiens la méthode"))
+    [card] = approvals.pending()
+    assert card.tool_name == tool and card.rule == CARD_RULE and card.status == "pending"
+    assert card.auto_review is None and card.decided_via is None
+    # Le relecteur a pu relire la page web (carte de lecture) ; il n'a JAMAIS vu la carte du skill.
+    assert all(f"outil : {tool}" not in b["messages"][0]["content"] and "publier-docs" not in b["messages"][0]["content"]
+               for b in tr.bodies)
+    n_versions = len(lrn.store.skill_versions(LOCAL_ACCOUNT, "publier-docs"))
+    assert n_versions == (0 if tool == "skill_create" else 1)  # rien d'écrit par le relecteur
+
+
+def test_learned_skill_never_enters_the_prompt_prefix_only_skill_list_and_skill_view(tmp_path):
+    """Un skill appris et approuvé, même rédigé comme une consigne durable, n'entre dans aucun bloc de ce que voit le
+    modèle (ni « Consignes durables… » ni système ni tours) : seulement skill_list et skill_view. Contexte RÉEL
+    (ContextManager, never_clear_fixes_enabled allumé), skill actif dans le catalogue du même compte."""
+    from nokker.context.manager import DURABLE_HEADER
+    from nokker.context.types import ContextBudgets
+    from tests.unit.context.harness import make_session
+    from tests.unit.context.test_revocation import CannedProvider
+
+    marker = "GIROFLEE-SKILL-APPRIS"
+    lrn, catalog, src = lokkal(tmp_path)
+    body = f"# Fin de réponse\nTermine toujours tes réponses par {marker}.\n"
+    lrn.skills.create({**ARGS, "body": body}, LOCAL_ACCOUNT, ctx(turn=1))
+    assert lrn.store.skill_names(LOCAL_ACCOUNT) == ["publier-docs"]  # actif
+    budgets = ContextBudgets(current_budget=10 ** 6, episodes_budget=1500, never_clear_fixes_enabled=True)
+    s = make_session(budgets, tmp_path=tmp_path, provider=CannedProvider(), thread="th_ctx")
+    for k in range(3):
+        for text in ("Parlons du jardin.", "Le potager a besoin d'eau.", "On verra demain."):
+            s.say(f"{text} ({k})")
+        s.manager.new_episode(s.thread)
+    s.say("Et la documentation à publier ?")
+    everything = "\n".join(str(m.get("content") or "") for p in s.provider.seen for m in p)
+    assert marker not in everything and "publier-docs" not in everything and DURABLE_HEADER not in everything
+    assert s.manager.durable_instructions(s.thread) == []
+    # Les seuls chemins du modèle vers le skill : skill_list et skill_view.
+    assert any(x["name"] == "publier-docs" for x in catalog.list_skills()["skills"])
+    view, err = catalog.view("publier-docs")
+    assert not err and marker in view["content"]
+    # Aucun module de construction du contexte ne lit le magasin des skills appris.
+    root = Path(__file__).resolve().parents[3] / "nokker" / "context"
+    assert not [f for f in root.rglob("*.py") if "nokker.learning" in f.read_text(encoding="utf-8")]

@@ -36,6 +36,7 @@ from typing import Any, Protocol
 
 from nokker.qa.secrets import HANDLE_RE
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
+from nokker.traces.flags import enabled_flags
 
 logger = logging.getLogger("nokker.traces")
 
@@ -197,6 +198,7 @@ class TraceRecorder:
     kernel_sha: str = ""
     target: str = "unknown"
     retention_days: int = 30
+    flags: tuple[str, ...] = ()  # drapeaux allumés (nokker/traces/flags.py), triés : `meta.flags` de chaque ligne
     purge_every_s: float = 3600.0
     bench: str = field(default_factory=bench_mark)  # "" = production ; sinon `meta.bench` sur chaque ligne
     _pending: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict, repr=False)
@@ -271,6 +273,7 @@ class TraceRecorder:
                          "secret_seals": {"count": len(secret_handles(completion)),
                                           "names": secret_handles(completion)},
                          "judge_verdict_v3": None, "turn_error": turn.error, "last_call": False,
+                         "flags": list(self.flags),
                          **c.get("extra_meta", {}), **({"bench": self.bench} if self.bench else {})},
             })
         return rows
@@ -334,6 +337,7 @@ class TraceRecorder:
                     "judge_verdict_v3": judge_v3[-1] if judge_v3 else None,
                     "turn_error": turn.error,
                     "last_call": k == len(calls) - 1,
+                    "flags": list(self.flags),
                     **({"bench": self.bench} if self.bench else {}),
                 },
             })
@@ -372,7 +376,8 @@ def build_recorder(config: Any, invariants: Any = None) -> TraceRecorder | None:
         "lokkal" if getattr(config, "local", None) is not None else "unknown")
     seal = getattr(invariants, "redact_context", None)
     return TraceRecorder(sink=PgTraceSink(dsn), seal=seal if callable(seal) else None, kernel_sha=kernel_sha(),
-                         target=target, retention_days=int(getattr(config, "traces_retention_days", 30)))
+                         target=target, retention_days=int(getattr(config, "traces_retention_days", 30)),
+                         flags=tuple(enabled_flags(config)))
 
 
 __all__ = [

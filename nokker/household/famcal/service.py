@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from nokker.household.famcal import ics as ics_mod
 from nokker.household.famcal import review as rv
 from nokker.household.famcal.store import DEFAULT_TZ, Draft, Settings
+from nokker.qa.untrusted import inline
 from nokker.tenancy.context import current_tenant
 
 logger = logging.getLogger("nokker.household.famcal")
@@ -38,6 +39,13 @@ logger = logging.getLogger("nokker.household.famcal")
 MAX_PEOPLE = 12
 MAX_DOC_CHARS = 60_000
 ACTIONS = ("reject", "restore", "keep", "update")
+
+
+
+def _origin_line(origin: str) -> str:
+    """Ligne d'origine écrite dans l'agenda : le libellé peut être le nom d'un fichier tiers, donc sur une ligne, sans
+    balise ni crochet, coupé (comme la carte, `review.MAX_SHOWN`). Relue plus tard par `calendar_events`."""
+    return f"Ajouté par Nokker (calendrier familial) depuis {inline(origin, rv.MAX_SHOWN)}."
 
 
 class FamcalError(ValueError):
@@ -256,7 +264,7 @@ class FamilyCalendar:
         if not ok:
             return {"written": 0, "not_written": not_written, "message": "aucune ligne valide : rien n'est écrit"}
         tzname = d.timezone or DEFAULT_TZ
-        origin = f"Ajouté par Nokker (calendrier familial) depuis {d.origin}."
+        origin = _origin_line(d.origin)
         src = self.writer()
         done: list[int] = []
         failed: list[int] = []
@@ -308,7 +316,7 @@ class FamilyCalendar:
         wanted = set(d.result["ics_lines"])
         lines = [x for x in self.lines(d) if x.index + 1 in wanted]
         return ics_mod.build(lines, tzname=d.timezone or DEFAULT_TZ,
-                             description=f"Ajouté par Nokker (calendrier familial) depuis {d.origin}.")
+                             description=_origin_line(d.origin))
 
     def drafts(self, status: str | None = "open") -> list[Draft]:
         return self.store.list(self.account(), status)

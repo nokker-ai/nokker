@@ -389,6 +389,12 @@ class NokkerConfig:
     # lecture seule et événements `presence.changed`. Aucun texte vu par le modèle. Éteint par défaut : aucune route,
     # aucun observateur sur le bus, rien ne change.
     who_does_what: bool = False
+    # Guide (docs/GUIDE.md, nokker/guide/) : sur-agent qui présente les fonctions allumées pour le compte, comment les
+    # activer, et propose la suivante d'après les compteurs d'usage (codes, jamais de contenu). Routes /v1/guide*,
+    # appel modèle sur le palier `guide_settings.tier` (défaut `small`, sinon Ship). N'active rien. Éteint : aucune
+    # route, aucun observateur, rien de vu par le modèle.
+    guide: bool = False
+    guide_settings: dict[str, Any] | None = None  # tier, max_tokens (400), max_asks_per_day (40)
     # SSO OIDC des équipes (docs/LOKKAL.md §7.24, nokker/sso/) : connexion par le fournisseur d'une organisation,
     # groupes → rôles des projets, « SSO obligatoire ». Demande `team`. Éteint par défaut : aucune route /v1/sso*,
     # /v1/auth/oidc/*, /v1/projects/{id}/sso, aucun contrôle de plus sur l'équipe.
@@ -479,6 +485,11 @@ class NokkerConfig:
     admin_access_aud_env: str = "NOKKER_ADMIN_ACCESS_AUD"
     admin_operators: dict[str, str] = field(default_factory=dict)
     admin_console_url: str = "https://admin.nokker.ai"
+    # Module candidatures / invitations de la console. Faux (bêta OVH) : aucun écran, aucun tirage, aucun appel vers
+    # intake/front1 (même si `beta_pull_url` est posé) ; la console renvoie vers la console suisse. Les candidatures ne
+    # quittent pas la Suisse (scope §16).
+    admin_candidatures: bool = True
+    admin_candidatures_console: str = "admin.nokker.ai"  # console qui porte les candidatures (affichée si désactivé)
     # Tirage des candidatures depuis nokker-beta-api (front1, routes /internal/* liées à une adresse privée). Vide = pas de
     # tirage. Notification Telegram de chaque nouvelle candidature aux `admin_notify_chat_ids` (bot : ci-dessous).
     beta_pull_url: str = ""

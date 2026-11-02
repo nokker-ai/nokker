@@ -114,6 +114,7 @@ from nokker.homewatch import http as home_watch_http
 from nokker.plan import http as plan_http
 from nokker.house import http as house_http
 from nokker.presence import http as presence_http
+from nokker.guide import http as guide_http
 from nokker.household import http as household_http
 from nokker.ambient import http as ambient_http
 from nokker.household.paper import http as paper_http
@@ -1164,6 +1165,85 @@ def configure_presence(config: NokkerConfig, kernel: Any, *, events: Any = None,
     return svc
 
 
+def configure_guide(config: NokkerConfig, kernel: Any, *, events: Any = None, tenancy: Any = None) -> Any:
+    """Guide (nokker/guide/, docs/GUIDE.md) : drapeau `guide`. Éteint : aucune route /v1/guide, aucun observateur sur
+    le bus, rien de vu par le modèle. Allumé : statuts des fonctions pour le compte, compteurs d'usage (par code),
+    questions au palier `guide_settings.tier` (défaut `small`, sinon Ship). Rien n'est ajouté au registre d'outils."""
+    if not config.guide:
+        guide_http.configure(None)
+        return None
+    from nokker.core.turn import LLMCall, Tier, Usage
+    from nokker.guide.service import AccountFacts, GuideService, prefix_sha
+    from nokker.guide.store import MemoryUsage, PgUsage
+    from nokker.guide.texts import GUIDE_SYSTEM
+
+    st = dict(config.guide_settings or {})
+    dsn = config.pg_dsn()
+    tier_name = str(st.get("tier") or "small")
+    t = config.tiers.get(tier_name) or config.tiers.get("ship") or next(iter(config.tiers.values()), None)
+    if tier_name not in config.tiers:
+        tier_name = "ship" if "ship" in config.tiers else next(iter(config.tiers), "ship")
+    transport = None
+    if t is not None:
+        extra = t.reasoning_off_body if t.reasoning_off_body is not None else {"reasoning_effort": "none"}
+        transport = HttpJudgeTransport(base_url=t.base_url, model=t.model, api_key=t.api_key(), extra_body=dict(extra),
+                                       top_logprobs=0, timeout_s=30.0,
+                                       known=getattr(getattr(kernel, "invariants", None), "known", None))
+    try:
+        tier = Tier(tier_name)
+    except ValueError:
+        tier = Tier.SHIP
+
+    def facts_of(sender: str | None) -> AccountFacts:
+        if not is_account(sender):
+            return AccountFacts()
+        house = household_http.service()
+        member = minor = False
+        if house is not None:
+            try:
+                member = house.membership(sender) is not None
+                minor = house.minor_state(sender) is not None
+            except Exception:  # noqa: BLE001 — un foyer illisible : profil seul
+                logger.warning("guide : foyer illisible", exc_info=True)
+        telegram = False
+        if tenancy is not None:
+            try:
+                telegram = bool(tenancy.identities_of(str(sender), "telegram"))
+            except Exception:  # noqa: BLE001
+                telegram = False
+        return AccountFacts(household=member, minor=minor, telegram=telegram)
+
+    seq = {"n": 0}
+
+    def on_call(tenant: str, model: str, usage: dict, latency: float) -> None:
+        ledger = getattr(kernel, "ledger", None)
+        if ledger is None:
+            return
+        seq["n"] += 1
+        u = Usage(prompt=int(usage.get("prompt_tokens") or 0), completion=int(usage.get("completion_tokens") or 0))
+        call = LLMCall(tier=tier, model=model, reasoning=False, prefix_sha256=prefix_sha(GUIDE_SYSTEM), layer_tokens={},
+                       usage=u, latency_s=latency, route_reason="guide : réponse du Guide")
+        ledger.record(scoped_thread_id(tenant, "guide"), seq["n"], call)
+
+    inv = getattr(kernel, "invariants", None)
+    svc = GuideService(config=config, usage=PgUsage(dsn) if dsn else MemoryUsage(), facts_of=facts_of,
+                       transport=transport, model_name=t.model if t is not None else "",
+                       max_tokens=max(100, int(st.get("max_tokens", 400))),
+                       max_asks_per_day=max(1, int(st.get("max_asks_per_day", 40))),
+                       scrub_in=(lambda s: inv.check_input(s).text) if inv is not None else (lambda s: s),
+                       scrub_out=inv.scrub_output if inv is not None else (lambda s: s), on_call=on_call)
+    if events is not None:
+        events.observers[:] = [o for o in events.observers if not getattr(o, "guide", False)]
+
+        def observe(event_type: str, data: dict) -> None:
+            svc.observe(event_type, data)
+
+        observe.guide = True  # type: ignore[attr-defined]
+        events.observers.append(observe)
+    guide_http.configure(svc)
+    return svc
+
+
 def configure_packs(config: NokkerConfig, kernel: Any, hub: Any, *, local: bool) -> None:
     """Packs d'agents chez nokker.ai (nokker/webpacks/, docs/LOKKAL.md §7.30) : drapeau `packs_web`, jamais dans Lokkal
     (qui a ses outils de packs locaux, lot X16). Allumé : routes /v1/packs* (session du compte) et outils `pack_*`,
@@ -1711,12 +1791,24 @@ def start_admin(config: NokkerConfig) -> Any:
             logger.warning("console opérateur : %s vide, toutes les requêtes seront refusées", config.admin_access_aud_env)
         token = os.environ.get(config.beta_pull_token_env, "")
         front = None
-        if config.beta_pull_url and token:
+        pull = bool(config.admin_candidatures and config.beta_pull_url)
+        if config.beta_pull_url and not config.admin_candidatures:
+            logger.warning("console opérateur : admin_candidatures est faux, beta_pull_url ignoré (aucun tirage)")
+        if not config.admin_candidatures:
+            logger.info("console opérateur : module candidatures désactivé (console Suisse : %s)",
+                        config.admin_candidatures_console)
+        if pull and token:
             from nokker.onboarding.front import FrontInvitations
 
             front = FrontInvitations(config.beta_pull_url, token)  # invitations : mêmes routes internes que le tirage
-        httpd = serve_admin(store, verifier, config.admin_host, config.admin_port, front)
-        if config.beta_pull_url and token:
+        from nokker.admin.overview import MemoryOverview, PgOverview, enabled_flags
+
+        httpd = serve_admin(store, verifier, config.admin_host, config.admin_port, front,
+                            overview=PgOverview(dsn) if dsn else MemoryOverview(),
+                            candidatures=config.admin_candidatures,
+                            candidatures_console=config.admin_candidatures_console, limits=config.tenant_limits,
+                            billing_plans=config.billing_plans, flags=enabled_flags(config))
+        if pull and token:
             bot = os.environ.get(config.admin_notify_token_env, "")
             notify = TelegramText(bot, config.admin_notify_ids()).send \
                 if bot and config.admin_notify_ids() else None
@@ -1725,7 +1817,7 @@ def start_admin(config: NokkerConfig) -> Any:
                                config.admin_notify_token_env)
             BetaPuller(store=store, base_url=config.beta_pull_url, token=token, send=notify,
                        console_url=config.admin_console_url, interval_s=config.beta_pull_interval_s).start()
-        elif config.beta_pull_url:
+        elif pull:
             logger.warning("tirage des candidatures : %s vide, tirage désactivé", config.beta_pull_token_env)
         return httpd
     except Exception:  # noqa: BLE001
@@ -3305,6 +3397,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if previews is not None and previews.handle_get(self, self.path):
                 return
 
+            if guide_http.enabled() and guide_http.is_guide_path(path):  # Guide (docs/GUIDE.md), drapeau `guide`
+                self._guide_route("GET", path, {})
+                return
+
             if hub is not None and (path.startswith(("/v1/threads", "/v1/bubbles")) or path == "/v1/notifications"
                                     or (path == "/v1/events" and approvals is None)):
                 self._bubbles_route("GET", path, {})
@@ -3594,6 +3690,18 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._bubbles_error(e)
             except ShareNotFound:
                 self._json(404, {"error": {"message": "partage inconnu"}})
+
+        def _guide_route(self, method: str, path: str, body: dict[str, Any]) -> None:
+            """`/v1/guide*` (docs/GUIDE.md) : toute identité vérifiée (compte, propriétaire Lokkal), dans son locataire."""
+            sender = self._resolve_identity(body)
+            if sender is None:
+                self._json(401, {"error": {"message": "unauthorized"}})
+                return
+            tid = self._tenant_for(sender)
+            if tid is None:
+                return
+            with tenant_scope(tid):
+                guide_http.handle(self, method, path, body, sender, tid)
 
         def _goal_route(self, method: str, tid: str, action: str | None, body: dict[str, Any], sender: str) -> None:
             """`GET|POST /v1/threads/{id}/goal[/stop|resume|freeze]` (docs/OUTCOMES-GOAL.md) : membres du fil
@@ -4208,6 +4316,9 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     if tenant is None:
                         return
                     self._json(*account_control(path.rsplit("/", 1)[1], tenant, sender))
+                    return
+                if guide_http.enabled() and guide_http.is_guide_path(path):  # Guide (docs/GUIDE.md), drapeau `guide`
+                    self._guide_route("POST", path, self._read_json_body())
                     return
                 if hub is not None and path.startswith(("/v1/threads", "/v1/bubbles")):
                     self._bubbles_route("POST", path, self._read_json_body())
@@ -5286,6 +5397,7 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         register_house_providers(home=home, home_watch=home_watch)  # agents de la salle Maison (si allumée)
         room = configure_house_room(config, kernel, events)  # après le foyer : portes des mineurs déjà posées
         configure_presence(config, kernel, events=events, hub=hub, approvals=approvals, agents=agents_hub, room=room)
+        configure_guide(config, kernel, events=events, tenancy=tenancy)
     configure_ambient(config, kernel)  # écrans e-ink et voix de la pièce : éteints par défaut
     if hub is not None:
         hub.agents_hub = agents_hub

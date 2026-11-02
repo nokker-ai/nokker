@@ -290,6 +290,10 @@ def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: boo
             except SessionMemoryEraseError as e:
                 raise EraseError(str(e)) from None
         if apply:
+            if "admin_audit" in cols:  # même transaction : pas d'effacement sans sa ligne d'audit (ni l'inverse)
+                conn.execute("INSERT INTO admin_audit (actor, action, object, after, reason) VALUES (%s,%s,%s,%s,%s)",
+                             ("system:erase", "account.erase", f"account:{acc}",
+                              json.dumps({"tenant_id": tenant, "deleted": report.deleted}), "nokker erase --apply"))
             conn.commit()
             report.applied = True
         else:

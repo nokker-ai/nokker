@@ -8,6 +8,13 @@ Routes (toutes sauf `/admin/healthz` exigent un jeton Cloudflare Access vérifi�
   GET /admin/v1/applications/<id>                        fiche (journalisée : application.view)
   GET /admin/v1/stats    compteurs (profils, langues, « nous a connus par », jours)
   GET /admin/v1/audit    journal (owner seulement)
+  GET /admin/v1/accounts comptes et locataires de la bêta, palier (owner/ops ; journalisé : accounts.list)
+  GET /admin/v1/usage?days=  tours par compte et par jour, plafonds effectifs (owner/ops ; journalisé : usage.list)
+  GET /admin/v1/flags    drapeaux allumés de la config (owner/ops)
+  GET /admin/v1/stats    sans module candidatures : agrégats de la bêta (comptes, tours du jour) au lieu des candidatures
+Module candidatures désactivé (`admin_candidatures: false`, bêta OVH) : /applications*, /invite* répondent 404
+`candidatures_disabled` ; aucune donnée de candidature ne transite par ce processus. Comptes et usage ne portent que des
+identifiants et des agrégats, jamais le contenu des conversations.
   GET  /admin/v1/applications/<id>/invitations          invitations de la candidature (front1)
   GET  /admin/v1/applications/<id>/invite/preview?lang=  aperçu du mail (front1, sans envoi)
   POST /admin/v1/applications/<id>/invite {lang}        ENVOI (ops/owner, en-tête X-Nokker-Console) ; audit après l'appel
@@ -25,6 +32,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from nokker.admin.access import AccessDenied, AccessVerifier
+from nokker.admin.overview import MAX_DAYS, Overview, accounts_view, now_utc, usage_view
 from nokker.admin.store import AdminStore
 
 logger = logging.getLogger("nokker.admin.server")
@@ -55,9 +63,15 @@ def _jsonable(obj: Any) -> Any:
     raise TypeError(type(obj).__name__)
 
 
-def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any = None) -> type[BaseHTTPRequestHandler]:
+def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any = None, *,
+                       overview: Overview | None = None, candidatures: bool = True,
+                       candidatures_console: str = "admin.nokker.ai", limits: dict[str, Any] | None = None,
+                       billing_plans: dict[str, dict[str, int]] | None = None,
+                       flags: list[str] | None = None) -> type[BaseHTTPRequestHandler]:
     """`front` : client des invitations de front1 (`nokker/onboarding/front.py::FrontInvitations`) ; None = pas
-    d'invitation depuis cette console."""
+    d'invitation depuis cette console. `candidatures=False` : module candidatures coupé (bêta OVH). `overview` : lecture
+    des comptes et de l'usage ; `flags` : drapeaux allumés (noms)."""
+    note = f"candidatures : console Suisse ({candidatures_console})"
     class AdminHandler(BaseHTTPRequestHandler):
         server_version = "nokker-admin/0"
 
@@ -124,7 +138,15 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
             qs = {k: v[-1] for k, v in parse_qs(url.query).items()}
             try:
                 if path == "/admin/v1/me":
-                    self._json(200, {"email": email, "role": role})
+                    self._json(200, {"email": email, "role": role, "candidatures": candidatures,
+                                     "candidatures_note": "" if candidatures else note})
+                elif path in ("/admin/v1/accounts", "/admin/v1/usage", "/admin/v1/flags"):
+                    self._beta_get(path, email, role, qs)
+                elif not candidatures and (path == "/admin/v1/applications" or _INVITE_RE.match(path)
+                                           or _APP_RE.match(path)):
+                    self._json(404, {"error": "candidatures_disabled", "detail": note})
+                elif path == "/admin/v1/stats" and not candidatures:
+                    self._beta_get(path, email, role, qs)
                 elif path == "/admin/v1/applications":
                     limit = max(1, min(500, int(qs.get("limit", 100))))
                     items, total = store.list_applications(statut=qs.get("statut", ""), q=qs.get("q", "")[:200],
@@ -152,6 +174,34 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
             except Exception:  # noqa: BLE001
                 logger.exception("console : %s en échec", path)
                 self._json(500, {"error": "internal"})
+
+        def _beta_get(self, path: str, email: str, role: str, qs: dict[str, str]) -> None:
+            """Comptes, usage, drapeaux, agrégats de la bêta : owner/ops, identifiants et agrégats seulement."""
+            if role not in WRITE_ROLES:
+                self._json(403, {"error": "role"})
+                return
+            if path == "/admin/v1/flags":
+                self._json(200, {"items": list(flags or [])})
+                return
+            if overview is None:
+                self._json(503, {"error": "overview_unconfigured"})
+                return
+            now = now_utc()
+            if path == "/admin/v1/accounts":
+                plans = overview.plans()
+                store.record(email, "accounts.list", "accounts")
+                self._json(200, accounts_view(overview.accounts(), plans, role))
+                return
+            days = max(1, min(MAX_DAYS, int(qs.get("days", 7))))
+            rows, plans = overview.usage_rows(days, now)
+            usage = usage_view(rows, plans, limits, billing_plans, now, days)
+            if path == "/admin/v1/usage":
+                store.record(email, "usage.list", "usage", {"days": days})
+                self._json(200, usage)
+                return
+            acc = accounts_view(overview.accounts(), plans, role)  # /stats sans candidatures
+            self._json(200, {"accounts": acc["total"], "by_status": acc["by_status"], "by_plan": acc["by_plan"],
+                             **usage["totals"], "by_day": usage["by_day"]})
 
         def _front_app(self, app_id: int, role: str) -> dict[str, Any] | None:
             """Candidature venue de front1, opérateur qui peut agir ; sinon répond et None."""
@@ -191,6 +241,9 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
             if not m or m.group(2) != "invite":
                 self._json(404, {"error": "not_found"})
                 return
+            if not candidatures:  # avant tout : pas d'appel vers front1, pas de lecture du corps
+                self._json(404, {"error": "candidatures_disabled", "detail": note})
+                return
             # Une page tierce ne peut pas poser cet en-tête sans pré-vol CORS, refusé : pas de requête forgée avec le
             # cookie Access de l'opérateur.
             if self.headers.get("X-Nokker-Console") != "1":
@@ -222,11 +275,12 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
     return AdminHandler
 
 
-def serve_admin(store: AdminStore, verifier: AccessVerifier, host: str, port: int, front: Any = None) -> ThreadingHTTPServer:
+def serve_admin(store: AdminStore, verifier: AccessVerifier, host: str, port: int, front: Any = None,
+                **settings: Any) -> ThreadingHTTPServer:
     """Démarre l'écouteur dans un thread (le processus principal garde l'API du noyau)."""
     import threading
 
-    httpd = ThreadingHTTPServer((host, port), make_admin_handler(store, verifier, front))
+    httpd = ThreadingHTTPServer((host, port), make_admin_handler(store, verifier, front, **settings))
     threading.Thread(target=httpd.serve_forever, name="nokker-admin", daemon=True).start()
     logger.info("console opérateur sur %s:%d", host, port)
     return httpd

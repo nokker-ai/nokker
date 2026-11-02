@@ -79,8 +79,10 @@ class AccessVerifier:
 
     def verify(self, token: str) -> dict[str, Any]:
         """Claims du jeton s'il est valide pour cette application ; `AccessDenied` sinon."""
-        if not self.audience:
+        if not self.audience:  # fail closed : sans AUD (variable absente ou vide), aucun jeton n'est accepté
             raise AccessDenied("audience Access non configurée")
+        if not self.team_domain:
+            raise AccessDenied("organisation Access non configurée")
         parts = (token or "").split(".")
         if len(parts) != 3:
             raise AccessDenied("jeton absent ou illisible")

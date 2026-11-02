@@ -329,8 +329,7 @@ def _kernel_surfaces(monkeypatch, show_me):
     config.prefix_path = str(root / "bench/conv/fixtures/prefix.md")
     config.previews_enabled = False
     config.admin_enabled = False
-    if show_me is not None:
-        config.show_me = show_me
+    config.show_me = bool(show_me)  # la config de la bêta l'allume : la base de comparaison est « éteint »
     hub = build_hub(config, EventBus())
     kernel = build_kernel(config, hub=hub)
 

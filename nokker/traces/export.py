@@ -19,6 +19,8 @@ d'une commande `/goal` (verdict `turn:synthetic` du tour, `nokker/goals/service.
 `meta.synthetic = "grader" | "goal_cmd"` (`null` sur une ligne d'appel modèle) ; et dans toute ligne,
 `meta.synthetic_in_prompt` liste les positions du prompt (messages `assistant` de l'historique) qui sont ces réponses
 du noyau, retrouvées par le verdict de leur tour (même fil, tour antérieur), jamais devinées d'après leur texte.
+`meta.flags` : liste triée des drapeaux de config allumés sur le noyau qui a produit la ligne (`nokker/traces/flags.py`) ; `null`
+sur une ligne enregistrée avant l'ajout du champ.
 
 Lot : `<out>/traces-<YYYYMMDD>-<n>/` avec `calls.jsonl` (ou `calls-00001.jsonl`… au-delà de `max_lines`),
 `manifest.json` et `SHA256SUMS` (format `sha256sum -c`).
@@ -388,6 +390,7 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
                 "judge_verdict_v3": meta.get("judge_verdict_v3"), "user_signal": signal, "training_ok": ok,
                 "reconstructed": reconstructed, "at": at.astimezone(timezone.utc).isoformat(),
                 "synthetic": synthetic, "synthetic_in_prompt": in_prompt,
+                "flags": sorted(meta["flags"]) if isinstance(meta.get("flags"), list) else None,  # lignes d'avant : null
                 "extra": {k: meta[k] for k in ("reasoning", "route_reason", "finish_reason", "turn_error", "last_call",
                                                "channel", "verdict_scope", "alignment", "shadow", "side",
                                                "advisor_tier", "advisor_model", "grader_tier", "grader_model")
