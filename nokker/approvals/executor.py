@@ -32,6 +32,7 @@ from typing import Any
 from nokker.approvals.crypto import args_sha256
 from nokker.account.delete import ACCOUNT_CHANNEL
 from nokker.core.loop import DIRECT_CHANNEL, Kernel
+from nokker.tools.mcp_apps import APP_CHANNEL
 from nokker.tenancy.context import tenant_of_thread, tenant_scope
 from nokker.core.ports import Approval, ToolContext
 from nokker.core.turn import Turn, TurnInput
@@ -170,12 +171,19 @@ class ApprovalExecutor:
             return None
 
         kernel = self._k(approval.thread_id)
-        spec = kernel.tools.spec(approval.tool_name)
+        app_server = None
+        if approval.channel == APP_CHANNEL and getattr(kernel, "mcp_apps", None) is not None:
+            # Carte d'un `tools/call` d'app MCP (docs/MCP-NEXT.md §4) : l'outil peut être réservé aux apps, donc absent
+            # du registre du modèle ; le registre des apps sait quel serveur le sert.
+            app_server = kernel.mcp_apps.server_of(approval.tool_name)
+        spec = (kernel.mcp_apps.spec(app_server, approval.tool_name) if app_server is not None
+                else kernel.tools.spec(approval.tool_name))
         ctx = ToolContext(thread_id=approval.thread_id, turn_index=approval.turn_index, channel=approval.channel,
                           sender=approval.decided_by, approval_id=approval.id, kernel=kernel)
         t0 = time.monotonic()
         try:
-            result = kernel.tools.call(approval.tool_name, approval.arguments, ctx)
+            result = (kernel.mcp_apps.call(app_server, approval.tool_name, approval.arguments, ctx)
+                      if app_server is not None else kernel.tools.call(approval.tool_name, approval.arguments, ctx))
             result = kernel.invariants.redact_result(result, spec)
         except Exception as e:  # noqa: BLE001 — un outil qui plante n'est pas un bug de l'exécuteur
             error = f"{type(e).__name__}: {e}"
@@ -203,6 +211,12 @@ class ApprovalExecutor:
                        ran: bool = False, ms: int | None = None) -> Turn | None:
         if approval.channel == ACCOUNT_CHANNEL:
             return None  # refus d'une carte de compte : rien à faire, aucun tour modèle
+        if approval.channel == APP_CHANNEL:
+            # Appel d'une app MCP : le résultat va au client (`tool.result` avec `approval_id`), jamais au modèle — ni
+            # note « hors tour », ni tour relancé.
+            if self.on_direct is not None:
+                self.on_direct(approval, content, is_error)
+            return None
         if approval.channel == DIRECT_CHANNEL:
             self.kernel.add_owner_note(approval.thread_id, "[hors tour] " + block)
             if self.on_direct is not None:

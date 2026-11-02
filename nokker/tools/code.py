@@ -345,6 +345,9 @@ class CodeToolSource:
     # Diagnostics de langage (lot 13, `local.lsp.enabled`) : le `nokker.tools.lsp.LspManager` de l'instance (plafonds
     # partagés entre fils), ou None = fonction absente (outil absent, résultats intacts).
     lsp: Any = None
+    # Injection des secrets à la sortie (docs/EGRESS-SECRETS.md) : variables ajoutées à l'environnement du bac à sable
+    # (URL du proxy avec le jeton de session, certificat de l'AC, noms disponibles). Vide = environnement d'origine.
+    sandbox_env: dict[str, str] = field(default_factory=dict)
     _spaces: dict[str, Workspace] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -447,8 +450,9 @@ class CodeToolSource:
             env, cwd = LocalEnvironment(cwd=self._base, timeout=120), self._base
         elif self.backend == "kubernetes":
             cwd = self.mount + ("/" + self.subdir if self.subdir else "")
+            extra = {"env": dict(self.sandbox_env)} if self.sandbox_env else {}
             env = self.env_factory(cfg=dict(self.k8s), cwd=cwd, sub_path=self.sub_path, labels=dict(self.labels),
-                                   timeout=120)
+                                   timeout=120, **extra)
         else:
             from tools.environments import docker as upstream_docker
             from tools.environments.docker import DockerEnvironment
@@ -472,7 +476,7 @@ class CodeToolSource:
                                     persistent_filesystem=False, persist_across_processes=False,
                                     # --user <uid:gid> du processus : les fichiers créés dans le dépôt appartiennent à
                                     # l'utilisateur, pas à root (compose : le noyau tourne sous l'uid de l'hôte).
-                                    run_as_host_user=True, env={"HOME": "/tmp"},
+                                    run_as_host_user=True, env={"HOME": "/tmp", **self.sandbox_env},
                                     extra_args=["--label", f"nokker.sandbox={safe}",
                                                 *(["--label", f"nokker.instance={self.instance}"]
                                                   if self.instance else []),

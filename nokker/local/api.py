@@ -17,6 +17,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -31,7 +32,7 @@ import httpx
 from nokker.local.setup import LocalLink, LocalSetup, LocalVault, VaultError
 from nokker.secrets.base import SecretsError
 from nokker.secrets.vault import Vault
-from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, CodeToolSource
+from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, WORKSPACE_MOUNT, CodeToolSource
 
 LOCAL_OWNER = "local-owner"
 logger = logging.getLogger("nokker.local.api")
@@ -116,6 +117,10 @@ class SessionCodeTools:
     # Diagnostics de langage (lot 13, `local.lsp.enabled`) : un `LspManager` pour toute l'instance (plafonds de
     # serveurs partagés entre fils) ; None = éteint.
     lsp: Any = None
+    # Injection des secrets à la sortie (`local.code.egress_secrets`, docs/EGRESS-SECRETS.md) : `EgressSecrets` et la
+    # portée `user` du coffre local ; None = éteint (environnement d'origine).
+    egress: Any = None
+    egress_provider: Any = None
     _by_thread: dict[str, CodeToolSource] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -123,9 +128,14 @@ class SessionCodeTools:
         rel = os.path.relpath(cwd, root)
         host_root = self.host_roots.get(root)
         host = os.path.normpath(os.path.join(host_root, rel)) if host_root else None
+        extra: dict[str, Any] = {}
+        if self.egress is not None and self.backend == "docker":
+            setup = self.egress.open_session(_egress_id(thread_id), "local", self.egress_provider, cwd, WORKSPACE_MOUNT)
+            if setup is not None:
+                extra["sandbox_env"] = dict(setup.env)
         src = CodeToolSource(root=cwd, backend=self.backend, image=self.image, network_name=self.network_name,
                              host_root=host, instance=self.instance, background=self.background,
-                             state_dir=self.state_dir, lsp=self.lsp)
+                             state_dir=self.state_dir, lsp=self.lsp, **extra)
         with self._lock:
             old = self._by_thread.pop(thread_id, None)
             self._by_thread[thread_id] = src
@@ -197,11 +207,30 @@ class SessionCodeTools:
     def close(self) -> None:
         with self._lock:
             srcs = list(self._by_thread.values())
+            threads = list(self._by_thread)
             self._by_thread.clear()
         for s in srcs:
             s.close()
+        if self.egress is not None:
+            for tid in threads:
+                self.egress.close_session(_egress_id(tid))
         if self.lsp is not None:
             self.lsp.close()
+
+
+def _egress_id(thread_id: str) -> str:
+    """Identifiant de session au proxy de sortie pour un fil Lokkal (stable, sans caractère d'URL)."""
+    import hashlib
+
+    return "lk-" + hashlib.sha256(thread_id.encode()).hexdigest()[:24]
+
+
+def _egress(code: dict[str, Any]) -> Any:
+    """`EgressSecrets` si `local.code.egress_secrets.enabled` est vrai, sinon None (drapeau éteint par défaut)."""
+    from nokker.egress.kernel import EgressSecrets, EgressSecretsConfig
+
+    cfg = EgressSecretsConfig.from_config(code.get("egress_secrets"))
+    return EgressSecrets(cfg) if cfg is not None else None
 
 
 def _lsp_manager(local: dict[str, Any]) -> Any:
@@ -262,6 +291,9 @@ class LocalApi:
     # Packs d'agents (lot X16) : la `PackToolSource` du noyau et « ce fil existe-t-il ? », posés par serve.
     packs: Any = None
     packs_thread: Any = None
+    # Écrans du foyer (docs/SCREEN-CAST.md) : `local.cast.enabled`, éteint par défaut ; None = ni outils, ni routes
+    # `/v1/local/cast/*`, ni écouteur.
+    cast: Any = None
     _pages: Any = None
     _preview: Any = None
     # Bulles `artifact` d'une page changée hors d'un tour (`BubbleHub.page_changed`), posé par le serveur.
@@ -303,6 +335,9 @@ class LocalApi:
     emit: Any = None
     # `LocalPermissions` du noyau (posées par serve) : `GET|PUT /v1/local/sessions/{fil}/mode` (§7.4.10) ; None = 404.
     permissions: Any = None
+    # Mode dossier (docs/FOLDER-MODE.md) : `local.folder_mode` ; `folder` est le `nokker.folder.run.FolderRuns` posé par
+    # serve quand le drapeau est allumé. None = éteint : ni route, ni outil.
+    folder: Any = None
 
     def _emit(self, name: str, payload: dict[str, Any]) -> None:
         if self.emit is not None:
@@ -410,12 +445,20 @@ class LocalApi:
                                          image=code.get("image") or DEFAULT_SANDBOX_IMAGE,
                                          network_name=_network_name(code), host_roots=host_roots,
                                          background=bool(local.get("background_processes", False)),
-                                         state_dir=str(state_dir), lsp=_lsp_manager(local)))
+                                         state_dir=str(state_dir), lsp=_lsp_manager(local),
+                                         egress=_egress(code), egress_provider=vault.user))
         if api.code.lsp is not None:
             api.code.lsp.emit = api._emit  # `lsp.diagnostics` sur le bus, comme `checkpoint.created`
         from nokker.learning.wiring import local_learning
 
         api.learning = local_learning(local, state_dir, state_dir, api.project_memory)
+        cast_conf = local.get("cast") if isinstance(local.get("cast"), dict) else {}
+        if cast_conf.get("enabled") is True:
+            from nokker.cast.service import build_cast
+
+            _code = api.code
+            api.cast = build_cast(cast_conf, state_dir, vault=vault,
+                                  root_of=lambda tid: _code.sessions().get(tid))
         if local.get("ops"):
             api.enable_ops(local)
         from nokker.local.connectors import FILE_NAME, LocalConnectors
@@ -476,6 +519,8 @@ class LocalApi:
             learned = local_tool_source(self.learning, skills)
             if learned is not None:
                 memory.append(learned)
+        if self.cast is not None:  # écrans du foyer (docs/SCREEN-CAST.md), `local.cast.enabled`
+            memory.append(self.cast.tool_source())
         if not self.pages_enabled:
             return [wrapper, checkpoints, skills, *memory]
         # Pages (§10) : l'enveloppe des pages autour de celle des points de retour (photo avant, version de page après).
@@ -582,6 +627,47 @@ class LocalApi:
             self._emit("session.mode", {"thread_id": thread_id, "mode": out["mode"], "effective": out["effective"]})
         return 200, out
 
+    def _cast(self, method: str, path: str, body: dict[str, Any], relayed: bool) -> tuple[int, dict[str, Any]]:
+        """Écrans du foyer (docs/SCREEN-CAST.md §9) : sur la machine seulement (jeton local), jamais par la passerelle —
+        la liste des écrans, l'appairage et les décisions ne sortent pas du réseau local.
+        GET /v1/local/cast/screens[?refresh=1] ; PUT|DELETE /v1/local/cast/screens/{id} {room, name, owner} ;
+        POST /v1/local/cast/screens/{id}/pair {pin?} ; POST /v1/local/cast/requests/{id} {decision: approve|refuse} ;
+        DELETE /v1/local/cast/consents {member, screen}."""
+        if self.cast is None:
+            return 404, {"error": {"message": "écrans désactivés (local.cast.enabled)"}}
+        if relayed:
+            return 403, {"error": {"message": "écrans : sur la machine seulement (jeton local)"}}
+        bare, _, query = path.partition("?")
+        parts = bare[len("/v1/local/cast/"):].strip("/").split("/") if bare.startswith("/v1/local/cast/") else []
+        body = body if isinstance(body, dict) else {}
+        try:
+            if parts == ["screens"] and method == "GET":
+                return 200, {"screens": self.cast.screens_view(refresh="refresh=1" in query)}
+            if len(parts) == 2 and parts[0] == "screens" and method == "PUT":
+                owner = body.get("owner", False)
+                e = self.cast.book.set(parts[1], room=body.get("room"), name=body.get("name"), owner=owner)
+                return 200, {"screen": parts[1], **{k: e.get(k) for k in ("room", "name", "owner")}}
+            if len(parts) == 2 and parts[0] == "screens" and method == "DELETE":
+                return 200, {"forgotten": self.cast.book.forget(parts[1])}
+            if len(parts) == 3 and parts[0] == "screens" and parts[2] == "pair" and method == "POST":
+                return 200, self.cast.pair(parts[1], str(body.get("pin") or "") or None)
+            if len(parts) == 2 and parts[0] == "requests" and method == "POST":
+                decision = body.get("decision")
+                if decision not in ("approve", "refuse"):
+                    return 400, {"error": {"message": "decision : approve ou refuse"}}
+                st = self.cast.decide(parts[1], decision == "approve", LOCAL_OWNER, machine_owner=True)
+                return 200, {"cast": {k: v for k, v in st.items() if k != "html"}}
+            if parts == ["consents"] and method == "DELETE":
+                return 200, {"revoked": self.cast.book.revoke_consent(str(body.get("member") or ""),
+                                                                      str(body.get("screen") or ""))}
+        except LookupError as e:
+            return 404, {"error": {"message": str(e)}}
+        except PermissionError as e:
+            return 403, {"error": {"message": str(e)}}
+        except Exception as e:  # noqa: BLE001 — appareil injoignable pendant l'appairage
+            return 502, {"error": {"message": f"écran : {type(e).__name__}"}}
+        return 404, {"error": {"message": "route inconnue"}}
+
     def _root_of(self, cwd: str) -> str | None:
         full = os.path.realpath(os.path.expanduser(cwd))
         for r in self.roots:
@@ -683,6 +769,8 @@ class LocalApi:
             return self._mirror_projects(method, path, body)
         if path == "/v1/local/mirror" or path.startswith("/v1/local/mirror/"):
             return self._mirror(method, path, body)
+        if path.split("?", 1)[0] == "/v1/local/cast" or path.startswith("/v1/local/cast/"):
+            return self._cast(method, path, body, relayed)
         if path == "/v1/local/resources" and method == "GET":
             # Ce que la machine publie à nokker.ai (X21) : noms seulement, comme envoyé.
             return 200, self.inventory.collect() if self.inventory is not None else {"v": 1}
@@ -692,8 +780,12 @@ class LocalApi:
             return self._mcp_servers(method, path, body, relayed)
         if path in ("/v1/local/import/scan", "/v1/local/import/apply") and method == "POST":
             return self._import(path.rsplit("/", 1)[1], body, relayed)
+        if self.folder is not None and (path == "/v1/local/folder/runs" or path.startswith("/v1/local/folder/runs/")):
+            return self._folder(method, path, body, relayed)
         if path.split("?", 1)[0] == "/v1/local/import/report" and method == "GET":
             return self._import_report(path, relayed)
+        if path == "/v1/local/import/memory" or path.startswith("/v1/local/import/memory/") or path == "/v1/local/import/undo":
+            return self._import_memory(method, path, body, relayed)
         if path == "/v1/local/packs" or path.startswith("/v1/local/packs/"):
             return self._packs(method, path, body, relayed)
         if path.split("?", 1)[0].rstrip("/") == "/v1/local/connectors" or path.startswith("/v1/local/connectors/"):
@@ -730,6 +822,73 @@ class LocalApi:
         except PackError as e:
             return 404, {"error": {"message": str(e), "code": "unknown_pack"}}
 
+    def _folder(self, method: str, path: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]]:
+        """Mode dossier (docs/FOLDER-MODE.md §6). Sur la machine seulement : la passerelle (et donc nokker.ai) ne touche
+        jamais les fichiers (§6.4). Dossier et sortie sous une racine déclarée. Plan et exécution tournent en fond ;
+        le client suit `folder.run` / `folder.step` ou relit `GET …/runs/{id}`."""
+        from nokker.folder.tools import FolderError
+
+        if relayed:
+            return 403, {"error": {"message": "mode dossier : sur la machine seulement (jeton local)",
+                                   "code": "local_only"}}
+        runs = self.folder
+        b = body if isinstance(body, dict) else {}
+        if path == "/v1/local/folder/runs":
+            if method == "GET":
+                return 200, {"runs": runs.list()}
+            if method != "POST":
+                return 405, {"error": {"message": "GET ou POST", "code": "bad_method"}}
+            folder, task = str(b.get("path") or ""), b.get("task")
+            if not folder or not isinstance(task, str) or not task.strip():
+                return 400, {"error": {"message": "path et task requis", "code": "bad_body"}}
+            out = str(b["out"]) if b.get("out") else None
+            folder_real = os.path.realpath(folder)
+            if self._root_of(folder_real) is None or not os.path.isdir(folder_real):
+                return 403, {"error": {"message": "dossier hors des racines déclarées", "code": "outside_roots"}}
+            from nokker.folder.run import default_out
+
+            out_real = os.path.realpath(out) if out else default_out(folder_real)
+            if self._root_of(out_real) is None:
+                return 403, {"error": {"message": "sortie hors des racines déclarées", "code": "outside_roots"}}
+            try:
+                run = runs.create(folder_real, task, in_place=bool(b.get("in_place")), out=out_real)
+            except FolderError as e:
+                return 400, {"error": {"message": str(e), "code": "bad_folder"}}
+            view = run.view()  # avant le fil de fond, qui fait avancer le passage
+            threading.Thread(target=runs.plan, args=(run,), name=f"folder-plan-{run.run_id}", daemon=True).start()
+            return 202, view
+        rest = path[len("/v1/local/folder/runs/"):]
+        run_id, _, action = rest.partition("/")
+        run = runs.get(run_id)
+        if run is None:
+            return 404, {"error": {"message": "passage inconnu", "code": "not_found"}}
+        try:
+            if not action and method == "GET":
+                return 200, run.view()
+            if action == "decide" and method == "POST":
+                decision = b.get("decision")
+                if decision not in ("approve", "reject"):
+                    return 400, {"error": {"message": "decision ∈ approve, reject", "code": "bad_body"}}
+                if run.status != "awaiting_approval":
+                    return 409, {"error": {"message": f"passage {run.status} : rien à valider", "code": "not_pending"}}
+                if decision == "approve" and run.in_place and b.get("confirm_in_place") is not True:
+                    return 400, {"error": {"message": "passage en place : confirm_in_place: true requis",
+                                           "code": "confirm_in_place"}}
+                runs.decide(run, decision == "approve", confirm_in_place=b.get("confirm_in_place") is True)
+                if decision == "reject":
+                    return 200, run.view()
+                view = run.view()
+                threading.Thread(target=runs.execute, args=(run,), name=f"folder-run-{run.run_id}",
+                                 daemon=True).start()
+                return 202, view
+            if action == "undo" and method == "POST":
+                if run.status in ("planning", "running"):
+                    return 409, {"error": {"message": f"passage {run.status} : attends sa fin", "code": "busy"}}
+                return 200, runs.rollback(run, force=b.get("force") is True).view()
+        except FolderError as e:
+            return 409, {"error": {"message": str(e), "code": "conflict"}}
+        return 404, {"error": {"message": "route inconnue", "code": "not_found"}}
+
     def _import(self, action: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]]:
         """Import d'un autre agent (lot 30, nokker/importers), pour l'écran « Tu viens de X ? » du premier lancement :
         `scan {source, project?}` → le rapport à blanc ; `apply` → refait le scan puis écrit ce qui est prévu. Sur la
@@ -739,14 +898,14 @@ class LocalApi:
         personnel lu est celui du noyau (`NOKKER_IMPORT_HOME`, sinon le sien) : sous docker, seul ce qui y est monté."""
         if relayed:
             return 403, {"error": {"message": "import : sur la machine seulement (jeton local)"}}
-        from nokker.importers import claude_code, cursor, hermes, openclaw
+        from nokker.importers import claude_code, codex, cursor, hermes, openclaw
         from nokker.importers.apply import apply
         from nokker.tools.packs import user_home
 
         b = body if isinstance(body, dict) else {}
         source = str(b.get("source") or "")
-        if source not in ("claude-code", "cursor", "hermes", "openclaw"):
-            return 400, {"error": {"message": "source ∈ claude-code, cursor, hermes, openclaw", "code": "bad_body"}}
+        if source not in ("claude-code", "codex", "cursor", "hermes", "openclaw"):
+            return 400, {"error": {"message": "source ∈ claude-code, codex, cursor, hermes, openclaw", "code": "bad_body"}}
         project = None
         if b.get("project"):
             cwd = os.path.realpath(str(b["project"]))
@@ -759,6 +918,8 @@ class LocalApi:
             report = claude_code.scan(home, project, nokker_home=nk)
         elif source == "cursor":
             report = cursor.scan(home, project)
+        elif source == "codex":
+            report = codex.scan(home, project, nokker_home=nk)
         elif source == "hermes":
             report = hermes.scan(home, nokker_home=nk)
         else:
@@ -771,6 +932,41 @@ class LocalApi:
                 if it.kind == "mcp" and it.status == "skipped":
                     it.reason = "à ajouter dans une session : Nina le propose, vous signez la carte forte"
         return 200, report.to_json()
+
+    def _import_memory(self, method: str, path: str, body: Any, relayed: bool) -> tuple[int, dict[str, Any]] | None:
+        """Mémoire importée d'un autre agent comme DONNÉES (lot 30 d, drapeau `local.import_codex_memory`) :
+        `GET /v1/local/import/memory` → les entrées (titre, texte caviardé à l'import, date d'origine) ;
+        `POST /v1/local/import/undo {source:"codex", what:"memory", name?}` → défait tout l'import, ou une entrée ;
+        `POST /v1/local/import/memory/{nom}/promote` → « retenir en note personnelle » (geste explicite : note user).
+        Sur la machine seulement (jeton local) : la passerelle n'y lit ni n'y écrit rien."""
+        if relayed:
+            return 403, {"error": {"message": "import : sur la machine seulement (jeton local)"}}
+        pm = self.project_memory
+        if pm is None or not getattr(pm, "import_data", False):
+            return 404, {"error": {"message": "mémoire importée désactivée (local.import_codex_memory)", "code": "import_memory_off"}}
+        from nokker.context.imported import origin_date
+
+        if path == "/v1/local/import/memory" and method == "GET":
+            return 200, {"entries": [{"name": n.name, "title": n.title, "text": n.text, "date": origin_date(n.name),
+                                      "source": "codex"} for n in pm.list_import_data()]}
+        b = body if isinstance(body, dict) else {}
+        if path == "/v1/local/import/undo" and method == "POST":
+            if b.get("source") != "codex" or b.get("what") != "memory":
+                return 400, {"error": {"message": "corps {source: \"codex\", what: \"memory\", name?}", "code": "bad_body"}}
+            name = b.get("name")
+            if name is not None and not re.fullmatch(r"codex-[a-z0-9-]{1,120}", str(name)):
+                return 400, {"error": {"message": "nom d'entrée invalide", "code": "bad_body"}}
+            n = pm.forget_import_data(None if name is None else str(name))
+            if name is not None and n == 0:
+                return 404, {"error": {"message": "entrée inconnue", "code": "not_found"}}
+            return 200, {"undone": n}
+        m = re.fullmatch(r"/v1/local/import/memory/(codex-[a-z0-9-]{1,120})/promote", path)
+        if m and method == "POST":
+            note = pm.promote_import_data(m.group(1))
+            if note is None:
+                return 404, {"error": {"message": "entrée inconnue", "code": "not_found"}}
+            return 200, {"note": {"name": note.name, "title": note.title, "scope": "user"}}
+        return None
 
     def _import_report(self, path: str, relayed: bool) -> tuple[int, dict[str, Any]]:
         """Dernier rapport écrit par `nokker import <source> --state-dir <ce dossier>` lancé sur l'HÔTE (chemin
@@ -785,8 +981,8 @@ class LocalApi:
 
         q = parse_qs(path.split("?", 1)[1]) if "?" in path else {}
         source = (q.get("source") or [""])[0]
-        if source and source not in ("claude-code", "cursor", "hermes", "openclaw"):
-            return 400, {"error": {"message": "source ∈ claude-code, cursor, hermes, openclaw", "code": "bad_body"}}
+        if source and source not in ("claude-code", "codex", "cursor", "hermes", "openclaw"):
+            return 400, {"error": {"message": "source ∈ claude-code, codex, cursor, hermes, openclaw", "code": "bad_body"}}
         root = user_home(self.state_dir) / "imports"
         found = sorted(root.glob(f"{source or '*'}-*/report.json"), key=lambda p: p.parent.name.rsplit("-", 2)[-2:])
         if not found:

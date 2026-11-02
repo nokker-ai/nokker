@@ -6,7 +6,8 @@ transactions que l'équipe :
     acceptation d'une invitation `household`) : un foyer par compte et 6 membres au plus, refusés EN BASE (039) ;
   - le profil mineur d'un compte (`account_minors`, hors RLS : lu avant de connaître le locataire) ;
   - les attestations du représentant légal (`parental_consents`, locataire du foyer) ;
-  - les foyers autorisés à déclarer des profils mineurs (`household_minor_grants`, 043, hors RLS : mode `allowlist`).
+  - les foyers autorisés à déclarer des profils mineurs (`household_minor_grants`, 043, sous RLS depuis 058, lue par
+    sa clé hors du locataire du payeur : mode `allowlist`).
 
 Les DROITS restent dans le service (nokker/household/service.py). Les erreurs de la base deviennent des refus clairs :
 409 `already_in_household`, 409 `household_full`.
@@ -339,15 +340,25 @@ class PgHouseholdStore(PgTeamStore):
         with self._conn(actor) as c:
             c.execute("DELETE FROM account_minors WHERE account_id = %s", (account_id,))
 
-    # ── foyers autorisés à déclarer des profils mineurs (043, hors RLS) ──
+    # ── foyers autorisés à déclarer des profils mineurs (043 ; sous RLS depuis 058) ──
+    # Locataire du PAYEUR. Le tour du mineur (autre locataire) et l'opérateur lisent la ligne par sa clé (le compte du
+    # payeur) ; toute écriture se fait dans le locataire du payeur ; la liste de l'opérateur, locataire par locataire.
     _G_COLS = "account_id, tenant_id, code, granted_at, revoked_at"
+
+    def _grant_tenant(self, account_id: str) -> str | None:
+        from nokker.store.conn import connect_key
+
+        with connect_key(self.dsn, account_id) as c:
+            r = c.execute("SELECT tenant_id FROM household_minor_grants WHERE account_id = %s",
+                          (account_id,)).fetchone()
+        return r[0] if r else None
 
     def minor_grant(self, account_id: str) -> dict[str, Any] | None:
         from psycopg.rows import dict_row
 
-        from nokker.store.conn import connect_admin
+        from nokker.store.conn import connect_key
 
-        with connect_admin(self.dsn, row_factory=dict_row) as c:
+        with connect_key(self.dsn, account_id, row_factory=dict_row) as c:
             r = c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants WHERE account_id = %s",
                           (account_id,)).fetchone()
         return dict(r) if r else None
@@ -355,18 +366,21 @@ class PgHouseholdStore(PgTeamStore):
     def grant_list(self) -> list[dict[str, Any]]:
         from psycopg.rows import dict_row
 
-        from nokker.store.conn import connect_admin
+        from nokker.store.conn import connect_tenant, known_tenants
 
-        with connect_admin(self.dsn, row_factory=dict_row) as c:
-            return [dict(r) for r in c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants "
-                                               "ORDER BY granted_at, code").fetchall()]
+        rows: list[dict[str, Any]] = []
+        for tid in known_tenants(self.dsn):
+            with connect_tenant(self.dsn, tid, row_factory=dict_row) as c:
+                rows += [dict(r) for r in c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants "
+                                                    "WHERE tenant_id = %s", (tid,)).fetchall()]
+        return sorted(rows, key=lambda r: (r["granted_at"], r["code"]))
 
     def grant_allow(self, account_id: str, tenant_id: str, now: float) -> tuple[dict[str, Any], str]:
         from psycopg.rows import dict_row
 
-        from nokker.store.conn import connect_admin
+        from nokker.store.conn import connect_tenant
 
-        with connect_admin(self.dsn, row_factory=dict_row) as c:
+        with connect_tenant(self.dsn, tenant_id, row_factory=dict_row) as c:
             r = c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants WHERE account_id = %s FOR UPDATE",
                           (account_id,)).fetchone()
             if r is not None and r["revoked_at"] is None:
@@ -387,17 +401,20 @@ class PgHouseholdStore(PgTeamStore):
     def grant_revoke(self, account_id: str, now: float) -> tuple[dict[str, Any] | None, int]:
         from psycopg.rows import dict_row
 
-        from nokker.store.conn import connect_admin
+        from nokker.store.conn import connect_tenant
 
-        with connect_admin(self.dsn, row_factory=dict_row) as c:
-            r = c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants WHERE account_id = %s FOR UPDATE",
-                          (account_id,)).fetchone()
+        tenant = self._grant_tenant(account_id)
+        if tenant is None:
+            return None, 0
+        with connect_tenant(self.dsn, tenant, row_factory=dict_row) as c:  # RLS : foyer du payeur
+            r = c.execute(f"SELECT {self._G_COLS} FROM household_minor_grants WHERE account_id = %s "
+                          "AND tenant_id = %s FOR UPDATE", (account_id, tenant)).fetchone()
             if r is None:
                 return None, 0
             if r["revoked_at"] is not None:
                 return dict(r), 0
-            c.execute("UPDATE household_minor_grants SET revoked_at = %s WHERE account_id = %s", (now, account_id))
-            c.execute("SELECT set_config('app.tenant_id', %s, true)", (r["tenant_id"],))  # RLS : foyer du payeur
+            c.execute("UPDATE household_minor_grants SET revoked_at = %s WHERE account_id = %s AND tenant_id = %s",
+                      (now, account_id, tenant))
             n = c.execute("UPDATE household_members SET status = 'suspended' WHERE tenant_id = %s "
                           "AND profile = ANY(%s) AND status <> 'suspended'",
                           (r["tenant_id"], list(MINOR_PROFILES))).rowcount
@@ -407,16 +424,14 @@ class PgHouseholdStore(PgTeamStore):
         return dict(r), n
 
     def grant_minors(self, account_id: str) -> int:
-        from nokker.store.conn import connect_admin
+        from nokker.store.conn import connect_tenant
 
-        with connect_admin(self.dsn) as c:
-            g = c.execute("SELECT tenant_id FROM household_minor_grants WHERE account_id = %s",
-                          (account_id,)).fetchone()
-            if g is None:
-                return 0
-            c.execute("SELECT set_config('app.tenant_id', %s, true)", (g[0],))
+        tenant = self._grant_tenant(account_id)
+        if tenant is None:
+            return 0
+        with connect_tenant(self.dsn, tenant) as c:
             return c.execute("SELECT count(*) FROM household_members WHERE tenant_id = %s AND profile = ANY(%s)",
-                             (g[0], list(MINOR_PROFILES))).fetchone()[0]
+                             (tenant, list(MINOR_PROFILES))).fetchone()[0]
 
     # ── attestations ──
     def add_consent(self, actor: Actor, k: Consent) -> Consent:

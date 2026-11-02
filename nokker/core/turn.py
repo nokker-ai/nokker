@@ -101,6 +101,9 @@ class ToolResult:
     # Motif stable d'un refus, pour les clients seulement (`Verdict.code` : `plan_mode`…) : `tool.result` et réponse de
     # `tools/call` le portent en `reason`. Jamais dans `content` (le texte vu par le modèle ne change pas).
     reason: str | None = None
+    # MCP Apps (drapeau `mcp_apps`, docs/MCP-NEXT.md) : l'interface `ui://` renvoyée par l'outil, pour le CLIENT seulement
+    # (événement `tool.app`). Jamais dans `content`, jamais persistée avec le tour, jamais vue par le modèle.
+    app: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -203,6 +206,10 @@ class TurnInput:
     # Bloc `[Pièces jointes]` (texte, dossier, url ; `nokker/attachments.py`) déjà caviardé et borné par la frontière ;
     # vide = aucune (drapeau `text_attachments_enabled` éteint, ou message sans pièce texte).
     attached: str = ""
+    # Étiquette d'un tour envoyé par un client lui-même (`metadata.cli_control` de /v1/chat/completions : btw,
+    # goal_check, goal_continue, loop ; nokker-apps apps/cli/src/prompts.ts), ou `goal_continue` pour un tour enchaîné
+    # par le noyau (docs/OUTCOMES-GOAL.md). Vide = tour tapé. Lue seulement par les objectifs (`Kernel.goals`).
+    control: str = ""
 
 
 @dataclass

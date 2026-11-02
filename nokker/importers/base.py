@@ -15,7 +15,10 @@ UNACCOUNTED = "unaccounted-source"
 # Code STABLE d'une raison (le web traduit ; le texte français reste en repli). Premier fragment trouvé dans la
 # raison, dans cet ordre (les plus précis d'abord). Une raison sans fragment connu → "other".
 REASON_CODES: tuple[tuple[str, str], ...] = (
-    ("importé comme skill", "subagent_as_skill"), ("bloc .nokker/settings.json du dépôt", "project_hooks"),
+    ("importé comme skill", "subagent_as_skill"), ("prompt personnalisé repris comme skill", "prompt_as_skill"),
+    ("importée comme données", "codex_memory_imported"), ("mémoire générée par le modèle", "codex_memory_generated"), ("skills livrés avec Codex", "bundled_skill"),
+    ("bac à sable et approbations", "sandbox_manual"), ("serveur désactivé", "mcp_disabled"),
+    ("AGENTS.override.md n'a pas d'équivalent", "override_manual"), ("prompt vide", "empty_file"), ("bloc .nokker/settings.json du dépôt", "project_hooks"),
     ("inactif tant que", "hooks_untrusted"), ("à déclarer de confiance", "needs_trust"),
     ("hooks de l'utilisateur", "user_hooks_manual"), ("l'événement", "hook_event_unsupported"),
     ("seuls les hooks de type commande", "hook_type_unsupported"), ("outil sans équivalent", "tool_unsupported"),

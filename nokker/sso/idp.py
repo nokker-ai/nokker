@@ -59,7 +59,7 @@ class SafeHttp:
     def _send(self, method: str, url: str, **kw: Any) -> tuple[int, bytes]:
         import httpx
 
-        from nokker.previews.ssrf import pinned_client
+        from nokker.previews.ssrf import pinned_client, proxy_refusal
 
         hop = self._hop(url)
         try:
@@ -70,7 +70,9 @@ class SafeHttp:
                     if len(body) > MAX_BODY:
                         raise IdpError("unreachable", "réponse trop grande")
                 return r.status_code, bytes(body)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if proxy_refusal(exc) is not None:  # mode mandataire : même refus que `_hop` en direct
+                raise IdpError("unreachable", "adresse refusée") from None
             raise IdpError("unreachable", "fournisseur injoignable") from None
 
     def get(self, url: str) -> tuple[int, bytes]:

@@ -469,7 +469,9 @@ def with_user_extensions(config: Any, state_dir: Path) -> Any:
     raised = installed_effect_overrides(state_dir, EffectsTable.load(config.effect_overrides).effect_for)
     return dataclasses.replace(
         config, effect_overrides={**config.effect_overrides, **raised},
-        mcp_tool_servers=merge_servers(list(config.mcp_tool_servers), load_user_servers(Path(state_dir) / FILE_NAME)))
+        mcp_tool_servers=merge_servers(list(config.mcp_tool_servers),
+                                       # « origin » : la garde SSRF stricte (nokker/api/server.py) ne vise qu'eux
+                                       [{**s, "origin": "user"} for s in load_user_servers(Path(state_dir) / FILE_NAME)]))
 
 
 # ─────────────────────────────── outils du modèle ───────────────────────────────

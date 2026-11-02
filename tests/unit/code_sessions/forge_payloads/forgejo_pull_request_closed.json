@@ -1,0 +1,6 @@
+{"action": "closed", "number": 7,
+ "pull_request": {"number": 7, "title": "Corrige le calcul des remises", "merged": true,
+   "head": {"ref": "fix/remises", "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "repo": {"full_name": "team/app"}},
+   "base": {"ref": "main", "repo": {"full_name": "team/app"}}},
+ "repository": {"full_name": "team/app", "html_url": "https://git.example.org/team/app"},
+ "sender": {"login": "alice"}}

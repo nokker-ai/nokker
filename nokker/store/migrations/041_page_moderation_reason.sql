@@ -8,11 +8,22 @@ ALTER TABLE lokkal_public_pages ADD COLUMN IF NOT EXISTS moderation_reason text
     CHECK (moderation_reason IS NULL OR length(moderation_reason) <= 500);
 
 -- Lignes retirées avant cette migration : le motif du dernier retrait de l'audit pour la même page (page_id ou
--- empreinte, même machine). Idempotent : seulement les lignes retirées sans motif.
-UPDATE lokkal_public_pages p
-   SET moderation_reason = (
-       SELECT a.reason FROM lokkal_page_moderation a
-        WHERE a.machine_id = p.machine_id AND a.action = 'unpublish'
-          AND (a.page_id = p.page_id OR a.public_sha256 = p.public_sha256)
-        ORDER BY a.id DESC LIMIT 1)
- WHERE p.moderated_at IS NOT NULL AND p.moderation_reason IS NULL;
+-- empreinte, même machine). Idempotent : seulement les lignes retirées sans motif. Les deux tables sont sous RLS forcée
+-- depuis 058 (le propriétaire n'y échappe pas) : locataire par locataire (`tenants` et l'interne).
+DO $$
+DECLARE
+    tid text;
+BEGIN
+    FOR tid IN SELECT 'tn_ninabot' UNION SELECT id FROM tenants LOOP
+        PERFORM set_config('app.tenant_id', tid, true);
+        UPDATE lokkal_public_pages p
+           SET moderation_reason = (
+               SELECT a.reason FROM lokkal_page_moderation a
+                WHERE a.machine_id = p.machine_id AND a.action = 'unpublish'
+                  AND (a.page_id = p.page_id OR a.public_sha256 = p.public_sha256)
+                ORDER BY a.id DESC LIMIT 1)
+         WHERE p.moderated_at IS NOT NULL AND p.moderation_reason IS NULL;
+    END LOOP;
+    PERFORM set_config('app.tenant_id', '', true);
+END
+$$;

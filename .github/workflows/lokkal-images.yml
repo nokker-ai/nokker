@@ -36,6 +36,8 @@ jobs:
           - {name: nokker,   context: ".",                       file: Dockerfile,                         target: lokkal, suffix: "-lokkal", hermes: true}
           - {name: sandboxd, context: deploy/lokkal/sandboxd,    file: deploy/lokkal/sandboxd/Dockerfile,  target: "",     suffix: "",        hermes: false}
           - {name: sandbox,  context: deploy/lokkal/sandbox,     file: deploy/lokkal/sandbox/Dockerfile,   target: "",     suffix: "",        hermes: false}
+          # Passerelle du foyer (docs/LOKKAL-HOME-BRIDGE.md) : profils home, home-mdns (sous-commande discovery), home-mic.
+          - {name: home-bridge, context: ".",                    file: deploy/lokkal/home-bridge/Dockerfile, target: "",   suffix: "",        hermes: false}
           - {name: nokker-web, context: apps-src,                file: apps-src/deploy/web/Dockerfile,     target: "",     suffix: "",        hermes: false, apps: true}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0

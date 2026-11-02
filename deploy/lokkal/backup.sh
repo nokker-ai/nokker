@@ -94,7 +94,7 @@ do_backup() {
   for db in nokker corthexis; do dc exec -T postgres pg_dump -U postgres -Fc "$db" > "$B/db/$db.dump"; done
   dc exec -T postgres pg_dumpall -U postgres --globals-only --no-role-passwords > "$B/db/globals.sql"
   say "fichiers (.env, config, state, vault)"
-  tar -C "$DIR" -cf "$B/files.tar" .env config state vault $( [ -f "$DIR/backup.env" ] && echo backup.env )
+  tar -C "$DIR" -cf "$B/files.tar" .env config state vault $( [ -f "$DIR/backup.env" ] && echo backup.env ) $( [ -d "$DIR/home" ] && echo home )
   if dc ps --services 2>/dev/null | grep -qx openbao; then
     say "coffre OpenBao (volume ${PROJECT}_vault, coffre arrêté le temps de la copie)"
     dc stop openbao >/dev/null 2>&1 || true
@@ -147,7 +147,7 @@ do_restore() {
     read -r a < /dev/tty; case "$a" in o|O|oui|y|Y|yes) ;; *) die "abandon";; esac
   fi
   say "arrêt de Lokkal"; dc stop >/dev/null 2>&1 || true
-  say "fichiers"; rm -rf "${DIR:?}/state" "${DIR:?}/config" "${DIR:?}/vault"; tar -C "$DIR" -xpf "$B/files.tar"   # -p : droits d'origine (config/ lisible par les services, malgré umask 077)
+  say "fichiers"; rm -rf "${DIR:?}/state" "${DIR:?}/config" "${DIR:?}/vault" "${DIR:?}/home"; tar -C "$DIR" -xpf "$B/files.tar"   # -p : droits d'origine (config/ lisible par les services, malgré umask 077)
   chmod 600 "$DIR/.env"; chmod 755 "$DIR/config"; chmod 644 "$DIR"/config/*
   say "bases (volume postgres recréé)"
   dc rm -fsv postgres >/dev/null 2>&1 || true; docker volume rm "${PROJECT}_postgres" >/dev/null 2>&1 || true

@@ -57,6 +57,13 @@ FAMILIES: tuple[Family, ...] = (
         r"\bnavigat", r"\bbrowser\b", r"\bouvre\b", r"\bva sur\b", r"\bva voir\b", r"\bconnecte", r"\bconnexion\b",
         r"\blog ?in\b", r"\bclique", r"\bclick", r"\bformulaire", r"\bremplis", r"\binscri", r"\br[ée]serv",
         r"\bcommande", r"\bach[eè]te", r"\bcapture", r"\bscreenshot", r"\bonglets?\b", r"\btabs?\b", r"\bpage\b")),
+    # Papiers du foyer (drapeau `household_paper`, docs/HOUSEHOLD-PAPER.md) : sans les outils `paper_*` dans le
+    # registre (drapeau éteint), la famille ne produit aucune ligne et ne charge rien.
+    Family("Papiers", ("paper_*",), ("paper_*",), _rx(
+        r"\bpapiers?\b", r"\bcourriers?\b", r"\blettres?\b", r"\bfactures?\b", r"\bqr\b", r"\bpaie", r"\bpaye",
+        r"\bpaiements?\b", r"\bvirements?\b", r"\bpain\.?001\b", r"\bimp[oô]ts?\b", r"\bfiscal", r"\brelev[ée]s?\b",
+        r"\b[ée]ch[ée]ances?\b", r"\bprogramme\b", r"\b[ée]cole\b", r"\bclub\b", r"\bscann?", r"\bdocuments?\b",
+        r"\bbills?\b", r"\binvoices?\b", r"\btax\b")),
     Family("Bulles", ("bubble_*",), ("bubble_*",), _rx(
         r"\bmontre", r"\baffiche", r"\bfais voir", r"\bbulles?\b", r"\baper[çc]u", r"\binstagram", r"\blinkedin",
         r"\bprofil\b", r"\bshow me\b")),

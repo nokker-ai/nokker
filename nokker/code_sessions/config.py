@@ -114,12 +114,17 @@ class CodeConfig:
     # Sous-agents (§7.22) : enfants vivants au plus par session (premier plan, fond, en attente d'une carte) ; 0 = aucun
     # outil `delegate*`.
     max_subagents: int = 3
+    # Déclencheurs de forge (§7.28.9, `forge_triggers.py`) : webhook Forgejo/GitHub → une session par PR, outil
+    # `forge_push`. Faux par défaut : ni route, ni outil.
+    forge_triggers: bool = False
     state_dir: str = ""
     secrets: dict[str, Any] | None = None
     docker: dict[str, Any] = field(default_factory=dict)
     kubernetes: dict[str, Any] = field(default_factory=dict)
     env_factory: Any = None  # KubernetesEnvironment du module (backend kubernetes), sinon None
     reaper: Any = None  # reap_k8s_sandboxes du module (backend kubernetes), sinon None
+    # Injection des secrets à la sortie (docs/EGRESS-SECRETS.md, `code.egress_secrets`) : None = drapeau éteint.
+    egress_secrets: Any = None
 
     @property
     def mount(self) -> str:
@@ -197,8 +202,18 @@ class CodeConfig:
         project_skills = raw.get("project_skills", True)
         _check_type("code.project_skills", project_skills, bool)
         max_sub = _int(raw, "max_subagents", 3, minimum=0)
+        forge_triggers = raw.get("forge_triggers", False)
+        _check_type("code.forge_triggers", forge_triggers, bool)
         if max_sub > 10:
             raise CodeConfigError("code.max_subagents : 10 au plus (un enfant = un tour du modèle dans le noyau)")
+        from nokker.egress.kernel import EgressSecretsConfig
+
+        try:
+            egress = EgressSecretsConfig.from_config(raw.get("egress_secrets"))
+        except ValueError as e:
+            raise CodeConfigError(f"code.{e}") from None
+        if egress is not None and backend == "kubernetes" and k8s.get("network") != "egress":
+            raise CodeConfigError("code.egress_secrets : demande code.kubernetes.network=egress")
         env_factory = reaper = None
         if backend == "kubernetes":
             mod = kubernetes_module()
@@ -209,9 +224,11 @@ class CodeConfig:
         return cls(backend=backend, workspace_root=root, max_sessions_per_user=max_s, idle_ttl_s=idle,
                    instance=stable_instance(raw), modes=tuple(modes), default_mode=default_mode,
                    forge_hosts=tuple(h.strip().lower() for h in hosts), clone_timeout_s=clone_t, hooks=hooks,
-                   project_skills=project_skills, max_subagents=max_sub, state_dir=state_dir,
+                   project_skills=project_skills, max_subagents=max_sub, forge_triggers=forge_triggers,
+                   state_dir=state_dir,
                    secrets=dict(secrets) if secrets is not None else None, docker=docker,
-                   kubernetes=k8s if backend == "kubernetes" else {}, env_factory=env_factory, reaper=reaper)
+                   kubernetes=k8s if backend == "kubernetes" else {}, env_factory=env_factory, reaper=reaper,
+                   egress_secrets=egress)
 
 
 __all__ = ["BACKENDS", "CodeConfig", "CodeConfigError", "K8S_MODULE", "K8S_TYPES", "k8s_labels", "kubernetes_module",

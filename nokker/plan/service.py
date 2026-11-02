@@ -137,6 +137,9 @@ class Plan:
     # Livraison du brief hors de l'app (Telegram, e-mail : nokker/plan/delivery.py::BriefDelivery) ; None = dans l'app
     # seulement (bulle + notification).
     delivery: Any = None
+    # Veille du foyer (docs/HOME-WATCH.md §6, drapeau `home_watch`) : membre → bloc texte `maison_veille` du brief, ou
+    # None. None (drapeau éteint) : `plan_brief` rend exactement ce qu'il rendait.
+    home_watch: Callable[[str | None], str | None] | None = None
     clock: Callable[[], float] = time.time
     cache_ttl_s: float = 30.0
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -584,6 +587,13 @@ class Plan:
         has_cal = bool(self.has_tool is not None and self.has_tool(CALENDAR_TOOL))
         out["agenda"] = ("appelle calendar_events pour la journée" if has_cal
                          else "aucun connecteur d'agenda sur ce compte : ne pas inventer d'agenda")
+        if self.home_watch is not None:
+            try:
+                watch = self.home_watch(sender)
+            except Exception:  # noqa: BLE001 — une veille en panne ne casse jamais le brief
+                watch = None
+            if watch:
+                out["maison_veille"] = watch
         return out
 
     def get_brief(self, owner: str) -> Any:

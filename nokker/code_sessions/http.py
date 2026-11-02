@@ -43,11 +43,19 @@ TOOLS_CALL = frozenset({"checkpoint_list", "checkpoint_diff", "checkpoint_restor
 _RE_CRED = re.compile(r"^/v1/code/credentials/([^/]+)$")
 
 _service: CodeSessions | None = None
+_forge: Any = None  # ForgeTriggers (drapeau `code.forge_triggers`), None : routes /v1/code/forge-hooks* en 404
+_RE_FORGE_EVENTS = re.compile(r"^/v1/code/forge-hooks/([^/]+)/events$")
+_RE_FORGE_HOOK = re.compile(r"^/v1/code/forge-hooks/([^/]+)(?:/(sessions))?$")
 
 
-def configure(service: CodeSessions | None) -> None:
-    global _service
+def configure(service: CodeSessions | None, forge_triggers: Any = None) -> None:
+    global _service, _forge
     _service = service
+    _forge = forge_triggers if service is not None else None
+
+
+def forge_triggers() -> Any:
+    return _forge
 
 
 def service() -> CodeSessions | None:
@@ -55,8 +63,8 @@ def service() -> CodeSessions | None:
 
 
 def is_path(path: str) -> bool:
-    return path in ("/v1/code/sessions", "/v1/code/credentials") or path.startswith(
-        ("/v1/code/sessions/", "/v1/code/credentials/"))
+    return path in ("/v1/code/sessions", "/v1/code/credentials", "/v1/code/forge-hooks") or path.startswith(
+        ("/v1/code/sessions/", "/v1/code/credentials/", "/v1/code/forge-hooks/"))
 
 
 def _err(h: Any, status: int, code: str, message: str) -> None:
@@ -67,6 +75,15 @@ def handle(h: Any, method: str, path: str) -> bool:
     svc = _service
     if svc is None or not is_path(path):
         return False
+    if path.startswith("/v1/code/forge-hooks"):
+        if _forge is None:
+            return False
+        m = _RE_FORGE_EVENTS.match(path)
+        if m and method == "POST":  # webhook de la forge : sans identité, la signature du hook en tient lieu
+            length = int(h.headers.get("Content-Length", 0) or 0)
+            raw = h.rfile.read(min(length, 2_000_000)) if length else b""
+            h._json(*_forge.receive(m.group(1), h.headers, raw))
+            return True
     body = h._read_json_body() if method in ("POST", "PUT", "PATCH") else {}
     body = body if isinstance(body, dict) else {}
     sender = h._resolve_identity(body)
@@ -94,6 +111,8 @@ def handle(h: Any, method: str, path: str) -> bool:
 
 def _dispatch(svc: CodeSessions, h: Any, method: str, path: str, body: dict[str, Any], user: str
               ) -> tuple[int, Any] | None:
+    if path.startswith("/v1/code/forge-hooks"):
+        return _forge_dispatch(method, path, body, user)
     if path == "/v1/code/sessions":
         if method == "GET":
             return 200, svc.list(user)
@@ -132,6 +151,28 @@ def _dispatch(svc: CodeSessions, h: Any, method: str, path: str, body: dict[str,
         if method == "DELETE":
             return 200, svc.delete_credential(name)
     return None
+
+
+def _forge_dispatch(method: str, path: str, body: dict[str, Any], user: str) -> tuple[int, Any] | None:
+    from nokker.code_sessions.forge_triggers import ForgeHookError
+
+    try:
+        if path == "/v1/code/forge-hooks":
+            if method == "GET":
+                return 200, _forge.list_hooks(user)
+            if method == "POST":
+                return 201, _forge.create_hook(user, body)
+            return None
+        m = _RE_FORGE_HOOK.match(path)
+        if not m:
+            return None
+        if m.group(2) == "sessions" and method == "GET":
+            return 200, _forge.list_prs(user, m.group(1))
+        if not m.group(2) and method == "DELETE":
+            return 200, _forge.delete_hook(user, m.group(1))
+        return None
+    except ForgeHookError as e:
+        raise CodeError(e.status, e.code, e.message) from None
 
 
 def _tool_call(svc: CodeSessions, h: Any, sid: str, body: dict[str, Any], user: str) -> tuple[int, Any]:

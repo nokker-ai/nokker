@@ -59,7 +59,7 @@ class TenantRegistry:
             from nokker.household.guard import FilteredSource
 
             sources = [FilteredSource(src, keep) for src in sources]
-        reg = Registry(sources=sources)
+        reg = Registry(sources=sources, overlay=self.internal.overlay)  # variante approuvée : la même pour tous
         if not sure:
             return reg  # disponibilité illisible : rien en cache, on relira au prochain appel
         with self._lock:

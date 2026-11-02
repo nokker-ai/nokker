@@ -49,7 +49,7 @@ EXISTANT, une identité qui n'en est pas membre reçoit 403 (serveur ouvert sans
 ```
 
 - `kind` ∈ `monitor` (cyan #5FD4C8) · `search` (violet #B49CFF) · `notify` (laiton #E3B06A) · `timer` (vert #5BD39A) ·
-  `script` (bleu #6FA8FF) · `media` (rose #FF8BB5) · `agent_draft` (cyan) · `approval` (laiton) · `episode` (mémoire de session délestée, couleur côté client) · `artifact` (page créée en session, §10, couleur côté client) · `handoff` (relais vers une machine Lokkal, docs/LOKKAL.md §7.16, couleur côté client). Couleurs côté client
+  `script` (bleu #6FA8FF) · `media` (rose #FF8BB5) · `agent_draft` (cyan) · `approval` (laiton) · `episode` (mémoire de session délestée, couleur côté client) · `artifact` (page créée en session, §10, couleur côté client) · `handoff` (relais vers une machine Lokkal, docs/LOKKAL.md §7.16, couleur côté client) · `home` (état d'une entité Home Assistant, docs/HOME-ASSISTANT.md §6, couleur côté client). Couleurs côté client
   (`packages/brand`), jamais dans l'API.
 - `status` ∈ `idle` · `working` (le client glow) · `done` · `failed`.
 - `version` : entier croissant, chaque modification l'incrémente ; un `PATCH` peut porter `if_version` (409 sinon).
@@ -70,6 +70,7 @@ EXISTANT, une identité qui n'en est pas membre reçoit 403 (serveur ouvert sans
 | `approval` | `{approval_id}` — la carte elle-même se lit par `/v1/approvals/{id}` |
 | `artifact` | `{page_id, path, title, mime, version, size, public, updated_at}` — page créée en session (§10) ; jamais le contenu de la page ; jamais créable par un client (400) |
 | `handoff` | `{handoff_id, state, need: {kind, name}, machine_id, machine_name, online, task, lokkal_thread, reply, error, pending_approvals, created_at, updated_at}` — relais d'une session web vers une machine Lokkal (docs/LOKKAL.md §7.16, X21) ; actions `accept`/`refuse` = décision de l'utilisateur, jamais un tour ; jamais créable par un client (400) |
+| `home` | `{entity_id, name, domain, area, state, unit, attributes, last_changed, live}` — état d'une entité Home Assistant (docs/HOME-ASSISTANT.md §6), tenu à jour par `bubble.updated` tant qu'elle est ouverte ; jamais créable par un client (400) ; aucune action en P2 |
 | `episode` | `{episode_id, title, summary, turns, from_turn, to_turn, tokens_raw, closed_reason, day, keywords}` — créée par le noyau à la **clôture d'un épisode** (docs/NEVER-CLEAR.md §3) ; jamais créable par un client (400). Actions : `reload` (épingle l'épisode dans la mémoire de session du fil), `archive` (désépingle et ferme). `move`/`copy` vers un autre fil copie la transcription (caviardée) dans le **réservoir du fil d'arrivée** et injecte `[Contexte reçu]` + `recall_context("rs_…")` : la mémoire voyage sans lecture inter-fils |
 
 | Méthode | Chemin | Rôle |
@@ -172,6 +173,8 @@ turn_id, call_id, name, seq, text, path?, field?, truncated?, discarded?} (écri
 règles : §10.7) · `tool.call` {thread_id, turn_id,
 call_id, name, args_preview} · `tool.result` {thread_id, turn_id, call_id, name, ok, ms, approval_id?} (`approval_id` :
 publié par l'exécuteur après une carte approuvée, même `call_id` que l'appel en attente, docs/LOKKAL.md §7.4.9) ·
+`tool.app` {thread_id, turn_id, call_id, app_id, server, tool, html, csp, sandbox, allowed_messages, …} (MCP Apps,
+drapeau `mcp_apps`, entre `tool.call` et `tool.result` du même `call_id` ; contrat complet : docs/MCP-NEXT.md §3) ·
 `turn.cost` {thread_id,
 turn_id, calls, subagent_calls, input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens, cost
 {devise: montant}, unpriced_models, models} (juste avant `turn.done` ; forme et règles : docs/en/cli.md « Cost per
@@ -758,3 +761,9 @@ tool.input.delta {thread_id, turn_id, call_id, name, seq, text, path?, field?, t
 - Client terminal : les six dernières lignes sous la ligne d'outil, en couleur discrète, repliées au résultat
   (docs/en/cli.md). Web : le même bloc vivant dans le chat (chemin, lignes qui défilent, puis le résultat), et la bulle
   ci-dessus ; le SDK porte le type et un accumulateur pur (`applyLiveInputEvent`).
+
+## 11. Bulle `cast` (écrans du foyer, 01.11.2026, derrière `local.cast.enabled`)
+
+Kind `cast`, posé par le noyau seulement, une bulle par affichage sur une télé du foyer (`show_on_screen`). Contrat
+complet (état, actions `approve` / `refuse` / `stop` dans `state.actions`, page en `srcdoc` sandboxée) :
+docs/SCREEN-CAST.md §7. Un client qui ne connaît pas ce kind retombe sur la bulle générique (thème de repli).

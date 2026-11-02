@@ -273,9 +273,21 @@ def test_minor_grants_allow_revoke_suspend_audit_append_only(fam):
         assert conn.execute("SELECT count(*) FROM parental_consents WHERE tenant_id = %s", (TP,)).fetchone()[0] == 1
         assert conn.execute("SELECT action, suspended FROM household_minor_grant_audit ORDER BY id").fetchall() == \
             [("allow", 0), ("revoke", 1)]
+    from nokker.store.conn import connect_key, connect_tenant
+
     for sql in ("UPDATE household_minor_grant_audit SET suspended = 9", "DELETE FROM household_minor_grant_audit"):
-        with psycopg.connect(app) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
-            conn.execute(sql)
+        with connect_tenant(app, TP) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(sql)  # ajout seul, même dans le locataire du payeur
+    with psycopg.connect(app) as conn:  # sous RLS (058) : sans locataire, ni la liste ni l'audit
+        assert conn.execute("SELECT count(*) FROM household_minor_grants").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM household_minor_grant_audit").fetchone()[0] == 0
+    with connect_tenant(app, TQ) as conn:  # un autre locataire non plus
+        assert conn.execute("SELECT count(*) FROM household_minor_grants").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM household_minor_grant_audit").fetchone()[0] == 0
+    with connect_key(app, P.account_id) as conn:  # par la clé du payeur : sa seule ligne, jamais l'audit
+        assert conn.execute("SELECT tenant_id FROM household_minor_grants").fetchall() == [(TP,)]
+        assert conn.execute("SELECT count(*) FROM household_minor_grant_audit").fetchone()[0] == 0
+        assert conn.execute("UPDATE household_minor_grants SET revoked_at = 1").rowcount == 0  # lecture seule
     assert store.grant_allow(P.account_id, TP, 14.0)[1] == "restored"
     assert kid_active(hh) is False  # réautorisé, mais le profil reste suspendu jusqu'au renouvellement (service)
     with psycopg.connect(su) as conn:  # remise en état pour la suite (le renouvellement est couvert en unitaire)

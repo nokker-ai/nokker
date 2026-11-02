@@ -1,4 +1,4 @@
-"""`nokker import <claude-code|cursor|hermes|openclaw> [--project DOSSIER] [--apply]` : rapport à blanc par défaut, écriture avec
+"""`nokker import <claude-code|codex|cursor|hermes|openclaw> [--project DOSSIER] [--apply]` : rapport à blanc par défaut, écriture avec
 --apply. Le rapport (report.json, summary.md) est rangé sous `$NOKKER_HOME/imports/<origine>-<horodatage>/`."""
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nokker.importers import claude_code, cursor, hermes, openclaw
+from nokker.importers import claude_code, codex, cursor, hermes, openclaw
 from nokker.importers.apply import apply
 from nokker.importers.base import ImportItem
 from nokker.tools.mcp_config import FILE_NAME as MCP_FILE
 
-SOURCES = ("claude-code", "cursor", "hermes", "openclaw")
+SOURCES = ("claude-code", "codex", "cursor", "hermes", "openclaw")
 
 
 def add_import_subparser(sub: Any) -> argparse.ArgumentParser:
@@ -61,6 +61,8 @@ def run(args: argparse.Namespace, *, nokker_home: Path, user_settings: Path, mem
 
         hh = os.environ.get("HERMES_HOME") if not args.home else None
         report = hermes.scan(home, Path(hh).expanduser() if hh else None, nokker_home=nokker_home)
+    elif args.source == "codex":
+        report = codex.scan(home, project, nokker_home=nokker_home)
     elif args.source == "openclaw":
         report = openclaw.scan(home, nokker_home=nokker_home)
     else:

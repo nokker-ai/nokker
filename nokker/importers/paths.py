@@ -4,7 +4,7 @@ ce qui ne doit JAMAIS être monté (identifiants), même si un chemin parent l'�
 (`--project`) est monté à part par la commande (règles Cursor, `.claude/` du dépôt)."""
 from __future__ import annotations
 
-DIRS = {".claude/skills", ".claude/agents", ".cursor/rules", ".hermes/memories", ".hermes/skills", ".openclaw/workspace",
+DIRS = {".codex/prompts", ".codex/skills", ".codex/memories", ".codex/memories_v2", ".agents/skills", ".claude/skills", ".claude/agents", ".cursor/rules", ".hermes/memories", ".hermes/skills", ".openclaw/workspace",
         ".openclaw/workspace.default", ".openclaw/workspace-main", ".openclaw/workspace-assistant", ".openclaw/skills",
         ".agents/skills"}
 
@@ -26,6 +26,12 @@ READ_PATHS: dict[str, dict[str, list[str]]] = {
         "project": ["CLAUDE.md", ".claude/settings.json", ".claude/settings.local.json", ".claude/skills",
                     ".claude/agents", ".mcp.json"],
         "never": [".claude/.credentials.json"],
+    },
+    "codex": {
+        "home": [".codex/AGENTS.md", ".codex/AGENTS.override.md", ".codex/config.toml", ".codex/prompts", ".codex/skills",
+                 ".codex/memories", ".codex/memories_v2", ".agents/skills"],
+        "project": ["AGENTS.md", "AGENTS.override.md", ".codex/config.toml", ".codex/skills", ".agents/skills"],
+        "never": [".codex/auth.json", ".codex/.credentials.json", ".codex/sessions", ".codex/history.jsonl", ".codex/log"],
     },
     "cursor": {
         "home": [".cursor/mcp.json"],

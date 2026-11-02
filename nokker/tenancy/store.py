@@ -124,6 +124,15 @@ class PgTenancy:
 
         return psycopg.connect(self.dsn, row_factory=dict_row)
 
+    def _key(self, key: str):
+        """`accounts` est sous RLS (migration 058) : lue avant le locataire par sa clé (identifiant `us_…` ou adresse),
+        une seule ligne. `account_identities` reste hors RLS (aucun locataire)."""
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_key
+
+        return connect_key(self.dsn, key, row_factory=dict_row)
+
     @staticmethod
     def _acc(row) -> Account | None:
         if row is None:
@@ -140,6 +149,7 @@ class PgTenancy:
         tenant_id, account_id = _new_id("tn"), _new_id("us")
         try:
             with self._conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))  # RLS : le nouveau locataire
                 cur.execute("INSERT INTO tenants (id) VALUES (%s)", (tenant_id,))
                 cur.execute("INSERT INTO accounts (id, tenant_id, email, lang, invitation_id) VALUES (%s,%s,%s,%s,%s) "
                             "RETURNING *", (account_id, tenant_id, email, "en" if lang == "en" else "fr", invitation_id))
@@ -151,17 +161,18 @@ class PgTenancy:
         return self._acc(row)  # type: ignore[return-value]
 
     def account(self, account_id: str) -> Account | None:
-        with self._conn() as conn:
+        with self._key(account_id) as conn:
             return self._acc(conn.execute("SELECT * FROM accounts WHERE id=%s", (account_id,)).fetchone())
 
     def suspend_for_deletion(self, account_id: str, approval_id: str) -> None:
         """Compte et locataire suspendus (plus aucune requête), ligne dans la file d'effacement (migration 017) : une
         seule transaction. L'effacement lui-même est fait par l'outil d'opérateur (`nokker erase --pending`)."""
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._key(account_id) as conn, conn.cursor() as cur:
             cur.execute("UPDATE accounts SET status = 'suspended' WHERE id = %s RETURNING tenant_id", (account_id,))
             row = cur.fetchone()
             if row is None:
                 raise KeyError(account_id)
+            cur.execute("SELECT set_config('app.tenant_id', %s, true)", (row["tenant_id"],))  # file d'effacement : RLS
             cur.execute("UPDATE tenants SET status = 'suspended' WHERE id = %s", (row["tenant_id"],))
             cur.execute("INSERT INTO account_deletions (account_id, tenant_id, approval_id) VALUES (%s, %s, %s) "
                         "ON CONFLICT (account_id) DO NOTHING", (account_id, row["tenant_id"], approval_id))
@@ -188,13 +199,26 @@ class PgTenancy:
         return [r["value"] for r in rows]
 
     def account_for_identity(self, kind: str, value: str) -> Account | None:
+        from nokker.store.conn import set_lookup_key
+
         with self._conn() as conn:
-            row = conn.execute("SELECT a.* FROM account_identities i JOIN accounts a ON a.id = i.account_id "
-                               "WHERE i.kind=%s AND i.value=%s AND a.status='active'", (kind, str(value))).fetchone()
+            ident = conn.execute("SELECT account_id FROM account_identities WHERE kind=%s AND value=%s",
+                                 (kind, str(value))).fetchone()
+            if ident is None:
+                return None
+            set_lookup_key(conn, ident["account_id"], local=True)
+            row = conn.execute("SELECT * FROM accounts WHERE id=%s AND status='active'",
+                               (ident["account_id"],)).fetchone()
         return self._acc(row)
 
     def account_for_tenant(self, tenant_id: str) -> Account | None:
-        with self._conn() as conn:
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_tenant
+
+        if not tenant_id:
+            return None
+        with connect_tenant(self.dsn, tenant_id, row_factory=dict_row) as conn:
             return self._acc(conn.execute("SELECT * FROM accounts WHERE tenant_id=%s AND status='active'",
                                           (tenant_id,)).fetchone())
 

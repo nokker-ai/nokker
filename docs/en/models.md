@@ -46,8 +46,9 @@ protocol).
 
 - **Ollama** is detected automatically and its models are listed. Choosing one sets the default to
   `local:<url>|<model>`, served through `<url>/v1`. Lokkal looks for the Ollama of the `local-llm` profile below, then
-  for one on your machine (`host.docker.internal:11434`, `127.0.0.1:11434`); `NOKKER_OLLAMA_URLS` in `~/.nokker/.env`
-  replaces that list (comma-separated).
+  for one at `127.0.0.1:11434`; `NOKKER_OLLAMA_URLS` in `~/.nokker/.env` replaces that list (comma-separated). An
+  Ollama on the host or on your LAN is not reachable from the core in Lokkal (the core only goes out through `egress`,
+  which refuses private addresses): use the `local-llm` profile.
 - **The `local-llm` profile** starts Ollama for you, next to the core, with no port published:
   `install.sh --local-llm` (or `install.ps1 -LocalLlm`). It pulls `qwen3:4b` by default, about 2.5 GB, in the
   background; `--local-llm-model <name>` picks another Ollama model. It runs on the CPU and is capped at 8 GB of

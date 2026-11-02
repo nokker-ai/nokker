@@ -59,6 +59,12 @@ dev = [
   "ruff>=0.15",
   "pytest>=8",
 ]
+# Écrans du foyer (docs/SCREEN-CAST.md, drapeau `local.cast.enabled`, éteint) : importés à l'usage seulement. MIT tous
+# les deux (vérifié le 01.11.2026 : PyChromecast 14.1.0, pyatv 0.18.0).
+cast = [
+  "PyChromecast>=14.1",
+  "pyatv>=0.18",
+]
 
 [tool.setuptools.packages.find]
 include = ["nokker*"]
@@ -67,7 +73,7 @@ include = ["nokker*"]
 nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*.sql", "bubbles/migrations/*.sql",
           "approvals/migrations/*.sql", "store/migrations/*.sql", "agents/migrations/*.sql",
           "api/miniapp/*.html", "api/miniapp/*.js", "api/miniapp/*.css", "prompts/*.md", "onboarding/terms/*.md",
-          "household/consent/*.md",
+          "household/consent/*.md", "household/paper/schemas/*.xsd",
           "tools/browser_pool_tools.json",
           "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*",
           "admin/ui/*.html"]

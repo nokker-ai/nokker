@@ -2,8 +2,8 @@
 
 Une page publique vit sur la machine de son auteur ; nokker.ai n'en voit que ce que le relais lui montre. D'où :
 
-- **Registre** (`lokkal_public_pages`, migration 040, HORS RLS comme `lokkal_machines` : l'opérateur le lit pour tous
-  les locataires, le relais le consulte avant de connaître le locataire) : une ligne par page publique servie au moins
+- **Registre** (`lokkal_public_pages`, migration 040, sous RLS depuis 058 : le relais le lit et l'écrit dans le locataire
+  de la machine qu'il a trouvée par son nom, l'opérateur locataire par locataire) : une ligne par page publique servie au moins
   une fois par le relais (machine en ligne : `POST /v1/gateway/public-page/check` ; machine éteinte : la copie
   publique du miroir), avec la machine, le locataire, le `page_id` (dit par la machine, en-tête `X-Nokker-Page-Id`),
   l'EMPREINTE de l'id public (jamais l'id), la taille, la première et la dernière vue, et l'heure du retrait.
@@ -15,7 +15,7 @@ Une page publique vit sur la machine de son auteur ; nokker.ai n'en voit que ce 
   La machine apprend ses pages retirées au contrôle qu'elle fait déjà (`GET /v1/gateway/machine` →
   `moderated_pages`, `moderated_public`) : elle dépublie, garde la page à son auteur marquée `moderated_at` et refuse
   de la republier tant que l'opérateur ne l'a pas rendue (`restore`).
-- **Audit** (`lokkal_page_moderation`, migration 040, ajout seul) : page, empreinte, machine, locataire, action, motif,
+- **Audit** (`lokkal_page_moderation`, migration 040, ajout seul, sous RLS depuis 058 comme le registre) : page, empreinte, machine, locataire, action, motif,
   date. Le motif est obligatoire ; une adresse e-mail qu'il contiendrait est remplacée avant d'être rangée.
 - **Exposé des motifs à l'auteur** (DSA art. 17, décision du 25.10) : le registre garde le motif du retrait en cours
   (`moderation_reason`, migration 041) ; `GET /v1/gateway/machine` → `moderation_notices` en donne, pour chaque page
@@ -185,13 +185,13 @@ class MemoryPublicPages:
                         last_seen_at=now)
             return blocked
 
-    def moderated_of(self, machine_id: str) -> dict[str, list[str]]:
+    def moderated_of(self, machine_id: str, tenant_id: str | None = None) -> dict[str, list[str]]:
         with self.lock:
             rows = [r for r in self.rows.values() if r["machine_id"] == machine_id and r["moderated_at"] is not None]
         return {"page_ids": sorted(r["page_id"] for r in rows if r["page_id"]),
                 "public_sha256": sorted(r["public_sha256"] for r in rows if r["public_sha256"])}
 
-    def notices_of(self, machine_id: str) -> list[dict[str, Any]]:
+    def notices_of(self, machine_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
         """Exposé des motifs des pages retirées de cette machine (`moderation_notices`)."""
         with self.lock:
             return _notices([dict(r) for r in self.rows.values() if r["machine_id"] == machine_id])
@@ -238,16 +238,27 @@ class MemoryPublicPages:
 
 
 class PgPublicPages:
-    """Registre et audit en Postgres (migration 040, hors RLS). Une page à la fois par machine : verrou consultatif de
-    la machine pendant la fusion des lignes."""
+    """Registre et audit en Postgres (migration 040 ; sous RLS depuis 058 : toute connexion porte le locataire de la
+    machine, l'opérateur passe locataire par locataire). Une page à la fois par machine : verrou consultatif de la
+    machine pendant la fusion des lignes."""
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
 
-    def _conn(self, autocommit: bool = True) -> Any:
-        import psycopg
+    def _conn(self, tenant_id: str, autocommit: bool = True) -> Any:
+        from nokker.store.conn import connect_tenant
 
-        return psycopg.connect(self.dsn, autocommit=autocommit)
+        return connect_tenant(self.dsn, tenant_id, autocommit=autocommit)
+
+    def _each_tenant(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Lecture de l'opérateur : la même requête dans chaque locataire connu (jamais de joker dans la politique)."""
+        from nokker.store.conn import known_tenants
+
+        out: list[tuple] = []
+        for tid in known_tenants(self.dsn):
+            with self._conn(tid) as conn:
+                out += conn.execute(sql, params).fetchall()
+        return out
 
     @staticmethod
     def _rows(cur: Any) -> list[dict[str, Any]]:
@@ -281,14 +292,14 @@ class PgPublicPages:
 
     def view(self, machine_id: str, tenant_id: str, public_sha256: str, page_id: str | None, size: int,
              now: float) -> bool:
-        with self._conn() as conn:  # lecture seule d'abord : une page déjà inscrite et vue il y a peu ne réécrit rien
+        with self._conn(tenant_id) as conn:  # lecture seule d'abord : une page déjà inscrite et vue il y a peu ne réécrit rien
             match = self._match(conn, machine_id, page_id, public_sha256)
         if len(match) == 1:
             r = match[0]
             if r["public_sha256"] == public_sha256 and (page_id is None or r["page_id"] == page_id) \
                     and r["size"] == int(size) and now - r["last_seen_at"] < SEEN_WRITE_EVERY_S:
                 return r["moderated_at"] is not None
-        with self._conn(autocommit=False) as conn:
+        with self._conn(tenant_id, autocommit=False) as conn:
             self._lock(conn, machine_id)
             match = self._match(conn, machine_id, page_id, public_sha256)
             blocked = any(r["moderated_at"] is not None for r in match)
@@ -316,32 +327,32 @@ class PgPublicPages:
             self._apply(conn, keep, drop)
             return blocked
 
-    def moderated_of(self, machine_id: str) -> dict[str, list[str]]:
-        with self._conn() as conn:
+    def moderated_of(self, machine_id: str, tenant_id: str | None = None) -> dict[str, list[str]]:
+        with self._conn(tenant_id or "") as conn:
             rows = conn.execute("SELECT page_id, public_sha256 FROM lokkal_public_pages WHERE machine_id = %s "
                                 "AND moderated_at IS NOT NULL", (machine_id,)).fetchall()
         return {"page_ids": sorted(r[0] for r in rows if r[0]), "public_sha256": sorted(r[1] for r in rows if r[1])}
 
-    def notices_of(self, machine_id: str) -> list[dict[str, Any]]:
-        with self._conn() as conn:
+    def notices_of(self, machine_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        with self._conn(tenant_id or "") as conn:
             return _notices(self._rows(conn.execute(f"{self._SELECT} WHERE machine_id = %s AND moderated_at IS NOT NULL "
                                                     "ORDER BY id", (machine_id,))))
 
     def listing(self, moderated: bool = False) -> list[dict[str, Any]]:
         cond = "IS NOT NULL" if moderated else "IS NULL"
-        with self._conn() as conn:
-            return self._rows(conn.execute(f"{self._SELECT} WHERE moderated_at {cond} ORDER BY first_seen_at, id"))
+        rows = [dict(zip(_COLS, r, strict=True)) for r in self._each_tenant(f"{self._SELECT} WHERE moderated_at {cond}")]
+        return sorted(rows, key=lambda r: (r["first_seen_at"], r["id"]))
 
     def find(self, *, page_id: str | None = None, public_sha256: str | None = None) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            return self._rows(conn.execute(f"{self._SELECT} WHERE page_id = %s OR public_sha256 = %s ORDER BY id",
-                                           (page_id, public_sha256)))
+        rows = [dict(zip(_COLS, r, strict=True)) for r in self._each_tenant(
+            f"{self._SELECT} WHERE page_id = %s OR public_sha256 = %s", (page_id, public_sha256))]
+        return sorted(rows, key=lambda r: r["id"])
 
     def set_moderation(self, machine_id: str, tenant_id: str, page_id: str | None, public_sha256: str | None,
                        action: str, reason: str, now: float) -> dict[str, Any]:
         if action not in ("unpublish", "restore"):
             raise ValueError(action)
-        with self._conn(autocommit=False) as conn:
+        with self._conn(tenant_id, autocommit=False) as conn:
             self._lock(conn, machine_id)
             keep, drop = _plan(self._match(conn, machine_id, page_id, public_sha256), page_id)
             if keep is None:
@@ -362,9 +373,8 @@ class PgPublicPages:
                 "public_sha256": public_sha256, "action": action, "reason": reason}
 
     def events(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT at, machine_id, tenant_id, page_id, public_sha256, action, reason "
-                                "FROM lokkal_page_moderation ORDER BY id").fetchall()
+        rows = [r[1:] for r in sorted(self._each_tenant(
+            "SELECT id, at, machine_id, tenant_id, page_id, public_sha256, action, reason FROM lokkal_page_moderation"))]
         cols = ("at", "machine_id", "tenant_id", "page_id", "public_sha256", "action", "reason")
         return [dict(zip(cols, r, strict=True)) for r in rows]
 
@@ -513,15 +523,16 @@ class Moderation:
 
 
 class PgMachines:
-    """Machines liées (`lokkal_machines`, hors RLS) vues par l'opérateur : nom de passerelle et locataire seulement."""
+    """Machines liées (`lokkal_machines`, sous RLS depuis 058, lues par leur clé : nom ou identifiant) vues par
+    l'opérateur : nom de passerelle et locataire seulement."""
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
 
     def _one(self, where: str, value: str) -> Any:
-        import psycopg
+        from nokker.store.conn import connect_key
 
-        with psycopg.connect(self.dsn, autocommit=True) as conn:
+        with connect_key(self.dsn, value, autocommit=True) as conn:
             r = conn.execute(f"SELECT id, tenant_id, host FROM lokkal_machines WHERE {where} = %s", (value,)).fetchone()
         if r is None:
             return None

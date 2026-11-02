@@ -127,6 +127,16 @@ _SPECS_PARAMS: dict[str, Any] = {
 _BACKGROUND_PARAM = {"type": "boolean", "default": False,
                      "description": "true : rend la main tout de suite avec les ids des enfants ; relire avec "
                                     "delegate_status, arrêter avec delegate_cancel"}
+# Fork (drapeau `delegate_fork`, `context/fork.py`) : textes vus par le modèle, ajoutés seulement drapeau allumé.
+_FORK_PARAM = {"type": "boolean", "default": False,
+               "description": "true : chaque sous-agent part de ta conversation actuelle (même contexte, cache "
+                              "réutilisé) ; un but court suffit, inutile de réexpliquer"}
+FORK_NOTE = ("[Sous-agent fork] Tu es un sous-agent lancé depuis la conversation ci-dessus : tu en as tout le contexte. "
+             "Ne poursuis pas le tour de l'agent principal : fais seulement la tâche ci-dessous, puis réponds par un "
+             "résumé de ce que tu as fait et trouvé ; ce résumé revient à l'agent principal. Tu ne peux ni déléguer, ni "
+             "poser de question à l'utilisateur, ni envoyer de message.\n[/Sous-agent]\n\nTâche : ")
+FORK_UNAVAILABLE = ("fork indisponible : le contexte de ce tour n'est pas disponible ici. Relance sans fork, avec un but "
+                    "complet et autonome.")
 _STATUS_PARAMS: dict[str, Any] = {"type": "object", "properties": {
     "ids": {"type": "array", "items": {"type": "string"}, "description": "child_id à lire (défaut : tous)"},
     "wait_s": {"type": "number", "minimum": 0, "maximum": MAX_STATUS_WAIT_S,
@@ -398,6 +408,7 @@ class _Child:
     created_at: float = field(default_factory=time.time)  # heure murale (gardée dans l'état local)
     restored: bool = False  # relu de l'état local après un redémarrage : fini, jamais repris
     registry: Any = None  # registre du parent résolu à l'appel (`bind` d'une fonction : multi-locataire)
+    fork_base: Any = None  # fork : contexte du dernier appel du parent (`Kernel.fork_base`), None = fenêtre neuve
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -542,7 +553,7 @@ class DelegateToolSource:
                  = None, parent_observer: Any | None = None, poll_s: float = 0.05, background: bool = False,
                  max_background: int = MAX_TASKS, note: Callable[[str, str], None] | None = None,
                  state_path: str | os.PathLike[str] | None = None, max_live: int | None = None,
-                 require_isolation: bool = False) -> None:
+                 require_isolation: bool = False, fork: bool = False) -> None:
         self.kernel_factory, self.code_source = kernel_factory, code_source
         self.max_children, self.max_depth, self.idle_timeout_s = max(1, max_children), max_depth, idle_timeout_s
         self._emit_fn, self.parent_observer, self.poll_s = emit, parent_observer, poll_s
@@ -551,6 +562,9 @@ class DelegateToolSource:
         # fond, en attente d'une carte) pour cette source, refus au-delà ; `require_isolation` : `isolate=true` sans
         # worktree possible est REFUSÉ (jamais de repli sur le dossier de travail : l'effet annoncé était WRITE).
         self.max_live, self.require_isolation = max_live, require_isolation
+        # Mode fork (drapeau `delegate_fork`, défaut éteint) : paramètre `fork` au schéma, enfant sur le contexte du
+        # parent. Éteint : schéma et comportement d'avant, un `fork` envoyé quand même est ignoré.
+        self.fork = fork
         self._registry: Any = None
         self._slots = threading.BoundedSemaphore(self.max_children)
         # Enfants par fil parent : ceux de fond (lus par delegate_status) et ceux de premier plan en cours (pour
@@ -586,6 +600,12 @@ class DelegateToolSource:
             return self._live_locked()
 
     # ── ToolSource ──
+    def _params(self, background: bool) -> dict[str, Any]:
+        extra = {"background": _BACKGROUND_PARAM} if background else {}
+        if self.fork:
+            extra["fork"] = _FORK_PARAM
+        return {**_SPECS_PARAMS, "properties": {**_SPECS_PARAMS["properties"], **extra}} if extra else _SPECS_PARAMS
+
     def specs(self) -> list[ToolSpec]:
         if not self.background:
             return [ToolSpec(
@@ -593,8 +613,8 @@ class DelegateToolSource:
                 description="Confie des sous-tâches à des sous-agents qui travaillent en parallèle, chacun dans son "
                             "worktree git (branche nokker/sa-<id>) ; rend un résumé par enfant. Bloque jusqu'à leur "
                             "retour.",
-                parameters=_SPECS_PARAMS)]
-        params = {**_SPECS_PARAMS, "properties": {**_SPECS_PARAMS["properties"], "background": _BACKGROUND_PARAM}}
+                parameters=self._params(False))]
+        params = self._params(True)
         return [
             ToolSpec(name="delegate", core=False, source=SOURCE, effect=Effect.WRITE, effect_of=self._effect_of,
                      description="Confie des sous-tâches à des sous-agents qui travaillent en parallèle, chacun dans "
@@ -670,6 +690,14 @@ class DelegateToolSource:
         tasks = arguments.get("tasks")
         if not isinstance(tasks, list) or not tasks or len(tasks) > MAX_TASKS:
             return out(f"tasks : 1 à {MAX_TASKS} tâches requises", True)
+        base = None
+        if self.fork and arguments.get("fork", False) is True:
+            # Le contexte EXACT du dernier appel du parent dans CE tour (et pour CE locataire) ; sinon, refus clair :
+            # un but écrit pour un fork est trop court pour une fenêtre neuve.
+            getter = getattr(ctx.kernel, "fork_base", None)
+            base = getter(ctx.thread_id, ctx.turn_index) if callable(getter) else None
+            if base is None:
+                return out(FORK_UNAVAILABLE, True)
         children: list[_Child] = []
         code = self._code_for(ctx.thread_id)
         for i, t in enumerate(tasks):
@@ -683,7 +711,7 @@ class DelegateToolSource:
             cid = uuid.uuid4().hex[:8]
             children.append(_Child(index=i, id=cid, thread_id=f"{ctx.thread_id}/sa-{cid}", task=t, schema=schema,
                                    parent_thread_id=ctx.thread_id, code=code, background=background,
-                                   registry=registry))
+                                   registry=registry, fork_base=base))
         with self._table_lock:
             if self.max_live is not None:
                 live = self._live_locked()
@@ -1110,6 +1138,8 @@ class DelegateToolSource:
     def _prompt(self, ch: _Child) -> str:
         t = ch.task
         text = str(t["goal"]).strip()
+        if ch.fork_base is not None:
+            text = FORK_NOTE + text
         ctx = str(t.get("context") or "").strip()
         if ctx:
             text += "\n\nContexte :\n" + ctx
@@ -1130,6 +1160,9 @@ class DelegateToolSource:
             registry = self._child_registry(ch, scoped, self.depth_of(ctx.thread_id))
             observer = _ChildObserver(ch, self.emit, self.parent_observer, on_resumed=self._resumed)
             kernel = self.kernel_factory(registry, ch.thread_id, observer)
+            if ch.fork_base is not None:
+                # Fork : même contexte que le dernier appel du parent, même affinité de cache (fil parent).
+                kernel = kernel.forked(ch.fork_base, session_key=ch.parent_thread_id, child_thread=ch.thread_id)
             ch.kernel = kernel
             if ch.cancelled:  # annulé pendant la construction : rien ne part
                 return dict(ch.result)

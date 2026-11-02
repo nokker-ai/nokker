@@ -180,13 +180,28 @@ def check_create(body: dict, cfg: Config) -> dict:
         if set(eps) - {cfg.network, "none"}:
             raise Refused(f"réseaux refusés : {sorted(set(eps) - {cfg.network, 'none'})}")
         if net == cfg.network:
+            given = {e.split("=", 1)[0]: e.split("=", 1)[1] for e in (body.get("Env") or []) if "=" in e}
             env = [e for e in (body.get("Env") or []) if e.split("=", 1)[0].lower() not in
                    ("http_proxy", "https_proxy", "no_proxy", "all_proxy")]
             for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-                env.append(f"{k}={cfg.egress_proxy}")
+                # Le noyau peut poser l'identité du bac à sable (`nokker:<jeton>@`, injection de secrets par egress,
+                # docs/EGRESS-SECRETS.md) : gardée SEULEMENT si l'URL vise exactement le même proxy ; sinon écrasée.
+                v = given.get(k, "")
+                env.append(f"{k}={v if v and same_proxy(v, cfg.egress_proxy) else cfg.egress_proxy}")
             env += ["NO_PROXY=localhost,127.0.0.1", "no_proxy=localhost,127.0.0.1"]
             body["Env"] = env
     return body
+
+
+def same_proxy(url: str, egress: str) -> bool:
+    """`url` = `egress` à l'identité près : même schéma, hôte et port, utilisateur `nokker`, ni chemin ni requête."""
+    try:
+        u, e = urlsplit(url), urlsplit(egress)
+        same = (u.scheme, u.hostname, u.port) == (e.scheme, e.hostname, e.port)
+    except ValueError:
+        return False
+    return (same and u.username == "nokker" and bool(u.password) and u.path in ("", "/")
+            and not u.query and not u.fragment and "\n" not in url and " " not in url)
 
 
 def check_exec(body: dict) -> dict:

@@ -32,11 +32,15 @@ def test_floor_rules_are_the_ssh_ones_and_the_local_mailbox_send():
 
     from nokker.household.model import GUARDIAN_RULE
 
-    assert eng._FLOOR_RULES == {PROD_RULE, TRUST_RULE, LOCAL_STRONG_RULE, GUARDIAN_RULE}
+    from nokker.home.source import STRONG_RULE as HOME_STRONG_RULE
+    from nokker.homewatch.source import STRONG_RULE as HOME_WATCH_RULE
+
+    assert eng._FLOOR_RULES == {PROD_RULE, TRUST_RULE, LOCAL_STRONG_RULE, GUARDIAN_RULE, HOME_STRONG_RULE,
+                                HOME_WATCH_RULE}
 
 
 @pytest.mark.parametrize("rule", [PROD_RULE, TRUST_RULE, "permissions:local_connector_strong",
-                                  "household:guardian"])
+                                  "household:guardian", "home:strong", "home_watch:strong"])
 def test_agent_rule_never_lifts_a_floor_card(rule):
     gates = AgentRunGates(inner=Inner(rule), rules=[Rule.parse("ssh_run"), Rule.parse("ssh_trust")])
     out = gates.action(CALL, SPEC, SimpleNamespace(thread_id="th_x"))

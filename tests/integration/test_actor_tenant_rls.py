@@ -4,7 +4,7 @@ jetable, rôle `nokker_app`. Ignoré sans `NOKKER_TEST_PG_DSN`.
 Scénario : une connexion du noyau dans le locataire de O (non membre) pose `app.account_id` (et `app.account_email`)
 d'un membre du foyer de P. Le noyau ne le fait jamais exprès (l'acteur vient de la session), mais un acteur mal passé
 ne doit rien ouvrir : chaque politique qui lit `app.account_id` exige désormais que ce compte appartienne au locataire
-posé (`nokker_actor()`, migration 050). Tables attaquées : mémoire longue du foyer (049), notes et adhésions d'équipe
+posé (`nokker_actor()`, migration 059). Tables attaquées : mémoire longue du foyer (049), notes et adhésions d'équipe
 (023), adhésions du foyer (039), lignes de dépense du foyer (039), invitations (023, par l'adresse)."""
 from __future__ import annotations
 

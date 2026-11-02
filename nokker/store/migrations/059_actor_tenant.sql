@@ -1,5 +1,6 @@
--- Compte posé = compte DU locataire posé (défense en profondeur, 02.11.2026). Numéro 050 (071 sur la branche, renumérotée à l'intégration) : la dernière ;
--- l'intégrateur la garde en dernier. Idempotente : rejouable à chaque démarrage, et APRÈS 023, 032, 037, 039, 049 (ordre alphabétique).
+-- Compte posé = compte DU locataire posé (défense en profondeur, 02.11.2026). Numéro 059 (071 sur la branche, 050 au train 0211, 058 au train 0311, 059 depuis p2/rls-out-tables) : la dernière ;
+-- l'intégrateur la garde en dernier. Idempotente : rejouable à chaque démarrage, et APRÈS 023, 032, 037, 039, 049 à 058 (ordre alphabétique ;
+-- 058_out_tables_rls met `accounts` sous RLS : `nokker_actor()` la lit avec le locataire posé, ce qui suffit).
 --
 -- Trou : les politiques d'équipe, de foyer et de mémoire longue lisaient `app.account_id` / `app.account_email` tels
 -- quels. Une connexion du locataire O qui posait le compte (ou l'adresse) d'un membre du foyer de P lisait les notes

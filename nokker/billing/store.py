@@ -1,5 +1,6 @@
 """Stockage des abonnements (migration 010). `subscriptions` est sous RLS (connexion du locataire courant) ;
-`billing_customers` et `billing_events` sont hors RLS (le webhook arrive sans locataire)."""
+`billing_events` est hors RLS (le webhook arrive sans locataire) ; `billing_customers` est sous RLS (058) et lue par
+le webhook par sa clé (`stripe_customer`)."""
 from __future__ import annotations
 
 import threading
@@ -96,19 +97,34 @@ class PgBilling:
 
         return connect(self.dsn, row_factory=dict_row, autocommit=True)
 
+    def _for(self, tenant_id: str):
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_tenant
+
+        return connect_tenant(self.dsn, tenant_id, row_factory=dict_row, autocommit=True)
+
+    def _by_key(self, key: str):
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_key
+
+        return connect_key(self.dsn, key, row_factory=dict_row, autocommit=True)
+
+    # `billing_customers` (migration 058) : RLS du locataire ; le webhook lit la seule ligne de SON client Stripe (clé).
     def customer_for_tenant(self, tenant_id: str) -> str | None:
-        with self._admin() as conn:
+        with self._for(tenant_id) as conn:
             row = conn.execute("SELECT stripe_customer FROM billing_customers WHERE tenant_id = %s", (tenant_id,)).fetchone()
         return row["stripe_customer"] if row else None
 
     def tenant_for_customer(self, customer: str) -> tuple[str, str] | None:
-        with self._admin() as conn:
+        with self._by_key(customer) as conn:
             row = conn.execute("SELECT tenant_id, account_id FROM billing_customers WHERE stripe_customer = %s",
                                (customer,)).fetchone()
         return (row["tenant_id"], row["account_id"]) if row else None
 
     def put_customer(self, customer: str, tenant_id: str, account_id: str) -> str:
-        with self._admin() as conn:
+        with self._for(tenant_id) as conn:
             conn.execute("INSERT INTO billing_customers (stripe_customer, tenant_id, account_id) VALUES (%s,%s,%s) "
                          "ON CONFLICT DO NOTHING", (customer, tenant_id, account_id))
             row = conn.execute("SELECT stripe_customer FROM billing_customers WHERE tenant_id = %s", (tenant_id,)).fetchone()

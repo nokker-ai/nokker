@@ -48,7 +48,8 @@ logger = logging.getLogger("nokker.bubbles.hub")
 NOTIFY_TTL_S = 600.0
 # Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
 # `pack_agents` (pack retiré, ses agents créés : désarmer / supprimer / garder) : ses actions touchent des agents.
-KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents"})
+KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents", "home",
+                          "home_watch", "cast"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
@@ -98,6 +99,17 @@ def _merge_search(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def _scrub_deep(value: Any, scrub: Callable[[str], str]) -> Any:
+    """Caviarde chaque chaîne d'une structure JSON (clés comprises) sans en casser la forme."""
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, dict):
+        return {scrub(str(k)): _scrub_deep(v, scrub) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_deep(v, scrub) for v in value]
+    return value
+
+
 def _turn_id(turn: Turn) -> str:
     return f"{turn.thread_id}:{turn.index}"
 
@@ -135,6 +147,8 @@ class BubbleHub:
     handoffs: Any = None
     # Plan (X18, docs/LOKKAL.md §7.18) : nokker.plan.service.Plan (bulles `plan_split` : accepter / refuser) ; None ailleurs
     plan: Any = None
+    # Écrans du foyer (docs/SCREEN-CAST.md, drapeau `local.cast.enabled`) : nokker.cast.service.CastService ; None ailleurs
+    cast: Any = None
     # Écriture en direct (X22, §10.7) : (fil, call_id) → bulles `artifact` passées « en cours d'écriture » par cet appel.
     _live_writes: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     _live_guard: threading.Lock = field(default_factory=threading.Lock)
@@ -416,6 +430,21 @@ class BubbleHub:
                 n += 1
         return n
 
+    def cast_changed(self, cast_id: str, thread_id: str) -> int:
+        """Affichage sur un écran changé hors d'un tour (approbation, expiration, arrêt) : la bulle `cast` suit."""
+        if self.cast is None:
+            return 0
+        n = 0
+        with tenant_scope(tenant_of_thread(thread_id)):
+            state = self.cast.bubble_state(cast_id)
+            if state is None:
+                return 0
+            for b in self.bubbles.list_thread(thread_id):
+                if b.kind == "cast" and b.closed_at is None and (b.state or {}).get("cast_id") == cast_id:
+                    self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
+                    n += 1
+        return n
+
     def page_moderated(self, meta: Any, *, fallback_user: str | None = None) -> int:
         """Page retirée par la modération de nokker.ai (§7.26 point 6), vue pour la PREMIÈRE fois par la machine : une
         bulle `notify` à chaque personne du fil de la page (sinon `fallback_user`) — motif, identifiant de la page et
@@ -551,6 +580,22 @@ class BubbleHub:
                 raise (BubbleNotFound(e.message) if e.status == 404 else BubbleError(e.message)) from None
         if b.kind == "pack_agents":
             return self._pack_agents_action(b, user, action_id)
+        if b.kind == "cast":
+            # Écran du foyer (docs/SCREEN-CAST.md §6) : approuver un écran, donner son accord, arrêter. Décision de
+            # l'UTILISATEUR qui clique (contrôlée par le service : le membre dont c'est le contenu), jamais un tour.
+            if action_id not in ("approve", "refuse", "stop"):
+                raise BubbleNotFound(f"action inconnue : {action_id}")
+            if self.cast is None:
+                raise BubbleError("écrans non configurés")
+            try:
+                state = self.cast.bubble_action(dict(b.state or {}), action_id, user)
+            except LookupError as e:
+                raise BubbleNotFound(str(e)) from None
+            except PermissionError as e:
+                raise BubbleForbidden(str(e)) from None
+            if state:
+                self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
+            return {"cast": {k: v for k, v in state.items() if k != "html"}}
         if b.kind == "agent_draft":
             # Seule action : `activate` (§9.4) — crée l'agent (Crew), ferme la bulle, publie `agent.created`. Pas de
             # carte ici : armer une règle d'écriture reste un geste à part, avec la carte forte (§9.5).
@@ -850,7 +895,27 @@ class BubbleHub:
             data["ms"] = ms
         self._emit("tool.result", data, self.thread_audience(thread_id) or ({owner} if owner else set()))
 
+    def _emit_app(self, turn: Turn, call: ToolCall, app: dict[str, Any]) -> None:
+        """MCP Apps (drapeau `mcp_apps`, docs/MCP-NEXT.md §3) : `tool.app` porte l'interface `ui://` d'un outil au
+        client, avec sa provenance et ses contraintes. L'app est enregistrée (`app_id`) pour ses `tools/call`, qui
+        repassent par les portes du noyau. Tout le texte est caviardé comme le reste du flux."""
+        reg = getattr(self.kernel, "mcp_apps", None) if self.kernel is not None else None
+        if reg is None:
+            return
+        from nokker.tenancy.context import current_tenant_or_none
+
+        rec = reg.register(tenant=current_tenant_or_none(), thread_id=turn.thread_id, server=str(app.get("server")),
+                           tool=call.name, call_id=call.id)
+        data = {**_scrub_deep(app, self._scrub), "thread_id": turn.thread_id, "turn_id": _turn_id(turn),
+                "call_id": call.id, "app_id": rec.app_id}
+        self._emit("tool.app", data, self.thread_audience(turn.thread_id))
+
     def tool_executed(self, turn: Turn, call: ToolCall, spec: ToolSpec | None, result: ToolResult) -> str | None:
+        if getattr(result, "app", None):
+            try:
+                self._emit_app(turn, call, result.app)
+            except Exception:  # noqa: BLE001 — une app non affichée ne casse pas le tour
+                logger.exception("tool.app non émis")
         if call.name == "todo" and call.arguments.get("todos") is not None and not result.is_error:
             self._emit_todo(turn.thread_id, result.content)
         t0 = self._tool_t0.get((turn.thread_id, call.id))
@@ -870,6 +935,16 @@ class BubbleHub:
                 b = self.update_from_kernel(same.id, state=produced.state, status="working")
                 self._turn_artifacts[_turn_id(turn)].add(b.id)
                 return f"\n[bulle {b.id} (artifact) mise à jour : version {produced.state.get('version')}]"
+        if produced.kind == "cast":  # une bulle par affichage (docs/SCREEN-CAST.md §7)
+            cast_id = produced.state.get("cast_id")
+            same = next((b for b in self.bubbles.list_thread(turn.thread_id)
+                         if b.kind == "cast" and b.closed_at is None
+                         and (b.state or {}).get("cast_id") == cast_id), None)
+            if same is not None:
+                b = self.update_from_kernel(same.id, state=produced.state, status=produced.status)
+                from nokker.cast.texts import BUBBLE_UPDATED
+
+                return BUBBLE_UPDATED.format(id=b.id)
         prev_id = self._turn_search.get(_turn_id(turn)) if produced.kind == "search" else None
         prev = self.bubbles.get(prev_id) if prev_id else None
         if prev is not None and prev.closed_at is None:

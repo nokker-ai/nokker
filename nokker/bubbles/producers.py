@@ -6,6 +6,8 @@ Table outil → kind :
   - `session_send` → `notify` côté destinataire : produit par `hub.BubbleHub.send_message`, pas ici.
   - `page_create`, et `write_file`/`patch` sur une page du fil → `artifact` (§10 ; bloc `nokker:page` du résultat,
     posé par `nokker/pages/tools.py`) ; le hub garde UNE bulle par page et par fil.
+  - `show_on_screen` → `cast` (docs/SCREEN-CAST.md §7 ; bloc `nokker:cast` du résultat, état lu au service des
+    écrans) ; le hub garde UNE bulle par affichage.
   - `lokkal_handoff` → `handoff` (relais web → Lokkal, docs/LOKKAL.md §7.16 ; bloc `nokker:handoff` posé par
     `nokker/cloud/handoff.py`), actions `accept` / `refuse` de l'utilisateur.
 
@@ -26,6 +28,7 @@ from nokker.core.turn import Effect, ToolCall, ToolResult
 
 SEARCH_RESULTS_MAX = 10
 _WEB_DATA = re.compile(r"<!-- nokker:web_search:data -->\s*(.*?)\s*<!-- /nokker:web_search:data -->", re.S)
+_CAST_DATA = re.compile(r"<!-- nokker:cast -->\s*(\{.*?\})\s*<!-- /nokker:cast -->", re.DOTALL)
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
 _MONITOR_NAMES = frozenset({"infra_gpu_info", "infra_disk_usage"})
 _MONITOR_SUFFIXES = ("_usage", "_info", "_status", "_stats")
@@ -103,6 +106,9 @@ def monitor_state(name: str, arguments: dict[str, Any], content: str) -> dict[st
 @dataclass
 class Producers:
     request_previews: Callable[[Bubble], None] = _noop_previews
+    # Écrans du foyer (docs/SCREEN-CAST.md §7) : cast_id → état de la bulle `cast` (CastService.bubble_state) ; None =
+    # écrans éteints, aucune bulle `cast`.
+    cast_state: Callable[[str], dict[str, Any] | None] | None = None
 
     def produce(self, call: ToolCall, spec: ToolSpec | None, result: ToolResult,
                 took_ms: int | None = None) -> ProducedBubble | None:
@@ -122,6 +128,16 @@ class Producers:
                 return ProducedBubble(kind="artifact", title=str(st.get("title") or st.get("path"))[:200], state=st,
                                       status="working")
             return None
+        if call.name == "show_on_screen" and self.cast_state is not None:
+            m = _CAST_DATA.search(result.content or "")
+            try:
+                st = self.cast_state(str(json.loads(m.group(1)).get("cast_id", ""))) if m else None
+            except ValueError:
+                st = None
+            if st is None:
+                return None
+            title = str((st.get("view") or {}).get("title") or (st.get("screen") or {}).get("name") or "")
+            return ProducedBubble(kind="cast", title=title[:200], state=st, status=st.get("bubble_status") or "idle")
         if call.name == "lokkal_handoff":
             from nokker.cloud.handoff import bubble_state, handoff_state
 

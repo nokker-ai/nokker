@@ -44,6 +44,17 @@ MAX_TEXT = 1500
 HOUSEHOLD_PREFIX = "foyer:"  # = nokker.household.memory.PREFIX : même espace de noms que les notes du foyer de l'app
 HOUSEHOLD_LINE = "[Mémoire du foyer] {title} — {text}"  # texte existant (§7.29.2), inchangé
 USER_LINE = "{title} — {text}"
+# Leçon écrite par la consolidation nocturne (« Stratégie : … », « Piège à éviter : … », origine
+# `consolidation:lesson:…`, docs/CONSOLIDATION.md) : rappelée dans `[Rappel mémoire]` avec son origine, jamais comme une
+# consigne de l'utilisateur. N'existe que si la consolidation a tourné (drapeau `memory_consolidation`, éteint).
+LESSON_ORIGIN_PREFIX = "consolidation:lesson:"
+LESSON_LINE = "{title} (apprise par l'assistant) — {text}"
+
+
+def user_line(n: LongNote) -> str:
+    """Ligne de rappel d'une note du compte : `USER_LINE`, ou `LESSON_LINE` pour une leçon de la consolidation."""
+    line = LESSON_LINE if str(n.origin or "").startswith(LESSON_ORIGIN_PREFIX) else USER_LINE
+    return line.format(title=n.title, text=n.text)
 
 
 class LongMemoryError(Exception):
@@ -707,7 +718,7 @@ class LongMemory:
         except Exception:  # noqa: BLE001 — la mémoire en panne ne casse jamais un tour
             self._warn("recherche en échec")
             return []
-        u = [Recall(note=n.name, text=USER_LINE.format(title=n.title, text=n.text), score=s) for n, s in user]
+        u = [Recall(note=n.name, text=user_line(n), score=s) for n, s in user]
         h = [Recall(note=HOUSEHOLD_PREFIX + n.name, text=HOUSEHOLD_LINE.format(title=n.title, text=n.text), score=s)
              for n, s in hh]
         if self.household_recall is not None:  # notes du foyer écrites dans l'app (team_notes), rappel lexical

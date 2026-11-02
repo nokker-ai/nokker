@@ -12,9 +12,10 @@
 --      tables créées par un autre rôle). Sinon, les droits par défaut de l'étape 1 suffisent.
 -- Une base déjà peuplée par un autre rôle : `ALTER TABLE … OWNER TO nokker_owner` table par table AVANT l'étape 3.
 --
--- Hors RLS par conception, mais lisibles par nokker_app : tenants, accounts, account_identities, et les tables
+-- Hors RLS par conception, mais lisibles par nokker_app : tenants, account_identities, et les tables
 -- d'authentification devices, sessions, totp_secrets, used_nonces (lues avant de connaître le locataire) ; operators,
--- admin_audit, beta_applications (console).
+-- admin_audit, beta_applications (console). `accounts` et les autres tables qui portent un locataire sont sous RLS
+-- (058), lues avant le locataire par leur clé seulement.
 
 DO $$
 BEGIN

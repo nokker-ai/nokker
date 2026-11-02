@@ -80,12 +80,11 @@ def open_operator(config: Any) -> MinorGrants:
     dsn = config.pg_dsn()
     if not dsn:
         raise GrantError("aucun DSN Postgres configuré")
-    import psycopg
-
     from nokker.household.store import PgHouseholdStore
+    from nokker.store.conn import connect_key
 
     def lookup(email: str | None, account: str | None) -> tuple[str, str] | None:
-        with psycopg.connect(dsn) as c:
+        with connect_key(dsn, account or email or "") as c:  # `accounts` sous RLS (058) : par sa clé
             if account:
                 r = c.execute("SELECT id, tenant_id FROM accounts WHERE id = %s", (account,)).fetchone()
             else:

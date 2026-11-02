@@ -23,8 +23,9 @@
 #   sandbox     `<projet>-sandbox` (NOKKER_SANDBOX_NETWORK ; `nokker-sandbox` pour une installation antérieure) :
 #               bacs à sable ↔ egress seulement — interne ; nom fixe par installation, le noyau le passe à docker
 #   front       web seul : publie 127.0.0.1:${NOKKER_PORT} (docker ne publie pas depuis un réseau interne)
-#   outbound    core (modèles : Router Nokker ou fournisseur choisi), egress, embed et ollama (téléchargement des
-#               modèles)
+#   coreout     core ↔ egress seulement — interne : la sortie de core (modèles, canaux, forges) passe par egress, qui
+#               refuse les plages privées (box, NAS, métadonnées cloud) ; core n'a plus de route directe
+#   outbound    egress, embed et ollama (téléchargement des modèles)
 name: nokker
 
 x-hardening: &hardening
@@ -58,6 +59,18 @@ services:
       NOKKER_MEMORY_MODE: direct
       # Bac à sable : le CLI docker de l'image `-lokkal` parle au proxy filtrant, jamais au socket.
       DOCKER_HOST: tcp://dockerproxy:2375
+      # Fermé au LAN (docs/EGRESS-SECRETS.md §9.2 a) : core n'a plus de route directe ; toute sortie passe par egress
+      # (plages privées refusées à chaque connexion), les services de la pile restent en direct. NO_PROXY : les noms
+      # des services de la pile SEULEMENT, jamais une plage du LAN ni du tailnet (elle rouvrirait core au réseau local).
+      # egress laisse passer CONNECT vers tout port public (IMAP 993, SMTP 465/587, SSH…) : seules les plages privées
+      # sont refusées. core n'a pas de DNS sur ses réseaux internes : un client qui résout lui-même (épinglage anti-SSRF)
+      # doit passer par le proxy (p2/core-via-proxy).
+      HTTP_PROXY: http://egress:3128
+      HTTPS_PROXY: http://egress:3128
+      http_proxy: http://egress:3128
+      https_proxy: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
+      no_proxy: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
       # Réseau des bacs à sable de CETTE installation (config : code.network_name_env), le seul que le proxy accepte.
       NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
@@ -69,7 +82,10 @@ services:
       ROUTER_KEY: ${NOKKER_ROUTER_KEY:-}
       # Modèle local (setup.py, détection Ollama, premier qui répond) : le service `ollama` du profil local-llm, puis
       # un Ollama de l'hôte (les deux candidats d'avant). La variable remplace la liste entière.
-      NOKKER_OLLAMA_URLS: ${NOKKER_OLLAMA_URLS:-http://ollama:11434,http://host.docker.internal:11434,http://127.0.0.1:11434}
+      # Passerelle du foyer (profil home, docs/LOKKAL-HOME-BRIDGE.md) : jointe seulement si URL et jeton sont posés.
+      NOKKER_HOME_BRIDGE_URL: ${NOKKER_HOME_BRIDGE_URL:-}
+      NOKKER_HOME_BRIDGE_TOKEN: ${NOKKER_HOME_BRIDGE_TOKEN:-}
+      NOKKER_OLLAMA_URLS: ${NOKKER_OLLAMA_URLS:-http://ollama:11434,http://127.0.0.1:11434}   # pas host.docker.internal : core est fermé à l'hôte et au LAN (home-bridge)
       # Coffre (LOKKAL §7 X4) : `file` (vault.bin, NOKKER_LOCAL_SECRET_KEY) sans le profil vault ; `openbao` avec. Le
       # noyau ne reçoit que role_id et secret_id de l'AppRole nokker-core, en fichiers (rien dans l'environnement).
       NOKKER_SECRETS_PROVIDER: ${NOKKER_SECRETS_PROVIDER:-file}
@@ -83,9 +99,9 @@ services:
       # Dossier de travail AU MÊME CHEMIN que sur l'hôte : le chemin que le noyau voit est celui que le démon monte
       # dans le bac à sable (local.code.roots), sans table de correspondance.
       - ${NOKKER_HOST_WORKSPACE:?}:${NOKKER_HOST_WORKSPACE:?}
-    networks: [internal, dockerapi, outbound]
+    networks: [internal, dockerapi, coreout]
     # API locale pour la commande `nokker` de l'hôte ; le noyau vérifie le Host (local.allowed_hosts) et le jeton.
-    ports: ["127.0.0.1:${NOKKER_API_PORT:-8742}:8742"]
+    # Pas de port publié : core n'est que sur des réseaux internes ; `web` relaie 127.0.0.1:${NOKKER_API_PORT}.
     read_only: true
     tmpfs: [/tmp]
     mem_limit: 1536m
@@ -104,7 +120,7 @@ services:
     volumes:
       - ./web/lokkal.conf:/etc/nginx/conf.d/default.conf:ro
     networks: [internal, front]   # un port n'est publié que depuis un réseau non interne : `front`, rien d'autre dessus
-    ports: ["127.0.0.1:${NOKKER_PORT:-7420}:8080"]
+    ports: ["127.0.0.1:${NOKKER_PORT:-7420}:8080", "127.0.0.1:${NOKKER_API_PORT:-8742}:8742"]   # web, et API du noyau relayée
     mem_limit: 128m
 
   postgres:
@@ -214,7 +230,7 @@ services:
     image: ${NOKKER_SANDBOXD_IMAGE:-ghcr.io/nokker-ai/sandboxd}:${NOKKER_VERSION}
     command: ["python3", "egress.py"]
     read_only: true
-    networks: [sandbox, outbound]
+    networks: [sandbox, coreout, outbound]
     mem_limit: 64m
 
   # ---- profil vault (LOKKAL §7 X4) ---------------------------------------------------------------------------
@@ -332,7 +348,50 @@ services:
     tmpfs: [/tmp]
     networks: [internal]
 
+  # ── Passerelle du foyer (docs/LOKKAL-HOME-BRIDGE.md) : opt-in à l'installation (--home, --home-mdns). core et
+  # les bacs à sable restent fermés au LAN ; seule home-bridge le joint (liste blanche de home.yaml, livrée vide).
+  home-bridge:
+    <<: *hardening
+    profiles: [home]
+    image: ${NOKKER_HOME_IMAGE:-ghcr.io/nokker-ai/home-bridge}:${NOKKER_VERSION}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    environment:
+      HOME_BRIDGE_TOKEN: ${NOKKER_HOME_BRIDGE_TOKEN:-}   # même valeur côté core ; vide : la passerelle refuse de démarrer
+      HOME_CONFIG: /etc/home/home.yaml
+      HOME_STATE: /var/lib/home
+      HOME_SOCK: /run/home/discovery.sock
+      CAST_LISTEN: 0.0.0.0:8802
+      CAST_ADVERTISE: ${NOKKER_HOME_LAN_IP:-127.0.0.1}:8802
+    volumes:
+      - ./home:/etc/home:ro                             # home.yaml + secrets/ (0700), jamais vus par core
+      - home-state:/var/lib/home
+      - home-sock:/run/home
+    # Écoute du foyer (GET, URL à capacité) et pages des écrans, sur l'adresse LAN de l'hôte SEULEMENT ; l'API :8800
+    # n'est pas publiée (core la joint sur coreout).
+    ports: ["${NOKKER_HOME_LAN_IP:-127.0.0.1}:8801:8801", "${NOKKER_HOME_LAN_IP:-127.0.0.1}:8802:8802"]   # sans adresse LAN : rien d'exposé au foyer
+    networks: [coreout, homelan]
+    mem_limit: 256m
+
+  home-discovery:
+    <<: *hardening
+    profiles: [home-mdns]
+    image: ${NOKKER_HOME_IMAGE:-ghcr.io/nokker-ai/home-bridge}:${NOKKER_VERSION}
+    command: ["discovery"]
+    network_mode: host                                  # multicast mDNS/SSDP ; aucun port TCP (socket Unix seulement)
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    environment:
+      HOME_SOCK: /run/home/discovery.sock
+    volumes: [home-sock:/run/home]
+    mem_limit: 128m
+
 volumes:
+  home-state:
+  home-sock:
   postgres:
   models:
   vault:
@@ -341,6 +400,8 @@ volumes:
 networks:
   internal: {internal: true}
   dockerapi: {internal: true}
+  coreout: {internal: true}   # core ↔ egress (la seule sortie de core), et core ↔ home-bridge (profil home)
+  homelan: {}                 # home-bridge seulement (profil home) : sortie NAT vers le LAN ; Internet refusé par son code
   sandbox:
     name: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
     internal: true

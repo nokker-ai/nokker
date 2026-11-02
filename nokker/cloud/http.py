@@ -392,10 +392,10 @@ def handle(h: Any, method: str, path: str) -> bool:
                "pages_public": _pages_public(c, machine.account)}  # §7.26 : relais et machine le lisent
         if c.public_pages is not None:
             try:  # §7.26 point 6 : la machine dépublie et marque ses pages retirées par l'opérateur
-                mod = c.public_pages.moderated_of(machine.id)
+                mod = c.public_pages.moderated_of(machine.id, machine.tenant)
                 out.update(moderated_pages=mod["page_ids"], moderated_public=mod["public_sha256"],
                            # exposé des motifs (DSA art. 17) : date, motif nettoyé, comment contester ; aucun compte
-                           moderation_notices=c.public_pages.notices_of(machine.id))
+                           moderation_notices=c.public_pages.notices_of(machine.id, machine.tenant))
             except Exception:  # noqa: BLE001 — sans la liste, la machine garde ce qu'elle savait ; le relais bloque
                 logger.exception("registre de modération illisible (machine %s)", machine.id)
         h._json(200, out)

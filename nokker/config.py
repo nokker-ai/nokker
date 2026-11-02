@@ -133,13 +133,25 @@ class NokkerConfig:
     # `[Pièces jointes]` dans l'en-tête du tour. Éteint (défaut) : `attachments` reste au format images X7 seul, le
     # modèle voit exactement ce qu'il voyait (contrat avec l'entraînement, docs/CONTEXT-FORMAT.md).
     text_attachments_enabled: bool = False
+    # Provenance des valeurs (docs/PROVENANCE.md, `nokker/qa/provenance.py`) : `enabled` (défaut false : rien n'est
+    # construit, le modèle voit exactement ce qu'il voyait), `strict` (origine inconnue = non fiable), `workspace_trusted`
+    # (défaut true), `decisions` ({envoi|fetch|exec: carte|refus}).
+    provenance: dict[str, Any] = field(default_factory=dict)
     # Réponses vocales Telegram (docs/VOICE.md, `nokker/voice/tts.py`) : `enabled` (défaut false : aucune voix, aucun
     # fournisseur construit), `provider` (command | openai_compat), `reply_mode` (voice_in | always | off),
     # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur.
     tts: dict[str, Any] = field(default_factory=dict)
+    # Ambiant du foyer (docs/AMBIENT.md, `nokker/ambient/`) : `room_audio` (voix dite dans la pièce, Lokkal + passerelle
+    # home-bridge) et `eink` (écrans e-ink du foyer, cloud et Lokkal), chacun avec `enabled` (défaut false : aucune
+    # route, aucun fil, rien ne change).
+    ambient: dict[str, Any] = field(default_factory=dict)
     # Règles d'approbation suggérées (docs/APPROVALS.md §7) : `enabled` (défaut false : routes 404), `threshold`
     # (cartes approuvées sans refus, défaut 5), `window_days` (défaut 30).
     approval_suggestions: dict[str, Any] = field(default_factory=dict)
+    # Relecteur automatique des cartes `standard` (docs/APPROVALS.md §8) : `enabled` (défaut false : aucune carte relue),
+    # `tier` (`judge` par défaut, ou un palier de `tiers`), `policy` (texte de la politique ; défaut
+    # `auto_review.DEFAULT_POLICY`), `max_tokens`, `trajectory_calls`, `max_approvals_per_turn`.
+    auto_review: dict[str, Any] = field(default_factory=dict)
     host: str = "0.0.0.0"
     port: int = 8642
     tiers: dict[str, TierConfig] = field(default_factory=lambda: {
@@ -147,6 +159,10 @@ class NokkerConfig:
         "deep": TierConfig(base_url="https://router.sokkan.ch/v1", model="qwen/qwen3.5-397b-a17b"),
     })
     mcp_tool_servers: list[dict[str, Any]] = field(default_factory=list)  # [{"name","url","token_env"}]
+    # Garde SSRF des clients sortants (nokker/previews/ssrf.py, chantier p2/ssrf-audit) : `strict` (défaut false :
+    # comportement historique, octet pour octet), `allow` (["hôte:port", …] autorisés vers le réseau privé, jamais
+    # link-local), `ports` (défaut [80, 443, 8080, 8443] pour la récupération web, les MCP ajoutés, les compétences).
+    ssrf: dict[str, Any] = field(default_factory=dict)
     # Juge Nina QA (B-2). Mesuré le 17.10.2026 sur le banc B-1 (187 questions, Router) : Ship qwen3.8-27b 80,5 %,
     # Deep 397B 81,8 % — AUCUN backend n'atteint le seuil P1 de 90 %. Le juge est donc DÉSACTIVÉ par défaut
     # (`judge_enabled=False` → portes = invariants F3 seuls) jusqu'à un backend mesuré ≥ 90 % (cible : Nina-70B).
@@ -166,12 +182,40 @@ class NokkerConfig:
     judge_advice: bool = False
     judge_max_tokens: int = 400  # relecture et avis ; plus pour un juge qui raisonne d'abord (gpt-oss)
     judge_verdict_max_tokens: int = 1  # questions des portes : 1 jeton (logprobs) ; plus pour un juge qui raisonne
+    # ─────────────── Rubrique, correcteur séparé et objectifs persistants (docs/OUTCOMES-GOAL.md) ───────────────
+    # Éteints par défaut : rien ne change (`Kernel.goals is None`, ni outil, ni bloc, ni route).
+    # `outcomes_enabled` : rubrique d'une tâche (`POST /v1/threads/{id}/goal {mode: task}`, outil `rubric_propose`),
+    # notée par le correcteur dans sa propre fenêtre ; sous `outcomes_threshold` (part du maximum), l'agent refait une
+    # passe, `outcomes_max_passes` fois au plus par tour. `outcomes_grader` : palier du correcteur, `judge` (le juge
+    # X8, `judge:` ou Ship) ou un nom de palier de `tiers` (ship, deep, small…).
+    outcomes_enabled: bool = False
+    outcomes_grader: str = "judge"
+    outcomes_threshold: float = 1.0
+    outcomes_max_passes: int = 2
+    outcomes_max_tokens: int = 600
+    # `goals_enabled` : objectifs sur plusieurs tours (`/goal <texte>` dans un fil, l'API, ou la CLI par
+    # `metadata.cli_control`), persistés sous le fil (migration 050), repris au redémarrage ; budget par défaut
+    # `goals_default_budget` (tokens, seconds, turns, cost + currency) ; point d'étape toutes les
+    # `goals_checkpoint_every` notes ou `goals_checkpoint_s` secondes, sur le Telegram relié au compte.
+    goals_enabled: bool = False
+    goals_default_budget: dict[str, Any] = field(default_factory=lambda: {"tokens": 400_000, "seconds": 7200,
+                                                                          "turns": 20})
+    goals_checkpoint_every: int = 3
+    goals_checkpoint_s: float = 1800.0
     # Routage par tour : `policy` v0 (défaut : Ship, Deep sur signaux) | v1 (trivial → `small`, conversation → Ship,
     # code → Deep) ; `classifier` rules (défaut, aucun appel) | model (petit palier, 1 jeton, tour ambigu seulement) ;
     # `code_to_deep` (v1, défaut true) ; `classifier_max_tokens` (1 ; plus pour un petit modèle qui raisonne) ;
     # `deep_tool_failures` (3) : échecs d'outil d'un tour avant Deep ; `nina` : palier maison à part
     # (`{mode: off|shadow|route, shadow_fraction, kinds, max_tokens, max_in_flight}`, route/nina.py, défaut off).
     route: dict[str, Any] = field(default_factory=dict)
+    # Conseiller intra-tour (veille 01.11 §7.1, `nokker/route/advise.py`) : outil `advise` par lequel l'exécutant
+    # consulte un palier plus fort au milieu du tour. Clés : `enabled` (défaut false : outil absent), `tier` (clé de
+    # `tiers`, défaut deep), `fallback_tier` (ex. nina, déclaré sous `tiers`), `max_per_turn` (2), `max_tokens` (600),
+    # `question_chars`, `context_chars`, `demand_chars`. Locataire interne seulement (Lokkal, canari).
+    advise: dict[str, Any] = field(default_factory=dict)
+    # Fork de sous-agent (veille 01.11 §3.1, `nokker/context/fork.py`) : `delegate(fork=true)` part du contexte exact du
+    # dernier appel du parent (même préfixe, cache réutilisé). Défaut false : schéma de `delegate` et noyau inchangés.
+    delegate_fork: bool = False
 
     # ─────────────────────── P1 : approbations fortes (docs/APPROVALS.md) ───────────────────────
     # Doctrine produit (17.10) : jamais d'action à effet HITL exécutée sans preuve — donc câblé par défaut
@@ -240,6 +284,14 @@ class NokkerConfig:
     #            openbao: {address, mount, prefix, auth, role_id_file, secret_id_file, token_file, ca_file}}}
     # (coffre local, lot X4 : nokker/secrets/, docs/en/secrets.md)
     local: dict[str, Any] | None = None
+    # Maison (docs/HOME-ASSISTANT.md, nokker/home/) : `enabled` (défaut false : aucun outil, aucune connexion), `url`,
+    # `token: secret:NOM` (jamais une valeur), `entities` (liste blanche), `members`/`roles`, `tier` (small), `climate`.
+    home_assistant: dict[str, Any] = field(default_factory=dict)
+    # Veille du foyer (docs/HOME-WATCH.md, nokker/homewatch/) : `enabled` (défaut false : aucun outil, aucune connexion,
+    # aucun fil), `bridge_url` (http://home-bridge:8800), `media_base_url` (adresse de la passerelle vue de l'écran
+    # local), `members`/`roles`/`default_role`, `tenant`, `tz`, `poll_s`, `slow_poll_s`, `retention_h`. Lokkal seul ;
+    # le jeton de la passerelle vient de NOKKER_HOME_BRIDGE_TOKEN, jamais de ce fichier.
+    home_watch: dict[str, Any] = field(default_factory=dict)
     # Sessions de code multi-utilisateur (docs/LOKKAL.md §7.28, nokker/code_sessions/) : None ou `enabled: false`
     # (défaut) = aucune route /v1/code/*, aucun outil de code pour les comptes. {enabled, backend: docker|kubernetes,
     # workspace_root, layout: tenant/user/session, max_sessions_per_user, idle_ttl_s, instance, modes, default_mode,
@@ -255,6 +307,19 @@ class NokkerConfig:
     # `POST /v1/memory/search` (docs/MCP-SERVER.md) : recherche dans la mémoire longue du compte, sous la même
     # identité et le même locataire que les autres routes. Éteint = 404. Sert le serveur MCP `nokker mcp serve`.
     memory_search_api: bool = False
+    # Client MCP à la révision 2026-07-28 (docs/MCP-NEXT.md §1-§2) pour les serveurs de `mcp_tool_servers` : sonde
+    # `server/discover` puis repli `initialize` (serveurs 2025-11-25 et avant), MRTR, Tasks, listes en cache selon
+    # `ttlMs`. Éteint = poignée de main `initialize` seule, comme avant. `mcp_task_wait_s` : attente max d'une tâche.
+    mcp_modern: bool = False
+    mcp_task_wait_s: float = 20.0
+    # MCP Apps (docs/MCP-NEXT.md §3-§4) : l'interface `ui://` d'un outil part au client (`tool.app`), jamais au modèle ;
+    # ses `tools/call` repassent par les portes (POST /v1/apps/{app_id}/tools/call). Éteint = ni annonce de l'extension,
+    # ni événement, ni route (404).
+    mcp_apps: bool = False
+    # Domaine DÉDIÉ des apps MCP (`https://hôte[:port]`, distinct de l'app : refus au démarrage sinon). Vide (défaut) :
+    # `tool.app` porte `sandbox: "allow-scripts"` seul (iframe srcdoc, origine opaque) ; posé : `allow-scripts
+    # allow-same-origin` et `sandbox_origin`, pour un proxy servi sur ce domaine.
+    mcp_apps_origin: str = ""
     # nokker.ai, côté cloud du lien Lokkal (docs/LOKKAL.md §7.2 révisé, §7.5, nokker/cloud/) : None (défaut) = aucune
     # route /v1/link/*, /v1/gateway/*, /v1/inference/*. {signing_key_env, base_url, gateway_domain}
     cloud_link: dict[str, Any] | None = None
@@ -278,6 +343,28 @@ class NokkerConfig:
     # l'opérateur (`python -m nokker household minors allow`, en base, §7.29.4). Autre 403 `minors_not_enabled`.
     household_minors_mode: str = "all"
     household_settings: dict[str, Any] | None = None
+    # Papiers du foyer (docs/HOUSEHOLD-PAPER.md, nokker/household/paper/) : import de courrier et de PDF, QR-facture
+    # suisse décodée, échéances et programmes vers l'agenda (carte de relecture), fichier pain.001 PRÉPARÉ derrière une
+    # carte forte (jamais envoyé ni payé), relevés fiscaux eCH-0196 rangés par année. Éteint par défaut : aucune route
+    # /v1/paper*, aucun outil `paper_*`, aucune porte de plus, contexte inchangé à l'octet. Ne demande PAS `household`
+    # (un compte seul a ses papiers) ; le partage entre membres, lui, demande un foyer.
+    household_paper: bool = False
+    # Paiements « l'agent prépare, l'humain paie » (docs/PAYMENTS.md, nokker/payments/) : arrêt au paiement dans le
+    # navigateur (aucun champ de carte rempli, bouton de paiement refusé), outil `pay_request` → carte FORTE « à payer »,
+    # mandat signé par la passkey (WebAuthn, `webauthn_origin` requis), budgets par membre du foyer. Éteint par défaut :
+    # aucun outil, aucune porte, aucune route /v1/payments*, défis d'approbation inchangés.
+    # payments_settings : {default_budget: {currency: CHF, per_purchase: 200, per_day: 300, per_month: 1000} | null,
+    # mandate_ttl_s: 86400, timezone: Europe/Zurich, handoff: true}
+    payments: bool = False
+    payments_settings: dict[str, Any] | None = None
+    # Salle Maison (chantier p2/house-room, docs/HOUSE-ROOM.md, nokker/house/) : une salle persistante par foyer, où les
+    # membres parlent aux agents de la maison (intendant par défaut, @mention pour un agent) avec les droits de CHAQUE
+    # membre ; outil `ask_house` dans les sessions des membres. Demande `household`. Éteint par défaut : aucune route
+    # /v1/house*, aucun outil, aucun texte vu par le modèle ne change.
+    # house_room_settings : {agents: {<slug>: {tier, profiles, enabled}}, rights: {adult, teen, child},
+    # transcript_messages, transcript_chars, max_consults, max_text, page} (nokker/house/roster.py::Settings).
+    house_room: bool = False
+    house_room_settings: dict[str, Any] | None = None
     # SSO OIDC des équipes (docs/LOKKAL.md §7.24, nokker/sso/) : connexion par le fournisseur d'une organisation,
     # groupes → rôles des projets, « SSO obligatoire ». Demande `team`. Éteint par défaut : aucune route /v1/sso*,
     # /v1/auth/oidc/*, /v1/projects/{id}/sso, aucun contrôle de plus sur l'équipe.
@@ -308,6 +395,21 @@ class NokkerConfig:
     # max_candidates: 500, tools: false}.
     tenant_long_memory: bool = False
     tenant_long_memory_settings: dict[str, Any] | None = None
+    # Auto-amélioration hors ligne sous contrôle humain (docs/SELF-IMPROVE.md, nokker/improve/). Éteint par défaut :
+    # `nokker improve` refuse de tourner, aucune variante n'est lue au démarrage, aucun geste de carte n'est branché ;
+    # ce que voit le modèle est identique octet pour octet. Allumé, seule une variante APPROUVÉE sur carte (versionnée,
+    # réversible) change un texte ou un seuil. `self_improve_settings` : {state_dir, budget_eur (2.0), max_candidates
+    # (12), price_in_eur_per_mtok (0.5), price_out_eur_per_mtok (1.5), block_freeze (true), format_ack: [sha256…]}.
+    self_improve: bool = False
+    self_improve_settings: dict[str, Any] | None = None
+    # Consolidation nocturne de la mémoire (docs/CONSOLIDATION.md, nokker/memory/consolidation/, migration 053) : chaque
+    # nuit, à l'heure locale du compte, fusion des doublons, corrections, archivage du périmé, résumé des épisodes
+    # anciens, leçons tirées des échecs ; appliquée directement, journalisée avec son inverse, défaisable, rapportée le
+    # matin. Demande `tenant_long_memory`. Éteint par défaut : aucune route /v1/memory/consolidation*, aucun passage,
+    # aucun texte de plus. `memory_consolidation_settings` : {max_ops: 40, tier: flash, cron: "30 3 * * *",
+    # default_tz: Europe/Zurich, …} (engine.py::Settings).
+    memory_consolidation: bool = False
+    memory_consolidation_settings: dict[str, Any] | None = None
     # Plan et incidents (lot X18, docs/LOKKAL.md §7.18). `plan` : cartes hiérarchiques, consignes héritées injectées,
     # avancement calculé, propositions de découpe, brief du matin (routes /v1/plan*, outils plan_*). `operate` : alertes
     # signées → incidents → agents `alert:<nom>` (routes /v1/alerts*, /v1/incidents*). Éteints par défaut : 404 comme

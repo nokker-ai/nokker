@@ -1,0 +1,51 @@
+# Compose de TEST local de l'injection des secrets à la sortie (docs/EGRESS-SECRETS.md §8). Lancer : ./run.sh
+#   upstream  la « vraie » API (HTTPS, AC à elle) : dit si elle a reçu la bonne valeur, et la renvoie en écho
+#   egress    le proxy (python -m nokker.egress serve) : seul pont entre `sandbox` (interne) et `outbound`
+#   core      tient le coffre (valeur dans SON environnement), ouvre la session au proxy, écrit l'env du bac à sable
+#   sandbox   réseau interne seulement, ne reçoit que /work (env + certificat public) : curl avec secret:GH_TOKEN
+name: nokker-egress-test
+x-img: &img
+  build: {context: ., additional_contexts: {src: ../../../nokker}}
+  image: nokker-egress-test:local
+services:
+  upstream:
+    <<: *img
+    command: ["python", "egress-test/upstream.py"]
+    environment: {EXPECTED: "${TEST_SECRET_VALUE:?}"}
+    volumes: [upca:/up]
+    networks: {outbound: {ipv4_address: 10.254.250.10}}
+    healthcheck: {test: ["CMD", "test", "-f", "/up/ca.crt"], interval: 1s, retries: 30}
+  egress:
+    <<: *img
+    command: ["python", "-m", "nokker.egress", "serve"]
+    environment:
+      NOKKER_EGRESS_CONTROL_KEY: "${TEST_CONTROL_KEY:?}"
+      NOKKER_EGRESS_CA_DIR: /ca
+      NOKKER_EGRESS_UPSTREAM_CA: /up/ca.crt
+      # test seulement : les noms de l'API pointent sur l'amont local (adresse privée, refusée sans épinglage)
+      NOKKER_EGRESS_PINS: "api.example.test=10.254.250.10,evil.example.test=10.254.250.10"
+    volumes: [upca:/up:ro, ca:/ca]
+    networks: [sandbox, outbound, control]
+    depends_on: {upstream: {condition: service_healthy}}
+    healthcheck: {test: ["CMD", "test", "-f", "/ca/ca.crt"], interval: 1s, retries: 30}
+  core:
+    <<: *img
+    command: ["python", "egress-test/kernel_sim.py"]
+    environment:
+      NOKKER_EGRESS_CONTROL_KEY: "${TEST_CONTROL_KEY:?}"
+      TEST_SECRET_VALUE: "${TEST_SECRET_VALUE:?}"
+    volumes: [ca:/ca:ro, work:/work]
+    networks: [control]
+    depends_on: {egress: {condition: service_healthy}}
+  sandbox:
+    <<: *img
+    command: ["sh", "egress-test/sandbox.sh"]
+    volumes: [work:/workspace]
+    networks: [sandbox]
+    depends_on: {core: {condition: service_completed_successfully}}
+volumes: {upca: {}, ca: {}, work: {}}
+networks:
+  sandbox: {internal: true}
+  control: {internal: true}
+  outbound:
+    ipam: {config: [{subnet: 10.254.250.0/24}]}

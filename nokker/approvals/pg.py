@@ -22,6 +22,9 @@ MIGRATION_SQL = (Path(__file__).parent / "migrations" / "0001_approvals.sql").re
 # Marques des règles suggérées (docs/APPROVALS.md §7) : migration du store, rejouée aussi ici (après la table approvals).
 SUGGESTIONS_SQL = (Path(__file__).parent.parent / "store" / "migrations"
                    / "047_approval_suggestions.sql").read_text(encoding="utf-8")
+# Relecteur automatique (docs/APPROVALS.md §8) : colonne `auto_review` de la carte.
+AUTO_REVIEW_SQL = (Path(__file__).parent.parent / "store" / "migrations"
+                   / "051_approval_auto_review.sql").read_text(encoding="utf-8")
 
 _ENC_KEY_ENV = "NOKKER_APPROVALS_ENC_KEY"
 
@@ -41,22 +44,25 @@ def _enc_approval(a: Approval) -> dict[str, Any]:
             "strength": a.strength, "rule": a.rule, "reason": a.reason, "advice": a.advice,
             "status": a.status, "created_at": a.created_at, "expires_at": a.expires_at,
             "decided_by": a.decided_by, "decided_via": a.decided_via, "decided_at": a.decided_at,
-            "result_summary": a.result_summary, "error": a.error, "call_id": a.call_id}
+            "result_summary": a.result_summary, "error": a.error, "call_id": a.call_id,
+            "auto_review": Jsonb(a.auto_review) if a.auto_review is not None else None}
 
 
 def _row_to_approval(row: tuple) -> Approval:
     (aid, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, reason, advice,
-     status, created_at, expires_at, decided_by, decided_via, decided_at, result_summary, error, call_id) = row
+     status, created_at, expires_at, decided_by, decided_via, decided_at, result_summary, error, call_id,
+     auto_review) = row
     return Approval(id=aid, thread_id=thread_id, turn_index=turn_index, channel=channel, tool_name=tool_name,
                     arguments=dict(arguments), args_sha256=args_sha256, strength=strength, rule=rule,
                     reason=reason or "", advice=advice, status=status, created_at=created_at,
                     expires_at=expires_at, decided_by=decided_by, decided_via=decided_via,
-                    decided_at=decided_at, result_summary=result_summary, error=error, call_id=call_id)
+                    decided_at=decided_at, result_summary=result_summary, error=error, call_id=call_id,
+                    auto_review=dict(auto_review) if auto_review else None)
 
 
 _APPROVAL_COLUMNS = ("id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, "
                     "reason, advice, status, created_at, expires_at, decided_by, decided_via, decided_at, "
-                    "result_summary, error, call_id")
+                    "result_summary, error, call_id, auto_review")
 
 
 @dataclass
@@ -66,7 +72,7 @@ class PgApprovals(BaseApprovals):
     def __post_init__(self) -> None:
         if not self.dsn:
             raise ValueError("PgApprovals requiert un DSN Postgres")
-        migrate(self.dsn, MIGRATION_SQL, SUGGESTIONS_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
+        migrate(self.dsn, MIGRATION_SQL, SUGGESTIONS_SQL, AUTO_REVIEW_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
         self._db = TenantConn(self.dsn)
         # Tables d'authentification (devices, sessions, totp_secrets, used_nonces) : hors RLS, lues AVANT de connaître
         # le locataire (verify_session, login_challenge, create_session). Même DSN, donc même rôle nokker_app, mais une
@@ -97,13 +103,14 @@ class PgApprovals(BaseApprovals):
             cur.execute(
                 "INSERT INTO approvals (id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, "
                 "strength, rule, reason, advice, status, created_at, expires_at, decided_by, decided_via, "
-                "decided_at, result_summary, error, call_id) "
+                "decided_at, result_summary, error, call_id, auto_review) "
                 "VALUES (%(id)s, %(thread_id)s, %(turn_index)s, %(channel)s, %(tool_name)s, %(arguments)s, "
                 "%(args_sha256)s, %(strength)s, %(rule)s, %(reason)s, %(advice)s, %(status)s, %(created_at)s, "
-                "%(expires_at)s, %(decided_by)s, %(decided_via)s, %(decided_at)s, %(result_summary)s, %(error)s, %(call_id)s) "
+                "%(expires_at)s, %(decided_by)s, %(decided_via)s, %(decided_at)s, %(result_summary)s, %(error)s, %(call_id)s, "
+                "%(auto_review)s) "
                 "ON CONFLICT (id) DO UPDATE SET status=%(status)s, decided_by=%(decided_by)s, "
                 "decided_via=%(decided_via)s, decided_at=%(decided_at)s, result_summary=%(result_summary)s, "
-                "error=%(error)s, arguments=%(arguments)s, args_sha256=%(args_sha256)s",
+                "error=%(error)s, arguments=%(arguments)s, args_sha256=%(args_sha256)s, auto_review=%(auto_review)s",
                 {**d, "arguments": Jsonb(d["arguments"])})
 
     def _list_pending_approvals(self, user: str | None) -> list[Approval]:

@@ -22,11 +22,15 @@
 #   --vault-manual      idem, mais la part de descellement est affichée une fois et redemandée à chaque redémarrage
 #   --local-llm         moteur d'inférence local (Ollama, CPU, profil compose local-llm), proposé dans /setup
 #   --local-llm-model M modèle Ollama à tirer (défaut : qwen3:4b) ; implique --local-llm
+#   --home              passerelle du foyer (profil home : Home Assistant, enceintes, écrans ; docs/LOKKAL-HOME-BRIDGE.md),
+#                       écoute sur l'adresse LAN de l'hôte seulement ; ~/.nokker/home/home.yaml livré sans destination
+#   --home-mdns         en plus : découverte des écrans Cast/AirPlay (réseau de l'hôte, Linux seulement) ; implique --home
+#   --home-lan-ip IP    adresse LAN (privée) de l'hôte vue par les appareils du foyer (défaut : détectée)
 # Variables : NOKKER_VERSION (comme --version, qui prime). Tests : NOKKER_RELEASE_BASE (URL des pièces de release), NOKKER_SKIP_PULL=1, NOKKER_NO_CLI=1.
 set -eu
 
 REPO=nokker-ai/nokker
-VERSION="${NOKKER_VERSION:-}"; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""; LLM=0; LLM_MODEL=""
+VERSION="${NOKKER_VERSION:-}"; WORKSPACE=""; DIR="${HOME}/.nokker"; YES=0; MODE=install; PURGE=0; OPEN=1; VAULT=""; LLM=0; LLM_MODEL=""; HOME_BRIDGE=0; HOME_MDNS=0; HOME_LAN_IP=""
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nokker"
 # Arguments d'origine, quotés pour sh -c (relance sous le groupe docker juste après son installation)
 ARGS=""; for a in "$@"; do ARGS="$ARGS '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"; done
@@ -54,6 +58,9 @@ while [ $# -gt 0 ]; do
     --vault) VAULT=auto; shift;;
     --vault-manual) VAULT=manual; shift;;
     --local-llm) LLM=1; shift;;
+    --home) HOME_BRIDGE=1; shift;;
+    --home-mdns) HOME_BRIDGE=1; HOME_MDNS=1; shift;;
+    --home-lan-ip) HOME_BRIDGE=1; HOME_LAN_IP=${2:?}; shift 2;;
     --local-llm-model) LLM=1; LLM_MODEL=${2:?}; shift 2;;
     -h|--help) sed -n '2,27p' "$0" 2>/dev/null || true; exit 0;;
     *) die "option inconnue : $1";;
@@ -215,6 +222,9 @@ if [ "$MODE" = update ] && [ -z "${NOKKER_INSTALL_REEXEC:-}" ] && ! cmp -s "$0" 
   [ "$VAULT" = manual ] && set -- "$@" --vault-manual
   [ -n "$LLM_MODEL" ] && set -- "$@" --local-llm-model "$LLM_MODEL"
   [ "$LLM" = 1 ] && [ -z "$LLM_MODEL" ] && set -- "$@" --local-llm
+  [ -n "$HOME_LAN_IP" ] && set -- "$@" --home-lan-ip "$HOME_LAN_IP"
+  [ "$HOME_MDNS" = 1 ] && set -- "$@" --home-mdns
+  [ "$HOME_BRIDGE" = 1 ] && set -- "$@" --home
   NOKKER_INSTALL_REEXEC="$TMP.install.sh" exec sh "$TMP.install.sh" "$@"
 fi
 [ -n "${NOKKER_INSTALL_REEXEC:-}" ] && rm -f "$NOKKER_INSTALL_REEXEC"
@@ -310,6 +320,34 @@ if [ "$LLM" = 1 ]; then
     setv NOKKER_LOCAL_LLM_MODEL "$LLM_MODEL"
   fi
   add_profile local-llm
+fi
+# Passerelle du foyer (opt-in) : core reste fermé au LAN ; seule home-bridge le joint, sur une liste blanche vide.
+is_private_v4() { case "$1" in 10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0;; *) return 1;; esac; }
+if [ "$HOME_BRIDGE" = 1 ]; then
+  if [ -z "$HOME_LAN_IP" ]; then
+    if [ "$os" = darwin ]; then HOME_LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+    else HOME_LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}' | head -1); fi
+  fi
+  is_private_v4 "$HOME_LAN_IP" \
+    || die "--home : adresse LAN privée de l'hôte introuvable (${HOME_LAN_IP:-aucune}) ; précisez --home-lan-ip 192.168.x.y"
+  [ "$HOME_MDNS" = 1 ] && [ "$os" != linux ] && die "--home-mdns : Linux seulement (multicast du réseau de l'hôte)"
+  setv NOKKER_HOME_LAN_IP "$HOME_LAN_IP"
+  [ -n "$(getv NOKKER_HOME_BRIDGE_TOKEN)" ] || setv NOKKER_HOME_BRIDGE_TOKEN "$(rand 32)"
+  setv NOKKER_HOME_BRIDGE_URL http://home-bridge:8800
+  mkdir -p "$DIR/home/secrets"; chmod 700 "$DIR/home" "$DIR/home/secrets"
+  [ -f "$DIR/home/home.yaml" ] || cat > "$DIR/home/home.yaml" <<'HOMEYAML'
+# Passerelle du foyer Lokkal (docs/LOKKAL-HOME-BRIDGE.md). AUCUNE destination autorisée tant que `allow` est vide :
+# ajoutez les appareils de votre réseau (adresses privées seulement), puis : docker compose … restart home-bridge
+allow: []
+#  - {host: 192.168.1.10, ports: [8123]}                     # Home Assistant
+#  - {cidr: 192.168.1.0/24, ports: [1400, 1705, 4953, 7000]} # Sonos, Snapcast, AirPlay
+# home_assistant: {url: http://192.168.1.10:8123, token_file: secrets/ha_token}
+cast: {enabled: false}
+HOMEYAML
+  chmod 600 "$DIR/home/home.yaml"
+  add_profile home
+  [ "$HOME_MDNS" = 1 ] && add_profile home-mdns
+  say "passerelle du foyer : écoute sur $HOME_LAN_IP:8801/8802 ; destinations dans $DIR/home/home.yaml (vide)"
 fi
 chmod 600 "$DIR/.env"; chmod 700 "$DIR/state"
 WEB_PORT=$(getv NOKKER_PORT); API_PORT=$(getv NOKKER_API_PORT)

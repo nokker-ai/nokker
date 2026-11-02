@@ -59,30 +59,38 @@ CONTENT_TABLES = [
     "thread_shares",  # instantanés des liens de conversation partagés (044) : locataire du fil
     # apprentissage (046, docs/LEARNING.md) : skills appris, notes en attente, journal — locataire du compte
     "nokker_learned_skills", "nokker_memory_pending", "nokker_learning_journal",
+    # objectifs et notes du correcteur (050, docs/OUTCOMES-GOAL.md) : locataire du fil
+    "nokker_goals", "nokker_goal_grades",
+    "ambient_boards",  # tableau commun du foyer (054, docs/AMBIENT.md) : locataire du foyer
+    # papiers du foyer (055, docs/HOUSEHOLD-PAPER.md) : locataire du compte, aucune politique croisée
+    "paper_documents", "paper_exports", "paper_settings",
+    # paiements (056, docs/PAYMENTS.md) : mandats et budgets, locataire du membre
+    "pay_mandates", "pay_budgets",
+    # ex-« hors RLS » qui portent un locataire (058, chantier rls-out-tables) : RLS forcée, tenant_isolation ; celles
+    # qu'on cherche avant le locataire s'ouvrent en plus par leur CLÉ (KEYED ci-dessous, test_key_lookup_*)
+    "accounts", "account_deletions", "billing_customers", "household_minor_grants", "household_minor_grant_audit",
+    "lokkal_gateway_codes", "lokkal_gateway_refresh", "lokkal_machines", "lokkal_page_moderation",
+    "lokkal_public_pages", "sso_domain_claims", "sso_flows", "sso_routes", "thread_share_tokens", "ambient_displays",
 ]
-OUT_OF_RLS = {"tenants", "accounts", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
+# Tables sous RLS lues avant le locataire par une clé (058) : {table: colonnes de clé}
+KEYED = {"accounts": ("id", "email"), "billing_customers": ("stripe_customer",),
+         "household_minor_grants": ("account_id",), "lokkal_gateway_codes": ("code_sha256",),
+         "lokkal_gateway_refresh": ("token_sha256", "family"),
+         "lokkal_machines": ("id", "token_sha256", "host", "account_id"), "sso_domain_claims": ("domain",),
+         "sso_flows": ("state_sha256",), "sso_routes": ("connection_id",), "thread_share_tokens": ("token_sha256",),
+         "ambient_displays": ("id", "token_sha256", "pair_sha256", "account_id")}
+OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
-              "lokkal_machines", "lokkal_link_requests",  # lien Lokkal (014) : cherchées par empreinte de jeton ou par code
-              "lokkal_gateway_codes", "lokkal_gateway_refresh",  # connexion passerelle (019), idem, par empreinte
-              "billing_customers", "billing_events",  # webhook Stripe (010) : lus avant de connaître le locataire
+              "lokkal_link_requests",  # lien Lokkal (014) : demande d'appareil, aucun locataire avant l'approbation
+              "billing_events",  # webhook Stripe (010) : idempotence, lue avant de connaître le locataire
               "lokkal_relay_used_jti",  # jti des jetons de pages présentés au relais (035) : par empreinte, sans locataire
-              # SSO (032) : connexion → locataire, domaine prouvé → connexion, connexions en cours, (issuer, sub)
-              "sso_routes", "sso_domain_claims", "sso_flows", "sso_identities",
+              # SSO (032) : (issuer, sub) → compte, sans locataire
+              "sso_identities",
               # foyer (039) : « ce compte est un profil mineur », lu avant le locataire (SSO, consentements)
               "account_minors",
-              # foyers autorisés à déclarer des profils mineurs (043) : lus dans le tour du mineur (autre locataire que
-              # le payeur) et par l'opérateur ; audit en ajout seul
-              "household_minor_grants", "household_minor_grant_audit",
-              # modération des pages publiques (040) : registre lu par le relais avant le locataire, et par
-              # l'opérateur pour tous les locataires ; audit en ajout seul
-              "lokkal_public_pages", "lokkal_page_moderation",
-              # liens de conversation partagés (044) : empreinte du jeton → partage et locataire, lue sans locataire
-              # par la route publique ; ni contenu ni jeton en clair
-              "thread_share_tokens",
               # canaux Slack/WhatsApp (048) : codes d'appairage (comme telegram_pairing), événements déjà vus,
               # fenêtre de 24 h WhatsApp sous empreinte — lus avant de connaître le locataire
-              "channel_pairing", "channel_events", "channel_windows",
-              "account_deletions"}  # file d'effacement (017) : lue par l'outil d'opérateur pour tous les locataires
+              "channel_pairing", "channel_events", "channel_windows"}
 
 
 @pytest.fixture(scope="module")
@@ -160,6 +168,14 @@ def _insert(conn, table: str, tenant: str | None = None) -> None:
         vals[cols.index("thread_id")] = th
     if table == "parental_consents":  # foyer (039) : une attestation est attestée, pour un profil mineur
         vals[cols.index("attested")], vals[cols.index("profile")] = True, "teen"
+    if table == "paper_exports":  # papiers du foyer (055) : nature et état contraints
+        vals[cols.index("kind")], vals[cols.index("status")] = "ics", "ready"
+    if table == "lokkal_public_pages":  # 040 : page_id ou empreinte
+        cols, vals = [*cols, "page_id"], [*vals, "pg_" + uuid.uuid4().hex[:16]]
+    if table in ("lokkal_page_moderation", "household_minor_grant_audit"):  # 040, 043 : action contrainte
+        vals[cols.index("action")] = "unpublish" if table == "lokkal_page_moderation" else "allow"
+    if table == "ambient_displays":  # 054 : profondeur 1 ou 2
+        vals[cols.index("depth")] = 1
     if tenant is not None:
         cols, vals = [*cols, "tenant_id"], [*vals, tenant]
     names = ", ".join(f'"{c}"' for c in cols)
@@ -254,6 +270,76 @@ def test_every_table_is_covered(pg):
             assert not rls, f"{name} est hors RLS par conception"
             continue
         assert rls and force and policy and has_col, f"{name} : table de contenu sans RLS complète"
+
+
+@requires_pg
+def test_no_table_out_of_rls_carries_a_tenant(pg):
+    """Une table hors RLS ne porte pas de locataire (058) : celle qui en porte un est sous RLS forcée, cherchée au
+    besoin par sa clé — jamais une table où un filtre de locataire oublié montrerait tous les locataires."""
+    import psycopg
+
+    with psycopg.connect(pg["su"]) as conn:
+        carrying = {r[0] for r in conn.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_id' AND NOT a.attisdropped "
+            "WHERE n.nspname = 'public' AND c.relkind = 'r'").fetchall()}
+    assert not (carrying & OUT_OF_RLS), carrying & OUT_OF_RLS
+
+
+def _keyed_row(su: str, table: str, tenant: str) -> dict[str, str]:
+    """Une ligne de `table` dans `tenant`, écrite en superutilisateur ; rend ses valeurs de clé."""
+    import psycopg
+
+    with psycopg.connect(su, autocommit=True) as conn:
+        cols, vals = _dummy_row(conn, table)
+        if table == "ambient_displays":
+            vals[cols.index("depth")] = 1
+        row = dict(zip(cols, vals, strict=True))
+        row["tenant_id"] = tenant
+        for k in KEYED[table]:  # colonnes de clé nullables (ambient_displays) : une valeur aussi
+            row.setdefault(k, uuid.uuid4().hex)
+        names = ", ".join(f'"{c}"' for c in row)
+        conn.execute(f"INSERT INTO {table} ({names}) VALUES ({', '.join(['%s'] * len(row))})", list(row.values()))
+    return {k: str(row[k]) for k in KEYED[table]}
+
+
+@requires_pg
+@pytest.mark.parametrize("table", sorted(KEYED))
+def test_key_lookup_opens_only_the_row_of_its_key(pg, table):
+    """Attaque (058) : sans locataire, une connexion qui présente la clé d'une ligne de A ne voit QUE cette ligne —
+    pas les autres lignes de A, pas celles de B ; sans clé ou avec une clé inconnue, rien ; une clé n'écrit jamais
+    une nouvelle ligne ; une ligne lue par clé ne change pas de locataire ; B, dans son locataire, ne voit rien de A."""
+    import psycopg
+
+    from nokker.store.conn import connect, connect_admin, connect_key
+    from nokker.tenancy.context import tenant_scope
+
+    if table == "billing_customers":  # un client Stripe par locataire (UNIQUE) : lignes des tests précédents retirées
+        with psycopg.connect(pg["su"], autocommit=True) as su:
+            su.execute("DELETE FROM billing_customers")
+    a1 = _keyed_row(pg["su"], table, A)
+    a2 = a1 if table == "billing_customers" else _keyed_row(pg["su"], table, A)
+    b1 = _keyed_row(pg["su"], table, B)
+    for col in KEYED[table]:
+        key = a1[col].lower() if col == "email" else a1[col]
+        with connect_key(pg["app"], key, autocommit=True) as conn:
+            seen = conn.execute(f"SELECT tenant_id, {', '.join(KEYED[table])} FROM {table}").fetchall()
+            assert len(seen) == 1 and seen[0][0] == A, f"{table}.{col} : {seen}"
+            assert seen[0][1] == a1[KEYED[table][0]] and seen[0][1] != b1[KEYED[table][0]]
+            assert a2 is a1 or seen[0][1] != a2[KEYED[table][0]]
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):  # aucune écriture par clé
+                _insert(conn, table, tenant=A)
+            if conn.execute("SELECT 1 FROM pg_policies WHERE tablename = %s AND policyname = 'key_lookup_update'",
+                            (table,)).fetchone():
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):  # ni déplacement chez B
+                    conn.execute(f"UPDATE {table} SET tenant_id = %s", (B,))
+    for key in ("", "inconnue-" + uuid.uuid4().hex):
+        with connect_key(pg["app"], key, autocommit=True) as conn:
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    with connect_admin(pg["app"], autocommit=True) as conn:
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    with tenant_scope(B), connect(pg["app"], autocommit=True) as conn:
+        assert {r[0] for r in conn.execute(f"SELECT tenant_id FROM {table}").fetchall()} <= {B}
 
 
 @requires_pg
@@ -541,12 +627,17 @@ def test_crew_engine_ticks_each_tenant_in_its_own_scope(pg, pod_env, tmp_path):
 
 
 def test_billing_pg_store_isolation_idempotence_and_stale_events(pg, pod_env):
-    """nokker/billing sur le vrai rôle nokker_app : webhook sans locataire (tables hors RLS), abonnement sous RLS."""
+    """nokker/billing sur le vrai rôle nokker_app : webhook sans locataire (client par sa clé, 058 ; événements hors
+    RLS), abonnement sous RLS."""
     from datetime import datetime, timedelta, timezone
+
+    import psycopg
 
     from nokker.billing.store import PgBilling
     from nokker.tenancy.context import tenant_scope
 
+    with psycopg.connect(pg["su"], autocommit=True) as su:  # lignes factices des tests génériques (058 : sous RLS)
+        su.execute("DELETE FROM billing_customers")
     store = PgBilling(pg["app"])
     t0 = datetime(2100, 1, 1, 12, 0, tzinfo=timezone.utc)  # plus récent que les lignes factices des autres tests du module
     row = {"stripe_subscription": "sub_1", "stripe_customer": "cus_a", "plan": "solo", "status": "active",
@@ -576,10 +667,10 @@ def test_billing_pg_store_isolation_idempotence_and_stale_events(pg, pod_env):
         assert store.upsert_subscription({**gone, "status": "active"}) is False
         assert store.subscription(A)["stripe_subscription"] == "sub_1"  # sub_old est plus récent mais résilié
 
-    import psycopg
-
-    with psycopg.connect(pg["app"]) as conn:  # hors scope : la RLS ne rend rien
+    with psycopg.connect(pg["app"]) as conn:  # hors scope : la RLS ne rend rien (ni abonnements, ni clients, 058)
         assert conn.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM billing_customers").fetchone()[0] == 0
+    assert store.customer_for_tenant(A) == "cus_a" and store.customer_for_tenant(B) == "cus_b"
 
 
 @requires_pg
@@ -651,7 +742,7 @@ class _Accounts:
 
 def seed_accounts(su_dsn: str, *actors) -> None:
     """Comptes réels (`tenants`, `accounts`) des acteurs d'un test : les politiques d'équipe et de foyer n'ouvrent un
-    compte que s'il appartient au locataire posé (`nokker_actor()`, migration 050), comme en production."""
+    compte que s'il appartient au locataire posé (`nokker_actor()`, migration 059), comme en production."""
     import psycopg
 
     with psycopg.connect(su_dsn, autocommit=True) as su:

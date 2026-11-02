@@ -332,9 +332,9 @@ class MemoryLinkStore:
         with self.lock:
             self.requests.pop(device_sha, None)
 
-    def hosts(self) -> set[str]:
+    def host_taken(self, host: str) -> bool:
         with self.lock:
-            return {m.host for m in self.machines.values()}
+            return any(m.host == host for m in self.machines.values())
 
     def add_machine(self, m: Machine) -> None:
         with self.lock:
@@ -477,9 +477,9 @@ class LinkService:
                 req.state = "denied"
                 self.store.save_request(req)
                 return {"state": "denied"}
-            base, taken = slug(req.machine_name), self.store.hosts()
+            base = slug(req.machine_name)
             host, n = f"{base}.{self.gateway_domain}", 2
-            while host in taken:
+            while self.store.host_taken(host):  # un nom à la fois (lokkal_machines sous RLS, 058 : lu par sa clé)
                 host, n = f"{base}-{n}.{self.gateway_domain}", n + 1
             m = Machine(id=f"mc_{uuid.uuid4().hex[:16]}", account=account, tenant=tenant, name=req.machine_name,
                         host=host, token_sha256="", created_at=self.clock())

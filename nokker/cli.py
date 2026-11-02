@@ -15,10 +15,12 @@ La CLI est une frontière (docs/TENANCY.md §2) : les commandes qui touchent des
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 from nokker.api.server import build_approvals, build_kernel, build_ledger, serve
@@ -84,7 +86,7 @@ def _cmd_code(args: argparse.Namespace) -> int:
     delegate = DelegateToolSource(  # sous-agents : copies du noyau parent sur le registre filtré (hooks : héritage
         lambda registry, thread_id, observer: dataclasses.replace(  # explicite seulement, voir nokker/tools/hooks.py)
             parent["k"], observer=observer, tools=hooks["r"].wrap(registry) if "r" in hooks else registry),
-        source)
+        source, fork=bool(getattr(config, "delegate_fork", False)))
     memory_tools = [ProjectMemoryTools(project_memory)] if project_memory is not None else []
     skill_tools = []
     if getattr(args, "project_skills", False) or local.get("project_skills", False):
@@ -169,12 +171,137 @@ def _cmd_code(args: argparse.Namespace) -> int:
     return 1 if turn.error else 0
 
 
+def _folder_state_dir(local: dict):
+    import os
+    from pathlib import Path
+
+    if local.get("state_dir"):
+        return Path(local["state_dir"]).expanduser()
+    return Path(os.environ.get("NOKKER_HOME") or "~/.config/nokker").expanduser()
+
+
+def _cmd_folder(args: argparse.Namespace) -> int:
+    """`nokker folder <chemin> "<tâche>"` (mode dossier, docs/FOLDER-MODE.md) : plan, validation, exécution, rapport ;
+    `--undo <passage>` défait un passage. Drapeau `local.folder_mode`, éteint par défaut. Codes de sortie : 0 fait,
+    1 échec, 2 usage ou drapeau éteint, 3 plan en attente de validation (sans terminal ni --oui), 4 plan refusé."""
+    import dataclasses
+    import json
+
+    from nokker.folder.run import PREFIX_PATH, FolderRuns, folder_kernel, render_steps
+    from nokker.folder.tools import FolderError
+
+    config = load_config(args.config)
+    local = config.local or {}
+    if not local.get("folder_mode", False):
+        print("mode dossier éteint : pose `local.folder_mode: true` dans la configuration", file=sys.stderr)
+        return 2
+    holder: dict = {}
+
+    def make_kernel(source):
+        if "k" not in holder:
+            cfg = dataclasses.replace(config, prefix_path=PREFIX_PATH, product_prefix_path=PREFIX_PATH,
+                                      profile_path=None)
+            holder["k"] = build_kernel(cfg)
+            holder["k"].max_calls = args.max_calls
+            holder["k"].max_tokens = 8192
+        return folder_kernel(holder["k"], source)
+
+    def emit(name: str, payload: dict) -> None:
+        if name == "folder.step" and not args.json:
+            print(f"[{payload['done']}/{payload['total']}] {payload['step_status']} : {payload['path']}",
+                  file=sys.stderr)
+
+    runs = FolderRuns(state_dir=_folder_state_dir(local), make_kernel=make_kernel, emit=emit, channel="cli")
+
+    def done(run, code: int) -> int:
+        if args.json:
+            print(json.dumps(run.view(), ensure_ascii=False, default=str))
+        return code
+
+    try:
+        if args.undo:
+            run = runs.get(args.undo)
+            if run is None:
+                print(f"passage inconnu : {args.undo}", file=sys.stderr)
+                return 2
+            run = runs.rollback(run, force=args.force)
+            u = run.undo or {}
+            if not args.json:
+                gaps = u.get("differences", []) + [f"{c['path']} ({c['why']})" for c in u.get("conflicts", [])]
+                verdict = "état identique à l'instantané" if u.get("exact") else "écarts : " + " ; ".join(gaps)
+                print(f"retour arrière de {run.run_id} : {len(u.get('restored', []))} gestes défaits, {verdict}")
+            return done(run, 0 if u.get("exact") else 1)
+        if args.approve:
+            run = runs.get(args.approve)
+            if run is None:
+                print(f"passage inconnu : {args.approve}", file=sys.stderr)
+                return 2
+        else:
+            if not args.path or not args.task:
+                print("usage : nokker folder <chemin> \"<tâche>\"", file=sys.stderr)
+                return 2
+            task = args.task if args.task != "-" else sys.stdin.read()
+            run = runs.create(args.path, task, in_place=args.en_place, out=args.out)
+            if not args.json:
+                print(f"passage {run.run_id} : {run.root}" + (" (en place)" if run.in_place else
+                                                              f" → sortie {run.out}"), file=sys.stderr)
+            run = runs.plan(run)
+            if run.status != "awaiting_approval":
+                if not args.json:
+                    print(run.error or run.plan_reply, file=sys.stderr if run.error else sys.stdout)
+                return done(run, 1 if run.status == "failed" else 0)
+        if not args.json:
+            print(f"\nPlan : {(run.plan or {}).get('resume', '')}\n{render_steps(run.plan or {})}\n", file=sys.stderr)
+            print(run.view()["card"]["text"], file=sys.stderr)
+        if not args.oui:
+            if not sys.stdin.isatty():
+                print(f"plan en attente : `nokker folder --approve {run.run_id} --oui` pour l'exécuter",
+                      file=sys.stderr)
+                return done(run, 3)
+            want = "en place" if run.in_place else "oui"
+            answer = input(f"Tape « {want} » pour valider ce plan (autre chose : refus) : ").strip().lower()
+            if answer != want:
+                runs.decide(run, approve=False)
+                return done(run, 4)
+        runs.decide(run, approve=True, confirm_in_place=run.in_place)
+        run = runs.execute(run)
+    except FolderError as e:
+        print(f"[mode dossier] {e}", file=sys.stderr)
+        return 2
+    rep = run.report or {}
+    if not args.json:
+        print("\nFichiers touchés :")
+        for t in rep.get("fichiers_touches", []):
+            print(f"- {t['action']} {t['chemin']}" + (f" → {t['vers']}" if t.get("vers") else "")
+                  + (f" ({t['etat']})" if t.get("etat") else ""))
+        for s in rep.get("etapes_non_faites", []):
+            print(f"- NON FAIT : {s['action']} {s['chemin']}")
+        print(f"\n{rep.get('resume_modele', '')}")
+        if rep.get("point_de_retour"):
+            print(f"\nTout défaire : nokker folder --undo {run.run_id}", file=sys.stderr)
+    return done(run, 1 if run.status == "failed" else 0)
+
+
 def _cmd_import(args) -> int:
-    """`nokker import` (lot 30) : reprise d'une installation Claude Code ou Cursor."""
+    """`nokker import` (lot 30) : reprise d'une installation d'un autre agent. La config locale (si elle existe) donne
+    le dossier de la mémoire de projet et le drapeau `local.import_codex_memory` (mémoire Codex importée comme données)."""
+    from pathlib import Path
+
     from nokker.importers.cli import run
     from nokker.tools.packs import user_home
 
-    return run(args, nokker_home=user_home(None), user_settings=_user_settings_path())
+    try:
+        local = load_config(args.config).local or {}
+    except (OSError, ValueError):
+        local = {}
+    memory = None
+    if local.get("project_memory_dir") or local.get("import_codex_memory"):
+        from nokker.context.project_memory import ProjectMemory
+
+        state = Path(args.state_dir).expanduser() if getattr(args, "state_dir", None) else user_home(None)
+        memory = ProjectMemory(root=Path(local.get("project_memory_dir") or state / "project-memory").expanduser(),
+                               import_data=bool(local.get("import_codex_memory", False)))
+    return run(args, nokker_home=user_home(None), user_settings=_user_settings_path(local), memory=memory)
 
 
 def _user_settings_path(local: dict | None = None):
@@ -466,6 +593,67 @@ def _cmd_pages(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_memory_consolidate(args: argparse.Namespace) -> int:
+    """`nokker memory consolidate` (docs/CONSOLIDATION.md §5) : la consolidation nocturne d'un compte (ou de tous), tout
+    de suite, dans son locataire. `--dry-run` : rien n'est écrit, le plan est rendu. Sortie : un rapport par compte,
+    caviardé (jamais le locataire ni l'adresse)."""
+    import json as _json
+    import os
+
+    from nokker.memory.consolidation.wiring import build
+    from nokker.memory.tenant_long import CorthexisEmbedder, LongMemory, PgLongMemoryStore
+    from nokker.memory.tenant_long import Settings as LongSettings
+    from nokker.tenancy.context import INTERNAL_TENANT
+    from nokker.tenancy.store import PgTenancy
+
+    cfg = load_config(args.config)
+    dsn = cfg.pg_dsn()
+    if not dsn:
+        print("[erreur: aucun DSN Postgres configuré]", file=sys.stderr)
+        return 1
+    tenancy = PgTenancy(dsn)
+    if args.all:
+        from nokker.store.conn import known_tenants
+
+        accounts = [a for t in known_tenants(dsn) if t != INTERNAL_TENANT
+                    and (a := tenancy.account_for_tenant(t)) is not None]
+    else:
+        a = tenancy.account(args.account) if args.account else tenancy.account_by_email(args.email or "")
+        if a is None:
+            print("[erreur: compte inconnu]", file=sys.stderr)
+            return 1
+        accounts = [a]
+    embedder = CorthexisEmbedder() if os.environ.get("CORTHEXIS_EMBED_URLS") else None
+    if embedder is not None and not embedder.available():
+        embedder = None
+    long_svc = LongMemory(store=PgLongMemoryStore(dsn, migrate_now=False), embedder=embedder,
+                          settings=LongSettings.from_config(cfg.tenant_long_memory_settings))
+    from nokker.context.pg import PgEpisodeStore
+    from nokker.store.pg import PgStore
+
+    from nokker.api.server import build_ledger
+
+    svc = build(cfg, long_svc, dsn=dsn, episodes=PgEpisodeStore(dsn), history_from=PgStore(dsn).history_from,
+                ledger=None if args.dry_run else build_ledger(cfg), migrate_now=False)
+    code = 0
+    for a in accounts:
+        with tenant_scope(a.tenant_id):
+            out = svc.run(a.account_id, dry_run=args.dry_run, trigger="cli",
+                          tz=svc.get_settings(a.account_id)["tz"])
+        if args.json:
+            print(_json.dumps(out, ensure_ascii=False))
+        elif "run" in out:
+            r = out["run"]
+            late = f" ({r['skipped']} reportée(s))" if r.get("skipped") else ""
+            print(f"{r['id']} {'à blanc' if args.dry_run else r['status']} : {r['summary']}{late}")
+            for o in out["ops"]:
+                print(f"  - {o['kind']} [{o['scope']}] {o['reason']}")
+        else:
+            print(f"[{out.get('status')}]")
+            code = 1 if out.get("status") == "busy" else code
+    return code
+
+
 def _cmd_household(args: argparse.Namespace) -> int:
     """Foyers autorisés à déclarer des profils mineurs (docs/LOKKAL.md §7.29.4). Sorties : le code court `mg-…` du
     foyer, jamais l'adresse ni l'identifiant d'un compte."""
@@ -562,6 +750,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "local.project_skills")
     code_p.set_defaults(func=_cmd_code)
 
+    folder_p = sub.add_parser("folder", help="mode dossier : travail de bureau sur un dossier (local.folder_mode)")
+    folder_p.add_argument("path", nargs="?", help="le dossier")
+    folder_p.add_argument("task", nargs="?", help="la tâche, ou - pour la lire sur stdin")
+    folder_p.add_argument("--out", default=None, help="dossier de sortie (défaut : <dossier>-sortie-nokker à côté)")
+    folder_p.add_argument("--en-place", action="store_true",
+                          help="permet de modifier le dossier lui-même (point de retour pris avant)")
+    folder_p.add_argument("--oui", action="store_true", help="valide le plan sans le demander")
+    folder_p.add_argument("--approve", default=None, metavar="PASSAGE", help="exécute un plan en attente")
+    folder_p.add_argument("--undo", default=None, metavar="PASSAGE", help="défait un passage")
+    folder_p.add_argument("--force", action="store_true", help="avec --undo : défait aussi les fichiers modifiés depuis")
+    folder_p.add_argument("--max-calls", type=int, default=40, help="appels modèle par tour (défaut 40)")
+    folder_p.add_argument("--json", action="store_true", help="état du passage en JSON")
+    folder_p.set_defaults(func=_cmd_folder)
+
     hooks_p = sub.add_parser("hooks", help="hooks du dépôt : voir leur empreinte, leur faire confiance (lot X3)")
     hooks_sub = hooks_p.add_subparsers(dest="hooks_command", required=True)
     for name, help_text in (("show", "hooks du dépôt, empreinte et confiance"),
@@ -616,6 +818,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_traces_subparser(sub)  # traces d'entraînement (docs/TRACES.md) : traces export|purge|verify
 
+    from nokker.improve.cli import add_improve_subparser
+
+    add_improve_subparser(sub)  # auto-amélioration hors ligne sous carte (docs/SELF-IMPROVE.md), drapeau self_improve
+
     devices_p = sub.add_parser("devices", help="appareils enrôlés (approbations fortes, docs/APPROVALS.md)")
     devices_sub = devices_p.add_subparsers(dest="devices_command", required=True)
     approve_p = devices_sub.add_parser("approve", help="confirme un appareil `pending` par son code court")
@@ -657,6 +863,18 @@ def build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--apply", action="store_true", help="agit (sinon : à blanc)")
         cp.set_defaults(func=_cmd_pages, unscoped=True)
 
+    memory_p = sub.add_parser("memory", help="mémoire longue des comptes (docs/CONSOLIDATION.md)")
+    memory_sub = memory_p.add_subparsers(dest="memory_command", required=True)
+    cons_p = memory_sub.add_parser("consolidate", help="consolidation nocturne, tout de suite (drapeau "
+                                                       "memory_consolidation) ; --dry-run : rien n'est écrit")
+    who = cons_p.add_mutually_exclusive_group(required=True)
+    who.add_argument("--account", help="identifiant us_… du compte")
+    who.add_argument("--email", help="adresse du compte (jamais affichée)")
+    who.add_argument("--all", action="store_true", help="tous les comptes testeurs")
+    cons_p.add_argument("--dry-run", action="store_true", help="à blanc : le plan, sans rien écrire")
+    cons_p.add_argument("--json", action="store_true", help="rapport complet en JSON (caviardé)")
+    cons_p.set_defaults(func=_cmd_memory_consolidate, unscoped=True)
+
     household_p = sub.add_parser("household", help="foyers : commandes d'opérateur (profils mineurs, §7.29.4)")
     household_sub = household_p.add_subparsers(dest="household_command", required=True)
     minors_p = household_sub.add_parser("minors", help="foyers autorisés à déclarer des profils mineurs "
@@ -675,7 +893,32 @@ def build_parser() -> argparse.ArgumentParser:
             mp.add_argument("--apply", action="store_true", help="agit (sinon : à blanc)")
         mp.set_defaults(func=_cmd_household, unscoped=True)
 
+    mandate_p = sub.add_parser("mandate", help="mandats de dépense signés par passkey (docs/PAYMENTS.md)")
+    mandate_sub = mandate_p.add_subparsers(dest="mandate_command", required=True)
+    verify_p = mandate_sub.add_parser("verify", help="vérifie HORS LIGNE une enveloppe de mandat (fichier JSON, ou - "
+                                                     "pour l'entrée standard) : code 0 si valide, 1 sinon")
+    verify_p.add_argument("path", help="fichier de l'enveloppe (GET /v1/payments/mandates/{id} → `envelope`), ou -")
+    verify_p.add_argument("--origin", help="origine WebAuthn attendue (sinon celle de l'enveloppe)")
+    verify_p.add_argument("--device-key", help="clé publique SPKI (base64url) de l'appareil, si on la connaît")
+    verify_p.set_defaults(func=_cmd_mandate_verify, unscoped=True)
+
     return p
+
+
+def _cmd_mandate_verify(args: argparse.Namespace) -> int:
+    from nokker.payments.mandate import verify_envelope
+
+    try:
+        raw = sys.stdin.read() if args.path == "-" else Path(args.path).read_text(encoding="utf-8")
+        env = json.loads(raw)
+    except (OSError, ValueError) as e:
+        print(json.dumps({"valid": False, "errors": [f"enveloppe illisible : {e}"]}, ensure_ascii=False))
+        return 1
+    if isinstance(env, dict) and "envelope" in env and "format" not in env:  # réponse entière de la route
+        env = env["envelope"]
+    out = verify_envelope(env, trusted_spki=args.device_key, expected_origin=args.origin).to_json()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if out["valid"] else 1
 
 
 def _cmd_mcp(args: argparse.Namespace) -> int:

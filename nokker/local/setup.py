@@ -28,9 +28,11 @@ logger = logging.getLogger("nokker.local.setup")
 
 SECRET_KEY_ENV = "NOKKER_LOCAL_SECRET_KEY"
 ROUTER_URL = "https://router.sokkan.ch/v1"
-OLLAMA_CANDIDATES = ("http://host.docker.internal:11434", "http://127.0.0.1:11434")
+OLLAMA_CANDIDATES = ("http://127.0.0.1:11434",)
 # Profil compose `local-llm` : le service `ollama` du compose (http://ollama:11434), posé par le compose dans cette
-# variable (liste séparée par des virgules) ; sans elle, les deux candidats ci-dessus.
+# variable (liste séparée par des virgules) ; sans elle, le candidat ci-dessus. `host.docker.internal` n'en fait plus
+# partie : dans Lokkal, core sort par egress, qui refuse l'hôte (adresse privée) — un modèle de l'hôte ou du LAN se
+# déclare explicitement ici, ou passe par un service de la pile en NO_PROXY (docs/LOKKAL-CORE-EGRESS.md).
 OLLAMA_URLS_ENV = "NOKKER_OLLAMA_URLS"
 
 

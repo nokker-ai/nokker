@@ -1,0 +1,7 @@
+{"action": "opened", "number": 7,
+ "pull_request": {"number": 7, "title": "Corrige le calcul des remises", "body": "Voir le ticket.", "state": "open",
+   "html_url": "https://git.example.org/team/app/pull/7", "user": {"login": "alice"},
+   "head": {"ref": "fix/remises", "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "repo": {"full_name": "team/app"}},
+   "base": {"ref": "main", "sha": "0f0e0d0c0b0a09080706050403020100ffeeddcc", "repo": {"full_name": "team/app"}}},
+ "repository": {"full_name": "team/app", "html_url": "https://git.example.org/team/app", "clone_url": "https://git.example.org/team/app.git"},
+ "sender": {"login": "alice"}}

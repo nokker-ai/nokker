@@ -14,6 +14,12 @@ les lignes `training_ok` partent ; `--include-eval` ajoute les autres (évaluati
 `pii.py` dans TOUS les cas ; fils des testeurs pseudonymisés. Secrets : scellés à l'enregistrement, puis à nouveau ici
 (coffre chargé depuis la config + motifs forts), et une ligne où une valeur connue survivrait est retirée (comptée).
 
+Réponses écrites par le noyau (pas par le modèle) : la réponse « [Correcteur] … » d'un tour `goal_check` et la réponse
+d'une commande `/goal` (verdict `turn:synthetic` du tour, `nokker/goals/service.py`). Chacune sort en une ligne à part,
+`meta.synthetic = "grader" | "goal_cmd"` (`null` sur une ligne d'appel modèle) ; et dans toute ligne,
+`meta.synthetic_in_prompt` liste les positions du prompt (messages `assistant` de l'historique) qui sont ces réponses
+du noyau, retrouvées par le verdict de leur tour (même fil, tour antérieur), jamais devinées d'après leur texte.
+
 Lot : `<out>/traces-<YYYYMMDD>-<n>/` avec `calls.jsonl` (ou `calls-00001.jsonl`… au-delà de `max_lines`),
 `manifest.json` et `SHA256SUMS` (format `sha256sum -c`).
 """
@@ -36,6 +42,9 @@ from nokker.traces import pii
 from nokker.traces.recorder import TARGETS, copy_json, kernel_sha, triggered, verdict_dict
 
 FORMAT = "nokker-traces/1"
+# Fils d'un banc, reconnus même sans `meta.bench` (lignes reconstruites depuis `turns`) : `bench-…`, `improve-…`
+# (préfixe du locataire compris, `tn_…:bench-…`). docs/SELF-IMPROVE.md §5.
+BENCH_THREAD_PREFIXES = ("bench-", "improve-")
 APPROVAL_STATES = {"pending": "created", "expired": "created", "approved": "accepted", "executed": "accepted",
                    "failed": "accepted", "rejected": "refused"}
 
@@ -82,6 +91,24 @@ class TraceSource(Protocol):
 
     def approvals(self, tenant: str, thread_id: str, turn_index: int) -> list[dict[str, Any]]: ...
 
+    def synthetic_turns(self, tenant: str, thread_id: str) -> list[dict[str, Any]]: ...
+
+
+SYNTHETIC_RULE = "turn:synthetic"  # = nokker.goals.service.SYNTHETIC_RULE (import évité : l'export reste léger)
+
+
+def synthetic_kind(turn: dict[str, Any] | None) -> str | None:
+    """`grader` | `goal_cmd` quand la réponse du tour a été écrite par le noyau (verdict `turn:synthetic`), sinon None."""
+    for v in (turn or {}).get("verdicts") or []:
+        if v.get("rule") == SYNTHETIC_RULE:
+            return str(v.get("reason") or "") or None
+    return None
+
+
+def _reply_of(turn: dict[str, Any]) -> str:
+    msgs = [m for m in turn.get("messages") or [] if m.get("role") == "assistant"]
+    return str((msgs[-1].get("content") if msgs else turn.get("reply")) or "")
+
 
 @dataclass
 class MemoryTraceSource:
@@ -123,6 +150,9 @@ class MemoryTraceSource:
 
     def approvals(self, tenant, thread_id, turn_index):
         return self.approval_rows.get((tenant, thread_id, turn_index), [])
+
+    def synthetic_turns(self, tenant, thread_id):
+        return [d for t, _, d in self.turn_rows if t == tenant and d["thread_id"] == thread_id and synthetic_kind(d)]
 
 
 class PgTraceSource:
@@ -173,6 +203,11 @@ class PgTraceSource:
     def approvals(self, tenant, thread_id, turn_index):
         return self._q(tenant, "SELECT call_id, tool_name, status FROM approvals WHERE thread_id = %s "
                                "AND turn_index = %s ORDER BY created_at", (thread_id, turn_index))
+
+    def synthetic_turns(self, tenant, thread_id):
+        rows = self._q(tenant, "SELECT turn FROM turns WHERE thread_id = %s AND turn->'verdicts' @> %s::jsonb "
+                               "ORDER BY turn_index", (thread_id, json.dumps([{"rule": SYNTHETIC_RULE}])))
+        return [r["turn"] for r in rows if synthetic_kind(r["turn"])]
 
 
 @dataclass
@@ -268,6 +303,20 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
     pii_counts: Counter = Counter()
     lines: list[tuple[str, dict[str, Any]]] = []  # (clé de tri, ligne)
     turn_cache: dict[tuple[str, str, int], dict[str, Any] | None] = {}
+    synthetic_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    def synthetic_in_prompt(tenant: str, thread: str, index: int, prompt: Any) -> list[int]:
+        """Positions des messages `assistant` du prompt qui sont la réponse d'un tour antérieur du fil écrite par le
+        noyau (verdict `turn:synthetic`)."""
+        fn = getattr(source, "synthetic_turns", None)
+        if fn is None or not isinstance(prompt, list):
+            return []
+        key = (tenant, thread)
+        if key not in synthetic_cache:
+            synthetic_cache[key] = list(fn(tenant, thread))
+        replies = {_reply_of(d) for d in synthetic_cache[key] if int(d.get("index", -1)) < index}
+        return [i for i, m in enumerate(prompt) if isinstance(m, dict) and m.get("role") == "assistant"
+                and not m.get("tool_calls") and str(m.get("content") or "") in replies]
 
     def get_turn(tenant: str, thread: str, index: int) -> dict[str, Any] | None:
         key = (tenant, thread, index)
@@ -303,14 +352,20 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
         def emit(at: datetime, thread: str, index: int, call: int, account: str | None, target: str, sha: str,
                  prompt: Any, tools: Any, completion: Any, meta: dict[str, Any], reconstructed: bool,
                  tenant: str = tenant, tenant_type: str = tenant_type, training_ok: Any = training_ok,
-                 terms: Any = terms) -> None:
+                 terms: Any = terms, synthetic: str | None = None) -> None:
             if opts.targets and target not in opts.targets:
                 counts["excluded_target"] += 1
+                return
+            if meta.get("bench") or str(thread).rsplit(":", 1)[-1].startswith(BENCH_THREAD_PREFIXES):
+                # Ligne d'un banc (docs/SELF-IMPROVE.md §5) : jamais exportée, même avec --include-eval — aucun banc
+                # ne doit atteindre l'entraînement.
+                counts["excluded_bench"] += 1
                 return
             ok = training_ok(account)
             if not ok and not opts.include_eval:
                 counts["excluded_no_training_consent"] += 1
                 return
+            in_prompt = synthetic_in_prompt(tenant, thread, index, prompt)  # avant scellés et PII : texte d'origine
             prompt, tools, completion = seal(copy_json(prompt)), copy_json(tools), seal(copy_json(completion))
             if tenant_type == "tester" or opts.pii_internal:
                 t = terms(account)
@@ -332,8 +387,11 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
                 "secret_seals": meta.get("secret_seals") or {"count": 0, "names": []},
                 "judge_verdict_v3": meta.get("judge_verdict_v3"), "user_signal": signal, "training_ok": ok,
                 "reconstructed": reconstructed, "at": at.astimezone(timezone.utc).isoformat(),
+                "synthetic": synthetic, "synthetic_in_prompt": in_prompt,
                 "extra": {k: meta[k] for k in ("reasoning", "route_reason", "finish_reason", "turn_error", "last_call",
-                                               "channel", "verdict_scope", "alignment", "shadow") if k in meta},
+                                               "channel", "verdict_scope", "alignment", "shadow", "side",
+                                               "advisor_tier", "advisor_model", "grader_tier", "grader_model")
+                          if k in meta},
             }
             line = {"prompt": prompt, "tools": tools, "completion": completion, "meta": m}
             blob = json.dumps(line, ensure_ascii=False)
@@ -343,6 +401,8 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
             counts["lines"] += 1
             counts["training_ok" if ok else "eval_only"] += 1
             counts["reconstructed" if reconstructed else "recorded"] += 1
+            if synthetic:
+                counts[f"synthetic:{synthetic}"] += 1
             counts[f"target:{target}"] += 1
             counts[f"tenant_type:{tenant_type}"] += 1
             lines.append((f"{m['at']}|{thread}|{index:08d}|{call:04d}", line))
@@ -353,8 +413,16 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
             emit(r["recorded_at"], r["thread_id"], r["turn_index"], r["call_index"], r.get("account_id"),
                  r.get("target") or "unknown", r.get("kernel_sha") or "", r["prompt"], r["tools"], r["completion"],
                  r["meta"], False)
-        if opts.reconstruct:
-            for at, d in source.turns(tenant, opts.since, opts.until):
+        for at, d in source.turns(tenant, opts.since, opts.until):
+            kind = synthetic_kind(d)
+            if kind:  # réponse écrite par le noyau : une ligne à part, marquée (jamais prise pour un appel modèle)
+                turn_cache[(tenant, d["thread_id"], d["index"])] = d
+                emit(at, d["thread_id"], d["index"], 0, d.get("sender"), opts.assume_target, "",
+                     [{"role": "user", "content": _input_text(d) or ""}], None,
+                     [{"role": "assistant", "content": _reply_of(d)}],
+                     {"tier": None, "model": None, "channel": d.get("channel")}, True, synthetic=kind)
+                continue
+            if opts.reconstruct:
                 if (d["thread_id"], d["index"]) in recorded_turns:
                     continue
                 turn_cache[(tenant, d["thread_id"], d["index"])] = d

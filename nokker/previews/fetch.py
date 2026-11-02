@@ -21,6 +21,7 @@ from nokker.previews.ssrf import (
     ResolvedHop,
     SsrfBlocked,
     pinned_client,
+    proxy_refusal,
     resolve_and_check,
 )
 from nokker.tools.web import pii_violation
@@ -77,7 +78,7 @@ def guarded_get(url: str, *, max_bytes: int, timeout_s: float = TIMEOUT_S, max_r
         if remaining <= 0:
             raise FetchError(f"délai dépassé ({timeout_s:.1f}s) après {redirects} redirection(s)")
 
-        hop = resolve_and_check(current_url, resolver=resolver)
+        hop = resolve_and_check(current_url, resolver=resolver, enforce_ports=True)  # ports : mode strict seul
         client = factory(hop, remaining)
         try:
             try:
@@ -110,6 +111,9 @@ def guarded_get(url: str, *, max_bytes: int, timeout_s: float = TIMEOUT_S, max_r
             except httpx.TimeoutException as exc:
                 raise FetchError(f"délai dépassé : {exc}") from exc
             except httpx.HTTPError as exc:
+                refused = proxy_refusal(exc)  # mode mandataire : le refus d'egress est un refus de politique
+                if refused is not None:
+                    raise SsrfBlocked(refused) from None
                 raise FetchError(f"requête échouée : {exc}") from exc
         finally:
             client.close()

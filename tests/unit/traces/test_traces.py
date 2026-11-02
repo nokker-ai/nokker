@@ -460,3 +460,74 @@ def test_retention_purges_old_rows_of_the_current_tenant_only():
         TraceRecorder(sink=sink, retention_days=0)
     with pytest.raises(ValueError):
         TraceRecorder(sink=sink, target="prod")
+
+
+# ── Marque de banc (docs/SELF-IMPROVE.md §5) : aucune ligne d'un banc n'atteint un export ──
+
+def test_bench_mark_on_lines_and_never_exported(tmp_path, monkeypatch):
+    plain = recorder()
+    run(THREE_CALLS, rec=plain)
+    assert all("bench" not in r["meta"] for r in plain.sink.rows)  # sans NOKKER_BENCH : lignes inchangées
+    monkeypatch.setenv("NOKKER_BENCH", "conv")
+    marked = recorder()
+    run(THREE_CALLS, thread="fil-banc", rec=marked)
+    assert {r["meta"]["bench"] for r in marked.sink.rows} == {"conv"}
+    src = source_from([*plain.sink.rows, *marked.sink.rows])
+    for include_eval in (False, True):
+        res = export(src, tmp_path, opts(include_eval=include_eval))
+        lines = read_lines(res.path)
+        assert lines and {ln["meta"]["thread"] for ln in lines} == {"fil"}
+        assert res.manifest["counts"]["excluded_bench"] == len(marked.sink.rows)
+
+
+def test_bench_thread_prefix_never_exported(tmp_path):
+    rec = recorder()
+    run(THREE_CALLS, thread="bench-x9", rec=rec)
+    run(THREE_CALLS, thread="improve-nuit", rec=rec)
+    res = export(source_from(rec.sink.rows), tmp_path, opts(include_eval=True))
+    assert read_lines(res.path) == [] and res.manifest["counts"]["excluded_bench"] == len(rec.sink.rows)
+
+
+# ───────────────────── réponses écrites par le noyau (relecture du format, 02.11) ─────────────────────
+
+def test_export_marks_kernel_replies_grader_and_goal_cmd(tmp_path):
+    """Réponses du noyau (« [Correcteur] … » d'un `goal_check`, réponse d'une commande `/goal`) : une ligne à part
+    `meta.synthetic = grader | goal_cmd`, et leurs positions dans le prompt des appels suivants
+    (`meta.synthetic_in_prompt`) ; une ligne d'appel modèle porte `synthetic: null`."""
+    from nokker.goals.service import GoalService
+    from nokker.goals.store import MemoryGoals
+    from nokker.qa.outcomes import OutcomeGrader
+
+    class G:
+        def post(self, body):
+            return {"choices": [{"message": {"content": "C1: 1 | pas encore"}}], "model": "g"}
+
+    store = MemoryStore()
+    rec = recorder()
+    k, _prov = make_kernel([Message("assistant", "je m'y mets"), Message("assistant", "suite")], rec, store)
+    rec.seal = k.invariants.redact_context
+    svc = GoalService(store=MemoryGoals(), grader=OutcomeGrader(transport=G()), outcomes_enabled=True,
+                      goals_enabled=True, submit=lambda fn, *a: None)
+    svc.kernel, k.goals = k, svc
+    with tenant_scope(INTERNAL_TENANT):
+        cmd = k.run_turn(TurnInput("fil", "/goal corrige le parseur\nles tests passent", sender="alice"))
+        svc.current("fil").driver = "client"
+        k.run_turn(TurnInput("fil", "vas-y", sender="alice"))
+        chk = k.run_turn(TurnInput("fil", "[Vérification du but]", control="goal_check", sender="alice"))
+        k.run_turn(TurnInput("fil", "continue", sender="alice"))
+    assert chk.reply.startswith("[Correcteur]") and not chk.calls and not cmd.calls
+    lot = export(source_from(rec.sink.rows, turns_of(store, INTERNAL_TENANT)), tmp_path, opts(),
+                 exporter_sha="abc1234").path
+    lines = read_lines(lot)
+    synth = {ln["meta"]["synthetic"]: ln for ln in lines if ln["meta"]["synthetic"]}
+    assert set(synth) == {"grader", "goal_cmd"}
+    assert synth["grader"]["completion"] == [{"role": "assistant", "content": chk.reply}]
+    assert synth["goal_cmd"]["completion"][0]["content"] == cmd.reply
+    assert synth["grader"]["meta"]["reconstructed"] is True and synth["grader"]["meta"]["model"] is None
+    model_lines = [ln for ln in lines if ln["meta"]["synthetic"] is None]
+    assert len(model_lines) == 2 and all(ln["meta"]["model"] == "m-ship" for ln in model_lines)
+    last = max(model_lines, key=lambda ln: ln["meta"]["turn"])
+    marked = [last["prompt"][i]["content"] for i in last["meta"]["synthetic_in_prompt"]]
+    assert marked == [cmd.reply, chk.reply]  # repérées par le verdict de leur tour, pas par leur texte
+    first = min(model_lines, key=lambda ln: ln["meta"]["turn"])
+    assert [first["prompt"][i]["content"] for i in first["meta"]["synthetic_in_prompt"]] == [cmd.reply]

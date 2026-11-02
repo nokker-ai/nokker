@@ -617,6 +617,16 @@ class SkillToolSource:
             kind = "github"
         elif source.startswith("https://"):
             ident, scan_source, kind = source, "url", "url"
+            from nokker.previews.ssrf import SsrfBlocked, current_policy, resolve_and_check
+
+            if current_policy().strict:
+                # Mode strict : la garde du noyau AVANT celle de la bibliothèque amont (qui re-vérifie chaque saut).
+                # Message inchangé pour le modèle : c'est celui que rend déjà l'amont quand sa garde refuse l'adresse.
+                try:
+                    resolve_and_check(ident, enforce_ports=True)
+                except SsrfBlocked as e:
+                    self._emit(event="install_refused", source=source, reason=_clean(f"adresse refusée : {e}"))
+                    return f"compétence introuvable à cette source : {source}", True
         elif source.startswith("official/") and len(source.split("/")) >= 2 and ".." not in source.split("/"):
             ident, scan_source, kind = source, "official", "official"
         else:

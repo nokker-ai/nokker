@@ -23,11 +23,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from nokker.images.render import IMAGE_PART, shed_line
-from nokker.tools.select import compact_index
+from nokker.context.imported import IMPORT_SOURCE, render_imported
 from nokker.core.ports import Assembled, Recall, ToolRegistry, ToolSpec
 from nokker.core.turn import Tier, ToolResult, Turn
+from nokker.images.render import IMAGE_PART, shed_line
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
+from nokker.tools.select import compact_index
 
 logger = logging.getLogger("nokker.context.engine")
 
@@ -287,10 +288,16 @@ class ContextEngineV0:
             # elle changeait le bloc du tour et tout ce qui le suit (préfixe réutilisable 75-85 % au lieu de ~100 %,
             # mesuré sur le canari le 20.10.2026).
             parts = [f"[Date et heure actuelles]\n{format_now_fr(self.now_fn())}\n[/Date]"]
-            if recall:
+            own = [r for r in recall if getattr(r, "source", "") != IMPORT_SOURCE]
+            imported = [r for r in recall if getattr(r, "source", "") == IMPORT_SOURCE]
+            if own:
                 rappel = "\n".join(
-                    f"- [{r.note}] (score {r.score:.2f}) {r.text[:self.recall_text_limit]}" for r in recall)
+                    f"- [{r.note}] (score {r.score:.2f}) {r.text[:self.recall_text_limit]}" for r in own)
                 parts.append(f"[Rappel mémoire]\n{rappel}\n[/Rappel]")
+            if imported:
+                # Données importées d'un autre agent (lot 30 d, texte validé par la relecture du format) : bloc à part, après le rappel,
+                # jamais mêlées à la mémoire de Nokker. Seulement si `local.import_codex_memory` les a produites.
+                parts.append(render_imported(imported, self.recall_text_limit))
             if turn.injected:
                 # Contexte reçu d'un autre fil (docs/BUBBLES.md §3-§4, docs/CONTEXT-FORMAT.md) : après le rappel.
                 parts.append(render_injected(turn.injected))

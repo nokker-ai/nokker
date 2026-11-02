@@ -98,6 +98,10 @@ class Registry:
     gagne (collision journalisée par l'appelant s'il y en a — v0 ne détecte pas les doublons)."""
 
     sources: list[ToolSource] = field(default_factory=list)
+    # Variante de textes d'outils APPROUVÉE sur carte (docs/SELF-IMPROVE.md, `nokker/improve/overlay.py`) :
+    # {nom: {description, parameters: {champ: description}}}. None (défaut, drapeau `self_improve` éteint) : les specs
+    # des sources telles quelles, rien n'est recopié.
+    overlay: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self._cache: list[ToolSpec] | None = None
@@ -130,6 +134,10 @@ class Registry:
                         continue
                     seen.add(spec.name)
                     specs.append(spec)
+            if self.overlay:
+                from nokker.improve.overlay import apply_tool_overlay
+
+                specs = apply_tool_overlay(specs, self.overlay)
             self._cache = specs
         return self._cache
 

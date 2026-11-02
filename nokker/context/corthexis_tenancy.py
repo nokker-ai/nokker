@@ -22,6 +22,13 @@ tables n'ont ni locataire ni RLS — l'isolation y reposait sur le seul filtre d
    génération et les droits (DML et séquences seulement pour le rôle du noyau) ; le pod ne crée ni ne modifie rien,
    VÉRIFIE (`verify`) locataire, RLS forcée et propriété, et crée une génération d'index par deux fonctions
    `SECURITY DEFINER` du propriétaire, qui posent la RLS de la partition avant de rendre la main.
+4. **Fréquences lexicales** (`lex_df`, IDF de la recherche, docs/MEMORY-TENANCY.md §5.2) : par locataire. Globale,
+   elle faisait dépendre les poids lexicaux d'un locataire des notes des autres (canal auxiliaire : l'ordre observé
+   disait qu'un mot abonde ailleurs). `ensure` y ajoute `tenant_id`, la reconstruit depuis `notes` (un df et un
+   nombre de notes par locataire), passe la clé primaire à (tenant_id, token) sous le même nom et la met sous RLS
+   forcée ; les lectures du paquet (`WHERE token = …`) ne voient alors que le locataire courant. Écriture : le
+   `Store` gardé remplace `_apply_df` (même requête que le paquet, conflit désigné par la contrainte `lex_df_pkey`,
+   qui vaut pour les deux formes de la table).
 """
 from __future__ import annotations
 
@@ -38,6 +45,8 @@ ORPHAN = "tn_orphan"  # ligne d'un fil inconnu : invisible de tous, effacée ave
 # Tables de contenu du paquet corthexis (2.1.2) qui portent `project` ; `chunks` à part (par sa note).
 TABLES = ("notes", "links", "note_versions", "recall_log", "note_level_floor", "note_access")
 EXTRA = ("recall_turns",)  # sans projet : lignes existantes → ORPHAN
+STATS = ("lex_df",)  # statistique dérivée de `notes` : reconstruite par locataire, pas rattachée
+LEXDF_PK = "lex_df_pkey"  # nom de la clé primaire du paquet, gardé par la reconstruction
 _LOCK = 727060
 MANAGED, EXTERNAL = "managed", "external"
 OWNER_DSN_ENV = "CORTHEXIS_OWNER_DATABASE_URL"
@@ -100,6 +109,10 @@ def ensure(dsn: str, project_tenants: Callable[[], dict[str, str]] | None = None
                 _backfill(con, tables, project_tenants() if project_tenants is not None else {})
                 for t in fresh:
                     con.execute(f'ALTER TABLE "{t}" ALTER COLUMN tenant_id SET NOT NULL')
+            if _exists(con, "lex_df"):
+                if not _has_col(con, "lex_df"):
+                    _tenant_lex_df(con)
+                _protect(con, "lex_df")
             for t in tables:
                 _protect(con, t)
             if _exists(con, "chunks"):
@@ -135,6 +148,43 @@ def _backfill(con: Any, tables: list[str], mapping: dict[str, str]) -> None:
         con.execute("UPDATE chunks c SET tenant_id = n.tenant_id FROM notes n WHERE c.note_id = n.id "
                     "AND c.tenant_id IS NULL")
         con.execute("UPDATE chunks SET tenant_id = %s WHERE tenant_id IS NULL", (ORPHAN,))
+
+
+def _tenant_lex_df(con: Any) -> None:
+    """`lex_df` globale → un df par (locataire, mot), et un nombre de notes par locataire (mot vide), recalculés depuis
+    `notes` (`lex_tokens` : l'ensemble des mots de la note, ce que le paquet compte). Dans la transaction d'`ensure`,
+    après le rattachement des notes ; `notes` est lue sans FORCE le temps de la passe (rétablie par `_protect`)."""
+    con.execute('ALTER TABLE lex_df ADD COLUMN tenant_id text')
+    con.execute('ALTER TABLE notes NO FORCE ROW LEVEL SECURITY')
+    con.execute('ALTER TABLE lex_df NO FORCE ROW LEVEL SECURITY')
+    pk = con.execute("SELECT conname FROM pg_constraint WHERE conrelid = 'lex_df'::regclass AND contype = 'p'"
+                     ).fetchone()
+    if pk is not None:
+        name = next(iter(pk.values())) if isinstance(pk, dict) else pk[0]
+        con.execute(f'ALTER TABLE lex_df DROP CONSTRAINT "{name}"')
+    con.execute('DELETE FROM lex_df')
+    con.execute("INSERT INTO lex_df(tenant_id, token, df) "
+                "SELECT n.tenant_id, t, count(*) FROM notes n, unnest(n.lex_tokens) AS t GROUP BY 1, 2 "
+                "UNION ALL SELECT tenant_id, '', count(*) FROM notes GROUP BY 1")
+    con.execute('ALTER TABLE lex_df ALTER COLUMN tenant_id SET NOT NULL')
+    con.execute(f'ALTER TABLE lex_df ADD CONSTRAINT {LEXDF_PK} PRIMARY KEY (tenant_id, token)')
+
+
+def _apply_df(con: Any, delta: dict[str, int]) -> None:
+    """`Store._apply_df` du paquet (corthexis 2.1.2), conflit désigné par la contrainte : `ON CONFLICT (token)` n'a plus
+    d'index unique quand la clé est (tenant_id, token). Le locataire de la ligne : défaut de la colonne (connexion
+    gardée) ; la RLS borne la suppression aux lignes du locataire courant."""
+    delta = {t: d for t, d in delta.items() if d}
+    if not delta:
+        return
+    toks = sorted(delta)  # ordre fixe des verrous, comme le paquet
+    con.execute(
+        "INSERT INTO lex_df(token, df) SELECT t, d FROM unnest(%s::text[], %s::int[]) AS x(t, d) ORDER BY t "
+        f"ON CONFLICT ON CONSTRAINT {LEXDF_PK} DO UPDATE SET df = lex_df.df + excluded.df",
+        (toks, [delta[t] for t in toks]))
+    neg = [t for t in toks if delta[t] < 0]
+    if neg:
+        con.execute("DELETE FROM lex_df WHERE token = ANY(%s) AND df <= 0", (neg,))
 
 
 def _role_exists(con: Any, role: str) -> bool:
@@ -280,7 +330,7 @@ def verify(dsn: str) -> list[str]:
             problems.append(f"rôle du pod {me} superutilisateur ou BYPASSRLS")
         if not _exists(con, "notes"):
             return [*problems, "schéma CortHeXis absent (job `nokker migrate` avec " + OWNER_DSN_ENV + ")"]
-        for t in (*TABLES, *EXTRA, "chunks", *_partitions(con)):
+        for t in (*TABLES, *EXTRA, *STATS, "chunks", *_partitions(con)):
             row = con.execute(
                 "SELECT c.relrowsecurity, c.relforcerowsecurity, pg_get_userbyid(c.relowner), "
                 "EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' "
@@ -298,6 +348,10 @@ def verify(dsn: str) -> list[str]:
                 problems.append(f"{t} : RLS non forcée")
             if not policy:
                 problems.append(f"{t} : sans politique tenant_isolation")
+            if t in STATS and col and _one(con, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = "
+                                               "to_regclass(%s) AND contype = 'p'", (t,)) != \
+                    "PRIMARY KEY (tenant_id, token)":
+                problems.append(f"{t} : clé primaire sans tenant_id")
             if owner == me or member:  # membre du propriétaire : mêmes pouvoirs (SET ROLE, droits hérités)
                 problems.append(f"{t} : appartient au rôle du pod" if owner == me
                                 else f"{t} : le rôle du pod est membre de son propriétaire {owner}")
@@ -399,12 +453,14 @@ def guard_store(store: Any) -> Any:
                 raise RuntimeError(msg + " — non servie (require_rls)")
             log.warning(msg)
         store.pool = _TenantPool(store.pool)
+        store._apply_df = _apply_df
         _external_generations(store)
         store._nokker_tenant_guard = True
         return store
     if not ensure(store.dsn) and _strict:
         raise RuntimeError("base CortHeXis sans locataire ni RLS : non servie (require_rls)")
     store.pool = _TenantPool(store.pool)
+    store._apply_df = _apply_df
     create = store.create_generation
 
     def create_generation(*args: Any, **kwargs: Any) -> Any:
@@ -476,6 +532,6 @@ def guarded_store() -> Any:
     return guard_store(cx_service.get_store())
 
 
-__all__ = ["APP_ROLE", "BACKUP_ROLE", "EXTERNAL", "EXTRA", "MANAGED", "ORPHAN", "OWNER_DSN_ENV", "TABLES", "ensure",
-           "guard_store", "guarded_store", "migrate_schema", "project_tenants_from", "schema_mode", "set_mode",
-           "set_strict", "verify"]
+__all__ = ["APP_ROLE", "BACKUP_ROLE", "EXTERNAL", "EXTRA", "MANAGED", "ORPHAN", "OWNER_DSN_ENV", "STATS", "TABLES",
+           "ensure", "guard_store", "guarded_store", "migrate_schema", "project_tenants_from", "schema_mode",
+           "set_mode", "set_strict", "verify"]

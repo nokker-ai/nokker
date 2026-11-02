@@ -95,6 +95,9 @@ def _run(argv: list[str], env: dict[str, str], timeout: int) -> tuple[int, str]:
     return p.returncode, (p.stderr or "") + (p.stdout or "")
 
 
+_PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
+
+
 def clone(url: str, dest: str, token: str | None, *, ref: str | None = None, depth: int | None = None,
           timeout: int = 300, run: Callable[[list[str], dict[str, str], int], tuple[int, str]] | None = None) -> None:
     """`git clone` de `url` (déjà passé par `parse_repo`) dans `dest`. `ForgeError` caviardée sinon."""
@@ -108,6 +111,8 @@ def clone(url: str, dest: str, token: str | None, *, ref: str | None = None, dep
                "SSH_ASKPASS": "", "LC_ALL": "C", "GIT_CONFIG_COUNT": str(len(config))}
         for i, (k, v) in enumerate(config):
             env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
+        # Sortie par mandataire (Lokkal : core n'a ni DNS ni route, il sort par egress) : git lit ces variables lui-même.
+        env.update({k: os.environ[k] for k in _PROXY_ENV if os.environ.get(k)})
         argv = ["git", "clone", "--no-recurse-submodules", "--quiet"]
         if ref:
             argv += ["--branch", ref, "--single-branch"]

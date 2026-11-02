@@ -36,6 +36,7 @@ from nokker.connectors.errors import ConnectorError, scrub
 from nokker.connectors.net import https_client
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
+from nokker.previews.ssrf import proxy_refusal
 
 DEFAULT_TZ = "Europe/Zurich"
 MAX_BYTES = 5 * 1024 * 1024
@@ -610,7 +611,7 @@ class CalendarConnector:
             msg = f"{e.code} : {scrub(e.message, self._secret, self._url if self.mode == 'ical' else '')}"
         except ValueError as e:
             msg = scrub(str(e), self._secret)
-        except Exception:  # noqa: BLE001 — rien d'interne ni de secret ne sort d'un outil
+        except Exception:
             msg = "erreur interne du connecteur agenda"
         return ToolResult(call_id="", name=name, content=msg, is_error=True)
 
@@ -667,6 +668,11 @@ class CalendarConnector:
                 return Resp(r.status_code, r.headers, b"".join(chunks), url)
         except ConnectorError:
             raise
+        except httpx.ProxyError as e:
+            refused = proxy_refusal(e)  # mode mandataire : même refus que `check_endpoint` en direct
+            if refused is not None:
+                raise ConnectorError("host_blocked", refused) from None
+            raise ConnectorError("unreachable", "erreur réseau vers le serveur d'agenda") from None
         except httpx.ConnectError as e:
             if isinstance(e.__cause__, ssl.SSLError) or "CERTIFICATE" in str(e).upper():
                 raise ConnectorError("tls_failed", "certificat TLS refusé par le serveur d'agenda") from None

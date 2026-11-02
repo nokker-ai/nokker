@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from nokker.context.engine import ContextEngineV0, estimate_tokens, format_now_fr, render_injected
+from nokker.context.imported import IMPORT_SOURCE, render_imported
 from nokker.context.manager import ContextManager
 from nokker.core.ports import Assembled, Recall, ToolSpec
 from nokker.core.turn import Tier, ToolResult, Turn
@@ -84,10 +85,14 @@ class ContextEngineV1(ContextEngineV0):
             relevant = mgr.relevant_block(turn.thread_id, turn.input.text, exclude=mgr.layer3_ids(turn.thread_id))
             if relevant:
                 parts.append(relevant)
-            if recall:
+            own = [r for r in recall if getattr(r, "source", "") != IMPORT_SOURCE]
+            imported = [r for r in recall if getattr(r, "source", "") == IMPORT_SOURCE]
+            if own:
                 rappel = "\n".join(
-                    f"- [{r.note}] (score {r.score:.2f}) {r.text[:self.recall_text_limit]}" for r in recall)
+                    f"- [{r.note}] (score {r.score:.2f}) {r.text[:self.recall_text_limit]}" for r in own)
                 parts.append(f"[Rappel mémoire]\n{rappel}\n[/Rappel]")
+            if imported:  # lot 30 d : données importées, bloc à part (nokker/context/imported.py)
+                parts.append(render_imported(imported, self.recall_text_limit))
             if turn.injected:
                 parts.append(render_injected(turn.injected))
             if turn.attached:

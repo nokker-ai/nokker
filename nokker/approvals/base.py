@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlsplit
 
 from nokker.approvals.crypto import (
@@ -99,6 +100,10 @@ class BaseApprovals:
     # `<fil>/sa-<id>` compris), ou None hors session (`CodeSessions.owner_of_thread`). Une carte d'un tel fil n'est
     # décidée, listée et annoncée qu'à ce compte, pas aux autres membres du locataire. `None` = rien ne change.
     thread_owner: Callable[[str], str | None] | None = None
+    # Paiements (docs/PAYMENTS.md, drapeau `payments`) : `nokker.payments.service.Payments`. Une carte « à payer »
+    # (outil `pay_request`) porte un mandat : construit à la demande, lié au défi, scellé par la passkey à
+    # l'approbation. `None` (défaut) = rien ne change, aucune carte n'est concernée.
+    payment_mandates: Any = None
     # Une décision (locale, signée, ou venue par nokker.ai) passe la carte de `pending` à `approved|rejected` sous ce
     # verrou : deux décisions concurrentes de la même carte (le propriétaire en local ET son téléphone, lot X10) n'en
     # appliquent qu'une, jamais les deux.
@@ -255,7 +260,10 @@ class BaseApprovals:
 
     # ─────────────────────── port Approvals (core/ports.py) ───────────────────────
 
-    def request(self, turn: Turn, call: ToolCall, verdict: Verdict, advice: str | None) -> Approval:
+    def request(self, turn: Turn, call: ToolCall, verdict: Verdict, advice: str | None, *,
+                notify: bool = True) -> Approval:
+        """`notify=False` : la carte n'est pas encore poussée aux humains (relecteur automatique en cours, §8) ;
+        `notify_pending` le fait si elle leur revient."""
         now = self.clock()
         approval = Approval(
             id=str(uuid.uuid4()), thread_id=turn.thread_id, turn_index=turn.index, channel=turn.channel,
@@ -265,7 +273,15 @@ class BaseApprovals:
         )
         self._store_approval(approval)
         self._append_event(approval.id, "requested", {"rule": approval.rule, "strength": approval.strength})
+        if self._pays(approval):
+            self.payment_mandates.on_request(approval, turn.sender)
         self._emit("approval.requested", {"approval": approval}, approval.thread_id)
+        if notify:
+            self.notify_pending(approval)
+        return approval
+
+    def notify_pending(self, approval: Approval) -> Approval:
+        """Pousse la carte aux humains qui la décident (notificateur des opérateurs, ou celui du testeur)."""
         if self.tenant_of(approval) != INTERNAL_TENANT:
             # Le notificateur Telegram écrit aux opérateurs internes : une carte de testeur ne leur part jamais. La carte
             # d'un profil mineur (X23) ne part pas non plus au mineur : son représentant la décide (/v1/household/approvals).
@@ -367,7 +383,18 @@ class BaseApprovals:
         exp = min(now + (self.challenge_ttl_s if ttl_s is None else ttl_s), approval.expires_at)
         self._reserve_nonce(nonce, approval_id, exp)
         return Challenge(approval_id=approval_id, args_sha256=approval.args_sha256, nonce=nonce, exp=exp,
-                         tool=approval.tool_name if bind_tool else None)
+                         tool=approval.tool_name if bind_tool else None,
+                         mandate_sha256=self.payment_mandates.binding(approval) if self._pays(approval) else None)
+
+    def _pays(self, approval: Approval) -> bool:
+        """Carte « à payer » avec le drapeau `payments` allumé (docs/PAYMENTS.md)."""
+        return self.payment_mandates is not None and self.payment_mandates.covers(approval)
+
+    def _refuse_unsigned_payment(self, approval: Approval, decision: str) -> None:
+        """Une carte « à payer » ne s'approuve qu'avec la passkey de la personne (`decide`) : ni jeton local, ni
+        attestation, ni décision relayée. Refuser reste possible partout."""
+        if decision == "approve" and self._pays(approval):
+            raise ProofInvalid("carte « à payer » : approbation par passkey exigée (mandat signé)")
 
     def _pending_card(self, approval_id: str, decision: str) -> Approval:
         """La carte à décider, encore en attente ; lève sinon. Appelée SOUS `_decision_lock`."""
@@ -430,6 +457,11 @@ class BaseApprovals:
                        approval.thread_id)
 
     def _emit_decided(self, approval: Approval) -> None:
+        if approval.status == "rejected" and self._pays(approval):  # mandat refusé avec sa carte (budget libéré)
+            try:
+                self.payment_mandates.on_rejected(approval)
+            except Exception:  # noqa: BLE001 — la carte est refusée quoi qu'il arrive au mandat
+                logger.exception("mandat de la carte %s non marqué refusé", approval.id)
         self._emit("approval.decided", {"approval_id": approval.id, "decision": approval.status,
                                         "by": approval.decided_by, "via": approval.decided_via}, approval.thread_id)
 
@@ -442,6 +474,13 @@ class BaseApprovals:
             decided_by, decided_via = self._verify_proof(approval, decision, proof)
             if not self.decider_allowed(decided_by, self.tenant_of(approval), approval):
                 raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
+            if decision == "approve" and self._pays(approval):
+                try:  # le mandat est scellé AVANT l'approbation : pas de carte approuvée sans mandat signé
+                    self.payment_mandates.check_and_seal(
+                        approval, proof, self._load_device(proof.device_id or ""), decided_by, decided_via,
+                        origin=self.webauthn_origin, rp_id=None)
+                except ValueError as e:
+                    raise ProofInvalid(str(e)) from e
             approval = self._commit(approval, decision, decided_by, decided_via)
         self._emit_decided(approval)
         return approval
@@ -454,6 +493,7 @@ class BaseApprovals:
             approval = self._pending_card(approval_id, decision)
             if args_sha256(approval.arguments) != approval.args_sha256:
                 raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+            self._refuse_unsigned_payment(approval, decision)
             if decision == "approve" and approval.rule == GUARDIAN_RULE:
                 # Profil mineur (X23) : seul le représentant approuve, à la clé de SON appareil (decide).
                 raise ProofInvalid("carte d'un profil mineur : son représentant l'approuve depuis ses appareils")
@@ -461,12 +501,89 @@ class BaseApprovals:
                 # Plancher prod (lot X11) : approuver se fait à la clé d'appareil seulement, jamais au jeton local
                 # (défense en profondeur : la route locale refuse déjà) ; refuser reste possible ici.
                 raise ProofInvalid("carte prod : clé d'appareil exigée (docs/APPROVALS.md), pas le jeton local")
+            if decision == "approve" and approval.rule == "home:strong":
+                # Maison (docs/HOME-ASSISTANT.md) : serrure, alarme, garage, portail, caméra, script ou automatisation,
+                # chauffage hors bornes — passkey ou Mini App seulement ; refuser reste possible ici.
+                raise ProofInvalid("action sensible de la maison : clé d'appareil exigée, pas le jeton local")
+            if decision == "approve" and approval.rule == "home_watch:strong":
+                # Veille du foyer (docs/HOME-WATCH.md) : direct d'une caméra, pause d'un appareil, relance d'une
+                # sauvegarde — passkey ou Mini App seulement ; refuser reste possible ici.
+                raise ProofInvalid("veille du foyer : clé d'appareil exigée, pas le jeton local")
             if decision == "approve" and approval.rule == "pages:publish":
                 # Publier une page (docs/LOKKAL.md §7.26) : une sortie vers le public, signée à la clé d'appareil
                 # seulement ; refuser reste possible au jeton local.
                 raise ProofInvalid("publication de page : clé d'appareil exigée, pas le jeton local")
             approval = self._commit(approval, decision, decided_by, "local-token")
         self._emit_decided(approval)
+        return approval
+
+    # ─────────────────────── relecteur automatique (docs/APPROVALS.md §8) ───────────────────────
+
+    def decide_auto(self, approval_id: str, decision: str, reason: str, *, model: str = "", by_rule: bool = False,
+                    effect: str | None = None) -> Approval:
+        """Décision du relecteur automatique sur une carte `standard` encore en attente : `approve` | `reject` la
+        décident (`decided_by = decided_via = "auto-review"`), `escalate` la laisse en attente pour l'humain. Dans tous
+        les cas la relecture est rangée sur la carte (`auto_review`) et journalisée. Une carte de la liste fermée
+        (`auto_review.excluded`) lève `ProofInvalid` : défense en profondeur, le noyau ne la soumet déjà pas."""
+        from nokker.approvals.auto_review import DECIDED_BY, DECIDED_VIA, DECISIONS, excluded
+
+        if decision not in DECISIONS:
+            raise ProofInvalid(f"décision inconnue : {decision!r}")
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, "approve")
+            why = excluded(approval, effect)
+            if why is not None:
+                raise ProofInvalid(f"carte hors du relecteur automatique ({why})")
+            if args_sha256(approval.arguments) != approval.args_sha256:
+                raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+            approval.auto_review = {"decision": decision, "reason": reason, "model": model, "at": self.clock(),
+                                    "by_rule": by_rule}
+            extra = {"auto_review": dict(approval.auto_review)}
+            if decision == "escalate":
+                self._store_approval(approval)
+                self._append_event(approval.id, "auto_review", extra)
+            else:
+                approval = self._commit(approval, decision, DECIDED_BY, DECIDED_VIA, extra)
+        if decision == "escalate":
+            self._emit("approval.auto_review", {"approval_id": approval.id, "decision": decision, "reason": reason},
+                       approval.thread_id)
+        else:
+            self._emit_decided(approval)
+        return approval
+
+    def revoke_auto_review(self, approval_id: str, user: str) -> Approval:
+        """Le propriétaire révoque après coup une décision du relecteur automatique. Refus révoqué : la carte revient
+        en attente (`pending`, ou `expired` si son délai est passé) et part aux humains. Approbation révoquée : la
+        carte reste ce qu'elle est (l'effet a eu lieu, la carte le dit). Dans les deux cas : `auto_review.revoked_by`
+        / `revoked_at`, événement `auto_review_revoked`."""
+        from nokker.approvals.auto_review import DECIDED_VIA
+
+        with self._decision_lock:
+            approval = self._load_visible(approval_id)
+            if approval is None:
+                raise ApprovalNotFound(approval_id)
+            rec = dict(approval.auto_review or {})
+            if rec.get("revoked_by"):
+                raise ApprovalNotPending("décision automatique déjà révoquée")
+            if approval.decided_via != DECIDED_VIA or rec.get("decision") not in ("approve", "reject"):
+                raise ApprovalNotPending("aucune décision du relecteur automatique à révoquer")
+            if not self.decider_allowed(user, self.tenant_of(approval), approval):
+                raise ProofInvalid(f"utilisateur non autorisé à révoquer : {user!r}")
+            now = self.clock()
+            rec.update(revoked_by=user, revoked_at=now)
+            approval.auto_review = rec
+            previous = approval.status
+            if rec["decision"] == "reject":
+                approval.status = "pending" if now <= approval.expires_at else "expired"
+                approval.decided_by = approval.decided_via = approval.decided_at = None
+            self._store_approval(approval)
+            self._append_event(approval.id, "auto_review_revoked", {"by": user, "previous": previous,
+                                                                    "decision": rec["decision"]})
+        self._emit("approval.auto_review_revoked", {"approval_id": approval.id, "by": user,
+                                                    "decision": rec["decision"], "status": approval.status},
+                   approval.thread_id)
+        if approval.status == "pending":
+            self.notify_pending(approval)
         return approval
 
     def decide_remote(self, approval_id: str, decision: str, proof: Proof, device: Device, *, origin: str,
@@ -485,6 +602,7 @@ class BaseApprovals:
             approval = self._pending_card(approval_id, decision)
             if decision == "approve" and approval.rule == GUARDIAN_RULE:
                 raise ProofInvalid("carte d'un profil mineur : son représentant l'approuve depuis ses appareils")
+            self._refuse_unsigned_payment(approval, decision)
             nonce, via = self.verify_signed_decision(approval, decision, proof, device, origin=origin, rp_id=rp_id)
             if not self._consume_nonce(nonce, approval_id):
                 raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
@@ -507,6 +625,7 @@ class BaseApprovals:
             if approval.strength != "strong":
                 raise ProofInvalid("attestation : carte forte seulement")
             self._require_device_key_free(approval)
+            self._refuse_unsigned_payment(approval, decision)
             nonce = self._check_challenge(approval, Proof(challenge=challenge))
             if not self._consume_nonce(nonce, approval_id):
                 raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")

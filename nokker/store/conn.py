@@ -4,6 +4,9 @@ politiques RLS de `migrations/006_tenant_rls.sql`.
 - `connect(dsn)` : connexion courte, `app.tenant_id` posé à l'ouverture. Hors d'un `tenant_scope` : `NoTenant`.
 - `TenantConn` : connexion longue des stores (un seul objet pour tous les locataires). Le locataire est reposé à
   CHAQUE usage (`get()`) : figé à l'ouverture, il servirait les données du premier locataire à tous les autres.
+- `connect_tenant(dsn, tenant)` : `connect` pour un locataire nommé, hors de son scope (webhook, relais, opérateur).
+- `connect_key(dsn, clé)` : sans locataire, ouvre la seule ligne qui porte cette clé (empreinte de jeton, code) sur les
+  tables cherchées avant le locataire (migration 058, docs/TENANCY.md §4).
 - `connect_admin(dsn)` : sans locataire. Migrations (avec le DSN propriétaire, `owner_dsn`) et, avec le DSN du noyau,
   les tables hors RLS (`tenants`, tables d'authentification de `nokker/approvals`). Une requête de contenu par cette
   connexion ne voit rien : `app.tenant_id` absent, la politique est fausse.
@@ -22,7 +25,7 @@ from typing import Any
 import psycopg
 from psycopg import sql as sql_lib
 
-from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
+from nokker.tenancy.context import INTERNAL_TENANT, NoTenant, current_tenant
 
 logger = logging.getLogger("nokker.store.conn")
 
@@ -46,6 +49,45 @@ def connect(dsn: str, **kw: Any) -> psycopg.Connection:
         conn.close()
         raise
     return conn
+
+
+_SET_KEY = "SELECT set_config('app.lookup_key', %s, false)"
+
+
+def connect_tenant(dsn: str, tenant: str, **kw: Any) -> psycopg.Connection:
+    """`connect` pour un locataire NOMMÉ (la ligne qu'on écrit ou relit porte son locataire, hors de son scope :
+    webhook, relais, outil d'opérateur). Locataire vide : `NoTenant`, jamais de connexion sans locataire."""
+    if not tenant:
+        raise NoTenant("locataire vide")
+    conn = psycopg.connect(dsn, **kw)
+    try:
+        conn.execute(_SET_TENANT, (tenant,))
+        if not conn.autocommit:
+            conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def connect_key(dsn: str, key: str, **kw: Any) -> psycopg.Connection:
+    """Connexion SANS locataire qui ouvre la seule ligne portant `key` (empreinte de jeton, code, identifiant présenté)
+    sur les tables cherchées avant de connaître le locataire (migration 058, politiques `key_lookup_*`). Clé vide :
+    aucune ligne (la politique lit NULL)."""
+    conn = psycopg.connect(dsn, **kw)
+    try:
+        conn.execute(_SET_KEY, (key or "",))
+        if not conn.autocommit:
+            conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def set_lookup_key(conn: psycopg.Connection, key: str, *, local: bool = False) -> None:
+    """Pose (ou change) la clé de lecture d'une connexion ouverte ; `local` : pour la transaction en cours seulement."""
+    conn.execute("SELECT set_config('app.lookup_key', %s, %s)", (key or "", local))
 
 
 def connect_admin(dsn: str, **kw: Any) -> psycopg.Connection:
@@ -120,8 +162,8 @@ def known_tenants(dsn: str) -> list[str]:
     return [INTERNAL_TENANT, *(r[0] for r in rows if r[0] != INTERNAL_TENANT)]
 
 
-__all__ = ["OWNER_DSN_ENV", "RLS_MIGRATION", "TenantConn", "connect", "connect_admin", "known_tenants", "migrate",
-           "owner_dsn"]
+__all__ = ["OWNER_DSN_ENV", "RLS_MIGRATION", "TenantConn", "connect", "connect_admin", "connect_key", "connect_tenant",
+           "known_tenants", "migrate", "owner_dsn", "set_lookup_key"]
 
 
 def role_bypasses_rls(dsn: str) -> bool:

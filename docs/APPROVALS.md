@@ -296,3 +296,78 @@ recalculent depuis `approvals` à chaque lecture (index `approvals_created_at_id
 
 Limites : le calcul relit les cartes de la fenêtre à chaque `GET` (pas de cache) ; une règle acceptée puis retirée à
 la main des réglages n'est plus reproposée (sa marque `accepted` reste) ; la retirer aussi de la table, à la main.
+
+## 8. Relecteur automatique des cartes `standard` (lot P2, `nokker/approvals/auto_review.py`)
+
+Drapeau `auto_review` de la config : `{enabled: false (défaut), tier: judge | <palier de tiers>, policy: <texte>,
+max_tokens: 120, trajectory_calls: 8, max_approvals_per_turn: 20, tz: Europe/Zurich, own_addresses: []}`. Éteint : aucune carte relue, aucun texte vu par le
+modèle ne change, la route de révocation répond `404`.
+
+Allumé, une carte que les portes posent au fil d'un tour (`Kernel._tool_step`) et que la **liste fermée** laisse au
+relecteur (`auto_review.excluded`) n'est pas poussée tout de suite aux humains : le relecteur (un palier modèle) voit la
+carte, la trajectoire récente du tour (appels précédents et début de leurs résultats) et la politique, et répond
+`APPROUVER`, `REFUSER` ou `ESCALADER` avec une raison.
+
+- **Approuver** : `decide_auto` → `approved` (`decided_by = decided_via = "auto-review"`), l'outil s'exécute dans le
+  tour (le modèle voit son résultat, comme une action permise), puis `executed` | `failed`.
+- **Refuser** : `rejected` ; le modèle voit `REFUSÉ par le relecteur automatique (<raison>) [approval:<id>]. L'action
+  n'a pas été exécutée. L'utilisateur peut revenir sur ce refus ; ne la relance pas autrement.`
+- **Escalader**, et tout doute (réponse hors format ou ambiguë, raison vide, relecteur en panne) : la carte reste
+  `pending`, part aux humains, et le modèle voit le texte d'attente habituel.
+- **Dates, heures et adresses avant tout appel** (déterministe, `nokker/approvals/dates.py`) : chaque date et heure des
+  arguments (normalisées `AAAA-MM-JJ`, `HH:MM` ; décalage de fuseau ignoré ; heure de FIN d'un créneau non exigée, son
+  jour si) doit se retrouver dans la demande, relatifs résolus dans `auto_review.tz` (défaut `Europe/Zurich`, le fuseau
+  de la date donnée au modèle) : « aujourd'hui », « demain », « après-demain », « jeudi », « vendredi prochain »,
+  « le 24 », « 24 octobre », `24.10`. Un jour de semaine qui est aujourd'hui sans « prochain » est ambigu : rien n'est
+  résolu. Chaque adresse de courriel des arguments doit figurer dans la demande ou dans `auto_review.own_addresses`.
+  Sinon : escalade sans appel au modèle.
+- **Règles de trajectoire avant tout appel** (déterministes) : un secret lu plus tôt dans le tour, une action du tour
+  déjà refusée ou escaladée, le plafond d'approbations du tour, ou une approbation automatique de ce même outil révoquée
+  sur ce fil dans les 30 jours → escalade, sans appel au modèle.
+
+**Liste fermée (jamais relue)** : carte forte ; `ops:prod*` ; effets `destructive`, `send_external`, `send_bulk`,
+`spend`, `secret` (seuls `read` et `write` sont relus) ; règles `effect:*` de ces effets, `pages:publish`,
+`household:guardian`, `permissions:relayed_*`, `permissions:local_connector_strong`, `permissions:go_sandbox_only`,
+`permissions:hardline`, `ops:trust_host`, `account:delete`, `improve:proposal` ; outils `ssh_trust`, `account_delete`,
+`forge_push`, `send_bulk_email`, `agent_arm`, `improve_apply` ; commande `terminal`/`process_start`/`ssh_run` qui supprime, publie ou envoie (`rm`,
+`git push`, `git reset --hard`, `curl`, `scp`, `npm publish`, `kubectl delete`…). `decide_auto` revérifie la liste
+(défense en profondeur) et lève `ProofInvalid`. Une carte d'auto-amélioration (`improve:proposal` / `improve_apply`,
+docs/SELF-IMPROVE.md) n'est JAMAIS approuvée par le relecteur : en plus de la liste fermée, `review_text` l'escalade par
+règle (`IMPROVE_ESCALATION`), sans appel au modèle.
+
+**Clôture des données** : dans le prompt du relecteur, la demande, la trajectoire, les arguments et le motif de la carte
+sont chacun dans un bloc `<untrusted-data kind=demande|trajectoire|arguments|motif id=…>` (`nokker/qa/untrusted.py`,
+id = sha256 du contenu, balises internes neutralisées), annoncés comme des données. Une réponse qui porte plus d'une
+ligne « DÉCISION » (un modèle qui recopierait une décision injectée) escalade.
+
+**Trace** : `Approval.auto_review = {decision, reason, model, at, by_rule[, revoked_by, revoked_at]}` (colonne
+`approvals.auto_review`, migration `051_approval_auto_review.sql`), événements `auto_review`,
+`approved`/`rejected`, `auto_review_revoked` ; verdict `approvals:auto_review` au ledger ; jetons du relecteur comptés
+au tour (« relecteur automatique : carte standard »). L'API rend `auto_review` dans la carte (absent si non relue).
+
+**Révocation** : `POST /v1/approvals/{id}/auto-review/revoke` (identité résolue, propriétaire de la carte dans son
+locataire) → la carte. Refus révoqué : la carte revient `pending` (ou `expired`) et part aux humains, qui la décident
+par le chemin habituel (exécuteur, tour de continuation). Approbation révoquée : l'effet a eu lieu, la carte reste
+`executed` et le dit ; le relecteur n'approuve plus cet outil sur ce fil. `409` si rien à révoquer ou déjà révoquée.
+
+Mesure : banc B-1 (`nokker-judge-bench/auto_review_eval.py`, hors du dépôt), 01.11.2026, 49 cartes (21 fautives). Sans
+le contrôle des dates : 3 faux « approuver » (qwen3.6-35b-a3b). Avec le contrôle des dates et adresses :
+critère bêta = 0 faux « approuver », atteint sur les deux paliers mesurés :
+
+| palier | accord (49) | faux « approuver » | justes approuvées (28) | escalades |
+|---|---|---|---|---|
+| qwen3.6-35b-a3b (llama.cpp, sans raisonnement) | 83,7 % | 0 / 21 | 20 | 24 |
+| Ship du Router `qwen/qwen3.8-27b` (`reasoning_effort: none`) | 63,3 % | 0 / 21 | 10 | 39 |
+
+Remesure après la clôture `<untrusted-data>` du prompt (02.11.2026, même banc, `results/auto-review-*-fence-2026-11-02.json`) :
+
+| palier | accord (49) | faux « approuver » (tous) | faux « approuver » (éligibles, 9) | justes approuvées (28) | escalades |
+|---|---|---|---|---|---|
+| qwen3.6-35b-a3b (llama.cpp, sans raisonnement) | 69,4 % | 1 / 21 | 0 / 9 | 14 | 32 |
+| Ship du Router `qwen/qwen3.8-27b` (`reasoning_effort: none`, clé de banc) | 65,3 % | 0 / 21 | 0 / 9 | 11 | 38 |
+
+Le faux « approuver » du 35B (B1-A-035, `send_email_reply`, effet `send_external`) est une carte de la liste fermée :
+en production elle n'atteint jamais le relecteur. Critère bêta tenu sur le périmètre réel (éligibles : 0 / 9 sur les
+deux paliers) et sur les 49 avec Ship ; le 35B devient plus prudent (accord 83,7 % → 69,4 %, plus d'escalades).
+
+Le relecteur est donc **allumable** ; Ship reste prudent (beaucoup d'escalades, donc peu de fatigue évitée).

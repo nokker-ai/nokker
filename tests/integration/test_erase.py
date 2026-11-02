@@ -26,7 +26,18 @@ CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connecto
            # canaux (048) : un code d'appairage est d'un canal connu
            "channel_pairing": {"channel": "slack"},
            # suggestions de règles d'approbation (047) : une marque est acceptée ou écartée
-           "approval_suggestion_marks": {"state": "accepted"}}
+           "approval_suggestion_marks": {"state": "accepted"},
+           # consolidation nocturne (053) : une nuit a un déclencheur et un statut connus, une opération un type connu
+           "nokker_consolidation_runs": {"trigger": "manual", "status": "done"},
+           "nokker_consolidation_ops": {"kind": "merge"},
+           # écrans e-ink (054) : profondeur 1 ou 2 bits
+           "ambient_displays": {"depth": 1},
+           # salle Maison (057) : un message de membre a un auteur ; audience connue
+           "house_room_messages": {"kind": "member", "audience": "all"},
+           # papiers du foyer (055) : nature et état contraints
+           "paper_exports": {"kind": "ics", "status": "ready"},
+           # déclencheurs de forge (052) : fournisseur connu ; une session de PR ouverte ou fermée
+           "forge_hooks": {"provider": "forgejo"}, "forge_pr_sessions": {"status": "open"}}
 
 
 def _dummy_row(conn, table: str) -> tuple[list[str], list]:
@@ -93,6 +104,8 @@ def _seed(su: str) -> list[str]:
                     row["user"] = ACC[tenant]
                 row.update(CHECKED.get(t, {}))
                 if t == "nokker_long_memory":  # mémoire longue (049) : une note de profil est écrite par son compte
+                    row["author_account"] = ACC[tenant]
+                if t == "house_room_messages":  # salle Maison (057) : le message d'un membre, à son nom
                     row["author_account"] = ACC[tenant]
                 if t == "accounts":
                     row.update(id=ACC[tenant], email=f"{tenant}@recette.test")
@@ -512,3 +525,32 @@ def test_erase_pending_journal_is_written_before_the_commit(pg, tmp_path):  # no
     assert {"tenant_id": acc.tenant_id} in [{"tenant_id": x["tenant_id"]} for x in lines]
     assert all(set(x) == {"tenant_id", "erased_at"} for x in lines) and len(lines) == run.erased
     assert acc.account_id not in path.read_text() and "journal-moi" not in path.read_text()
+
+
+@requires_pg
+def test_erase_reaches_its_glance_view_in_another_household_under_rls(pg):  # noqa: F811
+    """`ambient_displays` sous RLS (058) : la vue glance d'un compte rattachée au foyer d'un AUTRE locataire part avec
+    lui (la transaction d'effacement lit par la clé du compte) ; l'écran e-ink qu'il a enregistré pour ce foyer reste,
+    comme les écrans des autres membres."""
+    import psycopg
+
+    from nokker.admin.erase import erase_account
+    from nokker.tenancy.store import PgTenancy
+
+    tenancy = PgTenancy(pg["app"])
+    gone = tenancy.create_account("glance-efface@recette.test")
+    payer = tenancy.create_account("payeur-foyer@recette.test")
+    cols = ("id", "kind", "tenant_id", "household_id", "account_id", "name", "model", "width", "height", "depth",
+            "refresh_s", "token_sha256", "created_at")
+    rows = [("dp_" + uuid.uuid4().hex[:16], kind, payer.tenant_id, "tp_foyer", who, "x", "m", 1, 1, 1, 60,
+             uuid.uuid4().hex, 1.0) for kind, who in (("glance", gone.account_id), ("eink", gone.account_id),
+                                                    ("glance", payer.account_id))]
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        for r in rows:
+            su.execute(f"INSERT INTO ambient_displays ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))})", r)
+    rep = erase_account(pg["app"], account_id=gone.account_id, apply=True, confirm=gone.account_id)
+    assert rep.applied and rep.deleted.get("ambient_displays") == 1
+    with psycopg.connect(pg["su"]) as su:
+        left = {r[0] for r in su.execute("SELECT id FROM ambient_displays WHERE tenant_id = %s",
+                                         (payer.tenant_id,)).fetchall()}
+    assert left == {rows[1][0], rows[2][0]}

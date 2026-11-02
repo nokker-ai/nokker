@@ -157,3 +157,25 @@ def test_plusieurs_dossiers_env():
 def test_workspace_obligatoire():
     with pytest.raises(SystemExit):
         dp.Config.from_env({"NOKKER_HOST_WORKSPACE": "/"})
+
+
+def _env_of(env_in):
+    body = sandbox()
+    body["Env"] = env_in
+    return dp.check_create(body, CFG)["Env"]
+
+
+def test_identite_du_noyau_gardee_si_meme_proxy():
+    env = _env_of(["HTTPS_PROXY=http://nokker:jeton123@egress:3128", "HTTP_PROXY=http://nokker:jeton123@egress:3128/"])
+    assert "HTTPS_PROXY=http://nokker:jeton123@egress:3128" in env
+    assert "HTTP_PROXY=http://nokker:jeton123@egress:3128/" in env
+    assert "https_proxy=http://egress:3128" in env       # absente côté noyau : valeur d'egress
+
+
+def test_autre_proxy_ou_identite_ecrases():
+    for v in ("http://nokker:j@evil:3128", "http://nokker:j@egress:3129", "https://nokker:j@egress:3128",
+              "http://root:j@egress:3128", "http://nokker@egress:3128", "http://nokker:j@egress:3128/x",
+              "http://nokker:j@egress:3128?a=1", "http://egress:3128@evil:1"):
+        env = _env_of([f"HTTPS_PROXY={v}"])
+        assert "HTTPS_PROXY=http://egress:3128" in env, v
+        assert f"HTTPS_PROXY={v}" not in env, v

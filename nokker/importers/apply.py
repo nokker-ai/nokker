@@ -109,6 +109,18 @@ def _notes(items: list[ImportItem], memory: Any) -> None:
         it.status, it.reason = ("imported", "") if note is not None else ("error", "note refusée par la mémoire")
 
 
+def _codex_memory(items: list[ImportItem], memory: Any) -> None:
+    """Lot 30 d : mémoire générée par Codex écrite comme DONNÉES (jamais en portée user), seulement si le drapeau
+    `local.import_codex_memory` est allumé ; sinon elle reste au rapport."""
+    if memory is None or not getattr(memory, "import_data", False):
+        return
+    for it in items:
+        notes = memory.put_import_data(it.detail.get("entries") or [], it.source)
+        it.status = "imported"
+        it.reason = f"importée comme données ({len(notes)} entrées), défaisable en un geste ; jamais comme consignes"
+        it.detail["notes"] = [n.name for n in notes]
+
+
 def _rules(items: list[ImportItem]) -> None:
     with_content = next((i for i in items if "content" in i.detail), None)
     if with_content is None:
@@ -163,7 +175,7 @@ def apply(report: Report, *, user_settings: Path, backup_dir: Path, mcp_path: Pa
         try:
             if it.kind == "skill":
                 _skill(it)
-            elif it.kind == "subagent":
+            elif it.kind in ("subagent", "prompt"):
                 _subagent(it)
             elif it.kind == "hooks":
                 _project_hooks(it, backup_dir)
@@ -175,6 +187,7 @@ def apply(report: Report, *, user_settings: Path, backup_dir: Path, mcp_path: Pa
     if mcp and mcp_path is not None:
         _mcp(mcp, mcp_path, confirm)
     _notes([i for i in planned if i.kind == "user-note"], memory)
+    _codex_memory([i for i in report.items if i.kind == "codex-memory" and i.status == "skipped"], memory)
     _agents([i for i in planned if i.kind == "cron"], create_agent)
     for it in report.items:  # filet : rien ne reste « prévu » après apply
         if it.status == "planned":

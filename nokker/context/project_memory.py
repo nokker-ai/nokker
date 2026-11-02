@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from nokker.context.engine import estimate_tokens
+from nokker.context.imported import IMPORT_SOURCE
 from nokker.core.ports import Recall, ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.memory.corthexis import named
@@ -58,6 +59,12 @@ MAX_TEXT = 1500
 MIN_QUOTE = 8
 MANIFEST = "sources.json"
 FORGOTTEN = ".forgotten"
+# Projet CortHeXis des données importées (lot 30 d) : jamais dans le noyau, jamais en portée user, jamais au miroir ni
+# à l'équipe ; une installation Lokkal = un compte, celui qui a importé.
+IMPORT_PROJECT = "x-import-codex"
+# Chemins de fichiers de clés (caviardés à l'import en plus du passage des secrets) : ~/.ssh/…, id_rsa…, *.pem, *.key…
+_KEY_PATH = re.compile(r"(?:~|\$HOME|/[\w.-]+)?(?:/[\w.-]+)*/(?:\.ssh/[\w.@-]+|[\w.@-]+\.(?:pem|key|p12|pfx|ppk|asc|gpg|jks|keystore)"
+                       r"|id_(?:rsa|ed25519|ecdsa|dsa)[\w.-]*)\b")
 SOURCE_PREFIX = "src-"
 
 # Résultat de `memory_note` quand la quarantaine est allumée (`memory_pending`) : texte vu par le modèle.
@@ -321,6 +328,9 @@ class ProjectMemory:
     # l'humain au lieu d'être écrite ; None (défaut) : écrite tout de suite, comme avant.
     pending: Any = None
     now_fn: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    # Lot 30 d : données importées d'un autre agent (mémoire générée par Codex) dans le projet à part `x-import-codex`,
+    # rappelées dans leur propre bloc (nokker/context/imported.py). Drapeau `local.import_codex_memory`, éteint.
+    import_data: bool = False
     _sessions: dict[str, _Session] = field(default_factory=dict, init=False, repr=False)
     _cores: dict[str, tuple[int, str, frozenset[str]]] = field(default_factory=dict, init=False, repr=False)
     _turn_text: dict[str, tuple[int, str]] = field(default_factory=dict, init=False, repr=False)
@@ -363,6 +373,9 @@ class ProjectMemory:
             if USER_PROJECT not in self._indexed and (self.root / USER_PROJECT).is_dir():
                 self._indexed.add(USER_PROJECT)
                 self._enqueue(USER_PROJECT)
+            if self.import_data and IMPORT_PROJECT not in self._indexed and (self.root / IMPORT_PROJECT).is_dir():
+                self._indexed.add(IMPORT_PROJECT)
+                self._enqueue(IMPORT_PROJECT)
 
     def _session(self, thread_id: str) -> _Session | None:
         """La session du fil ; un sous-agent `<fil>/sa-<id>` a celle de son parent (même dépôt)."""
@@ -561,6 +574,80 @@ class ProjectMemory:
         self._publish("memory.noted", {"name": name, "kind": kind, "scope": "user", "title": title, "derived_from": "import"})
         return got
 
+    # ── données importées d'un autre agent (lot 30 d) ──
+
+    @staticmethod
+    def scrub_import(text: str) -> str:
+        """Caviardage À L'IMPORT : le passage des secrets (`qa/secrets.py::redact`, celui de test_secrets : jetons, clés,
+        IBAN groupé, « mot de passe du X : valeur »), puis les chemins de fichiers de clés."""
+        from nokker.qa.secrets import redact
+
+        return _KEY_PATH.sub("[chemin de clé]", redact(text or "").text)
+
+    def put_import_data(self, entries: list[dict[str, Any]], origin_path: str) -> list[Note]:
+        """Écrit des entrées de mémoire générée par Codex comme DONNÉES (projet `x-import-codex`, `trust: data`,
+        derived_from=agent) : jamais en portée user, jamais dans le noyau. Nom déterministe (date, titre, texte) : un
+        second import ne double rien. Appelé par `nokker import` ou la route locale, drapeau allumé seulement."""
+        if not self.import_data:
+            return []
+        written: list[str] = []
+        with self._lock:
+            known = {n.name for n in self.learned(IMPORT_PROJECT)}
+            for e in entries:
+                title = self.scrub_import(" ".join(str(e.get("title") or "").split()))[:MAX_TITLE]
+                text = self.scrub_import(str(e.get("text") or "").strip())[:MAX_TEXT]
+                date = str(e.get("date") or "")
+                if not title or not text or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                    continue
+                name = f"codex-{date}-{slug(title, 30)}-{hashlib.sha1(f'{title}\n{text}'.encode()).hexdigest()[:6]}"
+                written.append(name)
+                if name in known:
+                    continue
+                created = self.now_fn().isoformat(timespec="seconds")
+                body = f"# {title}\n\n{text}\n\n_Origine : mémoire générée par Codex ({date}), importée comme données._"
+                _atomic_write(self._dir(IMPORT_PROJECT) / file_name(name), render(
+                    name, title, "fact", body, {"scope": "data", "trust": "data", "derived_from": "agent",
+                                                "origin": f"{IMPORT_SOURCE}:{origin_path}"[:200], "date": date,
+                                                "created": created, "links": [], "modified": created[:10]}))
+                known.add(name)
+            got = [n for n in self.learned(IMPORT_PROJECT) if n.name in set(written)]
+        if written:
+            self._enqueue(IMPORT_PROJECT)
+        return got
+
+    def list_import_data(self) -> list[Note]:
+        return self.learned(IMPORT_PROJECT)
+
+    def forget_import_data(self, name: str | None = None) -> int:
+        """Défaire : TOUT l'import (name=None) ou une entrée passe dans `.forgotten` du projet (rien n'est détruit)."""
+        n = 0
+        with self._lock:
+            d = self.root / IMPORT_PROJECT
+            if not d.is_dir():
+                return 0
+            trash = d / FORGOTTEN
+            for p in sorted(d.glob("*.md")):
+                if name is not None and p.name != file_name(name):
+                    continue
+                trash.mkdir(exist_ok=True)
+                p.replace(trash / p.name)
+                n += 1
+        if n:
+            self._enqueue(IMPORT_PROJECT)
+            self._publish("memory.forgotten", {"name": name or "*", "scope": "data", "derived_from": "import"})
+        return n
+
+    def promote_import_data(self, name: str) -> Note | None:
+        """« Retenir en note personnelle » : geste EXPLICITE de la personne (route locale seulement) ; l'entrée devient
+        une note de portée user (put_imported) et quitte les données importées."""
+        entry = next((n for n in self.learned(IMPORT_PROJECT) if n.name == name), None)
+        if entry is None:
+            return None
+        note = self.put_imported(entry.title, entry.text, f"codex:{name}", kind="fact")
+        if note is not None:
+            self.forget_import_data(name)
+        return note
+
     def forget_synced(self, project: str, name: str) -> bool:
         """Oubli reçu de l'équipe : la note passe dans `.forgotten` du projet (hors de l'index, rien n'est détruit),
         comme un oubli local. False si elle n'est pas là."""
@@ -666,8 +753,12 @@ class ProjectMemory:
         st = self._session(thread_id)
         if st is None or self.engine is None or not (query or "").strip():
             return []
+        return self._recall_rows(thread_id, (st.project, USER_PROJECT), query, k) + (
+            self._recall_rows(thread_id, (IMPORT_PROJECT,), query, k, source=IMPORT_SOURCE) if self.import_data else [])
+
+    def _recall_rows(self, thread_id: str, projects: tuple[str, ...], query: str, k: int, source: str = "") -> list[Recall]:
         try:
-            rows = self.engine.search_rows((st.project, USER_PROJECT), query, max(k, 8))
+            rows = self.engine.search_rows(projects, query, max(k, 8))
         except Exception:
             logger.warning("mémoire de projet : rappel en échec", exc_info=True)
             return []
@@ -687,7 +778,7 @@ class ProjectMemory:
             desc = " ".join(str(r.get("description") or "").split())
             snippet = " ".join(str(r.get("snippet") or "").split())
             text = f"{desc} — extrait : {snippet}" if desc and snippet and snippet not in desc else (desc or snippet)
-            out.append(Recall(note=name, text=text, score=max(score, rerank or 0.0), rerank=rerank))
+            out.append(Recall(note=name, text=text, score=max(score, rerank or 0.0), rerank=rerank, source=source))
             if len(out) >= k:
                 break
         return out
@@ -966,6 +1057,7 @@ def from_local_config(local: dict[str, Any], state_dir: Path | None) -> ProjectM
     root = Path(local.get("project_memory_dir") or (state_dir or Path("~/.config/nokker").expanduser())
                 / "project-memory").expanduser()
     return ProjectMemory(root=root, engine=CorthexisSemanticIndex(root, chunk_target=600),
+                         import_data=bool(local.get("import_codex_memory", False)),
                          core_tokens=int(local.get("project_memory_core_tokens", DEFAULT_CORE_TOKENS)),
                          min_score=float(local.get("project_memory_min_score", DEFAULT_MIN_SCORE)))
 
@@ -984,7 +1076,7 @@ def install(kernel: Any, memory: ProjectMemory) -> None:
 
 
 __all__ = [
-    "DEFAULT_CORE_TOKENS", "INSTRUCTION_FILES", "KINDS", "SCOPES", "USER_PROJECT", "ProjectMemory",
+    "DEFAULT_CORE_TOKENS", "IMPORT_PROJECT", "INSTRUCTION_FILES", "KINDS", "SCOPES", "USER_PROJECT", "ProjectMemory",
     "ProjectMemoryTools", "ProjectRecallMemory", "code_prefix", "discover", "find_git_root", "from_local_config",
     "install", "normalize_remote", "project_key", "project_name", "split_sections",
 ]

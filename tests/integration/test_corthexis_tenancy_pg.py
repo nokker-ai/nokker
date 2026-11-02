@@ -276,7 +276,7 @@ def test_migrate_as_owner_then_external_pod_indexes_recalls_and_cannot_disable_r
     rep = ct.migrate_schema(dsn["owner"], app_role=app, backup_role=backup, project_tenants=dict)
     assert rep["applied"] and rep["backup"] is True
     state = _rls_state(dsn["su"])
-    for t in (*ct.TABLES, *ct.EXTRA, "chunks"):
+    for t in (*ct.TABLES, *ct.EXTRA, *ct.STATS, "chunks"):
         assert state[t] == (True, out["owner"][0], True), (t, state[t])
     with psycopg.connect(dsn["su"]) as su:
         def priv(role, t, p):
@@ -307,6 +307,12 @@ def test_migrate_as_owner_then_external_pod_indexes_recalls_and_cannot_disable_r
     with tenant_scope(TB):
         assert [h.note_name for h in store.search(q, TEXT, k=10)] == ["ep-bbbb0001"]
     assert store.search(q, TEXT, k=10) == []
+    # fréquences lexicales écrites par le pod (`_apply_df` gardé) : un df et un nombre de notes PAR locataire
+    with psycopg.connect(dsn["su"]) as su:
+        df = {(r[0], r[1]): r[2] for r in su.execute("SELECT tenant_id, token, df FROM lex_df").fetchall()}
+        assert su.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'lex_df_pkey'"
+                          ).fetchone()[0] == "PRIMARY KEY (tenant_id, token)"
+    assert df[(TA, "")] == df[(TB, "")] == 1 and df[(TA, "portail")] == df[(TB, "portail")] == 1
     # la génération créée par le pod : partition au propriétaire, RLS forcée, index HNSW, lisible par la sauvegarde
     state = _rls_state(dsn["su"])
     assert state["chunks_g1"] == (True, out["owner"][0], True)
@@ -378,6 +384,8 @@ def test_old_form_database_reowned_then_migrated_passes(roles, monkeypatch, tmp_
     with psycopg.connect(dsn["su"]) as su:
         assert dict(su.execute("SELECT name, tenant_id FROM notes").fetchall()) == {"ep-aaaa0001": TA,
                                                                                    "ep-bbbb0001": TB}
+        # `lex_df` de l'ancienne forme (globale, 2 notes) reconstruite par locataire (1 note chacun)
+        assert dict(su.execute("SELECT tenant_id, df FROM lex_df WHERE token = ''").fetchall()) == {TA: 1, TB: 1}
     _assert_pod_locked_out(dsn["app"])
     # pod external sur la base reprise : rappel sous locataire, nouvelle note indexée
     from corthexis import service as cx_service

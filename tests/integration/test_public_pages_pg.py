@@ -77,6 +77,7 @@ def test_moderation_registry_and_append_only_audit(pg):  # noqa: F811
     import psycopg
 
     from nokker.cloud.moderation import PgPublicPages
+    from nokker.store.conn import connect_tenant
 
     s = PgPublicPages(pg["app"])
     sha = hashlib.sha256(b"AbCdEfGhIjKlMnOpQrStUv_-").hexdigest()
@@ -89,16 +90,23 @@ def test_moderation_registry_and_append_only_audit(pg):  # noqa: F811
     assert s.view("mc_b", B, sha2, "pg_bbbbbbbbbbbbbbbb", 50, now=210.0) is True
     s.set_moderation("mc_a", A, "pg_aaaaaaaaaaaaaaaa", None, "unpublish", "spam", now=300.0)
     assert s.view("mc_a", A, sha, "pg_aaaaaaaaaaaaaaaa", 1200, now=310.0) is True
-    assert s.moderated_of("mc_a") == {"page_ids": ["pg_aaaaaaaaaaaaaaaa"], "public_sha256": [sha]}
+    assert s.moderated_of("mc_a", A) == {"page_ids": ["pg_aaaaaaaaaaaaaaaa"], "public_sha256": [sha]}
     assert {r["page_id"] for r in s.listing(moderated=True)} == {"pg_aaaaaaaaaaaaaaaa", "pg_bbbbbbbbbbbbbbbb"}
     s.set_moderation("mc_a", A, "pg_aaaaaaaaaaaaaaaa", None, "restore", "infondé", now=400.0)
     assert s.view("mc_a", A, sha, "pg_aaaaaaaaaaaaaaaa", 1200, now=410.0) is False
     assert [e["action"] for e in s.events()] == ["unpublish", "unpublish", "restore"]
-    with psycopg.connect(pg["app"], autocommit=True) as conn:
+    with connect_tenant(pg["app"], B, autocommit=True) as conn:  # sous RLS (058) : dans le locataire de la machine
         with pytest.raises(psycopg.errors.RaiseException):
             conn.execute("UPDATE lokkal_page_moderation SET reason = 'autre'")
         n = conn.execute("SELECT count(*) FROM lokkal_public_pages WHERE machine_id = 'mc_b'").fetchone()[0]
     assert n == 1
+    with connect_tenant(pg["app"], A, autocommit=True) as conn:  # A ne voit ni la page de B ni son audit
+        assert conn.execute("SELECT count(*) FROM lokkal_public_pages WHERE machine_id = 'mc_b'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM lokkal_page_moderation WHERE tenant_id = %s", (B,)).fetchone()[0] == 0
+    with psycopg.connect(pg["app"], autocommit=True) as conn:  # sans locataire : rien
+        assert conn.execute("SELECT count(*) FROM lokkal_public_pages").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM lokkal_page_moderation").fetchone()[0] == 0
+    assert s.moderated_of("mc_b", A) == {"page_ids": [], "public_sha256": []}  # machine de B lue chez A : rien
 
 
 @requires_pg
@@ -116,7 +124,7 @@ def test_moderation_never_rewrites_a_removed_identity_pg(pg):  # noqa: F811
     assert s.view("mc_c", A, sha, other, 10, now=210.0) is True
     assert s.view("mc_c", A, sha2, pid, 10, now=220.0) is True
     assert s.view("mc_c", A, sha2, other, 10, now=230.0) is True
-    assert s.moderated_of("mc_c") == {"page_ids": sorted([pid, other]), "public_sha256": sorted([sha, sha2])}
+    assert s.moderated_of("mc_c", A) == {"page_ids": sorted([pid, other]), "public_sha256": sorted([sha, sha2])}
     assert not [r for r in s.listing() if r["machine_id"] == "mc_c"]
 
 
@@ -128,30 +136,31 @@ def test_moderation_notices_carry_the_reason_to_the_author_pg(pg):  # noqa: F811
     import psycopg
 
     from nokker.cloud.moderation import APPEAL, PgPublicPages
+    from nokker.store.conn import connect_tenant
     from nokker.store.pg import apply_migrations
 
     s = PgPublicPages(pg["app"])
     pid, other = "pg_eeeeeeeeeeeeeeee", "pg_ffffffffffffffff"
     sha = hashlib.sha256(b"EeEeEeEeEeEeEeEeEeEeEe_-").hexdigest()
     assert s.view("mc_e", A, sha, pid, 10, now=100.0) is False
-    assert s.notices_of("mc_e") == []
+    assert s.notices_of("mc_e", A) == []
     s.set_moderation("mc_e", A, None, sha, "unpublish", "contenu trompeur", now=200.0)
-    assert s.notices_of("mc_e") == [{"page_id": pid, "public_sha256": sha, "at": 200.0, "reason": "contenu trompeur",
+    assert s.notices_of("mc_e", A) == [{"page_id": pid, "public_sha256": sha, "at": 200.0, "reason": "contenu trompeur",
                                      "appeal": APPEAL}]
     assert s.view("mc_e", A, sha, other, 10, now=210.0) is True        # page_id mensonger : retiré, même motif
-    assert {(n["page_id"], n["reason"]) for n in s.notices_of("mc_e")} == {(pid, "contenu trompeur"),
+    assert {(n["page_id"], n["reason"]) for n in s.notices_of("mc_e", A)} == {(pid, "contenu trompeur"),
                                                                             (other, "contenu trompeur")}
     s.set_moderation("mc_e", A, pid, None, "restore", "infondé", now=300.0)
-    assert [n["page_id"] for n in s.notices_of("mc_e")] == [other]
-    with psycopg.connect(pg["app"], autocommit=True) as conn:
+    assert [n["page_id"] for n in s.notices_of("mc_e", A)] == [other]
+    with connect_tenant(pg["app"], A, autocommit=True) as conn:
         assert conn.execute("SELECT moderation_reason FROM lokkal_public_pages WHERE page_id = %s",
                             (pid,)).fetchone()[0] is None
         with pytest.raises(psycopg.errors.RaiseException):           # l'audit ne bouge pas
             conn.execute("UPDATE lokkal_page_moderation SET reason = 'autre'")
     # une ligne retirée « d'avant 041 » (motif absent) : la migration rejouée reprend le dernier retrait de l'audit
     s.set_moderation("mc_e", A, pid, None, "unpublish", "récidive", now=400.0)
-    with psycopg.connect(pg["app"], autocommit=True) as conn:
+    with connect_tenant(pg["app"], A, autocommit=True) as conn:
         conn.execute("UPDATE lokkal_public_pages SET moderation_reason = NULL WHERE page_id = %s", (pid,))
-    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e")}[pid] is None
+    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e", A)}[pid] is None
     assert apply_migrations(pg["owner"], strict=True)
-    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e")} == {pid: "récidive", other: "contenu trompeur"}
+    assert {n["page_id"]: n["reason"] for n in s.notices_of("mc_e", A)} == {pid: "récidive", other: "contenu trompeur"}

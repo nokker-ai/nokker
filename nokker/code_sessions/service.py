@@ -120,7 +120,10 @@ class CodeSessions:
     parent_registry: Callable[[], Any] | None = None  # le registre du locataire courant (filtré pour l'enfant)
     emit: Callable[[str, dict[str, Any]], Any] | None = None  # EventBus.publish : subagent.*, skill.untrusted
     parent_observer: Any = None  # BubbleHub : l'enfant le nourrit (son fil y naît au nom du propriétaire)
+    delegate_fork: bool = False  # mode fork de `delegate` (drapeau `delegate_fork`, nokker/context/fork.py)
     skills_fallback: Callable[[], Any] | None = None  # skills du compte (packs du web), hors session et après le dépôt
+    # Injection des secrets à la sortie (`code.egress_secrets`, nokker/egress/kernel.py `EgressSecrets`) ; None = éteint.
+    egress: Any = None
     _open: dict[str, _Open] = field(default_factory=dict, init=False, repr=False)
     _perms: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _hooks: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -247,6 +250,12 @@ class CodeSessions:
                                    + (f" (dépôt {url}" + (f", {ref}" if ref else "") + ")" if url else "")
                                    + f", mode {mode} ; outils read_file, search_files, write_file, patch, terminal, "
                                      "todo, points de retour")
+            if self.egress is not None:
+                from nokker.egress.kernel import note_text
+
+                rules = self.egress.available(self._egress_provider(tenant))
+                if rules:
+                    self.note(s.thread_id, note_text(rules))
         logger.info("session de code %s ouverte (%s, %s)", sid, tenant, self.cfg.backend)
         return self.view(s)
 
@@ -404,21 +413,43 @@ class CodeSessions:
         from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, CodeToolSource
 
         root = self._root(s)
+        setup = self._egress_setup(s, root)
+        extra: dict[str, Any] = {"sandbox_env": dict(setup.env)} if setup is not None else {}
         if self.cfg.backend == "kubernetes":
+            k8s = self.cfg.k8s_cfg()
+            if setup is not None:  # le pod passe par le proxy avec le jeton de SA session
+                k8s["egress_proxy"] = setup.proxy_url
             return CodeToolSource(root=root, backend="kubernetes", env_factory=self.cfg.env_factory,
-                                  k8s=self.cfg.k8s_cfg(), sub_path=s.root_rel, instance=self.cfg.instance,
-                                  labels=k8s_labels(self.cfg.instance, s.tenant_id, s.id))
+                                  k8s=k8s, sub_path=s.root_rel, instance=self.cfg.instance,
+                                  labels=k8s_labels(self.cfg.instance, s.tenant_id, s.id), **extra)
         d = self.cfg.docker
         host = d.get("host_root")
         return CodeToolSource(root=root, backend="docker",
                               image=str(d.get("image") or os.environ.get("NOKKER_SANDBOX_IMAGE") or DEFAULT_SANDBOX_IMAGE),
                               network=bool(d.get("network", True)), network_name=d.get("network_name"),
                               host_root=os.path.join(str(host), s.root_rel) if host else None,
-                              instance=self.cfg.instance)
+                              instance=self.cfg.instance, **extra)
+
+    def _egress_provider(self, tenant: str) -> Any:
+        if self.secrets is None:
+            return None
+        try:
+            return self.secrets.for_tenant(tenant)
+        except SecretsError:
+            return None
+
+    def _egress_setup(self, s: CodeSession, root: str) -> Any:
+        """Drapeau `code.egress_secrets` : accorde au proxy les secrets déclarés présents dans le coffre de CE
+        locataire (jamais un autre : le chemin du coffre vient de la session) ; None = environnement d'origine."""
+        if self.egress is None:
+            return None
+        return self.egress.open_session(s.id, s.tenant_id, self._egress_provider(s.tenant_id), root, self.cfg.mount)
 
     def _release(self, session_id: str) -> None:
         with self._lock:
             o = self._open.pop(session_id, None)
+        if o is not None and self.egress is not None:
+            self.egress.close_session(session_id)  # jeton révoqué : la réouverture en pose un neuf
         if o is not None:
             try:
                 o.source.close()
@@ -646,7 +677,7 @@ class CodeSessions:
                     lambda registry, thread_id, observer: self.kernel_factory(registry, thread_id, observer),
                     self.tools(), max_children=n, max_background=n, max_live=n, require_isolation=True,
                     background=True, emit=self._emitter(s), parent_observer=self.parent_observer,
-                    note=self.note, state_path=self._subagents_state(s))
+                    note=self.note, state_path=self._subagents_state(s), fork=self.delegate_fork)
                 d.bind(self._parent_registry)
                 self._delegates[s.id] = d
         return d

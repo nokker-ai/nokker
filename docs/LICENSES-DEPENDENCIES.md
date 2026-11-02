@@ -76,6 +76,13 @@
 | nvidia-* (13), cuda-toolkit | 13.x | **NVIDIA EULA propriétaire** | optionnel (opt-in) | kittentts (via torch) |
 | torch | 2.14.0 | BSD-3 + composants Apache/BSL/MIT | optionnel (opt-in) | kittentts |
 
+### Fichiers tiers embarqués (hors paquets)
+
+| Fichier | Origine | Licence | Usage |
+|---|---|---|---|
+| `nokker/household/paper/schemas/pain.001.001.09.ch.03.xsd` (sha256 `8daf0973…`) | SIX, archive `ig-credit-transfer-xml-schema-sps-2026-en.zip` (six-group.com, 01.11.2026), « (C) Copyright 2021, SIX » | **à vérifier** : publié par SIX pour la mise en œuvre des SPS, sans licence explicite dans le fichier | validation des fichiers pain.001 préparés (drapeau `household_paper`) ; **retiré de l'export public** (`scripts/public-tree.sh`) tant que la licence n'est pas claire : sans lui, la validation est sautée et la carte le dit |
+| `tests/unit/household/fixtures/qr/six-sample-*.txt` | SIX, exemples de données des QR-factures (`samples-data-schema-de.zip`) | idem, **à vérifier** | tests seulement ; retirés de l'export public avec les tests qui les lisent |
+
 ### Python — liste complète du périmètre image (144 paquets)
 
 | Paquet | Version | Licence | Périmètre |

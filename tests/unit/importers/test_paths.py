@@ -36,7 +36,9 @@ def test_every_reason_has_a_stable_code(tmp_path):
     from nokker.context.project_memory import ProjectMemory
     from nokker.importers import claude_code, cursor, hermes, openclaw
     from nokker.importers.apply import apply
+    from nokker.importers import codex as codex_mod
     from tests.unit.importers.test_claude_code import _home
+    from tests.unit.importers.test_codex import _codex
     from tests.unit.importers.test_cursor import _repo
     from tests.unit.importers.test_hermes import _hermes
     from tests.unit.importers.test_openclaw import _oc
@@ -48,6 +50,7 @@ def test_every_reason_has_a_stable_code(tmp_path):
     after = openclaw.scan(_oc(tmp_path / "e"), nokker_home=tmp_path / "nk2")
     apply(after, user_settings=tmp_path / "s.json", backup_dir=tmp_path / "bak", memory=ProjectMemory(root=tmp_path / "pm"))
     reports.append(after)
+    reports.append(codex_mod.scan(_codex(tmp_path / "f"), nokker_home=tmp_path / "nk3"))
     for r in reports:
         for item in r.to_json()["items"]:
             assert item["code"] != "other", (item["kind"], item["reason"])

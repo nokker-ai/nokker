@@ -67,6 +67,16 @@ _CROSS_TENANT = {
     # ses propositions encore en attente chez le payeur (politiques `long_memory_author_*`, pendant l'effacement).
     "nokker_long_memory": ("tenant_id = %s OR author_account = %s", "acc"),
     "nokker_memory_pending": ("tenant_id = %s OR author_account = %s", "acc"),
+    # Consolidation nocturne (053, docs/CONSOLIDATION.md) : ses contributions au foyer d'un autre, archivées, et les
+    # opérations du journal du payeur qui les citent (politiques `consolidation_author_erase*`, pendant l'effacement).
+    "nokker_memory_archive": ("tenant_id = %s OR author_account = %s", "acc"),
+    "nokker_consolidation_ops": ("tenant_id = %s OR %s = ANY (authors)", "acc"),
+    # Ambiant (054) : ses vues glance (lunettes) rattachées au foyer d'un autre locataire (hors RLS, par account_id) ;
+    # un écran e-ink qu'il a enregistré pour le foyer d'un autre reste au foyer.
+    "ambient_displays": ("tenant_id = %s OR (account_id = %s AND kind = 'glance')", "acc"),
+    # Salle Maison (057, docs/HOUSE-ROOM.md) : ses messages dans la salle du foyer d'un autre, et les réponses des
+    # agents qu'il a fait parler (politiques `house_room_author_erase*`, pendant l'effacement).
+    "house_room_messages": ("tenant_id = %s OR author_account = %s", "acc"),
 }
 
 
@@ -141,6 +151,10 @@ def _children_first(conn: psycopg.Connection, tables: list[str]) -> list[str]:
 
 
 def _find_account(conn: psycopg.Connection, email: str | None, account_id: str | None) -> tuple[str, str, str]:
+    """`accounts` est sous RLS (058) : lue par sa clé (identifiant ou adresse), pour cette transaction."""
+    from nokker.store.conn import set_lookup_key
+
+    set_lookup_key(conn, account_id or (email or "").strip().lower(), local=True)
     if account_id:
         row = conn.execute("SELECT id, tenant_id, email FROM accounts WHERE id = %s", (account_id,)).fetchone()
     else:
@@ -214,6 +228,10 @@ def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: boo
         acc, tenant, mail = _find_account(conn, email, account_id)
         if tenant == INTERNAL_TENANT:
             raise EraseError(f"{acc} appartient au locataire interne {INTERNAL_TENANT} : refusé")
+        # RLS : ce locataire, cette transaction ; la clé = ce compte (ses vues glance rattachées au foyer d'un autre
+        # locataire, `ambient_displays`, 058)
+        conn.execute("SELECT set_config('app.tenant_id', %s, true), set_config('app.lookup_key', %s, true)",
+                     (tenant, acc))
         others = conn.execute("SELECT count(*) FROM accounts WHERE tenant_id = %s AND id <> %s",
                               (tenant, acc)).fetchone()[0]
         if others:
@@ -305,10 +323,18 @@ def remove_device(dsn: str, code: str, *, apply: bool = False) -> str:
 def pending_deletions(dsn: str) -> list[str]:
     """Comptes dont la suppression a été accordée par la personne (carte forte, nokker/account/delete.py), dans
     l'ordre des demandes : `nokker erase --pending` les efface un par un."""
-    with psycopg.connect(dsn) as conn:
+    from nokker.store.conn import known_tenants
+
+    with psycopg.connect(dsn) as conn:  # sous RLS (058) : locataire par locataire, dans une seule transaction
         if conn.execute("SELECT to_regclass('account_deletions')").fetchone()[0] is None:
             return []
-        return [r[0] for r in conn.execute("SELECT account_id FROM account_deletions ORDER BY requested_at")]
+        rows = []
+        for tid in known_tenants(dsn):
+            conn.execute("SELECT set_config('app.tenant_id', %s, true)", (tid,))
+            rows += conn.execute("SELECT requested_at, account_id FROM account_deletions WHERE tenant_id = %s",
+                                 (tid,)).fetchall()
+        conn.rollback()
+    return [acc for _, acc in sorted(rows)]
 
 
 # Verrou consultatif de SESSION (Postgres) : un seul passage de la file à la fois, sur toute l'instance (CronJob relancé

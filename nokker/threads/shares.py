@@ -1,7 +1,8 @@
 """Liens de conversation partageables et révocables (docs/CLIENT-API.md « Export et partage d'un fil »).
 
 - **Jeton** : `secrets.token_urlsafe(32)` (256 bits), rendu UNE fois à la création (dans `url`), stocké seulement en
-  empreinte sha256 (`thread_share_tokens`, hors RLS : la lecture publique arrive sans locataire). Pas de sel : un jeton
+  empreinte sha256 (`thread_share_tokens`, sous RLS depuis 058 : la lecture publique, sans locataire, n'ouvre que la
+  ligne de SON empreinte). Pas de sel : un jeton
   de 256 bits aléatoires ne se devine pas par dictionnaire.
 - **Instantané figé** : l'export `public=True` du fil au moment du partage (`thread_shares.snapshot`, sous RLS) ; les
   tours suivants n'y entrent jamais. Les résultats d'outils secrets y sont scellés comme dans l'export.
@@ -151,7 +152,8 @@ class MemoryShares:
 
 
 class PgShares:
-    """Tables `thread_shares` (RLS) et `thread_share_tokens` (hors RLS, empreintes), migration 044."""
+    """Tables `thread_shares` et `thread_share_tokens` (empreintes), migration 044, toutes deux sous RLS (058) ; la
+    route publique lit l'empreinte par sa clé (`connect_key`)."""
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
@@ -161,10 +163,10 @@ class PgShares:
 
         return connect(self.dsn)
 
-    def _admin(self):
-        from nokker.store.conn import connect_admin
+    def _by_key(self, digest: str):
+        from nokker.store.conn import connect_key
 
-        return connect_admin(self.dsn)
+        return connect_key(self.dsn, digest)
 
     @staticmethod
     def _meta(r: Any) -> ShareMeta:
@@ -219,7 +221,7 @@ class PgShares:
         return len(ids)
 
     def lookup(self, digest: str, now: float) -> tuple[str, str] | None:
-        with self._admin() as conn, conn.cursor() as cur:
+        with self._by_key(digest) as conn, conn.cursor() as cur:
             cur.execute("SELECT share_id, tenant_id, expires_at, revoked_at FROM thread_share_tokens "
                         "WHERE token_sha256 = %s", (digest,))
             r = cur.fetchone()
@@ -234,11 +236,16 @@ class PgShares:
         return (self._meta(r), r[7]) if r else None
 
     def purge_expired(self, now: float, grace_s: float = 30 * 86400) -> int:
-        """Empreintes expirées ou révoquées depuis plus de `grace_s` : supprimées (hors RLS, sans locataire)."""
-        with self._admin() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM thread_share_tokens WHERE expires_at < %s OR revoked_at < %s",
-                        (now - grace_s, now - grace_s))
-            return cur.rowcount
+        """Empreintes expirées ou révoquées depuis plus de `grace_s` : supprimées, locataire par locataire (RLS, 058)."""
+        from nokker.store.conn import connect_tenant, known_tenants
+
+        n = 0
+        for tid in known_tenants(self.dsn):
+            with connect_tenant(self.dsn, tid) as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM thread_share_tokens WHERE tenant_id = %s AND (expires_at < %s OR revoked_at < %s)",
+                            (tid, now - grace_s, now - grace_s))
+                n += cur.rowcount
+        return n
 
 
 # ─────────────────────────────── débit public ───────────────────────────────

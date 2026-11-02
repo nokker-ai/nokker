@@ -108,6 +108,9 @@ class Recall:
     text: str  # extrait injecté
     score: float
     rerank: float | None = None
+    # Provenance : "" (mémoire de Nokker) ou `import:codex` (données importées d'un autre agent, rendues à part, jamais
+    # comme consignes ; nokker/context/imported.py).
+    source: str = ""
 
 
 class MemoryPort(Protocol):
@@ -302,6 +305,9 @@ class Approval:
     # `ToolCall.id` de l'appel qui a posé la carte (docs/LOKKAL.md §7.4.9) : le `tool.result` publié après l'exécution
     # porte ce `call_id`, et le client ferme l'appel resté « en attente ». None pour une carte d'avant ce champ.
     call_id: str | None = None
+    # Relecteur automatique des cartes `standard` (docs/APPROVALS.md §8, drapeau `auto_review`) : `{decision, reason,
+    # model, at, by_rule[, revoked_by, revoked_at]}`, None si aucune relecture (drapeau éteint, carte hors périmètre).
+    auto_review: dict[str, Any] | None = None
 
 
 @dataclass
@@ -318,6 +324,9 @@ class Challenge:
     # Outil de la carte, lié au défi quand il est posé (cartes relayées par nokker.ai, lots X10/X20b) : une preuve
     # signée pour un outil ne vaut pas pour un autre. Absent du JSON quand il n'est pas posé (défis locaux).
     tool: str | None = None
+    # Empreinte du mandat de dépense d'une carte « à payer » (docs/PAYMENTS.md §3, drapeau `payments`) : la passkey
+    # signe ce défi, donc le mandat entier. Absent du JSON pour toute autre carte (défis inchangés).
+    mandate_sha256: str | None = None
 
     def canonical(self) -> str:
         import json
@@ -326,6 +335,8 @@ class Challenge:
                    "exp": self.exp, "aud": self.aud}
         if self.tool is not None:
             payload["tool"] = self.tool
+        if self.mandate_sha256 is not None:
+            payload["mandate_sha256"] = self.mandate_sha256
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 

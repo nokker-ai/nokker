@@ -2,8 +2,8 @@
 `store/migrations/032_sso.sql`), même contrat. Les DROITS vivent dans nokker/sso/service.py, pas ici.
 
 Sous RLS (locataire courant, `nokker/store/conn.py::connect`) : connexions, domaines, liens, adhésions tenues,
-journal. Hors RLS (lus avant de connaître le locataire, connexion du même rôle `nokker_app` sans `app.tenant_id`) :
-`sso_routes`, `sso_domain_claims`, `sso_flows`, `sso_identities`. Le lien d'un projet se lit aussi par ses membres
+journal. `sso_routes`, `sso_domain_claims`, `sso_flows` aussi (058) : écrites dans le locataire de la connexion, lues
+avant de connaître le locataire par leur CLÉ seulement (`connect_key`). Hors RLS (aucun locataire) : `sso_identities`. Le lien d'un projet se lit aussi par ses membres
 d'autres locataires : `binding(actor, …)` pose `app.account_id` comme `PgTeamStore`.
 """
 from __future__ import annotations
@@ -260,13 +260,30 @@ class PgSsoStore:
 
         return psycopg.connect(self.dsn, row_factory=dict_row)
 
+    # `sso_routes`, `sso_domain_claims`, `sso_flows` : sous RLS depuis 058. Écrites et effacées dans le locataire de la
+    # connexion (nommé : la ligne le porte) ; lues avant le locataire par leur CLÉ seulement (connexion `sc_…`, domaine,
+    # empreinte du `state`).
+    def _for(self, tenant_id: str):
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_tenant
+
+        return connect_tenant(self.dsn, tenant_id, row_factory=dict_row)
+
+    def _by_key(self, key: str):
+        from psycopg.rows import dict_row
+
+        from nokker.store.conn import connect_key
+
+        return connect_key(self.dsn, key, row_factory=dict_row)
+
     # ── connexions ──
     def create_connection(self, c: Connection) -> None:
         with self._rls() as db:
             db.execute(f"INSERT INTO sso_connections ({_C_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                        (c.id, c.tenant_id, c.owner_account, c.name, c.issuer, c.client_id, c.secret_name,
                         c.groups_claim, c.token_auth, c.created_at, c.updated_at))
-        with self._plain() as db:
+        with self._for(c.tenant_id) as db:
             db.execute("INSERT INTO sso_routes (connection_id, tenant_id) VALUES (%s, %s)", (c.id, c.tenant_id))
 
     def connection(self, cid: str) -> Connection | None:
@@ -301,12 +318,12 @@ class PgSsoStore:
                 db.execute("DELETE FROM sso_managed WHERE project_id = ANY(%s) AND tenant_id = %s", (pids, c.tenant_id))
             for t in ("sso_bindings", "sso_domains", "sso_connections"):
                 db.execute(f"DELETE FROM {t} WHERE connection_id = %s AND tenant_id = %s", (c.id, c.tenant_id))
-        with self._plain() as db:
+        with self._for(c.tenant_id) as db:
             for t in ("sso_domain_claims", "sso_routes", "sso_flows"):
                 db.execute(f"DELETE FROM {t} WHERE connection_id = %s AND tenant_id = %s", (c.id, c.tenant_id))
 
     def route(self, cid: str) -> str | None:
-        with self._plain() as db:
+        with self._by_key(cid) as db:
             r = db.execute("SELECT tenant_id FROM sso_routes WHERE connection_id = %s", (cid,)).fetchone()
         return r["tenant_id"] if r else None
 
@@ -327,15 +344,18 @@ class PgSsoStore:
         with self._rls() as db:
             n = db.execute("DELETE FROM sso_domains WHERE connection_id = %s AND tenant_id = %s AND domain = %s",
                            (c.id, c.tenant_id, domain)).rowcount
-        with self._plain() as db:
+        with self._for(c.tenant_id) as db:
             db.execute("DELETE FROM sso_domain_claims WHERE domain = %s AND connection_id = %s AND tenant_id = %s",
                        (domain, c.id, c.tenant_id))
         return n > 0
 
     def claim_domain(self, d: Domain, now: float) -> bool:
-        with self._plain() as db:
+        from nokker.store.conn import set_lookup_key
+
+        with self._for(d.tenant_id) as db:
             db.execute("INSERT INTO sso_domain_claims (domain, connection_id, tenant_id, claimed_at) VALUES (%s,%s,%s,%s) "
                        "ON CONFLICT (domain) DO NOTHING", (d.domain, d.connection_id, d.tenant_id, now))
+            set_lookup_key(db, d.domain, local=True)  # le domaine peut être déjà pris par la connexion d'un autre
             r = db.execute("SELECT connection_id FROM sso_domain_claims WHERE domain = %s", (d.domain,)).fetchone()
         if r is None or r["connection_id"] != d.connection_id:
             return False
@@ -345,7 +365,7 @@ class PgSsoStore:
         return True
 
     def claim_for(self, domain: str) -> tuple[str, str] | None:
-        with self._plain() as db:
+        with self._by_key(domain) as db:
             r = db.execute("SELECT connection_id, tenant_id FROM sso_domain_claims WHERE domain = %s",
                            (domain,)).fetchone()
         return (r["connection_id"], r["tenant_id"]) if r else None
@@ -396,16 +416,16 @@ class PgSsoStore:
         with self._rls() as db:
             db.execute("DELETE FROM sso_managed WHERE project_id = %s AND account_id = %s", (project_id, account_id))
 
-    # ── connexions en cours (hors RLS, usage unique) ──
+    # ── connexions en cours (sous RLS depuis 058, lues par l'empreinte du `state` ; usage unique) ──
     def put_flow(self, f: Flow) -> None:
-        with self._plain() as db:
+        with self._for(f.tenant_id) as db:  # les flux échus de CE locataire ; ceux d'un autre à son prochain flux
             db.execute("DELETE FROM sso_flows WHERE expires_at < %s", (f.created_at - 3600,))
             db.execute(f"INSERT INTO sso_flows ({_F_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                        (f.state_sha256, f.connection_id, f.tenant_id, f.nonce, f.code_verifier, f.public_key_spki,
                         f.device_name, f.lang, f.created_at, f.expires_at))
 
     def take_flow(self, state_sha256: str) -> Flow | None:
-        with self._plain() as db:  # DELETE … RETURNING : deux callbacks simultanés, un seul gagne
+        with self._by_key(state_sha256) as db:  # DELETE … RETURNING : deux callbacks simultanés, un seul gagne
             r = db.execute(f"DELETE FROM sso_flows WHERE state_sha256 = %s RETURNING {_F_COLS}",
                            (state_sha256,)).fetchone()
         return Flow(**r) if r else None

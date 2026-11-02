@@ -180,6 +180,9 @@ class Kernel:
     # compte comme une répétition. À la première, une note demande de changer d'approche ; à `stall_limit`
     # répétitions dans le tour, le noyau conclut sans outils (règle `loop:stalled`). None = pas de détection.
     stall_limit: int | None = None
+    # MCP Apps (drapeau `mcp_apps`, docs/MCP-NEXT.md) : `nokker.tools.mcp_apps.AppRegistry`, posé par `build_kernel` ;
+    # None = aucune app enregistrée, aucun `tool.app`, `app_tool_call` refuse.
+    mcp_apps: Any = None
     # Fils dont le tour en cours doit s'arrêter (POST /v1/threads/{id}/cancel, client terminal) : vérifié avant chaque
     # appel modèle et chaque outil ; le tour finit sur « annulé », sans erreur d'amont.
     _cancelled: set[str] = field(default_factory=set, init=False, repr=False)
@@ -285,6 +288,35 @@ class Kernel:
         return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"refusé par le noyau ({why})",
                           reason=rule.code if rule is not None and decision is Decision.DENY else None)
 
+    def app_tool_call(self, thread_id: str, server: str, name: str, arguments: dict,
+                      sender: str | None = None) -> ToolResult | str:
+        """Un `tools/call` demandé par une app MCP affichée (docs/MCP-NEXT.md §4) : mêmes portes que la boucle et que
+        `direct_call` (effet de CET appel, règles, invariants, carte prouvée), même caviardage. Contrairement à
+        `direct_call`, rien n'entre dans le contexte du modèle (ni note « hors tour », ni relance de tour après une
+        carte) : l'app n'écrit jamais dans la fenêtre du modèle. Rend le résultat, ou l'id de la carte."""
+        from nokker.tools.mcp_apps import APP_CHANNEL
+
+        reg = self.mcp_apps
+        spec = reg.spec(server, name) if reg is not None else None
+        tc = ToolCall(id=f"app-{time.monotonic_ns()}", name=name, arguments=arguments)
+        if spec is None:
+            return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"outil inconnu : {name}")
+        turn = Turn(thread_id=thread_id, index=self.store.next_index(thread_id), input=InputCheck(text=""),
+                    channel=APP_CHANNEL, sender=sender)
+        verdicts = self.gates.action(tc, spec, turn)
+        decision = worst(verdicts)
+        rule = next((v for v in verdicts if v.decision is decision), None)
+        if decision is Decision.ALLOW:
+            ctx = ToolContext(thread_id=thread_id, turn_index=turn.index, channel=APP_CHANNEL, sender=sender)
+            result = self.invariants.redact_result(reg.call(server, name, arguments, ctx), spec)
+            result.app = None  # une app n'en ouvre pas une autre (v1)
+            return result
+        if decision is Decision.HITL and self.approvals is not None:
+            return self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule)).id
+        why = f"{rule.rule}: {rule.reason}" if rule else decision.value
+        return ToolResult(call_id=tc.id, name=name, is_error=True, content=f"refusé par le noyau ({why})",
+                          reason=rule.code if rule is not None and decision is Decision.DENY else None)
+
     def script_turn(self, ctx: ToolContext) -> Turn:
         """Le tour d'un appel d'outil fait par un script `execute_code` quand l'appel ne vient pas d'un tour (carte
         d'`execute_code` approuvée puis exécutée par `approvals/executor.py`) : même fil, même index, même canal, le
@@ -306,12 +338,16 @@ class Kernel:
             return {"status": "error", "content": f"outil inconnu : {name}"}
         tc = ToolCall(id=f"xc-{time.monotonic_ns()}", name=name, arguments=arguments)
         verdicts = self.gates.action(tc, spec, turn)
+        if self.provenance is not None:  # un script qui lit un mail puis envoie : même politique que la boucle
+            verdicts = self.provenance.check(tc, spec, turn) + verdicts
         self._log_verdicts(turn, verdicts)
         decision = worst(verdicts)
         if decision is Decision.ALLOW:
             inner = ToolContext(thread_id=ctx.thread_id, turn_index=ctx.turn_index, channel=ctx.channel,
                                 sender=ctx.sender, kernel=self, turn=turn)
             result = self.invariants.redact_result(self.tools.call(name, arguments, inner), spec)
+            if self.provenance is not None:
+                self.provenance.record(turn, tc, spec, result)
             return {"status": "error" if result.is_error else "ok", "content": result.content or ""}
         rule = next((v for v in verdicts if v.decision is decision), None)
         why = f"{rule.rule}: {rule.reason}" if rule else decision.value
@@ -345,12 +381,83 @@ class Kernel:
                                 getattr(self.advisor, "last_latency_s", 0.0), "juge : avis sur une carte forte")
         return advice
 
+    def _auto_review_eligible(self, rule: Verdict | None, tc: ToolCall, effect: Effect) -> bool:
+        """La carte qui va être posée passe-t-elle par le relecteur automatique (§8) ? Drapeau, backend capable, et
+        hors de la liste fermée (`auto_review.excluded`)."""
+        if self.auto_reviewer is None or rule is None or not hasattr(self.approvals, "decide_auto"):
+            return False
+        from nokker.approvals.auto_review import excluded
+        from nokker.core.ports import Approval
+
+        probe = Approval(id="", thread_id="", turn_index=0, channel="", tool_name=tc.name,
+                         arguments=dict(tc.arguments or {}), args_sha256="", strength=rule.strength or "standard",
+                         rule=rule.rule)
+        return excluded(probe, effect.value) is None
+
+    def _auto_review(self, turn: Turn, tc: ToolCall, spec: Any, ctx: ToolContext, approval: Any,
+                     effect: Effect) -> ToolResult | None:
+        """Relit la carte qui vient d'être posée. Rend le résultat à donner au modèle (outil exécuté, ou refus motivé),
+        ou None quand la carte reste à l'humain (escalade, doute, panne) : le chemin habituel d'attente continue."""
+        from nokker.approvals.auto_review import REFUSED_RESULT
+
+        try:
+            res = self.auto_reviewer.review(turn, approval, call_id=tc.id, approvals=self.approvals)
+        except Exception:  # noqa: BLE001 — un relecteur qui tombe laisse la carte à l'humain
+            logger.warning("relecteur automatique en échec", exc_info=True)
+            res = None
+        if res is not None and res.usage:
+            self._record_judge_call(turn, self.auto_reviewer, res.model, res.usage, res.latency_s,
+                                    "relecteur automatique : carte standard")
+        decision = res.decision if res is not None else "escalate"
+        reason = res.reason if res is not None else "relecteur en échec : à l'humain"
+        try:
+            decided = self.approvals.decide_auto(approval.id, decision, reason, model=getattr(res, "model", ""),
+                                                 by_rule=bool(getattr(res, "by_rule", True)), effect=effect.value)
+        except Exception:  # noqa: BLE001 — carte déjà décidée ailleurs, ou refusée par la liste fermée
+            logger.warning("relecteur automatique : décision non appliquée", exc_info=True)
+            self.approvals.notify_pending(approval)
+            return None
+        label = {"approve": "approuvée", "reject": "refusée", "escalate": "laissée à l'humain"}[decision]
+        self._log_verdicts(turn, [Verdict(gate=Gate.ACTION, decision=Decision.ALLOW if decision == "approve" else
+                                          (Decision.DENY if decision == "reject" else Decision.HITL), layer=2,
+                                          rule="approvals:auto_review", reason=f"{label} : {reason}",
+                                          judge_model=getattr(res, "model", None) or None,
+                                          latency_s=getattr(res, "latency_s", 0.0), subject=tc.id)])
+        if decision == "escalate":
+            self.approvals.notify_pending(decided)
+            return None
+        turn.approval_ids.append(approval.id)
+        if tc in turn.pending_approvals:  # décidée : plus rien n'attend l'humain pour cet appel
+            turn.pending_approvals.remove(tc)
+        if decision == "reject":
+            return ToolResult(call_id=tc.id, name=tc.name, content=REFUSED_RESULT.format(
+                reason=reason, approval_id=approval.id), is_error=False, reason="auto_review_rejected")
+        # Approuvée : exécutée DANS le tour, comme une action permise (le modèle voit le résultat de l'outil).
+        try:
+            result = self.tools.call(tc.name, tc.arguments, ctx)
+        except Exception as e:  # noqa: BLE001 — même contrat que l'exécuteur de cartes
+            self.approvals.mark_failed(approval.id, f"{type(e).__name__}: {e}"[:500])
+            raise
+        result.call_id = tc.id
+        redacted = self.invariants.redact_result(result, spec)
+        if result.is_error:
+            self.approvals.mark_failed(approval.id, (redacted.content or "")[:500])
+        else:
+            self.approvals.mark_executed(approval.id, (redacted.content or "")[:2000])
+        suffix = self._observe("tool_executed", turn, tc, spec, redacted)
+        admit_in = getattr(self.context, "admit_result_in", None)
+        admitted = (admit_in(turn.thread_id, turn.index, redacted) if admit_in is not None
+                    else self.context.admit_result(redacted))
+        if suffix:
+            admitted.content = admitted.content + str(suffix)
+        return admitted
+
     def _record_judge_call(self, turn: Turn, role: Any, model: str, usage: dict | None, latency_s: float,
-                           reason: str) -> None:
+                           reason: str) -> LLMCall | None:
         """Les jetons du juge comptent au tour (`turn.cost`, X2) et au ledger, comme un appel modèle : palier
-        `role.tier` (celui dont le modèle sert de juge), motif « juge : … »."""
+        `role.tier` (celui dont le modèle sert de juge), motif « juge : … ». Rend l'appel compté (None sans usage)."""
         if not usage:
-            return
+            return None
         from nokker.providers.sokkan import _parse_usage
 
         call = LLMCall(tier=getattr(role, "tier", None) or Tier.SHIP, model=model or getattr(role, "model_name", ""),
@@ -361,6 +468,7 @@ class Kernel:
             self.ledger.record(turn.thread_id, turn.index, call)
         except Exception:  # noqa: BLE001 — un ledger qui tombe ne coûte pas le tour
             logger.warning("ledger : appel du juge non écrit", exc_info=True)
+        return call
 
     def _run_review(self, turn: Turn, final: bool = False):
         """Une relecture du diff du tour (X8), comptée au tour et tracée (`judge:review`). None : juge en panne ou
@@ -470,6 +578,14 @@ class Kernel:
     # risque sur les cartes fortes. `None` = éteints (défaut).
     reviewer: Any = None
     advisor: Any = None
+    # Rubrique et objectifs (docs/OUTCOMES-GOAL.md, `nokker/goals/service.py::GoalService`, drapeaux `outcomes_enabled`
+    # et `goals_enabled`) : commandes `/goal`, réponse au tour `goal_check`, passes notées par un correcteur séparé
+    # dans le tour, objectif noté et enchaîné en fin de tour. `None` = éteints (défaut) : rien ne change.
+    goals: Any = None
+    # Relecteur automatique des cartes `standard` (docs/APPROVALS.md §8, `nokker/approvals/auto_review.py`,
+    # drapeau `auto_review`) : approuve, refuse ou laisse à l'humain une carte de la liste permise. `None` = éteint
+    # (défaut) : aucune carte relue, chemin et textes inchangés.
+    auto_reviewer: Any = None
     # Traces d'entraînement (docs/TRACES.md, `nokker/traces/recorder.py::TraceRecorder`) : chaque appel modèle (messages
     # exacts envoyés, schémas, suite) gardé à part, écrit à la fin du tour. `None` = rien n'est enregistré (défaut ;
     # `traces_record: false`). Jamais d'effet sur ce que voit le modèle : l'enregistreur copie, et une erreur est avalée.
@@ -480,6 +596,11 @@ class Kernel:
     # Invitation de fin de tour (drapeau `learning_nudges`, nokker/learning/nudge.py, docs/LEARNING.md §4) :
     # `after_turn(turn)` → une ligne fixe ajoutée au contexte du PROCHAIN tour du fil, ou None. None = éteinte.
     learning: Any = None
+    # Provenance des valeurs (drapeau `provenance`, docs/PROVENANCE.md, `nokker/qa/provenance.py::ProvenanceGuard`) :
+    # étiquette ce qui entre dans le tour et les résultats d'outils, et refuse ou soumet à une carte forte une action
+    # sensible dont un argument critique ne vient que d'une source non fiable. Partagé par les copies du noyau
+    # (`dataclasses.replace`, sous-agents). None = éteint (défaut) : aucun verdict ni texte de plus.
+    provenance: Any = None
     # Dernier prompt rendu par fil (`prompt_text`), pour `LLMCall.reusable_tokens` ; borné aux fils récents.
     _last_prompts: OrderedDict = field(default_factory=OrderedDict, repr=False)
     _last_prompts_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -493,6 +614,13 @@ class Kernel:
     # Steer et mention de reprise vus par le modèle (STEER_BLOCK, RESUME_NOTE) : éteints par défaut, tant que les
     # traces d'entraînement ne les portent pas (docs/CONTEXT-FORMAT.md). La pause, elle, ne change rien au contexte.
     steer_enabled: bool = False
+    # Fork de sous-agent (drapeau `delegate_fork`, `tools/delegate.py`, `context/fork.py`) : le noyau garde, par fil, le
+    # contexte EXACT (messages assemblés + schémas) du dernier appel modèle, pour qu'un `delegate(fork=true)` du même
+    # tour en fasse le préfixe de l'enfant (même préfixe, cache réutilisé). False (défaut) : rien n'est gardé.
+    fork_bases: bool = False
+    fork_bases_max: int = 64
+    # Partagé par les copies du noyau (`dataclasses.replace`), comme `_last_prompts`.
+    _fork_bases: OrderedDict = field(default_factory=OrderedDict, repr=False)
 
     def _observe(self, method: str, *args):
         if self.observer is None:
@@ -556,6 +684,67 @@ class Kernel:
                     route.tier.value, comp.model, u.prompt, u.completion,
                     u.cached if u.cached_reported else "?", comp.latency_s or 0.0, route_reason[:160])
         return call
+
+    def record_side_call(self, turn: Turn, tier: Tier, comp, reason: str, messages: list[dict],
+                         side: str = "advisor", meta: dict[str, Any] | None = None) -> LLMCall:
+        """Un appel modèle fait À CÔTÉ de la boucle pendant un tour (outil `advise`, `route/advise.py`) : compté au tour
+        (`turn.calls`, donc `turn.cost` et les budgets), écrit au ledger avec son motif, et tracé à part
+        (`TraceRecorder.side`, sans toucher au découpage des appels de la boucle)."""
+        call = LLMCall(tier=tier, model=comp.model, reasoning=False, prefix_sha256="", layer_tokens={},
+                       usage=comp.usage, latency_s=comp.latency_s, route_reason=reason)
+        turn.calls.append(call)
+        try:
+            self.ledger.record(turn.thread_id, turn.index, call)
+        except Exception:  # noqa: BLE001 — un ledger qui tombe ne coûte pas le tour
+            logger.warning("ledger : appel %s non écrit", side, exc_info=True)
+        if self.traces is not None and hasattr(self.traces, "side"):
+            self._trace("side", turn, side, messages, comp, call, meta)
+        return call
+
+    def fork_base(self, thread_id: str, turn_index: int):
+        """Contexte du dernier appel modèle du fil (`fork_bases`), s'il appartient à CE tour et au locataire courant ;
+        None sinon. Rend une copie (l'enfant ne peut pas modifier celle du parent)."""
+        from nokker.tenancy.context import current_tenant_or_none
+
+        with self._last_prompts_lock:
+            got = self._fork_bases.get((current_tenant_or_none(), thread_id))
+        if got is None or got[0] != turn_index:
+            return None
+        _, messages, tools, sha = got
+        from nokker.core.ports import Assembled
+
+        return Assembled(messages=json.loads(json.dumps(messages)), tools=json.loads(json.dumps(tools)),
+                         prefix_sha256=sha)
+
+    def forked(self, base, session_key: str, child_thread: str) -> "Kernel":
+        """Copie du noyau dont le contexte part de `base` (fork, `context/fork.py`) ; affinité de cache sur le fil
+        parent (`session_key`). Le préfixe réutilisable du premier appel de l'enfant se mesure contre le dernier prompt
+        du parent (`LLMCall.reusable_tokens`)."""
+        import dataclasses
+
+        from nokker.context.fork import ForkedContext
+
+        with self._last_prompts_lock:
+            self._last_prompts[child_thread] = prompt_text(base)
+        return dataclasses.replace(self, context=ForkedContext(inner=self.context, base_messages=base.messages,
+                                                               base_tools=base.tools, session_key=session_key))
+
+    def _keep_fork_base(self, turn: Turn | None, assembled) -> None:
+        if not self.fork_bases or turn is None:
+            return
+        from nokker.tenancy.context import current_tenant_or_none
+
+        key = (current_tenant_or_none(), turn.thread_id)
+        try:
+            entry = (turn.index, json.loads(json.dumps(assembled.messages)), json.loads(json.dumps(assembled.tools)),
+                     assembled.prefix_sha256)
+        except (TypeError, ValueError):  # contenu non sérialisable (faux contexte d'un test) : pas de fork possible
+            return
+        with self._last_prompts_lock:
+            self._fork_bases[key] = entry
+            self._fork_bases.move_to_end(key)
+            while len(self._fork_bases) > self.fork_bases_max:
+                self._fork_bases.popitem(last=False)
 
     def _trace(self, hook: str, turn: Turn | None, *args) -> None:
         """Crochet de l'enregistreur de traces (`traces`) : sans effet sur le tour, toute erreur journalisée et avalée."""
@@ -694,6 +883,8 @@ class Kernel:
             notes = self._owner_notes.pop(inp.thread_id, [])
         turn.injected = notes + [self.invariants.scrub_output(str(b)) for b in injected]
         turn.attached = inp.attached  # déjà caviardé et borné par la frontière (API)
+        if self.provenance is not None:
+            self.provenance.begin_turn(turn)
         self._observe("turn_started", turn)
         # Never clear (docs/NEVER-CLEAR.md) : crochets OPTIONNELS du Context Engine v1 — frontières d'entrée (`/new`,
         # silence), fenêtre calculée au lieu de tout le journal. Un engine v0 ne les porte pas : comportement inchangé.
@@ -711,6 +902,19 @@ class Kernel:
             self._after_turn(turn)
             self._observe("turn_done", turn)
             return turn
+        if self.goals is not None:
+            try:
+                direct = self.goals.before_turn(self, turn, inp)
+            except Exception:  # noqa: BLE001 — les objectifs en panne ne cassent jamais un tour
+                logger.warning("objectifs : before_turn en échec", exc_info=True)
+                direct = None
+            if direct is not None:  # commande `/goal`, ou `goal_check` noté par le correcteur : sans appel modèle
+                turn.reply = self.invariants.scrub_output(direct)
+                turn.messages.append(Message(role="assistant", content=turn.reply))
+                self.store.append(turn)
+                self._after_turn(turn)
+                self._observe("turn_done", turn)
+                return turn
         window = getattr(self.context, "history_window", None)
         history = window(inp.thread_id) if window is not None else self.store.history(inp.thread_id)
         ctx = ToolContext(thread_id=inp.thread_id, turn_index=turn.index, channel=inp.channel, sender=inp.sender,
@@ -731,6 +935,13 @@ class Kernel:
         tool_result_cache: dict[tuple[str, str], ToolResult] = {}
         truncations = 0
         reviews = 0  # renvois de relecture faits ce tour (X8)
+        outcome = None  # (objectif, rubrique) d'une tâche notée dans le tour (docs/OUTCOMES-GOAL.md)
+        if self.goals is not None:
+            try:
+                outcome = self.goals.rubric_for_turn(turn, inp)
+            except Exception:  # noqa: BLE001
+                logger.warning("objectifs : rubrique du tour illisible", exc_info=True)
+        outcome_passes = 0  # passes de reprise faites ce tour sur la note du correcteur
         seen_calls: set[str] = set()  # signatures d'appels (stall_signature) déjà vues ce tour
         stalls = 0
         notice_at = (max(1, int(self.max_calls * self.budget_notice_at))
@@ -913,6 +1124,25 @@ class Kernel:
                         and reviews < int(getattr(self.reviewer, "rounds", 1))):
                     # Dernier appel du tour : plus de place pour un renvoi, la relecture se fait quand même (sans renvoi).
                     candidate = self._final_review(turn, candidate, "réponse au dernier appel du tour")
+                if outcome is not None and not turn.escalated and candidate.strip():
+                    # Rubrique de la tâche : le correcteur note dans sa propre fenêtre ; sous le seuil, une passe de
+                    # plus avec son retour (la candidate reste dans l'historique : l'agent la complète).
+                    can_retry = call_index + 2 <= self.max_calls and not (
+                        self.stop_check is not None and self.stop_check(turn))
+                    try:
+                        onote, candidate = self.goals.in_turn(self, turn, outcome[0], outcome[1], candidate,
+                                                              outcome_passes, can_retry)
+                    except Exception:  # noqa: BLE001 — un correcteur en panne ne casse jamais un tour
+                        logger.warning("objectifs : note du tour en échec", exc_info=True)
+                        onote = None
+                    if onote is not None:
+                        outcome_passes += 1
+                        if live is not None:
+                            live.discard()
+                        turn.messages.append(Message(role="assistant", content=candidate))
+                        turn.messages.append(Message(role="user", content=onote))
+                        continue
+                    outcome = None
                 reply = candidate
                 turn.messages.append(Message(role="assistant", content=reply))
                 break
@@ -968,6 +1198,11 @@ class Kernel:
         self._trace("finish", turn)  # traces d'entraînement du tour (docs/TRACES.md), après le tour qui fait foi
         self._after_turn(turn)
         self._observe("turn_done", turn)
+        if self.goals is not None:  # objectif du fil : dépense, note, arrêt ou tour suivant (docs/OUTCOMES-GOAL.md)
+            try:
+                self.goals.after_turn(self, turn, inp)
+            except Exception:  # noqa: BLE001 — jamais bloquant
+                logger.warning("objectifs : after_turn en échec", exc_info=True)
         # 10. Ressources tenues pendant le tour (onglets du navigateur…) rendues par les sources qui le déclarent.
         tools_done = getattr(self.tools, "turn_done", None)
         if callable(tools_done):
@@ -1072,6 +1307,8 @@ class Kernel:
                               secret_handles=cached.secret_handles)
 
         verdicts = self.gates.action(tc, spec, turn)
+        if self.provenance is not None:  # en tête : sa règle est celle que nomme la carte ou le refus
+            verdicts = self.provenance.check(tc, spec, turn) + verdicts
         self._log_verdicts(turn, verdicts)
         decision = worst(verdicts)
         if decision is Decision.ALLOW:
@@ -1079,6 +1316,8 @@ class Kernel:
             result.call_id = tc.id
             # Caviardage AVANT le contexte et le store : la garantie ne dépend ni du modèle ni de la source d'outils.
             redacted = self.invariants.redact_result(result, spec)
+            if self.provenance is not None:
+                self.provenance.record(turn, tc, spec, redacted)
             # Producteurs de bulles : le résultat CAVIARDÉ mais complet — `admit_result` peut le ranger au
             # réservoir et n'en garder qu'un extrait (vu sur le canari 18.10 : web_search sans bulle).
             suffix = self._observe("tool_executed", turn, tc, spec, redacted)
@@ -1102,7 +1341,14 @@ class Kernel:
                 # P1 (18.10.2026) : carte PROUVÉE (docs/APPROVALS.md), pas seulement une mention dans
                 # `pending_approvals`. `advice` : avis du juge sur une carte forte (X8, `advisor`), None sinon
                 # (accompagne, ne bloque rien).
-                approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule))
+                auto = self._auto_review_eligible(rule, tc, effect)
+                if auto:
+                    approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule), notify=False)
+                    reviewed = self._auto_review(turn, tc, spec, ctx, approval, effect)
+                    if reviewed is not None:
+                        return reviewed
+                else:
+                    approval = self.approvals.request(turn, tc, rule, self._card_advice(turn, tc, rule))
                 turn.approval_ids.append(approval.id)
                 return ToolResult(call_id=tc.id, name=tc.name,
                                   content=f"EN ATTENTE D'APPROBATION HUMAINE ({why}) [approval:{approval.id}]. "
@@ -1202,9 +1448,13 @@ class Kernel:
                 kwargs["on_tool_delta"] = self._cancellable(tools_live.feed, thread_id)
         budget = {"max_tokens": self.max_tokens} if self.max_tokens else {}
         self._trace("sent", turn, messages, assembled.tools)
+        self._keep_fork_base(turn, assembled)
+        # Fork (`context/fork.py`) : l'enfant garde l'affinité de cache du fil parent ; sinon, le fil.
+        session = getattr(self.context, "session_key", None)
+        session = session if isinstance(session, str) and session else thread_id
         try:
             comp = provider.complete(messages, assembled.tools, reasoning=route.reasoning,
-                                     session_key=thread_id, **budget, **kwargs)
+                                     session_key=session, **budget, **kwargs)
         except StreamInterrupted as e:
             logger.warning("flux amont interrompu (%s) : rejeu sans streaming", e)
             if live is not None:
@@ -1212,7 +1462,7 @@ class Kernel:
             if tools_live is not None:
                 tools_live.discard()
             return provider.complete(messages, assembled.tools, reasoning=route.reasoning,
-                                     session_key=thread_id, **budget), None
+                                     session_key=session, **budget), None
         except Exception:
             if live is not None:
                 live.discard()

@@ -41,6 +41,15 @@ logger = logging.getLogger("nokker.traces")
 
 TARGETS = ("beta", "canary", "lokkal", "unknown")
 KERNEL_SHA_ENV = "NOKKER_KERNEL_SHA"
+# Marque de banc (docs/SELF-IMPROVE.md §5, docs/TRACES.md §4) : un noyau lancé par un banc (bench/conv, bench/keys,
+# `nokker improve`) porte `NOKKER_BENCH=<banc>` ; chaque ligne enregistrée reçoit alors `meta.bench` et l'export ne la
+# sort JAMAIS (recouvrement nul entre bancs et entraînement). Variable absente : lignes inchangées.
+BENCH_ENV = "NOKKER_BENCH"
+
+
+def bench_mark() -> str:
+    """Nom du banc qui fait tourner ce processus, ou "" (production)."""
+    return os.environ.get(BENCH_ENV, "").strip()
 # Verdicts de routine (passage d'un effet de lecture, porte « ok ») : pas des déclenchements, pas dans la trace.
 _ROUTINE_RULES = ("ok", "judge-nul")
 
@@ -189,8 +198,12 @@ class TraceRecorder:
     target: str = "unknown"
     retention_days: int = 30
     purge_every_s: float = 3600.0
+    bench: str = field(default_factory=bench_mark)  # "" = production ; sinon `meta.bench` sur chaque ligne
     _pending: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict, repr=False)
     _calls: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict, repr=False)
+    # Appels faits à côté de la boucle pendant le tour (conseiller `advise`) : lignes à part, après celles de la boucle,
+    # pour ne pas casser `prompt(k+1) = prompt(k) + completion(k)`.
+    _side: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict, repr=False)
     _last_purge: dict[str, float] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -224,14 +237,53 @@ class TraceRecorder:
                 "finish_reason": getattr(comp, "finish_reason", None),
             })
 
+    def side(self, turn: Any, kind: str, messages: list[dict[str, Any]], comp: Any, call: Any,
+             meta: dict[str, Any] | None = None) -> None:
+        """Appel fait à côté de la boucle : conseiller (`advisor`) ou correcteur (`grader`). `meta` : champs de plus sur
+        la ligne (palier configuré et modèle réel : `advisor_tier`/`advisor_model`, `grader_tier`/`grader_model`)."""
+        usage = call.usage
+        entry = {"kind": kind, "prompt": strip_images(copy_json(messages)), "response": message_dict(comp.message),
+                 "tier": getattr(call.tier, "value", call.tier), "model": call.model,
+                 "latency_s": round(float(call.latency_s or 0.0), 3), "route_reason": call.route_reason,
+                 "tokens": {"prompt": usage.prompt, "cached": usage.cached if usage.cached_reported else None,
+                            "completion": usage.completion},
+                 "finish_reason": getattr(comp, "finish_reason", None), "extra_meta": dict(meta or {})}
+        with self._lock:
+            self._side.setdefault((turn.thread_id, turn.index), []).append(entry)
+
+    def side_rows(self, turn: Any, side: list[dict[str, Any]], start: int) -> list[dict[str, Any]]:
+        tenant = current_tenant_or_none()
+        tenant_type = "internal" if tenant in (None, INTERNAL_TENANT) else "tester"
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for j, c in enumerate(side):
+            prompt, completion = c["prompt"], [c["response"]]
+            if self.seal is not None:
+                prompt, completion = self.seal(prompt), self.seal(completion)
+            rows.append({
+                "tenant_id": tenant, "thread_id": turn.thread_id, "turn_index": turn.index, "call_index": start + j,
+                "account_id": turn.sender, "kernel_sha": self.kernel_sha, "target": self.target,
+                "recorded_at": now, "prompt": prompt, "tools": [], "completion": completion,
+                "meta": {"tenant_type": tenant_type, "channel": turn.channel, "side": c["kind"], "tier": c["tier"],
+                         "model": c["model"], "reasoning": False, "latency_s": c["latency_s"], "tokens": c["tokens"],
+                         "route_reason": c["route_reason"], "finish_reason": c["finish_reason"],
+                         "gates_and_invariants": [], "approvals": [], "escalation": {"call": False, "turn": False},
+                         "secret_seals": {"count": len(secret_handles(completion)),
+                                          "names": secret_handles(completion)},
+                         "judge_verdict_v3": None, "turn_error": turn.error, "last_call": False,
+                         **c.get("extra_meta", {}), **({"bench": self.bench} if self.bench else {})},
+            })
+        return rows
+
     def finish(self, turn: Any) -> int:
         key = (turn.thread_id, turn.index)
         with self._lock:
             self._pending.pop(key, None)
             calls = self._calls.pop(key, [])
-        if not calls:
+            side = self._side.pop(key, [])
+        if not calls and not side:
             return 0
-        rows = self.rows_for(turn, calls)
+        rows = self.rows_for(turn, calls) + self.side_rows(turn, side, len(calls))
         self.sink.write(rows)
         self._maybe_purge()
         return len(rows)
@@ -282,6 +334,7 @@ class TraceRecorder:
                     "judge_verdict_v3": judge_v3[-1] if judge_v3 else None,
                     "turn_error": turn.error,
                     "last_call": k == len(calls) - 1,
+                    **({"bench": self.bench} if self.bench else {}),
                 },
             })
         return rows
@@ -323,6 +376,7 @@ def build_recorder(config: Any, invariants: Any = None) -> TraceRecorder | None:
 
 
 __all__ = [
+    "BENCH_ENV",
     "KERNEL_SHA_ENV",
     "TARGETS",
     "MemoryTraceSink",

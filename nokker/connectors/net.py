@@ -1,6 +1,8 @@
 """Garde réseau des connecteurs : l'utilisateur choisit l'hôte, donc SSRF. Mêmes règles que les aperçus
 (`nokker/previews/ssrf.py` : aucune IP privée/loopback/CGNAT/ULA, toutes les IP du nom vérifiées) plus une liste de ports
-par protocole, et connexion épinglée à l'IP vérifiée (pas de seconde résolution), le TLS portant sur le vrai nom."""
+par protocole, et connexion épinglée à l'IP vérifiée (pas de seconde résolution), le TLS portant sur le vrai nom.
+Avec `HTTPS_PROXY` posé (Lokkal : core sans DNS ni route, sortie par `egress`), la garde est nominale et la connexion
+est un tunnel `CONNECT hôte:port` (IMAP, SMTP compris), TLS sur le vrai nom : voir `previews/ssrf.py`."""
 from __future__ import annotations
 
 import logging
@@ -8,8 +10,17 @@ import re
 import socket
 import ssl
 
+import httpcore
+
 from nokker.connectors.errors import ConnectorError
-from nokker.previews.ssrf import ResolvedHop, SsrfBlocked, pinned_client, resolve_and_check
+from nokker.previews.ssrf import (
+    ProxyRefused,
+    ResolvedHop,
+    SsrfBlocked,
+    open_tunnel,
+    pinned_client,
+    resolve_and_check,
+)
 
 # httpx journalise chaque requête en INFO avec l'URL complète ; or l'URL d'un agenda iCal EST le secret.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -47,10 +58,16 @@ def tls_context() -> ssl.SSLContext:
 
 
 def open_pinned(hop: ResolvedHop, *, tls: bool, timeout_s: float = TIMEOUT_S) -> socket.socket:
-    """Socket connecté à l'IP vérifiée ; enveloppé en TLS (vérification du certificat sur `hop.hostname`) si `tls`."""
+    """Socket connecté à l'IP vérifiée (ou tunnelé par le mandataire) ; enveloppé en TLS (vérification du certificat
+    sur `hop.hostname`) si `tls`."""
     try:
-        sock = socket.create_connection((hop.ip, hop.port), timeout=timeout_s)
-    except OSError as exc:
+        if hop.proxy:
+            sock = open_tunnel(hop, timeout_s=timeout_s)
+        else:
+            sock = socket.create_connection((hop.ip, hop.port), timeout=timeout_s)
+    except ProxyRefused as exc:  # refus d'egress : celui de `check_endpoint` en direct
+        raise ConnectorError("host_blocked", str(exc)) from None
+    except (OSError, httpcore.ConnectError, httpcore.ConnectTimeout, httpcore.ProxyError) as exc:
         raise ConnectorError("unreachable", f"connexion à {hop.hostname}:{hop.port} impossible ({exc.__class__.__name__})") from None
     if not tls:
         return sock

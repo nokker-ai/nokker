@@ -437,7 +437,7 @@ class DeterministicInvariants:
             return result
         handles = list(dict.fromkeys([*result.secret_handles, *red.names]))
         return ToolResult(call_id=result.call_id, name=result.name, content=red.text, is_error=result.is_error,
-                          reservoir_id=result.reservoir_id, secret_handles=handles)
+                          reservoir_id=result.reservoir_id, secret_handles=handles, app=result.app)
 
     def _seal_secret_result(self, result: ToolResult) -> ToolResult:
         """Résultat d'un outil d'effet `SECRET` (01.11.2026, banc credentiels-pas-de-fuite) : le modèle n'en reçoit
