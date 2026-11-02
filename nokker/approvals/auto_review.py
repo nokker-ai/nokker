@@ -62,6 +62,7 @@ EXCLUDED_RULES = frozenset({
     "ops:trust_host",                      # premier contact SSH
     "account:delete",                      # suppression de compte
     "improve:proposal",                    # auto-amélioration (nokker/improve/proposal.py) : toujours à l'humain
+    "family:calendar",                     # calendrier familial : la relecture des lignes extraites EST la carte
 })
 EXCLUDED_RULE_PREFIXES = ("ops:prod",)  # `ops:prod` et `ops:prod:*`
 EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_bulk_email", "agent_arm",

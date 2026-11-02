@@ -48,7 +48,13 @@ def build(raw: dict[str, Any] | None, *, scrub: Callable[[str], str], tts_raw: d
             tts = provider_from_config(tts_raw or {}) if (tts_raw or {}).get("provider") else None
             if tts is None:
                 logger.warning("ambient.room_audio : aucun fournisseur de voix (bloc tts) — seul l'audio fourni passe")
-            out.room_audio = from_config(audio_raw, bridge=bridge, tts=tts, scrub=scrub)
+            from nokker.voice import speak_lexicon
+
+            sl = speak_lexicon.service()  # None (drapeau éteint) : la voix de la pièce reste telle quelle
+            out.room_audio = from_config(audio_raw, bridge=bridge, tts=tts, scrub=scrub,
+                                         prepare=sl.prepare if sl is not None else None)
+            if sl is not None:
+                out.room_audio.speak_scope = sl.default_scope
     store = None
     if eink_raw.get("enabled") or glance_raw.get("enabled"):
         from nokker.ambient.displays import MemoryDisplayStore, PgDisplayStore

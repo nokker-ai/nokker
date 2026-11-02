@@ -62,8 +62,11 @@ CONTENT_TABLES = [
     # objectifs et notes du correcteur (050, docs/OUTCOMES-GOAL.md) : locataire du fil
     "nokker_goals", "nokker_goal_grades",
     "ambient_boards",  # tableau commun du foyer (054, docs/AMBIENT.md) : locataire du foyer
+    "household_lexicon",  # lexique de prononciation du foyer (060, docs/VOICE.md §6) : locataire du foyer
     # papiers du foyer (055, docs/HOUSEHOLD-PAPER.md) : locataire du compte, aucune politique croisée
     "paper_documents", "paper_exports", "paper_settings",
+    # calendrier familial (061, docs/FAMILY-CALENDAR.md) : locataire du compte, aucune politique croisée
+    "family_calendar_drafts", "family_calendar_settings",
     # paiements (056, docs/PAYMENTS.md) : mandats et budgets, locataire du membre
     "pay_mandates", "pay_budgets",
     # ex-« hors RLS » qui portent un locataire (058, chantier rls-out-tables) : RLS forcée, tenant_isolation ; celles
@@ -170,6 +173,8 @@ def _insert(conn, table: str, tenant: str | None = None) -> None:
         vals[cols.index("attested")], vals[cols.index("profile")] = True, "teen"
     if table == "paper_exports":  # papiers du foyer (055) : nature et état contraints
         vals[cols.index("kind")], vals[cols.index("status")] = "ics", "ready"
+    if table == "family_calendar_drafts":  # calendrier familial (061) : état contraint
+        vals[cols.index("status")] = "open"
     if table == "lokkal_public_pages":  # 040 : page_id ou empreinte
         cols, vals = [*cols, "page_id"], [*vals, "pg_" + uuid.uuid4().hex[:16]]
     if table in ("lokkal_page_moderation", "household_minor_grant_audit"):  # 040, 043 : action contrainte

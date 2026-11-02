@@ -79,6 +79,10 @@ class RoomAudio:
     enabled: bool = False
     max_chars: int = DEFAULT_MAX_CHARS
     quiet: tuple[int, int] | None = None
+    # Lexique du foyer + normalisation fr-CH avant la synthèse (docs/VOICE.md §6) : `(texte, lang, scope) -> texte`.
+    # None (défaut, drapeau `speak_lexicon` éteint) : texte inchangé. `speak_scope` : le foyer de la pièce (Lokkal).
+    prepare: Callable[..., str] | None = None
+    speak_scope: Any = None
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now().astimezone()
     clock: Callable[[], float] = time.time
     _guests_until: float = field(default=0.0, repr=False)
@@ -121,7 +125,8 @@ class RoomAudio:
             return self._log(SayResult("skipped", target, "empty"))
         if len(spoken) > self.max_chars:
             return self._speak_neutral(target, lang, "too_long")
-        return self._speak(target, spoken, lang, SayResult("spoken", target, "ok", spoken))
+        said = self.prepare(spoken, lang, self.speak_scope) if self.prepare is not None else spoken
+        return self._speak(target, said, lang, SayResult("spoken", target, "ok", spoken))
 
     # ── décisions ──
     def _presence(self) -> Presence:
@@ -176,14 +181,15 @@ class RoomAudio:
         return r
 
 
-def from_config(raw: dict[str, Any] | None, *, bridge: Any, tts: Any, scrub: Callable[[str], str]) -> RoomAudio:
+def from_config(raw: dict[str, Any] | None, *, bridge: Any, tts: Any, scrub: Callable[[str], str],
+                prepare: Callable[..., str] | None = None) -> RoomAudio:
     """`ambient.room_audio` de la config. Éteint par défaut ; allumé sans passerelle ni voix : reste inerte."""
     raw = raw or {}
     rooms = frozenset(str(r) for r in (raw.get("rooms") or {}) if valid_room(str(r)))
     return RoomAudio(bridge=bridge, tts=tts, scrub=scrub, rooms=rooms,
                      enabled=bool(raw.get("enabled", False)) and bridge is not None,
                      max_chars=int(raw.get("max_chars", DEFAULT_MAX_CHARS)),
-                     quiet=parse_quiet(raw.get("quiet_hours")))
+                     quiet=parse_quiet(raw.get("quiet_hours")), prepare=prepare)
 
 
 __all__ = ["AUTO", "NEUTRAL", "PRIVACY", "RoomAudio", "SayResult", "from_config", "in_quiet", "parse_quiet"]

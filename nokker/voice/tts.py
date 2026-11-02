@@ -180,6 +180,9 @@ class VoiceReplies:
     enabled: bool = False
     reply_mode: str = "voice_in"  # voice_in : en réponse à une note vocale ; always : à chaque réponse ; off
     max_chars: int = DEFAULT_MAX_CHARS
+    # Lexique du foyer + normalisation fr-CH (`speak_lexicon.SpeakLexicon.prepare`, docs/VOICE.md §6), appliqués au
+    # texte déjà nettoyé, juste avant le fournisseur. None (défaut, drapeau `speak_lexicon` éteint) : texte inchangé.
+    prepare: Callable[..., str] | None = None
     # Réglage « réponses vocales » par chat (`/voix on|off`) : en mémoire du processus (docs/VOICE.md, limites).
     _chat_pref: dict[str, bool] = field(default_factory=dict, repr=False)
 
@@ -203,12 +206,14 @@ class VoiceReplies:
             return None
         return spoken
 
-    def render(self, reply: str, lang: str) -> bytes | None:
+    def render(self, reply: str, lang: str, scope: Any = None) -> bytes | None:
         if not self.enabled or self.provider is None:
             return None
         spoken = self.speech_text(reply, lang)
         if spoken is None:
             return None
+        if self.prepare is not None:  # après le plafond de longueur : la même réponse reçoit ou non une voix
+            spoken = self.prepare(spoken, lang, scope)
         try:
             return self.provider.synthesize(spoken, lang)
         except TTSError as e:
@@ -237,7 +242,8 @@ def provider_from_config(raw: dict[str, Any]) -> TTSProvider | None:
     return None
 
 
-def from_config(raw: dict[str, Any] | None, scrub: Callable[[str], str]) -> VoiceReplies:
+def from_config(raw: dict[str, Any] | None, scrub: Callable[[str], str],
+                prepare: Callable[..., str] | None = None) -> VoiceReplies:
     """`tts:` de la config. Absent ou `enabled: false` (défaut) : aucune voix, aucun fournisseur construit."""
     raw = raw or {}
     enabled = bool(raw.get("enabled", False))
@@ -245,7 +251,7 @@ def from_config(raw: dict[str, Any] | None, scrub: Callable[[str], str]) -> Voic
     mode = str(raw.get("reply_mode") or "voice_in")
     return VoiceReplies(provider=provider, scrub=scrub, enabled=enabled and provider is not None,
                         reply_mode=mode if mode in REPLY_MODES else "voice_in",
-                        max_chars=int(raw.get("max_chars", DEFAULT_MAX_CHARS)))
+                        max_chars=int(raw.get("max_chars", DEFAULT_MAX_CHARS)), prepare=prepare)
 
 
 __all__ = ["CommandTTS", "OpenAICompatTTS", "TTSError", "TTSProvider", "VoiceReplies", "clean_for_speech",

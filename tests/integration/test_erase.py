@@ -36,6 +36,8 @@ CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connecto
            "house_room_messages": {"kind": "member", "audience": "all"},
            # papiers du foyer (055) : nature et état contraints
            "paper_exports": {"kind": "ics", "status": "ready"},
+           # calendrier familial (061) : état contraint
+           "family_calendar_drafts": {"status": "open"},
            # déclencheurs de forge (052) : fournisseur connu ; une session de PR ouverte ou fermée
            "forge_hooks": {"provider": "forgejo"}, "forge_pr_sessions": {"status": "open"}}
 

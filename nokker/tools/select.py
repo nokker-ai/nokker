@@ -50,6 +50,12 @@ FAMILIES: tuple[Family, ...] = (
         r"\bagenda\b", r"\bcalendri", r"\bcalendar\b", r"\brdv\b", r"\brendez-vous\b", r"\br[ée]union", r"\bmeeting",
         r"\b[ée]v[ée]nements?\b", r"\bevents?\b", r"\bplanifi", r"\bschedule", r"\bcr[ée]neau", r"\bdispo(nible|nibilit)",
         r"\bcale[rz]?\b", r"\bd[ée]place", r"\bannule")),
+    # Calendrier familial (drapeau `family_calendar`, docs/FAMILY-CALENDAR.md) : sans les outils `family_calendar_*`
+    # dans le registre (drapeau éteint), la famille ne produit aucune ligne et ne charge rien.
+    Family("Calendrier familial", ("family_calendar_*",), ("family_calendar_*",), _rx(
+        r"\bagenda\b", r"\bcalendri", r"\bcalendar\b", r"\bplannings?\b", r"\bprogrammes?\b", r"\bconvocations?\b",
+        r"\bhoraires?\b", r"\bd[ée]ch[eè]terie", r"\bentra[îi]nements?\b", r"\b[ée]cole\b", r"\bclub\b",
+        r"\b[ée]v[ée]nements?\b", r"\bbrouillon\b", r"\bschedule")),
     Family("Navigateur", ("browser_*",), (
         "browser_lane", "browser_navigate", "browser_snapshot", "browser_find", "browser_read_text", "browser_click",
         "browser_type", "browser_fill_form", "browser_press_key", "browser_select_option", "browser_wait_for",

@@ -141,6 +141,10 @@ class NokkerConfig:
     # fournisseur construit), `provider` (command | openai_compat), `reply_mode` (voice_in | always | off),
     # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur.
     tts: dict[str, Any] = field(default_factory=dict)
+    # Lexique de prononciation du foyer et normalisation suisse avant la synthèse (docs/VOICE.md §6,
+    # `nokker/voice/speak_lexicon.py`) : `enabled` (défaut false : le texte part au TTS tel quel, octet pour octet),
+    # `eighty` (huitante | quatre-vingts), `acronyms` ({sigle: lecture}), `entries` ({mot: prononciation}, Lokkal).
+    speak_lexicon: dict[str, Any] = field(default_factory=dict)
     # Heurtoir (docs/KNOCK.md, `nokker/knock/`) : déclencheurs physiques (toc toc toc, clap, touche, NFC) reçus de la
     # passerelle home-bridge. Vide ou `enabled: false` (défaut) : aucun fil lancé, aucune lecture de la passerelle,
     # aucune carte décidée autrement. Clés : `enabled`, `rooms`, `approve` ({enabled, rules, window_s ≤ 60, presence_max_age_s}).
@@ -353,6 +357,12 @@ class NokkerConfig:
     # /v1/paper*, aucun outil `paper_*`, aucune porte de plus, contexte inchangé à l'octet. Ne demande PAS `household`
     # (un compte seul a ses papiers) ; le partage entre membres, lui, demande un foyer.
     household_paper: bool = False
+    # Calendrier familial (docs/FAMILY-CALENDAR.md, nokker/household/famcal/) : photo ou PDF d'un planning (école,
+    # club, convocation, déchetterie) → brouillon relu par le noyau (dates ambiguës, doublons) → UNE carte → agenda CalDAV
+    # du compte (sinon fichier .ics). Éteint par défaut : aucune route /v1/family-calendar*, aucun outil
+    # `family_calendar_*`, aucune porte de plus, contexte inchangé à l'octet. Ne demande ni `household` ni
+    # `household_paper` (un PDF importé dans les Papiers se lit si ce drapeau-là est allumé aussi).
+    family_calendar: bool = False
     # Paiements « l'agent prépare, l'humain paie » (docs/PAYMENTS.md, nokker/payments/) : arrêt au paiement dans le
     # navigateur (aucun champ de carte rempli, bouton de paiement refusé), outil `pay_request` → carte FORTE « à payer »,
     # mandat signé par la passkey (WebAuthn, `webauthn_origin` requis), budgets par membre du foyer. Éteint par défaut :
@@ -368,7 +378,17 @@ class NokkerConfig:
     # house_room_settings : {agents: {<slug>: {tier, profiles, enabled}}, rights: {adult, teen, child},
     # transcript_messages, transcript_chars, max_consults, max_text, page} (nokker/house/roster.py::Settings).
     house_room: bool = False
+    # Mode « montre-moi » (docs/SHOW-ME.md, nokker/showme/) : outil `point_at` (lecture seule, aucune carte) qui pose un
+    # repère (flèche + légende) sur un élément du navigateur du fil, de l'interface ou d'une image jointe, en bulle
+    # `pointer` ; « Fait » dans la bulle → étape suivante. Demande les bulles (hub). Éteint par défaut : aucun outil,
+    # aucune bulle `pointer`, aucun texte vu par le modèle ne change.
+    show_me: bool = False
     house_room_settings: dict[str, Any] | None = None
+    # Vue « Qui fait quoi » (docs/WHO-DOES-WHAT.md, nokker/presence/) : présence des agents (fils en cours, sessions de
+    # code, objectifs, sous-agents, agents Crew, salle Maison) dérivée de l'état existant, route GET /v1/presence en
+    # lecture seule et événements `presence.changed`. Aucun texte vu par le modèle. Éteint par défaut : aucune route,
+    # aucun observateur sur le bus, rien ne change.
+    who_does_what: bool = False
     # SSO OIDC des équipes (docs/LOKKAL.md §7.24, nokker/sso/) : connexion par le fournisseur d'une organisation,
     # groupes → rôles des projets, « SSO obligatoire ». Demande `team`. Éteint par défaut : aucune route /v1/sso*,
     # /v1/auth/oidc/*, /v1/projects/{id}/sso, aucun contrôle de plus sur l'équipe.

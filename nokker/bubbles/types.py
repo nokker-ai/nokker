@@ -8,7 +8,7 @@ from typing import Any
 
 KINDS = frozenset({"monitor", "search", "notify", "timer", "script", "media", "agent_draft", "approval",
                     "episode", "artifact", "handoff", "plan_split", "brief",
-                    "pack_agents", "home", "home_watch", "cast"})
+                    "pack_agents", "home", "home_watch", "cast", "pointer"})
 # episode : mémoire de session délestée (docs/NEVER-CLEAR.md §3) ; artifact : page créée en session (docs/BUBBLES.md
 # §10), créée par le noyau seulement ; handoff : relais d'une
 # session web vers une machine Lokkal (docs/LOKKAL.md §7.16, X21), créée par le noyau seulement ; plan_split :
@@ -17,7 +17,8 @@ KINDS = frozenset({"monitor", "search", "notify", "timer", "script", "media", "a
 # garder (docs/BUBBLES.md §9.6), créée par le noyau seulement ; home : état d'une entité Home Assistant
 # (docs/HOME-ASSISTANT.md §6), créée par le noyau seulement ; home_watch : événement de caméra ou direct, image
 # chargée par l'écran local à la passerelle (docs/HOME-WATCH.md §5.3), créée par le noyau seulement ; cast : page
-# montrée sur un écran du foyer (docs/SCREEN-CAST.md §7), créée par le noyau seulement
+# montrée sur un écran du foyer (docs/SCREEN-CAST.md §7), créée par le noyau seulement ; pointer : repère du mode
+# « montre-moi » (docs/SHOW-ME.md), créée par le noyau seulement
 STATUSES = frozenset({"idle", "working", "done", "failed"})
 MODES = frozenset({"move", "copy"})
 

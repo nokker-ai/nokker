@@ -113,9 +113,11 @@ from nokker.incidents import http as incidents_http
 from nokker.homewatch import http as home_watch_http
 from nokker.plan import http as plan_http
 from nokker.house import http as house_http
+from nokker.presence import http as presence_http
 from nokker.household import http as household_http
 from nokker.ambient import http as ambient_http
 from nokker.household.paper import http as paper_http
+from nokker.household.famcal import http as famcal_http
 from nokker.payments import http as payments_http
 from nokker.team import http as team_http
 from nokker.webpacks import http as packs_http
@@ -148,6 +150,7 @@ from nokker.tools.registry import Registry, builtin_core_source
 from nokker.ledger.audit import AuditedTools
 from nokker.local.api import LOCAL_OWNER, LocalApi
 from nokker.tools.web import WebToolSource
+from nokker.voice import speak_lexicon as speak_lexicon_mod
 
 logger = logging.getLogger("nokker.api.server")
 
@@ -930,6 +933,8 @@ def configure_ambient(config: NokkerConfig, kernel: Any) -> None:
     fil). La passerelle du foyer n'est jointe que si NOKKER_HOME_BRIDGE_URL et NOKKER_HOME_BRIDGE_TOKEN sont posés
     (Lokkal, profil compose `home`) ; la bêta cloud n'en a jamais."""
     raw = getattr(config, "ambient", None) or {}
+    if speak_lexicon_mod.service() is None:  # Lokkal sans Telegram : le lexique se monte aussi ici
+        speak_lexicon_mod.setup(getattr(config, "speak_lexicon", None), config.pg_dsn() or None)
     if not any((raw.get(k) or {}).get("enabled") for k in ("room_audio", "eink", "glance")):
         ambient_http.configure(None)
         return
@@ -993,6 +998,48 @@ def configure_household_paper(config: NokkerConfig, kernel: Kernel, tenancy: Ten
     kernel.tools.refresh()
     kernel.gates = PaperGates(inner=kernel.gates, service=svc)
     paper_http.configure(svc)
+
+
+def configure_family_calendar(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy) -> None:
+    """Calendrier familial (docs/FAMILY-CALENDAR.md, nokker/household/famcal/) : drapeau `family_calendar`, nokker.ai
+    seulement (comptes `us_…`). Éteint (défaut) : aucune route /v1/family-calendar*, aucun outil `family_calendar_*`,
+    portes inchangées. Allumé : outils des comptes adultes (`available_for`), porte de la carte de relecture autour des
+    portes du noyau, routes du compte. L'agenda lu et écrit est toujours celui du locataire du tour."""
+    if not config.family_calendar or not hasattr(kernel.tools, "tester_sources"):
+        famcal_http.configure(None)
+        return
+    from nokker.household.famcal.gates import FamilyCalendarGates
+    from nokker.household.famcal.service import FamilyCalendar
+    from nokker.household.famcal.store import MemoryFamcalStore, PgFamcalStore
+    from nokker.household.famcal.tools import FamilyCalendarTools
+    from nokker.household.paper.tools import tenant_ok
+
+    def account_of(tid: str) -> str | None:
+        acc = tenancy.account_for_tenant(tid)
+        return acc.account_id if acc is not None and acc.status == "active" else None
+
+    connectors = getattr(kernel.tools, "connectors", None)
+
+    def calendars_for(tid: str) -> list[Any]:
+        return [src for src in (connectors.sources_for(tid) if connectors is not None else [])
+                if any(spec.name in ("calendar_events", "calendar_create") for spec in src.specs())]
+
+    house = household_http.service()
+    dsn = config.pg_dsn()
+    svc = FamilyCalendar(store=PgFamcalStore(dsn) if dsn else MemoryFamcalStore(), account_of=account_of,
+                         calendars_for=calendars_for, paper=paper_http.service())
+    kernel.tools.tester_sources.append(FamilyCalendarTools(service=svc, allowed=tenant_ok(
+        tenancy.account_for_tenant, house.is_minor if house is not None else None)))
+    # Une seule voie vers l'agenda pour un document : `paper_calendar_add` sort du catalogue des Papiers (s'ils sont
+    # allumés) ; `family_calendar_*` couvre aussi la date isolée d'un papier (docs/FAMILY-CALENDAR.md §2).
+    from nokker.household.paper.tools import PaperTools
+
+    for src in kernel.tools.tester_sources:
+        if isinstance(src, PaperTools):
+            src.hidden = src.hidden | {"paper_calendar_add"}
+    kernel.tools.refresh()
+    kernel.gates = FamilyCalendarGates(inner=kernel.gates, service=svc)
+    famcal_http.configure(svc)
 
 
 def configure_payments(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, approvals: Any,
@@ -1088,6 +1135,33 @@ def configure_house_room(config: NokkerConfig, kernel: Kernel, events: Any = Non
         kernel.tools.refresh()
     house_http.configure(room)
     return room
+
+
+def configure_presence(config: NokkerConfig, kernel: Any, *, events: Any = None, hub: Any = None, approvals: Any = None,
+                       agents: Any = None, room: Any = None) -> Any:
+    """Vue « Qui fait quoi » (nokker/presence/, docs/WHO-DOES-WHAT.md) : drapeau `who_does_what`. Éteint : aucune route
+    /v1/presence, aucun observateur sur le bus. Allumé : lecture seule de l'état des fils, cartes, objectifs, sessions de
+    code, agents Crew et salle Maison ; `presence.changed` sur le bus. Rien n'est ajouté au registre d'outils."""
+    if not config.who_does_what:
+        presence_http.configure(None)
+        return None
+    from nokker.presence.service import PresenceService
+    from nokker.presence.tracker import ActivityTracker
+
+    tracker = ActivityTracker(audience_of=hub.thread_audience if hub is not None else None)
+    if events is not None:
+        tracker.publish = events.publish
+        events.observers[:] = [o for o in events.observers if not getattr(o, "presence", False)]
+
+        def observe(event_type: str, data: dict) -> None:
+            tracker.observe(event_type, data)
+
+        observe.presence = True  # type: ignore[attr-defined]
+        events.observers.append(observe)
+    svc = PresenceService(hub=hub, approvals=approvals, goals=getattr(kernel, "goals", None),
+                          code=code_http.service(), agents=agents, room=room, tracker=tracker)
+    presence_http.configure(svc)
+    return svc
 
 
 def configure_packs(config: NokkerConfig, kernel: Any, hub: Any, *, local: bool) -> None:
@@ -1559,11 +1633,22 @@ def configure_telegram(config: NokkerConfig, tenancy: Tenancy, kernel: Kernel, h
         return kernel.run_turn(inp)
 
     bot = BotApi(token)
+    from nokker.voice import speak_lexicon
     from nokker.voice.tts import from_config as voice_from_config
+
+    sl = speak_lexicon.setup(config.speak_lexicon, dsn)  # None (drapeau éteint) : voix inchangée
+    house_of = household_http.service
+
+    def speak_scope(account: Any) -> Any:
+        h = house_of()
+        got = h.membership(account.account_id) if h is not None else None
+        return speak_lexicon.SpeakScope(got[1].tenant_id, got[1].id) if got is not None else None
 
     adapter = TelegramAdapter(tenancy=tenancy, pairing=pairing, run_turn=run_turn, bot=bot,
                               feedback=feedback_mod.service(),
-                              voice=voice_from_config(config.tts, kernel.invariants.scrub_output))
+                              voice=voice_from_config(config.tts, kernel.invariants.scrub_output,
+                                                      prepare=sl.prepare if sl is not None else None),
+                              speak_scope=speak_scope if sl is not None else None)
     telegram_http.configure(adapter, pairing, secret, config.telegram_bot_username)
     if getattr(kernel, "goals", None) is not None:  # points d'étape des objectifs : Telegram relié au compte
         from nokker.goals.service import TelegramGoalNotifier
@@ -1827,6 +1912,11 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
 
             previews_svc = get_default_service(config)
         bubble_sources = [BubbleToolSource(hub=hub, previews=previews_svc)]
+        if getattr(config, "show_me", False):  # docs/SHOW-ME.md ; éteint : aucune source, aucune bulle `pointer`
+            from nokker.showme.tool import ShowMeSource
+
+            hub.show_me = ShowMeSource()
+            bubble_sources.append(hub.show_me)
     ctx_manager = build_context_manager(config, store, hub) if config.context_enabled else None
     context_sources = [RecallContextSource(ctx_manager)] if ctx_manager is not None else []
     core_source = builtin_core_source()
@@ -1867,6 +1957,8 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         # Toute valeur du coffre (les deux portées) est caviardée dans chaque résultat d'outil et chaque réponse ; les
         # valeurs connues d'avant (env NOKKER_SECRET_*, fichier) sont gardées.
         inv.known = secrets.known.merge(inv.known)
+    if hub is not None and getattr(hub, "show_me", None) is not None:
+        hub.show_me.scrub = inv.scrub_output  # tout ce qui part dans la bulle `pointer` est caviardé
     gates = build_gates(config, inv)
     escalator = TenantEscalator(EscalatorV0(addressee=config.escalation_addressee))  # jamais chez un testeur
     limits = TenantLimits.from_config(config.tenant_limits, dsn)
@@ -2444,6 +2536,18 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     self._json(401, {"error": {"message": "jeton local requis"}})
                 else:
                     ambient_http.handle_glance_owner(self, method, path, LOCAL_OWNER, INTERNAL_TENANT, None)
+                return True
+            if speak_lexicon_mod.is_path(path):  # lexique de prononciation du foyer (docs/VOICE.md §6)
+                if local_api is None:
+                    self._account_route(method, path)
+                elif not self._local_owner():
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                else:
+                    from nokker.ambient.displays import Membership
+
+                    speak_lexicon_mod.handle_member(self, method, path, Membership(
+                        account_id="local", household_id="local", household_tenant=INTERNAL_TENANT, profile="adult"),
+                        ambient_http._body, ambient_http._json)
                 return True
             if ambient_http.is_device_path(path):  # écrans e-ink : jeton d'appareil (cloud et Lokkal), drapeau `ambient`
                 ambient_http.handle_device(self, method, path)
@@ -3187,8 +3291,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                     or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
                     or payments_http.is_payments_path(path) \
                     or (house_http.enabled() and house_http.is_house_path(path)) \
+                    or (presence_http.enabled() and presence_http.is_presence_path(path)) \
                     or account_http.matches(path) \
                     or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                 self._account_route("GET", path)
@@ -3785,6 +3891,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                     or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
                     or payments_http.is_payments_path(path):
                 self._account_route("PUT", path)
                 return
@@ -3919,6 +4026,9 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     # profil mineur (X23) : installer ou retirer un pack d'agents suit la liste blanche du foyer
                     self._json(403, {"error": {"code": "minor_agent_refused",
                                                "message": "packs d'agents hors de la liste blanche du foyer"}})
+                elif speak_lexicon_mod.is_path(path):  # lexique de prononciation du foyer (docs/VOICE.md §6)
+                    speak_lexicon_mod.handle_member(self, method, path, self._ambient_member(account),
+                                                    ambient_http._body, ambient_http._json)
                 elif ambient_http.is_ambient_path(path):  # ambiant du foyer (docs/AMBIENT.md §5)
                     ambient_http.handle_member(self, method, path, self._ambient_member(account))
                 elif ambient_http.is_glance_path(path):  # vue glance : offre, liste, révocation (docs/AMBIENT.md §6)
@@ -3963,8 +4073,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         or consolidation_http.handle(self, method, path, account) \
                         or household_http.handle(self, method, path, account) \
                         or paper_http.handle(self, method, path, account) \
+                        or famcal_http.handle(self, method, path, account) \
                         or payments_http.handle(self, method, path, account) \
-                        or house_http.handle(self, method, path, account):  # X17, packs_web, foyer, papiers, paiements, salle Maison
+                        or house_http.handle(self, method, path, account) \
+                        or presence_http.handle(self, method, path, account):  # X17, packs_web, foyer, papiers, paiements, salle Maison
                     pass
                 elif billing_http.handle(self, method, path, account):
                     pass
@@ -3982,7 +4094,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if (team_http.enabled() and team_http.is_team_path(path)) \
                     or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                     or (household_http.enabled() and household_http.is_household_path(path)) \
-                    or (paper_http.enabled() and paper_http.is_paper_path(path)):
+                    or (paper_http.enabled() and paper_http.is_paper_path(path)) \
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)):
                 self._account_route("PATCH", path)
                 return
             if agents is not None and path.startswith("/v1/agents/"):
@@ -4078,7 +4191,9 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                         or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
                         or (house_http.enabled() and house_http.is_house_path(path)) \
+                        or (presence_http.enabled() and presence_http.is_presence_path(path)) \
                         or account_http.matches(path) \
                         or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                     self._account_route("POST", path)
@@ -4741,6 +4856,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                     or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
                     or payments_http.is_payments_path(path):
                 self._account_route("DELETE", path)
                 return
@@ -5134,6 +5250,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         configure_household(config, kernel, tenancy, approvals)
         if local_api is None:  # papiers du foyer : comptes de nokker.ai seulement
             configure_household_paper(config, kernel, tenancy)
+        if local_api is None:  # calendrier familial : comptes de nokker.ai (après les papiers : PDF importés)
+            configure_family_calendar(config, kernel, tenancy)
         configure_payments(config, kernel, tenancy, approvals, events)  # après le foyer (portes des mineurs dedans)
         if cloud_http._cloud is not None:  # skill « sessions Lokkal » (§6.4) pour les comptes liés : outil DESTRUCTIVE
             from nokker.cloud.lokkal_session import LokkalSessionTools
@@ -5166,7 +5284,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             configure_long_memory(config, kernel, tenancy)  # après le foyer et la quarantaine
             configure_consolidation(config, kernel, tenancy, hub)  # après la mémoire longue
         register_house_providers(home=home, home_watch=home_watch)  # agents de la salle Maison (si allumée)
-        configure_house_room(config, kernel, events)  # après le foyer : portes des mineurs déjà posées
+        room = configure_house_room(config, kernel, events)  # après le foyer : portes des mineurs déjà posées
+        configure_presence(config, kernel, events=events, hub=hub, approvals=approvals, agents=agents_hub, room=room)
     configure_ambient(config, kernel)  # écrans e-ink et voix de la pièce : éteints par défaut
     if hub is not None:
         hub.agents_hub = agents_hub

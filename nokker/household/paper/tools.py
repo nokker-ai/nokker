@@ -113,17 +113,24 @@ class PaperTools:
     service: Paper
     # Locataire → vrai si le compte peut avoir ces outils (adulte ; un profil mineur ne les a pas).
     allowed: Callable[[str], bool] | None = None
+    # Outils retirés du catalogue (vide par défaut : rien ne change). Calendrier familial allumé : `paper_calendar_add`
+    # (une seule voie vers l'agenda pour un document : `family_calendar_*`, docs/FAMILY-CALENDAR.md §2).
+    hidden: frozenset[str] = frozenset()
 
     def available_for(self, tenant_id: str) -> bool:
         return self.allowed(tenant_id) if self.allowed is not None else True
 
     def specs(self) -> list[ToolSpec]:
-        return [ToolSpec(name=n, description=d, parameters=p, effect=e, source=SOURCE) for n, d, e, p in _SPECS]
+        return [ToolSpec(name=n, description=d, parameters=p, effect=e, source=SOURCE) for n, d, e, p in _SPECS
+                if n not in self.hidden]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         def out(payload: Any, error: bool = False) -> ToolResult:
             text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
             return ToolResult(call_id="", name=name, content=text, is_error=error)
+
+        if name in self.hidden:
+            return out(f"outil inconnu : {name}", True)
 
         a = arguments or {}
         svc = self.service

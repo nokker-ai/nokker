@@ -42,6 +42,9 @@ class EventBus:
     _buffer: list[StoredEvent] = field(default_factory=list)
     _next_id: int = field(default=1)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # Observateurs `(event_type, data)` appelés APRÈS la publication, hors du verrou (vue « Qui fait quoi »,
+    # drapeau `who_does_what`). Vide par défaut : le bus se comporte comme avant.
+    observers: list = field(default_factory=list)
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue()
@@ -65,6 +68,11 @@ class EventBus:
             subs = list(self._subscribers)
         for q in subs:
             q.put(ev)
+        for obs in list(self.observers):
+            try:
+                obs(event_type, payload)
+            except Exception:  # noqa: BLE001 — un observateur ne casse jamais la publication
+                pass
         return ev
 
     def _trim_locked(self) -> None:

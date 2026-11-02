@@ -49,7 +49,7 @@ NOTIFY_TTL_S = 600.0
 # Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
 # `pack_agents` (pack retiré, ses agents créés : désarmer / supprimer / garder) : ses actions touchent des agents.
 KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents", "home",
-                          "home_watch", "cast"})
+                          "home_watch", "cast", "pointer"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
@@ -149,6 +149,9 @@ class BubbleHub:
     plan: Any = None
     # Écrans du foyer (docs/SCREEN-CAST.md, drapeau `local.cast.enabled`) : nokker.cast.service.CastService ; None ailleurs
     cast: Any = None
+    # Mode « montre-moi » (docs/SHOW-ME.md, drapeau `show_me`) : nokker.showme.tool.ShowMeSource ; None = éteint, aucune
+    # bulle `pointer`
+    show_me: Any = None
     # Écriture en direct (X22, §10.7) : (fil, call_id) → bulles `artifact` passées « en cours d'écriture » par cet appel.
     _live_writes: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     _live_guard: threading.Lock = field(default_factory=threading.Lock)
@@ -596,6 +599,8 @@ class BubbleHub:
             if state:
                 self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
             return {"cast": {k: v for k, v in state.items() if k != "html"}}
+        if b.kind == "pointer":
+            return self._pointer_action(b, user, action_id)
         if b.kind == "agent_draft":
             # Seule action : `activate` (§9.4) — crée l'agent (Crew), ferme la bulle, publie `agent.created`. Pas de
             # carte ici : armer une règle d'écriture reste un geste à part, avec la carte forte (§9.5).
@@ -626,6 +631,45 @@ class BubbleHub:
         text = f"[Action « {action.get('label') or action_id} » demandée sur la bulle « {b.title} » ({b.id})]"
         self._run_background_turn(b.thread_id, text, user)
         return {"accepted": True, "thread_id": b.thread_id}
+
+    def _pointer_action(self, b: Bubble, user: str | None, action_id: str) -> dict[str, Any]:
+        """Réponse de la personne à un repère (docs/SHOW-ME.md §3) : « Fait » ou « Je ne trouve pas ». Membre du fil en
+        écriture seulement (`_writable`, appelé par `action`) ; la réponse devient un tour du fil, comme toute action de
+        bulle, et Nina pose l'étape suivante. « Fait » sur la dernière étape annoncée ferme la bulle."""
+        if self.show_me is None:
+            raise BubbleError("mode montre-moi éteint")
+        action = next((a for a in b.actions if isinstance(a, dict) and a.get("id") == action_id), None)
+        if action is None:
+            raise BubbleNotFound(f"action inconnue : {action_id}")
+        st = b.state or {}
+        last = action_id == "done" and bool(st.get("steps")) and st.get("step") == st.get("steps")
+        if last:
+            self._close(b.id)
+        else:
+            self.update_from_kernel(b.id, state={"waiting": True, "answer": action_id})
+        text = f"[Action « {action.get('label') or action_id} » demandée sur la bulle « {b.title} » ({b.id})]"
+        self._run_background_turn(b.thread_id, text, user)
+        return {"accepted": True, "thread_id": b.thread_id, "closed": last}
+
+    def _pointer_shown(self, turn: Turn) -> str | None:
+        """Repère posé par `point_at` dans ce tour → LA bulle `pointer` du fil (créée, ou mise à jour à chaque étape)."""
+        st = self.show_me.take(turn.thread_id)
+        if st is None:
+            return None
+        from nokker.showme import texts as SM
+
+        if self.threads.get(turn.thread_id) is None:
+            self.threads.ensure(turn.thread_id, turn.sender, turn.input.text)
+        title = str(st.pop("title", "") or SM.TITLE)
+        same = next((b for b in self.bubbles.list_thread(turn.thread_id)
+                     if b.kind == "pointer" and b.closed_at is None), None)
+        if same is not None:
+            b = self.update_from_kernel(same.id, title=title, state=st, status="idle")
+            return SM.BUBBLE_UPDATED.format(id=b.id)
+        b = self.bubbles.create(thread_id=turn.thread_id, kind="pointer", title=title, state=st, status="idle",
+                                actions=[dict(a) for a in SM.ACTIONS], created_by="nina")
+        self._emit_bubble("bubble.created", b)
+        return SM.BUBBLE_SHOWN.format(id=b.id)
 
     def _pack_agents_action(self, b: Bubble, user: str | None, action_id: str) -> dict[str, Any]:
         """Carte `pack_agents` (pack retiré, `pack_remove`) : `disarm` désarme, `delete` supprime, `keep` garde les
@@ -918,6 +962,8 @@ class BubbleHub:
                 logger.exception("tool.app non émis")
         if call.name == "todo" and call.arguments.get("todos") is not None and not result.is_error:
             self._emit_todo(turn.thread_id, result.content)
+        if self.show_me is not None and call.name == "point_at" and not result.is_error:
+            return self._pointer_shown(turn)
         t0 = self._tool_t0.get((turn.thread_id, call.id))
         took_ms = int((time.monotonic() - t0) * 1000) if t0 is not None else None
         produced = self.producers.produce(call, spec, result, took_ms)

@@ -127,6 +127,9 @@ class TelegramAdapter:
     feedback: Any = None  # nokker/feedback.py::Feedback ; None = /retour indisponible
     # Réponses vocales (docs/VOICE.md, `nokker.voice.tts.VoiceReplies`) ; None = texte seul, comme avant.
     voice: Any = None
+    # Foyer du compte pour le lexique de prononciation (docs/VOICE.md §6) : `(compte) -> SpeakScope | None`. None
+    # (défaut) : rien n'est passé au fournisseur de voix, comme avant.
+    speak_scope: Callable[[Any], Any] | None = None
     # Transcription d'une note vocale entrante : `(message Telegram) -> texte | None`. None (défaut du noyau) = une note
     # vocale reçoit « je ne lis que le texte », comme avant ; la STT de la passerelle amont n'est pas dans le noyau.
     transcribe: Callable[[dict[str, Any]], str | None] | None = None
@@ -187,7 +190,7 @@ class TelegramAdapter:
                                 channel="telegram", sender=account.account_id)
                 turn = self.run_turn(inp)
                 self.bot.send(chat_id, turn.reply)
-                self._maybe_voice(chat_id, turn.reply, lang, voice_in)
+                self._maybe_voice(chat_id, turn.reply, lang, voice_in, account)
         except Exception:  # noqa: BLE001 — un tour raté ne tue pas le pool
             logger.exception("tour Telegram en échec (chat %s)", chat_id)
             try:
@@ -204,14 +207,20 @@ class TelegramAdapter:
         self.voice.set_chat_pref(str(chat_id), on)
         self.bot.send(chat_id, t["voice_on"] if on else t["voice_off"])
 
-    def _maybe_voice(self, chat_id: int, reply: str, lang: str, voice_in: bool) -> None:
+    def _maybe_voice(self, chat_id: int, reply: str, lang: str, voice_in: bool, account: Any = None) -> None:
         """Note vocale EN PLUS du texte déjà envoyé. Toute erreur : rien de plus (le texte est parti)."""
         if self.voice is None or not self.voice.wanted(str(chat_id), voice_in):
             return
         send_voice = getattr(self.bot, "send_voice", None)
         if send_voice is None:
             return
-        audio = self.voice.render(reply, lang)
+        scope = None
+        if self.speak_scope is not None and account is not None:
+            try:
+                scope = self.speak_scope(account)
+            except Exception:  # noqa: BLE001 — pas de foyer lisible : voix sans lexique
+                logger.warning("foyer du lexique illisible (chat %s)", chat_id, exc_info=True)
+        audio = self.voice.render(reply, lang) if scope is None else self.voice.render(reply, lang, scope=scope)
         if not audio:
             return
         try:

@@ -882,6 +882,18 @@ class CalendarConnector:
             out["note"] = "invités inscrits dans l'événement ; aucune invitation envoyée"
         return out
 
+    def put_new_event(self, uid: str, ics: str, calendar: str | None = None) -> dict[str, Any]:
+        """Range un VCALENDAR complet DÉJÀ construit par l'appelant (calendrier familial : RRULE, EXDATE, VTIMEZONE),
+        sous `<agenda>/<uid>.ics`, sans écraser (If-None-Match). Méthode Python seulement, jamais un outil du modèle :
+        l'appelant passe par une carte approuvée. CalDAV seulement ; mêmes garde-fous réseau que `calendar_create`."""
+        if self.mode != "caldav":
+            raise ValueError("agenda en lecture seule (iCal) : écriture impossible")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", uid or "") or f"UID:{uid}" not in ics:
+            raise ValueError("uid invalide")
+        cal = self._select(calendar)[0]
+        self._put(urljoin(cal.url, uid + ".ics"), ics, create=True)
+        return {"created": True, "id": uid, "calendar": cal.name}
+
     def _update(self, a: dict[str, Any]) -> dict[str, Any]:
         uid = str(a.get("event_id") or "").strip()
         if not uid:
