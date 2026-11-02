@@ -634,6 +634,28 @@ class BaseApprovals:
         self._emit_decided(approval)
         return approval
 
+    def decide_physical(self, approval_id: str, *, decided_by: str, evidence: dict) -> Approval:
+        """Approbation par geste physique de présence (heurtoir, docs/KNOCK.md §5.3) : un toc toc toc entendu dans
+        une pièce où la carte était armée, ET la présence d'un membre autorisé recoupée (Home Assistant ou Wi-Fi). Le
+        noyau des déclencheurs (`nokker/knock/hub.py`) a déjà vérifié présence, fraîcheur et armement ; ici, l'état de
+        la carte, la liste FERMÉE (`knock_refusal` : standard seulement, jamais une carte à clé d'appareil),
+        l'empreinte des arguments et le décideur dans le locataire de la carte. Approuver seulement (un toc ne refuse
+        pas). `decided_via` = `knock+presence` ; `evidence` (pièce, source du toc, sources de présence) va au journal."""
+        from nokker.knock.policy import DECIDED_VIA, knock_refusal
+
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, "approve")
+            why = knock_refusal(approval)
+            if why:
+                raise ProofInvalid(f"heurtoir : {why}")
+            if args_sha256(approval.arguments) != approval.args_sha256:
+                raise ProofInvalid("empreinte des arguments modifiée depuis la demande (args_sha256)")
+            if not self.decider_allowed(decided_by, self.tenant_of(approval), approval):
+                raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
+            approval = self._commit(approval, "approve", decided_by, DECIDED_VIA, {"physical": dict(evidence)})
+        self._emit_decided(approval)
+        return approval
+
     @staticmethod
     def _require_device_key_free(approval: Approval) -> None:
         from nokker.qa.permissions import RELAY_CARD_RULE

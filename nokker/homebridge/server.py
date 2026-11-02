@@ -10,7 +10,8 @@
      GET  /api/display           protocole TRMNL (en-tête Access-Token) ;
      GET  /media/v1/thumb/<id>   vignette d'un événement de caméra (URL signée par le noyau, docs/HOME-WATCH.md) ;
      GET  /media/v1/live/<cam>   direct d'une caméra listée dans `watch.frigate.live` (même signature) ;
-     POST /api/log               journaux TRMNL (acceptés et jetés).
+     POST /api/log               journaux TRMNL (acceptés et jetés) ;
+     POST /knock/event           déclencheur d'un satellite du heurtoir (en-têtes X-Satellite + Bearer du satellite).
    Aucune opération du noyau n'est joignable par cette écoute.
 3. Écrans du foyer (`cast.*`, docs/SCREEN-CAST.md, section `cast` de home.yaml) : moteur `nokker.cast.bridge.CastEngine`
    servi par la MÊME API (:8800) ; ses pages éphémères ont leur propre écoute (`CAST_LISTEN`, défaut :8802, annoncée aux
@@ -70,6 +71,7 @@ class Bridge:
     ha_ops: HaOps | None = None  # opérations ha.* (docs/HOME-ASSISTANT.md §2.3), si home_assistant.url est posé
     watch: Any = None  # veille du foyer (nokker/homebridge/watch/, docs/HOME-WATCH.md) : `watch` de home.yaml, ou None
     cast: Any = None  # écrans du foyer (`nokker.cast.bridge.CastEngine`) si `cast.enabled: true` dans home.yaml, sinon None
+    knock: Any = None  # KnockBridge | None (heurtoir, docs/KNOCK.md §8 ; bloc `knock` de home.yaml)
 
     @classmethod
     def build(cls, cfg: BridgeConfig, *, ha: Any = None, sinks: dict[str, list[Any]] | None = None,
@@ -95,9 +97,14 @@ class Bridge:
             from nokker.homebridge.watch import Watch
 
             watch = Watch.build(cfg)
+        knock = None
+        if raw.get("knock"):
+            from nokker.homebridge.knock.events import KnockBridge, KnockConfig
+
+            knock = KnockBridge(KnockConfig.from_raw(raw["knock"], cfg.secret))
         return cls(cfg=cfg, frames=FrameCache(), clips=clips,
                    audio=AudioRouter(rooms=sinks, clips=clips, lan_url=cfg.lan_url), presence_source=presence,
-                   ha_ops=ha_ops, watch=watch, cast=cast if cast is not None else _cast_engine(raw))
+                   ha_ops=ha_ops, watch=watch, cast=cast if cast is not None else _cast_engine(raw), knock=knock)
 
     # ── opérations nommées ──
     def op(self, name: str, p: dict[str, Any]) -> dict[str, Any]:
@@ -139,6 +146,14 @@ class Bridge:
         if not isinstance(ids, list):
             raise OpError(400, "display_ids : une liste")
         return {"dropped": self.frames.retain([str(i) for i in ids])}
+
+    def _knock(self, name: str, p: dict[str, Any]) -> dict[str, Any]:
+        if self.knock is None:
+            raise OpError(404, "heurtoir absent de home.yaml")
+        try:
+            return getattr(self.knock, name)(p)
+        except ValueError as e:
+            raise OpError(400, str(e)) from None
 
     def _offer(self, p: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -205,6 +220,9 @@ OPS: dict[str, Callable[[Bridge, dict[str, Any]], dict[str, Any]]] = {
     "eink.revoke": Bridge._revoke,
     "eink.retain": Bridge._retain,
     "eink.setup_offer": Bridge._offer,
+    "knock.events": lambda b, p: b._knock("op_events", p),
+    "knock.status": lambda b, p: b._knock("op_status", p),
+    "knock.mute": lambda b, p: b._knock("op_mute", p),
 }
 OPS.update(WATCH_OPS)  # veille du foyer : watch.targets, cameras.reviews, network.clients, nas.status, watch.action
 # écrans du foyer (docs/SCREEN-CAST.md) : liste fermée de `nokker.cast.bridge.OPS`
@@ -334,6 +352,19 @@ def lan_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
             _json(self, 404, {"error": "not found"})
 
         def do_POST(self) -> None:
+            if self.path.split("?", 1)[0] == "/knock/event":
+                try:
+                    n = min(int(self.headers.get("Content-Length", 0) or 0), 4096)
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    _json(self, 400, {"error": "json illisible"})
+                    return
+                auth = self.headers.get("Authorization") or ""
+                ok = bridge.knock is not None and bridge.knock.accept_satellite(
+                    self.headers.get("X-Satellite") or "", auth[7:].strip() if auth.startswith("Bearer ") else "",
+                    body)
+                _json(self, 202, {"ok": True}) if ok else _json(self, 401, {"error": "unauthorized"})
+                return
             if self.path.split("?", 1)[0] == "/api/log":
                 try:
                     n = min(int(self.headers.get("Content-Length", 0) or 0), 64 * 1024)
@@ -353,6 +384,8 @@ def serve(bridge: Bridge) -> tuple[ThreadingHTTPServer, ThreadingHTTPServer]:
     lan = ThreadingHTTPServer(bridge.cfg.lan_listen, lan_handler(bridge))
     for s, name in ((api, "home-bridge-api"), (lan, "home-bridge-lan")):
         threading.Thread(target=s.serve_forever, name=name, daemon=True).start()
+    if bridge.knock is not None:
+        bridge.knock.serve_socket()  # home-audio → passerelle (socket Unix du volume home-sock)
     return api, lan
 
 

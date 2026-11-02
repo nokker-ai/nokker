@@ -55,6 +55,11 @@ dependencies = [
 # `python -m nokker` (voir `nokker/__main__.py`) tant que F7 ne bascule pas la CMD de l'image.
 
 [project.optional-dependencies]
+# Heurtoir (docs/KNOCK.md) : détecteur du conteneur home-audio seulement (image home-bridge) ; jamais le noyau.
+knock = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+]
 dev = [
   "ruff>=0.15",
   "pytest>=8",
@@ -76,7 +81,9 @@ nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*
           "household/consent/*.md", "household/paper/schemas/*.xsd",
           "tools/browser_pool_tools.json",
           "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*",
-          "admin/ui/*.html"]
+          "admin/ui/*.html", "homebridge/knock/classifier.json", "homebridge/knock/cnn.json",
+          "homebridge/knock/triple.json", "homebridge/knock/cnn-ATTRIBUTION.csv",
+          "homebridge/knock/triple-ATTRIBUTION.csv"]
 
 [tool.ruff]
 line-length = 100

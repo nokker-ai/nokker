@@ -1,7 +1,7 @@
 """`python -m nokker.homebridge [serve]` : la passerelle du foyer (profil compose `home`). Refuse de démarrer sans
 `HOME_BRIDGE_TOKEN`. `discovery` (profil `home-mdns`, conteneur home-discovery) : découverte multicast des écrans
-(Cast, AirPlay, DLNA), servie à home-bridge par socket Unix (docs/SCREEN-CAST.md). La sous-commande `audio` (profil
-`home-mic`) relève d'un autre chantier (docs/LOKKAL-HOME-BRIDGE.md)."""
+(Cast, AirPlay, DLNA), servie à home-bridge par socket Unix (docs/SCREEN-CAST.md). `audio` (profil `home-mic`) :
+l'écoute du heurtoir (docs/KNOCK.md §4)."""
 from __future__ import annotations
 
 import logging
@@ -17,6 +17,10 @@ def main(argv: list[str] | None = None) -> int:
         from nokker.cast.bridge import discovery_main
 
         return discovery_main()
+    if cmd == "audio":  # profil home-mic : micro du heurtoir (docs/KNOCK.md §4), réseau none, /dev/snd
+        from nokker.homebridge.knock.audio import main as audio_main
+
+        return audio_main(args[1:])
     if cmd != "serve":
         print(f"home-bridge : sous-commande {cmd!r} non fournie par cette image", file=sys.stderr)
         return 2

@@ -15,3 +15,8 @@ released 2026-10-15), consumed through the pinned fork nokker-ai/hermes-nokker@n
 
 Third-party components bundled with or fetched by this software keep their own
 licenses; see docs/LICENSES-DEPENDENCIES.md.
+
+The knock detector weights (nokker/homebridge/knock/cnn.json and triple.json, copied in web/knock/) were trained on
+clips of FSD50K (Fonseca et al., "FSD50K: An Open Dataset of Human-Labeled Sound Events", IEEE/ACM TASLP 2022;
+annotations CC BY 4.0), restricted to clips under CC0 1.0 or CC BY 3.0. No audio is distributed. Clip authors and
+licenses are credited in cnn-ATTRIBUTION.csv and triple-ATTRIBUTION.csv next to the weights.

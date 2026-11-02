@@ -141,6 +141,10 @@ class NokkerConfig:
     # fournisseur construit), `provider` (command | openai_compat), `reply_mode` (voice_in | always | off),
     # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur.
     tts: dict[str, Any] = field(default_factory=dict)
+    # Heurtoir (docs/KNOCK.md, `nokker/knock/`) : déclencheurs physiques (toc toc toc, clap, touche, NFC) reçus de la
+    # passerelle home-bridge. Vide ou `enabled: false` (défaut) : aucun fil lancé, aucune lecture de la passerelle,
+    # aucune carte décidée autrement. Clés : `enabled`, `rooms`, `approve` ({enabled, rules, window_s ≤ 60, presence_max_age_s}).
+    knock: dict[str, Any] = field(default_factory=dict)
     # Ambiant du foyer (docs/AMBIENT.md, `nokker/ambient/`) : `room_audio` (voix dite dans la pièce, Lokkal + passerelle
     # home-bridge) et `eink` (écrans e-ink du foyer, cloud et Lokkal), chacun avec `enabled` (défaut false : aucune
     # route, aucun fil, rien ne change).

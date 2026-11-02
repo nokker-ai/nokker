@@ -185,6 +185,7 @@ def _anon_enroll_allowed(now: float | None = None) -> bool:
 
 _RE_APPROVAL_ONE = re.compile(r"^/v1/approvals/([^/]+)$")
 _RE_APPROVAL_CHALLENGE = re.compile(r"^/v1/approvals/([^/]+)/challenge$")
+_RE_APPROVAL_KNOCK_ARM = re.compile(r"^/v1/approvals/([^/]+)/knock-arm$")  # heurtoir (docs/KNOCK.md §5.3)
 _RE_APPROVAL_DECISION = re.compile(r"^/v1/approvals/([^/]+)/decision$")
 _RE_APPROVAL_AUTO_REVOKE = re.compile(r"^/v1/approvals/([^/]+)/auto-review/revoke$")
 # Attente maximale de `POST /v1/approvals/{id}/decision` (Mini App, web) : sous les 100 s de Cloudflare, tour en cours
@@ -2094,7 +2095,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                  shares: ThreadShares | None = None,
                  approval_suggestions: dict[str, Any] | None = None,
                  memory_search_api: bool = False,
-                 improve_config: Any | None = None) -> type[BaseHTTPRequestHandler]:
+                 improve_config: Any | None = None,
+                 knock_hub: Any = None) -> type[BaseHTTPRequestHandler]:
     """`api_keys` = {jeton Bearer: identité} (`NokkerConfig.api_key_map()`). Vide = serveur ouvert
     (dev) ; alors AUCUNE requête n'a de `sender` de confiance (toujours `None`, jamais de GO).
 
@@ -2250,6 +2252,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             done.set()
             raise
         return ("running" if ticket.immediate else "queued"), done
+    if knock_hub is not None:
+        # Heurtoir (docs/KNOCK.md §5.3) : une carte approuvée par toc toc toc s'exécute par le même chemin que les
+        # autres décisions, dans la file de son fil.
+        knock_hub.execute = lambda d: schedule_decision(d)[1]
     if household_http.enabled() and approvals is not None:
         # Foyer (X23) : les cartes fortes des profils mineurs, décidées par leur représentant depuis ses appareils ;
         # la suite tourne dans la file du fil du mineur, comme une décision ordinaire.
@@ -4623,6 +4629,33 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._json(200, {"challenge": ch.canonical(), "nonce": ch.nonce, "exp": ch.exp})
                 return
 
+            m = _RE_APPROVAL_KNOCK_ARM.match(path)
+            if m:
+                # Heurtoir (docs/KNOCK.md §5.3) : « approuver au heurtoir » arme la carte pour une pièce ; le toc toc
+                # toc suivant dans cette pièce, avec un membre autorisé présent, l'approuvera. Drapeau éteint : 404.
+                if knock_hub is None:
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                sender = self._resolve_identity(body)
+                if sender is None:
+                    self._json(401, {"error": {"message": "unauthorized"}})
+                    return
+                tid = self._tenant_for(sender)
+                if tid is None:
+                    return
+                scope.enter_context(tenant_scope(tid))
+                card = approvals.get(m.group(1))
+                if card is None or not approvals.decider_allowed(sender, tid, card):
+                    self._json(404, {"error": {"message": "carte introuvable"}})
+                    return
+                why = knock_hub.arm(m.group(1), str(body.get("room", "")).strip())
+                if why:
+                    self._json(409, {"error": {"message": why, "code": "knock_refused"}})
+                    return
+                self._json(200, {"approval_id": m.group(1), "room": str(body.get("room", "")).strip(),
+                                 "window_s": knock_hub.config.approve.window_s})
+                return
+
             m = _RE_APPROVAL_DECISION.match(path)
             if m:
                 sender = self._resolve_identity(body)
@@ -5302,6 +5335,12 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
     api_keys = config.api_key_map()
     if local_api is not None:  # le jeton local vaut identité « propriétaire local » sur toutes les routes
         api_keys = {**api_keys, local_api.token: LOCAL_OWNER}
+    knock_hub = None
+    if config.knock.get("enabled"):
+        # Heurtoir (docs/KNOCK.md) : Lokkal seulement ; les déclencheurs viennent de home-bridge, jamais du LAN direct.
+        from nokker.knock.bridge import configure_knock
+
+        knock_hub = configure_knock(config, kernel, approvals, local=local_api is not None)
     handler = make_handler(kernel, api_keys, ledger, approvals=approvals, events=events, open_api=config.dev_open_api,
                            telegram_bot_token=config.telegram_bot_token() or None, telegram_ids=config.telegram_ids,
                            hub=hub, previews=register_previews_routes(config), agents=agents_hub,
@@ -5311,7 +5350,9 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                            shares=build_shares(config) if hub is not None else None,
                            approval_suggestions=config.approval_suggestions,
                            memory_search_api=config.memory_search_api,
-                           improve_config=config if config.self_improve else None)
+                           improve_config=config if config.self_improve else None, knock_hub=knock_hub)
+    if knock_hub is not None and getattr(knock_hub, "pump", None) is not None:
+        knock_hub.pump.start()
     if hub is not None:
         _start_notify_sweeper(hub)
     if local_api is not None and config.local.get("mirror") and local_api.setup is not None \
