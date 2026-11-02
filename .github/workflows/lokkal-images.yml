@@ -38,7 +38,8 @@ jobs:
           - {name: sandbox,  context: deploy/lokkal/sandbox,     file: deploy/lokkal/sandbox/Dockerfile,   target: "",     suffix: "",        hermes: false}
           # Passerelle du foyer (docs/LOKKAL-HOME-BRIDGE.md) : profils home, home-mdns (sous-commande discovery), home-mic.
           - {name: home-bridge, context: ".",                    file: deploy/lokkal/home-bridge/Dockerfile, target: "",   suffix: "",        hermes: false}
-          - {name: nokker-web, context: apps-src,                file: apps-src/deploy/web/Dockerfile,     target: "",     suffix: "",        hermes: false, apps: true}
+          - {name: nokker-web, context: apps-src,                file: apps-src/deploy/web/Dockerfile,     target: "",     suffix: "",        hermes: false, apps: true,
+             build_args: "VITE_NOKKER_SHOW_ME=1\nVITE_NOKKER_GUIDE=1"}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
       - name: Version
@@ -84,6 +85,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
+          build-args: ${{ matrix.build_args }}   # web : Montre-moi et Guide compilés allumés (comme la bêta)
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
