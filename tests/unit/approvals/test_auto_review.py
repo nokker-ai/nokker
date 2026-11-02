@@ -472,3 +472,11 @@ def test_provenance_send_card_stays_pending_and_the_reviewer_never_sees_it():
 def test_standard_card_outside_provenance_stays_reviewable():
     assert excluded(card(rule="permissions:default"), "write") is None
     assert excluded(card(rule="permissions:default", tool_name="patch", arguments={"path": "a.py"}), "write") is None
+
+
+def test_script_and_payment_preparation_are_never_reviewed():
+    """Lancer un script (`execute_code`) et préparer un paiement (`paper_payment_prepare`) : liste fermée du relecteur."""
+    from nokker.approvals import auto_review as ar
+
+    assert {"execute_code", "paper_payment_prepare", "pay_request"} <= ar.EXCLUDED_TOOLS
+    assert "payments:to_pay" in ar.EXCLUDED_RULES

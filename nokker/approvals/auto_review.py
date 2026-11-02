@@ -54,6 +54,7 @@ EXCLUDED_RULES = frozenset({
     "effect:destructive", "effect:destructive:unauthorized_sender",
     "effect:send_external", "effect:send_bulk", "effect:spend",
     "pages:publish",                       # sortie vers le public
+    "payments:to_pay",                     # arrêt au paiement : carte forte, la personne décide
     "household:guardian",                  # profil mineur : son représentant décide
     "permissions:relayed_connector",       # connecteur d'un compte nokker.ai
     "permissions:relayed_strong",          # tour venu du web
@@ -70,7 +71,10 @@ EXCLUDED_RULES = frozenset({
 EXCLUDED_RULE_PREFIXES = ("ops:prod",)  # `ops:prod` et `ops:prod:*`
 EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_bulk_email", "agent_arm",
                             "improve_apply",
-                            "skill_create", "skill_update", "skill_revert"})
+                            "skill_create", "skill_update", "skill_revert",
+                            # script arbitraire (ses appels internes passent les portes, mais le lancement reste humain)
+                            # et préparation d'un paiement (argent) : jamais décidés par le relecteur.
+                            "execute_code", "paper_payment_prepare", "pay_request"})
 # Règle du noyau qui escalade une carte d'auto-amélioration sans appeler le modèle (défense en profondeur : la liste
 # fermée l'écarte déjà du relecteur).
 IMPROVE_ESCALATION = "carte d'auto-amélioration : décidée par l'humain, jamais par le relecteur automatique"
