@@ -5,8 +5,12 @@
 # flux Snapcast et extraits audio ; pyatv (AirPlay) et PyChromecast (Cast), licence MIT, aux versions vérifiées par
 # p2/cast-display (extra `cast` de pyproject.toml) ; PyYAML pour home.yaml.
 FROM python:3.13-alpine
+# linux/arm64 : miniaudio (dépendance de pyatv) n'a pas de roue musllinux aarch64, pip la compile → compilateur C/C++
+# le temps du pip install seulement (paquets virtuels .build-deps retirés dans la même couche).
 RUN apk add --no-cache ffmpeg ca-certificates \
+    && apk add --no-cache --virtual .build-deps build-base \
     && pip install --no-cache-dir "pyatv==0.18.0" "PyChromecast==14.1.0" "PyYAML==6.0.2" \
+    && apk del .build-deps \
     && adduser -D -H -u 10002 homebridge
 COPY nokker/__init__.py /opt/home/nokker/__init__.py
 COPY nokker/homebridge /opt/home/nokker/homebridge
