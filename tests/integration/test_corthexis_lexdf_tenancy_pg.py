@@ -44,11 +44,11 @@ def _index(store, root, project: str) -> None:
     Indexer(store, HashEmbedder(dim=768), cfg).run()
 
 
-def _ranking(store) -> list[tuple[str, float]]:
+def _ranking(store, projects: tuple[str, ...] | None = None) -> list[tuple[str, float]]:
     from nokker.memory.tenant_long import HashEmbedder
 
     q = HashEmbedder(dim=768).embed_query(QUERY)
-    return [(h.note_name, round(h.score, 9)) for h in store.search(q, QUERY, k=10)]
+    return [(h.note_name, round(h.score, 9)) for h in store.search(q, QUERY, k=10, projects=projects)]
 
 
 def _df_by_tenant(su_dsn: str) -> dict[tuple[str, str], int]:
@@ -177,3 +177,52 @@ def test_single_tenant_ranking_is_identical_before_and_after_the_rebuild(cx):
         assert _df_by_tenant(cx["su"]) == _df_recomputed(cx["su"])
     finally:
         store.close()
+
+
+@requires_pg
+def test_search_under_a_role_that_bypasses_rls_reads_only_the_current_tenant_counts(cx):
+    """Rôle qui passe outre la RLS (superutilisateur : `POSTGRES_USER` du compose, banc bench/keys) : la RLS ne borne
+    plus `lex_df`. Avant le correctif, `SELECT df FROM lex_df WHERE token = ''` rendait une ligne PAR locataire dès le
+    2e locataire indexé → `CardinalityViolation`, recherche coupée, rappel sémantique nul. Après : les lectures de la
+    recherche sont bornées au locataire courant, classement (noms ET scores) identique à celui du rôle du pod."""
+    from corthexis.store import Store
+
+    from nokker.context import corthexis_tenancy as ct
+    from nokker.context.corthexis_index import project_of
+    from nokker.tenancy.context import tenant_scope
+
+    root = cx["root"]
+    pa, pb = project_of(f"{TA}:th-1"), project_of(f"{TB}:th-1")
+    for name, body in B_NOTES.items():
+        _note(root, pb, name, body)
+    _note(root, pa, "ep-aaaa0001", "Le xylophone de la cantine change lundi")
+    app = Store(cx["app"], max_size=2)
+    su = None
+    try:
+        for p in (pa, pb):
+            _index(app, root, p)
+        assert ct.ensure(cx["app"], lambda: {pa: TA, pb: TB})
+        ct.guard_store(app)
+        with tenant_scope(TB):  # le noyau cherche toujours dans le projet du fil (corthexis_index.search)
+            base = _ranking(app, (pb,))  # rôle du pod, sous RLS
+        assert [n for n, _ in base][:2] and {n for n, _ in base} <= set(B_NOTES)
+        su = ct.guard_store(Store(cx["su"], max_size=2, migrate=False))
+        with tenant_scope(TB):
+            assert _ranking(su, (pb,)) == base
+        with tenant_scope(TA):
+            assert [n for n, _ in _ranking(su, (pa,))] == ["ep-aaaa0001"]
+    finally:
+        app.close()
+        if su is not None:
+            su.close()
+
+
+def test_lexdf_reads_of_the_package_are_the_ones_scoped():
+    """Les deux lectures de `lex_df` remplacées existent telles quelles dans la recherche du paquet épinglé (sinon le
+    correctif ne s'appliquerait pas et la seule RLS bornerait)."""
+    store_mod = pytest.importorskip("corthexis.store", reason="paquet corthexis absent")
+    from nokker.context.corthexis_tenancy import LEXDF_READS
+
+    for old, new in LEXDF_READS:
+        assert store_mod.Store._Q_CTES.count(old) == 1
+        assert "tenant_id = current_setting('app.tenant_id', true)" in new

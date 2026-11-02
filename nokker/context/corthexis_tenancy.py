@@ -29,6 +29,10 @@ tables n'ont ni locataire ni RLS — l'isolation y reposait sur le seul filtre d
    forcée ; les lectures du paquet (`WHERE token = …`) ne voient alors que le locataire courant. Écriture : le
    `Store` gardé remplace `_apply_df` (même requête que le paquet, conflit désigné par la contrainte `lex_df_pkey`,
    qui vaut pour les deux formes de la table).
+   Lecture : le `Store` gardé borne aussi EXPLICITEMENT au locataire courant les deux lectures de `lex_df` de la
+   recherche (`_scope_lex_reads`) : sous un rôle qui passe outre la RLS (superutilisateur, BYPASSRLS, ex. le
+   `POSTGRES_USER` du compose ou un banc), la sous-requête du nombre de notes (`token = ''`) rendait une ligne par
+   locataire → `CardinalityViolation`, recherche coupée, rappel sémantique nul dès le 2e locataire.
 """
 from __future__ import annotations
 
@@ -47,6 +51,14 @@ TABLES = ("notes", "links", "note_versions", "recall_log", "note_level_floor", "
 EXTRA = ("recall_turns",)  # sans projet : lignes existantes → ORPHAN
 STATS = ("lex_df",)  # statistique dérivée de `notes` : reconstruite par locataire, pas rattachée
 LEXDF_PK = "lex_df_pkey"  # nom de la clé primaire du paquet, gardé par la reconstruction
+# Lectures de `lex_df` dans `Store._Q_CTES` (corthexis 2.1.2) → bornées au locataire courant (`_scope_lex_reads`)
+_TENANT_NOW = "current_setting('app.tenant_id', true)"
+LEXDF_READS = (
+    ("(SELECT df FROM lex_df WHERE token = '')",
+     f"(SELECT df FROM lex_df WHERE token = '' AND tenant_id = {_TENANT_NOW})"),
+    ("LEFT JOIN lex_df d ON d.token = t)",
+     f"LEFT JOIN lex_df d ON d.token = t AND d.tenant_id = {_TENANT_NOW})"),
+)
 _LOCK = 727060
 MANAGED, EXTERNAL = "managed", "external"
 OWNER_DSN_ENV = "CORTHEXIS_OWNER_DATABASE_URL"
@@ -185,6 +197,30 @@ def _apply_df(con: Any, delta: dict[str, int]) -> None:
     neg = [t for t in toks if delta[t] < 0]
     if neg:
         con.execute("DELETE FROM lex_df WHERE token = ANY(%s) AND df <= 0", (neg,))
+
+
+def _scope_lex_reads(store: Any) -> None:
+    """Borne au locataire courant les lectures de `lex_df` de la recherche (`_Q_CTES` de l'instance), si la table
+    porte `tenant_id`. Sous RLS (rôle du pod), le filtre redit la politique : mêmes lignes, même classement. Sous un
+    rôle qui passe outre la RLS, il remplace la politique : sans lui, `SELECT df FROM lex_df WHERE token = ''` rend une
+    ligne par locataire et la recherche lève (`CardinalityViolation`). SQL du paquet inattendu : laissé tel quel."""
+    q = getattr(store, "_Q_CTES", None)
+    if not isinstance(q, str):
+        return
+    try:
+        with store.pool.connection() as con:
+            if not _has_col(con, "lex_df"):
+                return
+    except Exception:  # base injoignable : la recherche le dira elle-même
+        log.debug("lex_df : colonne tenant_id non vérifiable", exc_info=True)
+        return
+    for old, _new in LEXDF_READS:
+        if q.count(old) != 1:
+            log.warning("corthexis : lectures de lex_df inattendues (paquet changé ?) — bornées par la seule RLS")
+            return
+    for old, new in LEXDF_READS:
+        q = q.replace(old, new)
+    store._Q_CTES = q
 
 
 def _role_exists(con: Any, role: str) -> bool:
@@ -452,6 +488,7 @@ def guard_store(store: Any) -> Any:
             if _strict:
                 raise RuntimeError(msg + " — non servie (require_rls)")
             log.warning(msg)
+        _scope_lex_reads(store)
         store.pool = _TenantPool(store.pool)
         store._apply_df = _apply_df
         _external_generations(store)
@@ -459,6 +496,7 @@ def guard_store(store: Any) -> Any:
         return store
     if not ensure(store.dsn) and _strict:
         raise RuntimeError("base CortHeXis sans locataire ni RLS : non servie (require_rls)")
+    _scope_lex_reads(store)
     store.pool = _TenantPool(store.pool)
     store._apply_df = _apply_df
     create = store.create_generation
@@ -532,6 +570,6 @@ def guarded_store() -> Any:
     return guard_store(cx_service.get_store())
 
 
-__all__ = ["APP_ROLE", "BACKUP_ROLE", "EXTERNAL", "EXTRA", "MANAGED", "ORPHAN", "OWNER_DSN_ENV", "STATS", "TABLES",
-           "ensure", "guard_store", "guarded_store", "migrate_schema", "project_tenants_from", "schema_mode",
-           "set_mode", "set_strict", "verify"]
+__all__ = ["APP_ROLE", "BACKUP_ROLE", "EXTERNAL", "EXTRA", "LEXDF_READS", "MANAGED", "ORPHAN", "OWNER_DSN_ENV",
+           "STATS", "TABLES", "ensure", "guard_store", "guarded_store", "migrate_schema", "project_tenants_from",
+           "schema_mode", "set_mode", "set_strict", "verify"]
