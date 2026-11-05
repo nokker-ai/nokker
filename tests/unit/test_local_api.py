@@ -630,11 +630,11 @@ def test_turn_stops_before_the_model_only_when_no_model_is_usable(tmp_path, monk
         return "model"
 
     cfg_key = {"on": False}
-    guarded = setup_guard(kernel, api.setup, 8742, run_turn, lambda: cfg_key["on"])
+    guarded = setup_guard(kernel, api.setup, "http://127.0.0.1:7420", run_turn, lambda: cfg_key["on"])
     inp = TurnInput(thread_id="t1", user_text="salut", channel="api", sender=None)
     turn = guarded(inp)  # rien du tout
     assert calls == [] and turn.reply == ("Aucun modèle n'est configuré. Termine la configuration : "
-                                          "http://127.0.0.1:8742/setup")
+                                          "http://127.0.0.1:7420/setup")
     cfg_key["on"] = True  # done faux, palier de config avec clé
     assert guarded(inp) == "model"
     cfg_key["on"] = False
@@ -645,3 +645,90 @@ def test_turn_stops_before_the_model_only_when_no_model_is_usable(tmp_path, monk
     assert guarded(inp) != "model"
     _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})  # byok avec modèle, done faux
     assert guarded(inp) == "model" and len(calls) == 3
+
+
+
+def test_no_model_guard_links_the_web_setup_with_the_token_and_fails_the_turn(tmp_path, monkeypatch):
+    """rc.9.3 : le lien visait le port API (8742 → 401) et le tour finissait sans erreur (exit 0, error null). Le lien
+    vise la page /setup du WEB, avec le jeton local en fragment pour un tour SUR la machine seulement ; le tour est un
+    échec `no_model` annoncé aux observateurs (turn.done.error), sans rien enregistrer dans le fil."""
+    from nokker.api.server import setup_guard, web_url_of_lokkal
+    from nokker.core.turn import TurnInput
+
+    api, _ = _setup(tmp_path, monkeypatch)
+    kernel = make_kernel()
+    seen = []
+
+    class Obs:
+        def turn_started(self, turn):
+            seen.append(("started", turn.thread_id))
+
+        def turn_done(self, turn):
+            seen.append(("done", turn.failure))
+            seen.append(("reply", turn.reply))  # ce que le bus d'événements publie (turn.delta)
+
+    kernel.observer = Obs()
+    guarded = setup_guard(kernel, api.setup, "http://127.0.0.1:7420", lambda *a, **k: "model", lambda: False,
+                          token=lambda: "tok-local-123")
+    base = "Aucun modèle n'est configuré. Termine la configuration : http://127.0.0.1:7420/setup"
+    turn = guarded(TurnInput(thread_id="t1", user_text="salut", channel="api", sender=None))
+    assert turn.reply == base + "#token=tok-local-123"
+    assert turn.failure == {"code": "no_model", "message": base}  # jamais le jeton dans l'erreur
+    assert seen == [("started", "t1"), ("done", {"code": "no_model", "message": base}), ("reply", base)]
+    assert all("tok-local" not in str(x) for x in seen)  # le jeton ne passe jamais par les observateurs (bus)
+    assert kernel.store.history("t1") == []  # rien dans le fil
+    for channel in ("relay", "telegram"):  # hors de la machine : jamais le jeton
+        assert guarded(TurnInput(thread_id="t2", user_text="x", channel=channel, sender=None)).reply == base
+    monkeypatch.delenv("NOKKER_WEB_URL", raising=False)
+    monkeypatch.setenv("NOKKER_PORT", "7520")
+    assert web_url_of_lokkal() == "http://127.0.0.1:7520"
+    monkeypatch.setenv("NOKKER_WEB_URL", "http://127.0.0.1:7420/")
+    assert web_url_of_lokkal() == "http://127.0.0.1:7420"
+
+
+class _TenantStrictApprovals:
+    """Approbations qui, comme le backend Postgres sous RLS, refusent tout accès sans locataire fixé (rc.9.3 : 502)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        from nokker.tenancy.context import current_tenant
+
+        attr = getattr(self.inner, name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*a, **kw):
+            current_tenant()  # NoTenant sans tenant_scope à la frontière
+            return attr(*a, **kw)
+        return guarded
+
+
+def test_local_approvals_set_the_tenant_at_the_boundary(tmp_path):
+    from nokker.approvals.memory import InMemoryApprovals
+    from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates
+    from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
+    from tests.unit.api.test_approvals_routes import make_kernel_with_approvals
+
+    inner = InMemoryApprovals()
+    approvals = _TenantStrictApprovals(inner)
+    kernel, _ = make_kernel_with_approvals(approvals)
+    kernel.gates = PermissionGates(inner=kernel.gates, permissions=LocalPermissions(mode=Mode.ACCEPT_EDITS))
+    api = _api(tmp_path)
+    api.settings_path = tmp_path / "settings.json"
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, approvals=approvals,
+                                                               local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with tenant_scope(INTERNAL_TENANT):
+            a = _card(inner, "th_t", "npm test")
+        status, body = _req(port, "/v1/local/approvals", token=api.token)
+        assert status == 200 and [x["id"] for x in body["approvals"]] == [a.id]
+        status, body = _req(port, f"/v1/local/approvals/{a.id}/decide", token=api.token,
+                            body={"decision": "approve", "scope": "once"})
+        assert status in (200, 202) and body["approval_id"] == a.id
+    finally:
+        httpd.shutdown()

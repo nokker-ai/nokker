@@ -550,7 +550,7 @@ def build_context_manager(config: NokkerConfig, store: Any, hub: BubbleHub | Non
                     " ; ".join(problems[:8]), " — index de session coupé (lexical)" if config.require_rls else "")
                 if config.require_rls:
                     return _finish_manager(mgr, hub)
-        elif cx_dsn and not corthexis_tenancy.ensure(
+        elif cx_dsn and not corthexis_tenancy.ensure_managed(  # migrations du paquet AVANT (course de la rc.9.3)
                 cx_dsn, corthexis_tenancy.project_tenants_from(dsn) if dsn else None) and config.require_rls:
             logger.error("context_corthexis : RLS non posée sur la base CortHeXis — index de session coupé (lexical)")
             return _finish_manager(mgr, hub)
@@ -3095,7 +3095,13 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             return local_api.is_owner(auth)
 
         def _local_approvals(self, method: str, path: str) -> None:
-            """Cartes des sessions locales, décidées avec le jeton local (docs/LOKKAL.md §7.4.3)."""
+            """Cartes des sessions locales, décidées avec le jeton local (docs/LOKKAL.md §7.4.3). Le propriétaire local
+            est le locataire interne : les approbations sont en Postgres sous RLS, le locataire se fixe ICI, à la
+            frontière (sans lui : NoTenant → 502 sur GET et decide, install neuve rc.9.3, 04.11.2026)."""
+            with tenant_scope(INTERNAL_TENANT):
+                self._local_approvals_scoped(method, path)
+
+        def _local_approvals_scoped(self, method: str, path: str) -> None:
             from nokker.local.approvals import append_user_rule, rule_kind, suggested_rules
             from nokker.qa.permissions import RELAY_CARD_RULE, RELAYED_STRONG_RULE, Rule
 
@@ -5101,12 +5107,23 @@ def link_endpoint(state: dict[str, Any], get_secret: Any) -> tuple[str, str] | N
     return (str(state.get("inference_base") or ROUTER_URL), key) if key else None
 
 
-def setup_guard(kernel: Kernel, setup: Any, port: int, run_turn: Any, tier_keys: Any = lambda: False) -> Any:
+def web_url_of_lokkal() -> str:
+    """Adresse du WEB de Lokkal sur la machine (page /setup), pas celle de l'API (8742, qui répond 401 sans jeton) :
+    `NOKKER_WEB_URL`, sinon `http://127.0.0.1:${NOKKER_PORT}` (port web du compose, 7420 par défaut)."""
+    url = os.environ.get("NOKKER_WEB_URL") or f"http://127.0.0.1:{os.environ.get('NOKKER_PORT') or 7420}"
+    return url.rstrip("/")
+
+
+def setup_guard(kernel: Kernel, setup: Any, web_url: str, run_turn: Any, tier_keys: Any = lambda: False,
+                token: Any = lambda: None) -> Any:
     """Lokkal sans AUCUN modèle utilisable (ni compte relié, ni byok avec modèle, ni palier de config avec clé ; `done`
-    seul ne bloque pas : un Lokkal mis à jour reste servi) : le tour s'arrête AVANT
-    l'appel au modèle, avec une phrase pour la personne (pas l'erreur brute du palier). Rien n'est enregistré dans le
-    fil : le message ne doit pas entrer dans l'historique que le modèle relira. Message destiné à la personne."""
-    message = (f"Aucun modèle n'est configuré. Termine la configuration : http://127.0.0.1:{port}/setup")
+    seul ne bloque pas : un Lokkal mis à jour reste servi) : le tour s'arrête AVANT l'appel au modèle, avec une phrase
+    pour la personne (pas l'erreur brute du palier) et le lien de la page de configuration du WEB. Le tour est un ÉCHEC
+    (`failure` `no_model` : `turn.done.error`, code de sortie non nul du client terminal), annoncé aux observateurs
+    (`turn.started` / `turn.done`) mais jamais enregistré dans le fil : le message n'entre pas dans l'historique que le
+    modèle relira. Le jeton local n'entre dans le lien (`/setup#token=…`, fragment jamais envoyé au serveur) que pour un
+    tour arrivé SUR la machine (`api`) : jamais par la passerelle ni par Telegram. Message destiné à la personne."""
+    base = f"Aucun modèle n'est configuré. Termine la configuration : {web_url}/setup"
 
     def guarded(inp: Any, *args: Any, **kwargs: Any) -> Any:
         try:
@@ -5117,9 +5134,25 @@ def setup_guard(kernel: Kernel, setup: Any, port: int, run_turn: Any, tier_keys:
             return run_turn(inp, *args, **kwargs)
         from nokker.core.turn import Message
 
-        turn = Turn(thread_id=inp.thread_id, index=0, input=kernel.invariants.check_input(inp.user_text),
-                    channel=inp.channel, sender=inp.sender, reply=message)
-        turn.messages.append(Message(role="assistant", content=message))
+        tok = None
+        if getattr(inp, "channel", None) == "api":
+            try:
+                tok = token()
+            except Exception:  # noqa: BLE001 — sans jeton, le lien reste valable (la page le demande)
+                tok = None
+        turn = Turn(thread_id=inp.thread_id, index=kernel.store.next_index(inp.thread_id),
+                    input=kernel.invariants.check_input(inp.user_text), channel=inp.channel, sender=inp.sender,
+                    reply=base)
+        turn.messages.append(Message(role="assistant", content=base))
+        turn.failure = {"code": "no_model", "message": base}  # jamais le jeton dans l'erreur
+        # Les observateurs (bus d'événements : turn.delta, turn.done, que la passerelle peut relayer) ne voient QUE la
+        # phrase sans jeton ; le lien avec jeton ne part que dans la réponse rendue à l'appelant, sur la machine.
+        kernel._observe("turn_started", turn)
+        kernel._observe("turn_done", turn)
+        if tok:
+            message = f"{base}#token={tok}"
+            turn.reply = message
+            turn.messages[-1] = Message(role="assistant", content=message)
         return turn
 
     return guarded
@@ -5655,8 +5688,9 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         kernel.run_turn = active.wrap(kernel.run_turn)  # fils dont un tour est en cours (API, Telegram)
         setup = local_api.setup
         if setup is not None:
-            kernel.run_turn = setup_guard(kernel, setup, config.port, kernel.run_turn,
-                                         lambda: any(t.api_key() for t in config.tiers.values()))
+            kernel.run_turn = setup_guard(kernel, setup, web_url_of_lokkal(), kernel.run_turn,
+                                         lambda: any(t.api_key() for t in config.tiers.values()),
+                                         token=lambda: getattr(local_api, "token", None))
 
         def machine_token() -> str | None:
             try:

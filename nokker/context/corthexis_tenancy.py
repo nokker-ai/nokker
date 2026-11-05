@@ -77,9 +77,9 @@ def _exists(con: Any, table: str) -> bool:
     return _one(con, "SELECT to_regclass(%s) IS NOT NULL", (table,))
 
 
-def _has_col(con: Any, table: str) -> bool:
+def _has_col(con: Any, table: str, column: str = "tenant_id") -> bool:
     return _one(con, "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(%s) "
-                     "AND attname = 'tenant_id' AND NOT attisdropped)", (table,))
+                     "AND attname = %s AND NOT attisdropped)", (table, column))
 
 
 def _partitions(con: Any) -> list[str]:
@@ -111,6 +111,14 @@ def ensure(dsn: str, project_tenants: Callable[[], dict[str, str]] | None = None
             if not _exists(con, "notes"):
                 return True  # base neuve : le paquet crée son schéma au premier usage ; rejoué ensuite
             tables = [t for t in (*TABLES, *EXTRA) if _exists(con, t)]
+            unmigrated = [t for t in tables if t not in EXTRA and not _has_col(con, t, "project")]
+            if unmigrated:
+                # Schéma du paquet pas encore migré (colonne `project` des migrations 0011/0012 absente) : rattacher
+                # maintenant rangerait des lignes de fils `s-…` sous le mauvais locataire, sans retour. Rien n'est
+                # touché ; `ensure` est rejouée (démarrage suivant, ou `ensure_managed` qui migre d'abord).
+                log.warning("base CortHeXis : schéma du paquet pas encore migré (%s sans project) — locataire et RLS "
+                            "remis au prochain passage", ", ".join(unmigrated))
+                return False
             parts = _partitions(con)
             fresh = [t for t in [*tables, *(["chunks"] if parts or _exists(con, "chunks") else [])]
                      if not _has_col(con, t)]
@@ -140,6 +148,34 @@ def ensure(dsn: str, project_tenants: Callable[[], dict[str, str]] | None = None
         log.error("base CortHeXis : locataire et RLS non posés (%s) — %s", type(e).__name__,
                   _no_credentials(str(e)).splitlines()[0] if str(e) else "")
         return False
+
+
+def migrate_package(dsn: str) -> list[int]:
+    """Migrations du paquet `corthexis` (`Store.migrate` seul : ni pool, ni connexion gardée). Chaque migration prend le
+    verrou consultatif du paquet et relit `schema_migrations` : appelée pendant qu'un autre `Store()` migre, elle attend
+    et rend la main quand TOUTES les migrations sont passées (par l'un ou par l'autre)."""
+    from corthexis.store import Store
+
+    class _Migrator(Store):
+        def __init__(self, dsn: str) -> None:  # pas d'appel au parent : il ouvrirait un pool
+            self.dsn = dsn
+
+    return _Migrator(dsn).migrate()
+
+
+def ensure_managed(dsn: str, project_tenants: Callable[[], dict[str, str]] | None = None, *,
+                   migrate: Callable[[str], Any] = migrate_package) -> bool:
+    """Mode `managed` (Lokkal) : migrations du paquet PUIS `ensure`. Sans cet ordre, `ensure` au démarrage courait contre
+    le premier `Store()` de la mémoire longue (rc.9.3 : « column x.project does not exist » entre les migrations 10 et
+    11). Migrations en échec (paquet absent, base injoignable) : journalisé, `ensure` décide comme avant."""
+    try:
+        migrate(dsn)
+    except Exception as e:  # noqa: BLE001
+        from nokker.memory.corthexis import _no_credentials
+
+        log.warning("base CortHeXis : migrations du paquet non jouées avant le locataire (%s) — %s", type(e).__name__,
+                    _no_credentials(str(e)).splitlines()[0] if str(e) else "")
+    return ensure(dsn, project_tenants)
 
 
 def _backfill(con: Any, tables: list[str], mapping: dict[str, str]) -> None:
@@ -331,13 +367,8 @@ def migrate_schema(owner_dsn: str, *, app_role: str = APP_ROLE, backup_role: str
     locataire et RLS forcée (`ensure`), fonctions de génération, droits du rôle du noyau et de la sauvegarde. Idempotent.
     Lève à la première erreur (le job d'init échoue franchement)."""
     import psycopg
-    from corthexis.store import Store
 
-    class _Migrator(Store):  # `Store.migrate` seul : ni pool, ni connexion gardée
-        def __init__(self, dsn: str) -> None:  # pas d'appel au parent : il ouvrirait un pool
-            self.dsn = dsn
-
-    applied = _Migrator(owner_dsn).migrate()
+    applied = migrate_package(owner_dsn)
     if not ensure(owner_dsn, project_tenants, backup_role=backup_role):
         raise RuntimeError("base CortHeXis : locataire et RLS non posés (voir le journal)")
     with psycopg.connect(owner_dsn, connect_timeout=10) as con:

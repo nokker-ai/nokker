@@ -76,6 +76,8 @@ local:
   project_memory_core_tokens: 800              # noyau toujours injecté ; le reste est rappelé par pertinence
   relayed_connectors: true                     # connecteurs posés chez nokker.ai (mail, agenda) appelés par le lien de
                                                # compte (X20, docs/LOKKAL.md §7.12) ; défaut du code : off
+  project_skills: true                         # skills du dépôt (.nokker/skills, docs/LOKKAL.md §7.21) : invisibles
+                                               # sans la confiance du propriétaire (dossier + sha256) ; défaut du code : off
   ops: true                                    # ops (X11, docs/LOKKAL.md §7.14) : ssh_hosts/run/copy/trust sur les
                                                # hôtes de /opt/data/hosts.yaml (clés au coffre, known_hosts à côté),
                                                # plancher prod = carte forte, journal d'audit chaîné

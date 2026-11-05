@@ -1,6 +1,7 @@
 # Nokker Lokkal — installeur Windows (docs/LOKKAL.md §3).
 #
 #   irm https://nokker.ai/install.ps1 | iex
+#   (-NoKeepAlive : pas de tâche planifiée qui garde la distribution WSL, donc Lokkal, démarrée)
 #   & ([scriptblock]::Create((irm https://nokker.ai/install.ps1))) -Workspace ~/code -Yes
 #
 # Lokkal tourne dans WSL 2 : le noyau, ses containers et vos dossiers de travail vivent dans une distribution Linux
@@ -26,6 +27,7 @@ param(
   [switch]$Uninstall,
   [switch]$Purge,
   [switch]$NoOpen,
+  [switch]$NoKeepAlive,             # pas de tâche planifiée qui garde la distribution (et donc Lokkal) vivante
   [switch]$Vault,                   # coffre OpenBao (profil vault), descellé automatiquement
   [switch]$VaultManual,             # idem, part de descellement affichée une fois, redemandée à chaque redémarrage
   [switch]$LocalLlm,                # moteur d'inférence local (Ollama, CPU, profil local-llm), proposé dans /setup
@@ -54,7 +56,11 @@ if (-not $wslOk) {
   if (-not (Ask "WSL 2 n'est pas installé. L'installer maintenant (droits administrateur, puis redémarrage) ?")) {
     Die "WSL 2 est requis : https://learn.microsoft.com/windows/wsl/install"
   }
-  Start-Process wsl.exe -ArgumentList "--install","-d","Ubuntu","--no-launch" -Verb RunAs -Wait
+  # Déjà administrateur (session élevée, ssh d'un compte admin) : directement ; RunAs sans bureau n'installe rien.
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+  if ($admin) { & wsl.exe --install -d Ubuntu --no-launch }
+  else { Start-Process wsl.exe -ArgumentList "--install","-d","Ubuntu","--no-launch" -Verb RunAs -Wait }
   Warn "WSL 2 installé. Redémarrez Windows, ouvrez « Ubuntu » une fois (création de votre compte Linux), puis relancez cette commande."
   exit 0
 }
@@ -118,9 +124,38 @@ else { $src = "curl -fsSL https://nokker.ai/install.sh" }
 # NOKKER_NO_CLI : la commande nokker Linux reste posée dans la distribution ; Windows reçoit nokker.exe plus bas.
 & wsl.exe -d $Distro -- bash -lc "$src | env $envs sh -s -- $quoted"
 if ($LASTEXITCODE -ne 0) { Die "install.sh a échoué dans $Distro (journal ci-dessus)." }
+$keepTask = "Nokker Lokkal (WSL $Distro)"
 if ($Uninstall) {
   Remove-Item -Force -ErrorAction SilentlyContinue "$HOME\.config\nokker\lokkal.json"
+  Unregister-ScheduledTask -TaskName $keepTask -Confirm:$false -ErrorAction SilentlyContinue
   exit 0
+}
+
+# --------------------------------------------------------------------------------------------- distribution gardée vivante
+# WSL arrête la distribution quand sa dernière session se ferme : Lokkal (dans Docker, dans la distribution) s'arrêterait
+# avec elle. Tâche planifiée à l'ouverture de session (compte courant, sans mot de passe stocké, sans limite de durée),
+# lancée tout de suite : `wsl -d <distro> --exec sleep infinity`, fenêtre cachée. -NoKeepAlive : pas de tâche (et
+# retrait d'une tâche posée avant).
+if ($NoKeepAlive) {
+  Unregister-ScheduledTask -TaskName $keepTask -Confirm:$false -ErrorAction SilentlyContinue
+} else {
+  try {
+    $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument (
+      "-NoProfile -WindowStyle Hidden -Command `"& wsl.exe -d '$Distro' --exec sleep infinity`"")
+    # MACHINE\compte réel : $env:USERDOMAIN vaut WORKGROUP dans une session ssh (« No mapping between account names »)
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $trg = New-ScheduledTaskTrigger -AtLogOn -User $me
+    $prn = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+    $set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
+      -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Hidden
+    $null = Register-ScheduledTask -TaskName $keepTask -Action $act -Trigger $trg -Principal $prn -Settings $set `
+      -Description "Garde la distribution WSL de Nokker Lokkal démarrée (sinon Lokkal s'arrête avec la dernière session)." -Force `
+      -ErrorAction Stop
+    Start-ScheduledTask -TaskName $keepTask -ErrorAction Stop
+    Say "distribution $Distro gardée démarrée (tâche planifiée « $keepTask » ; -NoKeepAlive pour s'en passer)"
+  } catch {
+    Warn "tâche planifiée non posée ($($_.Exception.Message)) : Lokkal s'arrête quand la dernière fenêtre WSL se ferme"
+  }
 }
 
 # --------------------------------------------------------------------------------------------- côté Windows : lokkal.json, nokker.exe
@@ -155,7 +190,12 @@ $binDir = Join-Path $env:LOCALAPPDATA "Nokker\bin"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 function Get-Asset($name, $out) {
   if ($rel -like "file://*") { Copy-Item "$($rel.Substring(7))/$name" $out -Force; return (Get-Content "$($rel.Substring(7))/$name.sha256" -Raw) }
-  Invoke-WebRequest -UseBasicParsing "$rel/$name" -OutFile $out; return (Invoke-WebRequest -UseBasicParsing "$rel/$name.sha256").Content
+  Invoke-WebRequest -UseBasicParsing "$rel/$name" -OutFile $out
+  # Windows PowerShell 5.1 : une réponse application/octet-stream (GitHub) arrive en Byte[] ; la lire en texte, sinon
+  # l'empreinte comparée est « 51 » (le code du premier caractère) et nokker.exe n'est jamais posé.
+  $c = (Invoke-WebRequest -UseBasicParsing "$rel/$name.sha256").Content
+  if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) }
+  return [string]$c
 }
 $tmp = New-TemporaryFile
 try {

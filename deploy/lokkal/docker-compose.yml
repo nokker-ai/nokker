@@ -53,6 +53,7 @@ services:
       NOKKER_HOME: /opt/data
       HERMES_HOME: /opt/data
       NOKKER_LOCAL_SECRET_KEY: ${NOKKER_LOCAL_SECRET_KEY:?}   # coffre local (Fernet) ; sans elle, il refuse d'écrire
+      NOKKER_CONNECTOR_KEY: ${NOKKER_CONNECTOR_KEY:-}         # identifiants de connecteurs (Fernet) ; vide = connecteurs éteints
       NOKKER_PG_DSN: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/nokker
       CORTHEXIS_DATABASE_URL: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/corthexis
       CORTHEXIS_EMBED_URLS: http://embed:8080
@@ -76,6 +77,7 @@ services:
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
       # local.allowed_hosts_env : Host acceptés (web relayé + API directe ; 127.0.0.1:8742 = sonde de santé dans le
       # container, un littéral de bouclage qu'un navigateur ne peut pas forger) ; plus tard <nom>.nokker.app
+      NOKKER_WEB_URL: http://127.0.0.1:${NOKKER_PORT:-7420}   # page /setup du web (garde « aucun modèle »)
       NOKKER_ALLOWED_HOSTS: 127.0.0.1:8742,${NOKKER_ALLOWED_HOSTS:-127.0.0.1:${NOKKER_PORT:-7420},localhost:${NOKKER_PORT:-7420},127.0.0.1:${NOKKER_API_PORT:-8742},localhost:${NOKKER_API_PORT:-8742}}
       NOKKER_SANDBOX_IMAGE: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
       APPROVALS_ENC_KEY: ${NOKKER_APPROVALS_KEY:?}
@@ -138,7 +140,9 @@ services:
     networks: [internal]
     mem_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d nokker"]
+      # -h 127.0.0.1 : pendant l'initdb, le serveur temporaire de l'image n'écoute que sur le socket (listen_addresses
+      # vide) ; sans -h, postgres est « healthy » trop tôt et `roles` (TCP) est refusé (WSL, rc.9.3, 04.11).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d nokker"]
       interval: 10s
       timeout: 5s
       retries: 10

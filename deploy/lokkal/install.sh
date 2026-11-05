@@ -302,11 +302,15 @@ NOKKER_OWNER_PASSWORD=$(rand 24)
 NOKKER_APP_PASSWORD=$(rand 24)
 NOKKER_APPROVALS_KEY=$(fernet)
 NOKKER_LOCAL_SECRET_KEY=$(fernet)
+NOKKER_CONNECTOR_KEY=$(fernet)
 EOF
 else
   setv NOKKER_VERSION "$VERSION"
   [ -n "$WORKSPACE" ] && warn "--workspace ignoré : installation existante (modifier NOKKER_HOST_WORKSPACE dans $DIR/.env)"
 fi
+# Clé des identifiants de connecteurs (Fernet, rc.9.4) : sans elle l'étape Connecteurs de /setup échoue (403). Posée à
+# l'installation ; ajoutée à la mise à jour d'une installation qui ne l'a pas, jamais remplacée (secrets déjà chiffrés).
+[ -n "$(getv NOKKER_CONNECTOR_KEY)" ] || setv NOKKER_CONNECTOR_KEY "$(fernet)"
 if [ -n "$VAULT" ]; then
   [ -f "$DIR/vault/init.sh" ] || die "--vault : cette version de Lokkal n'a pas le coffre OpenBao"
   [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ] || [ "$MODE" != update ] \
