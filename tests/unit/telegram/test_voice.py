@@ -242,3 +242,30 @@ def test_bot_send_voice_is_a_multipart_send_voice(monkeypatch):
     BotApi("T0K").send_voice(111, OGG)
     assert seen["url"].endswith("/sendVoice") and seen["ctype"].startswith("multipart/form-data; boundary=")
     assert b'name="voice"; filename="reply.ogg"' in seen["data"] and OGG in seen["data"]
+
+
+# ─────────────────────────── conditions à réaccepter (§5 : sous-traitant de voix) ───────────────────────────
+
+@pytest.mark.parametrize("outdated,voiced", [(True, False), (False, True)])
+def test_no_voice_note_until_the_current_terms_are_accepted(outdated, voiced):
+    """Conditions à réaccepter : texte seul, AUCUN texte chez le fournisseur de voix ; à jour : note vocale."""
+    prov = FakeProvider()
+    ad, bot, _ = _adapter(VoiceReplies(provider=prov, scrub=scrub, enabled=True), transcribe=lambda m: "salut")
+    seen = []
+    ad.terms_outdated = lambda acc: (seen.append(acc), outdated)[1]
+    ad._process(_voice_msg())
+    assert bot.sent[-1][1] == "Voici **la** réponse."  # le texte part toujours
+    assert bool(bot.voices) is voiced and bool(prov.calls) is voiced
+    assert seen and seen[0].startswith("us_")
+
+
+def test_unreadable_terms_state_sends_no_voice():
+    prov = FakeProvider()
+    ad, bot, _ = _adapter(VoiceReplies(provider=prov, scrub=scrub, enabled=True), transcribe=lambda m: "salut")
+
+    def boom(acc):
+        raise RuntimeError("base")
+
+    ad.terms_outdated = boom
+    ad._process(_voice_msg())
+    assert bot.sent and bot.voices == [] and prov.calls == []

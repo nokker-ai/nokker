@@ -23,6 +23,12 @@ par l'entrée standard (jamais dans la ligne de commande), écrite dans un fichi
 sable, effacée à la fin de la commande. Elle n'entre jamais dans un argument d'outil, un résultat ou le contexte du
 modèle ; sa valeur est de toute façon caviardée (coffre → `redact_result`). Le client ssh tourne DANS le bac à sable
 du fil (comme `terminal`), avec un known_hosts réduit aux lignes des hôtes touchés.
+
+Bac à sable docker de Lokkal (réseau interne) : le client sort par le proxy `egress` en CONNECT (`NOKKER_SSH_PROXY`,
+posé par dockerproxy ; `nc -X connect`). egress n'ouvre que les adresses ET ports déclarés : le noyau lui écrit la liste
+à l'ouverture de session (`egress_allow_path`, depuis l'inventaire VALIDÉ ; un hôte derrière un saut n'y est pas, c'est
+le saut qui le joint). Un uid que l'image ne connaît pas (≠ 1000) : entrée passwd fournie par nss_wrapper, le temps de
+la commande, sinon le client ssh refuse de tourner.
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ from typing import Any
 
 from nokker.core.ports import ToolContext, ToolSpec, call_effect
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, ToolResult, Turn, Verdict
+from nokker.qa.untrusted import fenced_result as fenced
 from nokker.tools.code import classify_command, hardline_reason
 from nokker.tools.hosts import (
     Host,
@@ -73,6 +80,24 @@ _BASE_OPTS = ("-F", "/dev/null", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=ye
               "-o", "PermitLocalCommand=no", "-o", "PasswordAuthentication=no",
               "-o", "KbdInteractiveAuthentication=no", "-o", "GSSAPIAuthentication=no", "-o", "LogLevel=ERROR")
 _KH_MARK = "@@nokker-known-hosts@@"
+# Sortie par egress (bac à sable docker de Lokkal) : `hôte:port` du proxy, posé par dockerproxy ; toute autre forme est
+# ignorée (connexion directe, comme en backend local).
+_PROXY_LINES = (
+    'PX=""; case "${NOKKER_SSH_PROXY:-}" in ""|*[!A-Za-z0-9.:_-]*) ;; *) PX=$NOKKER_SSH_PROXY;; esac',
+    'JPX=""; [ -z "$PX" ] || JPX="\'-oProxyCommand=nc -X connect -x $PX %%h %%p\'"',
+)
+# uid inconnu de l'image (le bac à sable tourne sous l'uid de l'utilisateur) : le client ssh refuse de tourner sans
+# entrée passwd ; nss_wrapper la fournit le temps de la commande, dans le dossier temporaire.
+_NSS_LINES = (
+    'if ! getent passwd "$(id -u)" >/dev/null 2>&1; then',
+    '  w=""; for f in /usr/lib/*/libnss_wrapper.so /usr/lib/libnss_wrapper.so; do [ -e "$f" ] && { w=$f; break; }; done',
+    '  if [ -n "$w" ]; then',
+    '    { printf \'nokker:x:%s:%s:nokker:%s:/bin/sh\\n\' "$(id -u)" "$(id -g)" "${HOME:-/tmp}"; cat /etc/passwd; } > "$d/pw"',
+    '    { printf \'nokker:x:%s:\\n\' "$(id -g)"; cat /etc/group; } > "$d/gr"',
+    '    export LD_PRELOAD="$w" NSS_WRAPPER_PASSWD="$d/pw" NSS_WRAPPER_GROUP="$d/gr"',
+    '  fi',
+    'fi',
+)
 
 
 def _specs() -> list[tuple[str, str, Effect, dict[str, Any]]]:
@@ -128,6 +153,7 @@ class SshToolSource:
     known_hosts_path: Path
     workspace_path: Callable[[str, str], str] | None = None
     core: bool = False
+    egress_allow_path: Path | None = None  # liste des hôtes ouverts par egress (Lokkal), écrite à l'ouverture de session
     _inventories: dict[str, Inventory] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -137,9 +163,27 @@ class SshToolSource:
         inv = load_inventory(self.hosts_path)
         with self._lock:
             self._inventories[thread_id] = inv
+            self._write_egress_allow(inv)
         return {"enabled": True, "hosts": len(inv.hosts), "roles": {r: sum(h.role == r for h in inv.hosts.values())
                                                                       for r in ("prod", "preprod", "dev")},
                 "notices": inv.notices}
+
+    def _write_egress_allow(self, inv: Inventory) -> None:
+        """`ssh-hosts.json` pour egress : adresse et port des hôtes joints DEPUIS le bac à sable (sans saut ; un saut
+        n'a jamais lui-même de saut). Seulement si le dossier existe (posé par l'installeur Lokkal) ; écriture
+        atomique, 0640 (egress la lit par le groupe de l'utilisateur). Rien d'autre : ni nom, ni utilisateur, ni clé."""
+        path = self.egress_allow_path
+        if path is None or not path.parent.is_dir():
+            return
+        hosts = sorted({(h.address, h.port) for h in inv.hosts.values() if not h.jump})
+        data = json.dumps({"v": 1, "hosts": [{"address": a, "port": p} for a, p in hosts]}, ensure_ascii=False)
+        tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(data + "\n", encoding="utf-8")
+            tmp.chmod(0o640)
+            tmp.replace(path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
 
     def inventory(self, thread_id: str) -> Inventory | None:
         """L'inventaire du fil ; un sous-agent (`<fil>/sa-<id>`) a celui de son fil parent."""
@@ -245,8 +289,11 @@ class SshToolSource:
 
     def _proxy(self, jump: Host) -> str:
         """`ProxyCommand` du saut : même client, clé du saut, known_hosts réduit (le saut doit y être)."""
+        # `$JPX` : la ProxyCommand du saut vers egress (bac à sable docker), vide ailleurs ; `%%h` pour que CETTE
+        # commande-ci (développée par le ssh extérieur) rende `%h` au ssh du saut.
         inner = ["ssh", *_BASE_OPTS, "-oIdentityFile=$d/j", "-oUserKnownHostsFile=$d/h",
-                 "-oStrictHostKeyChecking=yes", "-p", str(jump.port), "-l", jump.user, "-W", "%h:%p", jump.address]
+                 "-oStrictHostKeyChecking=yes", "$JPX", "-p", str(jump.port), "-l", jump.user, "-W", "%h:%p",
+                 jump.address]
         return f'"-oProxyCommand={" ".join(inner)}"'
 
     def _script(self, inv: Inventory, host: Host, *, remote: str | None, timeout: int, tail: str = "",
@@ -276,6 +323,8 @@ class SshToolSource:
             opts = self._target_opts(host, "$d/k", "$d/h", "yes")
         if jump is not None:
             opts.append(self._proxy(jump))
+        else:
+            opts.append('${PX:+"-oProxyCommand=nc -X connect -x $PX %h %p"}')
         ssh = " ".join(["$T", "ssh", *opts, "-n", "-T", _q(host.address), *([_q(remote)] if remote else [])])
         body = "\n".join([
             "umask 077",
@@ -283,6 +332,8 @@ class SshToolSource:
              '{ echo "nokker: dossier temporaire impossible dans le bac à sable" >&2; exit 97; }'),
             "trap 'rm -rf \"$d\"' EXIT HUP INT TERM",
             *lines,
+            *_PROXY_LINES,
+            *_NSS_LINES,
             f'T=""; command -v timeout >/dev/null 2>&1 && T="timeout -k 5 {int(timeout)}"',
             ssh + (" " + tail if tail else ""),
             "rc=$?",
@@ -308,6 +359,12 @@ class SshToolSource:
 
     @staticmethod
     def _hint(rc: int | None, output: str) -> str | None:
+        if "Proxy error" in output and " 403" in output:
+            return ("la sortie du bac à sable (egress) a refusé : l'adresse ET le port doivent être déclarés dans "
+                    "hosts.yaml, tels quels (après une modification, ouvre une nouvelle session) ; une adresse de "
+                    "bouclage, de lien local (169.254…) ou des réseaux de Lokkal reste refusée, même déclarée")
+        if "Proxy error" in output and (" 502" in output or " 504" in output):
+            return "hôte injoignable depuis la sortie du bac à sable (egress) : nom, adresse, port ou réseau"
         if "Host key verification failed" in output or "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
             return ("la clé présentée ne correspond pas à known_hosts : possible interception. Ne contourne pas ; "
                     "l'utilisateur vérifie et corrige known_hosts lui-même (ssh_trust ne remplace jamais une clé)")
@@ -331,10 +388,10 @@ class SshToolSource:
         timeout = max(1, min(int(a.get("timeout") or DEFAULT_TIMEOUT_S), MAX_TIMEOUT_S))
         rc, output = self._exec(thread_id, self._script(inv, host, remote=command, timeout=timeout, tail="2>&1"),
                                 timeout)
-        result: dict[str, Any] = {"host": host.name, "role": host.role, "returncode": rc, "output": output}
+        result: dict[str, Any] = {"host": host.name, "role": host.role, "returncode": rc}
         if (hint := self._hint(rc, output)) is not None:
             result["hint"] = hint
-        return out(result)
+        return out(fenced(result, f"ssh:{host.name}:output", output))
 
     def _copy(self, thread_id: str, inv: Inventory, host: Host, a: dict[str, Any], out: Any) -> ToolResult:
         remote = str(a.get("remote_path") or "").strip()
@@ -351,8 +408,9 @@ class SshToolSource:
             rc, output = self._exec(thread_id, self._script(inv, host, remote=f"cat -- {_q(remote)}",
                                                             timeout=MAX_TIMEOUT_S, tail=tail), MAX_TIMEOUT_S)
             if rc != 0:
-                return out({"host": host.name, "remote_path": remote, "returncode": rc, "error": output.strip(),
-                            **({"hint": h} if (h := self._hint(rc, output)) else {})}, True)
+                return out(fenced({"host": host.name, "remote_path": remote, "returncode": rc,
+                                   **({"hint": h} if (h := self._hint(rc, output)) else {})},
+                                  f"ssh:{host.name}:error", output.strip()), True)
             size = output.strip().splitlines()[-1] if output.strip() else "?"
             return out({"host": host.name, "remote_path": remote, "local_path": local, "bytes": size})
         limit = max(1, min(int(a.get("max_bytes") or READ_MAX_BYTES), READ_HARD_MAX))
@@ -360,19 +418,23 @@ class SshToolSource:
         rc, output = self._exec(thread_id, self._script(inv, host, remote=f"head -c {limit + 1} -- {_q(remote)}",
                                                         timeout=120, tail=tail), 120)
         if rc != 0:
-            return out({"host": host.name, "remote_path": remote, "returncode": rc, "error": output.strip(),
-                        **({"hint": h} if (h := self._hint(rc, output)) else {})}, True)
+            return out(fenced({"host": host.name, "remote_path": remote, "returncode": rc,
+                               **({"hint": h} if (h := self._hint(rc, output)) else {})},
+                              f"ssh:{host.name}:error", output.strip()), True)
         if "\x00" in output:
             return out({"host": host.name, "remote_path": remote,
                         "error": "fichier binaire : copie-le dans le dossier de travail (local_path)"}, True)
         truncated = len(output.encode()) > limit
         content = output.encode()[:limit].decode(errors="replace") if truncated else output
-        return out({"host": host.name, "remote_path": remote, "truncated": truncated, "content": content})
+        return out(fenced({"host": host.name, "remote_path": remote, "truncated": truncated},
+                          f"ssh:{host.name}:file", content))
 
-    def _scan(self, thread_id: str, inv: Inventory, host: Host) -> list[tuple[str, str, str]]:
-        _, output = self._exec(thread_id, self._script(inv, host, remote=None, timeout=20, tail="2>&1", scan=True), 20)
-        scanned = output.split(_KH_MARK, 1)[1] if _KH_MARK in output else ""
-        return [(k, t, b) for k, t, b in parse_scanned(scanned) if k == host.known_key]
+    def _scan(self, thread_id: str, inv: Inventory, host: Host) -> tuple[list[tuple[str, str, str]], str | None]:
+        """(clés présentées par l'hôte, indice si aucune : refus d'egress, hôte injoignable…)."""
+        rc, output = self._exec(thread_id, self._script(inv, host, remote=None, timeout=20, tail="2>&1", scan=True), 20)
+        head, _, scanned = output.partition(_KH_MARK)
+        keys = [(k, t, b) for k, t, b in parse_scanned(scanned) if k == host.known_key]
+        return keys, (None if keys else self._hint(255 if rc in (0, None) else rc, head))
 
     def _trust(self, thread_id: str, inv: Inventory, host: Host, fp: str, out: Any) -> ToolResult:
         jump = inv.chain(host)[0] if host.jump else None
@@ -380,10 +442,11 @@ class SshToolSource:
             return out(f"le saut {jump.name} n'est pas encore dans known_hosts : ssh_trust {{host: {jump.name!r}}} "
                        "d'abord", True)
         existing = known_entries(self.known_hosts_path, host.known_key)
-        scanned = self._scan(thread_id, inv, host)
+        scanned, why = self._scan(thread_id, inv, host)
         if not fp:
             if not scanned:
-                return out({"host": host.name, "error": "aucune clé d'hôte reçue (hôte injoignable ?)"}, True)
+                return out({"host": host.name, "error": "aucune clé d'hôte reçue (hôte injoignable ?)",
+                            **({"hint": why} if why else {})}, True)
             return out({"host": host.name, "address": f"{host.address}:{host.port}", "role": host.role,
                         "known": bool(existing),
                         "keys": [{"type": t, "fingerprint": fingerprint(b),

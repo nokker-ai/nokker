@@ -164,7 +164,7 @@ class FolderRun:
     def save(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         data = {k: v for k, v in dataclasses.asdict(self).items() if k != "run_dir"}
-        tmp = self.run_dir / "run.json.tmp"
+        tmp = self.run_dir / f"run.json.{os.getpid()}.{threading.get_ident()}.tmp"  # unique : deux save() concurrents
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, self.run_dir / "run.json")
 

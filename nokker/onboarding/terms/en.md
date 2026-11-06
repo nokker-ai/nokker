@@ -1,6 +1,6 @@
 # Nokker — Private beta terms
 
-**Version 2 — 28 October 2026**
+**Version 3 — 5 November 2026**
 
 ## 1. Who we are
 The beta is offered by **Ninabot Sàrl**, c/o Openest coworking SA, Chemin de Riantbosson 19, 1217 Meyrin, Switzerland
@@ -28,7 +28,9 @@ beta; it is, however, one of the conditions of the benefit in § 9. If you accep
 - this data is **pseudonymised** before training (name, e-mail address and identifiers removed) and is **never sold**;
 - the **content coming from your connectors** (your e-mails, your calendar, your files, the pages visited by the
   browser) is **never** used for training; it is used only to carry out your requests;
-- you can **exclude a specific conversation** from this use.
+- you can **exclude a specific conversation** from this use;
+- this also applies to conversations whose answers come from the inference provider you chose (§ 5a): we keep the
+  conversation on our side; what your provider does with it is governed by its own terms.
 
 You can **withdraw** this consent at any time in "My account": from then on we stop using your data, and the benefit in
 § 9 ends if it has not yet been earned.
@@ -39,8 +41,31 @@ data (§ 7) deletes your raw data; it does not change models that have already b
 ## 5. Where your data is processed
 - During the beta, the platform is hosted **in France**, with a European provider (OVHcloud): your account, your
   conversations, your connectors and the computations of the AI models. Any payments go through **Stripe**, a payment provider. Data is encrypted in transit and at rest.
+- **Reading aloud** (if you use it): when you ask to listen to a reply, or when the agent replies to you with a voice
+  note on Telegram, the text of that reply only, never the conversation history or your attachments, is sent to
+  **ElevenLabs** (speech synthesis), which stores it **in the United States**. This transfer is governed by the
+  European Commission's standard contractual clauses, adapted to Swiss law, and by the Swiss–U.S. Data Privacy
+  Framework, to which ElevenLabs states that it adheres.
 - Your beta application remains stored **in Switzerland**.
 - An entirely Swiss hosting will be offered later to customers who need it.
+
+## 5a. Inference you choose (BYOK)
+- With the **BYOK** plan, and also with **Solo**, **Family** and **Large**, you can plug in **your own inference
+  provider** (an OpenAI-compatible API: its address, the model and your key). To produce answers, Nokker sends it
+  **your messages and the context needed for the turn** (memory excerpts, tool results, connector content used to
+  answer).
+- Supporting functions (memory recall, reviews, guide, goal checker) are still processed by **our models**, under
+  § 5, and are included in your plan.
+- That provider is **a processor you choose yourself**, under **its** terms and in **its** hosting country. Ninabot Sàrl
+  does not choose or control it and is not responsible for its processing or availability. Check its terms, in
+  particular on retention and training, before plugging it in.
+- Your key is stored **encrypted** in our vault, never shown again after you enter it, and used only to call the
+  address where you gave it: if you change that address, the key is removed. You can remove it at any time.
+- The BYOK plan includes **no Nokker inference** for answers: with no provider configured, Nokker asks you to set one
+  up and does not answer. With Solo, Family or Large, the included inference remains available.
+- If your plan no longer includes BYOK (end of subscription), Nokker switches back to **its own model**, within the
+  limits of the plan that then applies (§ 8).
+- Inference is **billed by your provider**, directly to you.
 
 ## 6. Connectors and actions
 - You choose the services you connect (mail, calendar, Telegram…) and you can disconnect them at any time from the
@@ -63,6 +88,12 @@ Usage is counted in **messages** (one message = one conversation turn with Nokke
 **40 messages per day and 200 per week**, over fixed-time windows shown in "My account" (with the reset time, Zurich time).
 During the beta, **we warn you when you go over, without cutting you off**, while these limits are being calibrated;
 a safety cap of 150 messages per day still applies against abuse.
+
+**Prices.** Prices are in **Swiss francs (CHF)**, per month, and are final: Ninabot Sàrl is not registered for VAT.
+Payment is processed by Stripe.
+
+**BYOK.** Turns answered by your own provider (§ 5a) **are not counted** against the quotas above; the safety cap
+against abuse (150 messages a day) still applies.
 
 ## 9. "Solo free for 6 months" benefit
 At the end of the 30 days, participants who have **played the game** move to the **free Solo offer for 6 months**.

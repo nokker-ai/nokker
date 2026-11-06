@@ -576,6 +576,8 @@ def test_flags_do_not_change_what_the_model_sees():
     _, p0, _ = run(list(THREE_CALLS), rec=off)
     _, p1, _ = run(list(THREE_CALLS), rec=on)
     assert p0.seen == p1.seen
-    strip = lambda rows: [{**r, "meta": {k: v for k, v in r["meta"].items() if k not in ("flags", "latency_s")},
-                           "recorded_at": ""} for r in rows]
+    def strip(rows):
+        return [{**r, "meta": {k: v for k, v in r["meta"].items() if k not in ("flags", "latency_s")},
+                 "recorded_at": ""} for r in rows]
+
     assert strip(off.sink.rows) == strip(on.sink.rows)

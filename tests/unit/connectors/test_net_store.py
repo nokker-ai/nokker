@@ -101,7 +101,7 @@ def test_store_roundtrip_never_leaks_secret_in_status_or_repr():
     assert "s3cret-pass" not in repr(st.get("us_1", "mail"))
     assert [s.kind for s in st.statuses("us_1")] == ["mail"] and not hasattr(st.statuses("us_1")[0], "secret")
     assert st.statuses("us_2") == [] and st.get("us_2", "mail") is None
-    assert st._rows[("us_1", "mail")]["sealed"] != b"s3cret-pass"
+    assert st._rows[("us_1", st.get("us_1", "mail").id)]["sealed"] != b"s3cret-pass"
     st.mark_ok("us_1", "mail")
     assert st.get("us_1", "mail").last_ok_at is not None
     st.put("us_1", "mail", {"address": "new@b.org"}, "other-pass")  # remplacement : last_ok_at repart à zéro

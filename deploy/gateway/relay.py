@@ -5,7 +5,8 @@ Un Lokkal ouvre une connexion SORTANTE `wss://relay.nokker.app/v1/tunnel` (jeton
 JSON (`req` / `res` / `body` / `cancel` / `ping`).
 
 Le relais filtre AVANT la machine : sur `/v1/*`, seul un jeton d'accès ou de délégation de nokker.ai, signé, du MÊME
-compte que la machine, passe ; hors `/v1`, GET/HEAD seulement (fichiers de l'interface) ; jamais de jeton local ;
+compte que la machine, passe (seule exception : `GET /v1/cast/<id>/frame?exp=&sig=`, URL signée par le noyau, voir
+CAST_FRAME_PATH_RE) ; hors `/v1`, GET/HEAD seulement (fichiers de l'interface) ; jamais de jeton local ;
 cookies retirés dans les deux sens. Pages : origine séparée, CSP `sandbox` + `frame-ancestors`, entrée par un jeton de
 pages à usage unique (`/_auth`), puis cookie `__Host-nk_pg` (onglet) ou capacité d'URL `/_s/<cap>/` (iframe, `embed=1` :
 pas de cookie tiers, qui ne passe plus une fois nokker.app sur la PSL ni depuis nokker.ai).
@@ -77,6 +78,12 @@ STRIP_REQ = HOP | {"cookie", "x-forwarded-for", "x-forwarded-host", "x-forwarded
                    "x-nokker-relay", "x-nokker-account", "x-nokker-local", "forwarded", "cf-connecting-ip",
                    "cf-ray", "cf-visitor", "cf-ipcountry", "cdn-loop", "cf-access-jwt-assertion"}
 STRIP_RES = HOP | {"set-cookie"}
+# Cadre d'un aperçu d'écran (docs/SCREEN-CAST.md, noyau `GET /v1/cast/{id}/frame?exp=&sig=`) : la SEULE route /v1 qui
+# passe sans jeton signé de nokker.ai, parce qu'un `<iframe src>` ne pose jamais `Authorization`. La preuve est l'URL
+# signée par le noyau (HMAC, 2 min), vérifiée par le noyau. Motif exact sur le chemin BRUT (rien de décodé : ni %2F, ni
+# `..`, ni barre finale), GET seulement, requête faite d'exactement `exp` et `sig`, une fois chacun, rien d'autre.
+CAST_FRAME_PATH_RE = re.compile(r"^/v1/cast/cast_[0-9a-f]{12}/frame$")
+CAST_FRAME_QS_RE = re.compile(r"^(?:exp=[0-9]{10,12}&sig=[0-9a-f]{32}|sig=[0-9a-f]{32}&exp=[0-9]{10,12})$")
 PAGES_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
 PAGES_TOKEN_MAX_TTL = 60          # jeton de pages : exp − iat (BUBBLES §10.3)
 CAP_TTL = 3600                    # capacité d'URL des iframes
@@ -381,6 +388,14 @@ def bearer(req: web.Request) -> str | None:
     return h[7:].strip() if h[:7].lower() == "bearer " else None
 
 
+def is_cast_frame(req: web.Request) -> bool:
+    """`GET /v1/cast/<id>/frame?exp=<n>&sig=<hex>`, exactement (voir CAST_FRAME_PATH_RE)."""
+    if req.method != "GET":
+        return False
+    path, sep, qs = req.raw_path.partition("?")
+    return bool(sep) and bool(CAST_FRAME_PATH_RE.match(path)) and bool(CAST_FRAME_QS_RE.match(qs))
+
+
 def looks_local(tok: str) -> bool:
     """Le jeton local (docs/LOKKAL.md §7.4.5) n'est pas un JWT : tout jeton qui n'a pas la forme a.b.c est refusé."""
     return tok.count(".") != 2
@@ -557,6 +572,9 @@ class Relay:
     # ---- requêtes du navigateur
     async def app(self, req: web.Request, t: Tunnel) -> web.StreamResponse:
         tenant = None
+        if is_cast_frame(req):
+            # Sans jeton : ni Authorization ni compte ne partent vers la machine ; seule la signature de l'URL décide.
+            return await self.forward(req, t, req.raw_path, None, extra={}, strip=frozenset({"authorization"}))
         if req.path.startswith("/v1/") or req.path == "/v1":
             tok = bearer(req)
             if not tok or looks_local(tok) or req.headers.get("X-Nokker-Local"):
@@ -880,12 +898,12 @@ class Relay:
 
     async def forward(self, req: web.Request, t: Tunnel, path: str, tenant: str | None, extra: dict,
                       pages_host: str | None = None, location_prefix: str | None = None,
-                      response_timeout: float | None = None) -> web.StreamResponse:
+                      response_timeout: float | None = None, strip: frozenset = frozenset()) -> web.StreamResponse:
         if t.closed.is_set():
             return web.Response(status=502, text="machine hors ligne\n")
         if req.content_length and req.content_length > MAX_BODY:
             return web.Response(status=413, text="corps trop gros\n")
-        headers = [[k, v] for k, v in req.headers.items() if k.lower() not in STRIP_REQ]
+        headers = [[k, v] for k, v in req.headers.items() if k.lower() not in STRIP_REQ and k.lower() not in strip]
         headers += [["Host", f"{t.machine.name}.{self.s.domain}" if pages_host is None else pages_host],
                     ["X-Nokker-Relay", "1"],
                     ["X-Forwarded-For", req.headers.get("CF-Connecting-IP", req.remote or "")],

@@ -33,6 +33,7 @@ class Front(Protocol):
     def redeem(self, token: str) -> dict[str, Any]: ...
     def release(self, invitation_id: int) -> None: ...
     def send_code(self, email: str, code: str, lang: str) -> None: ...
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]: ...
 
 
 Transport = Callable[[str, dict[str, Any], dict[str, str], float], tuple[int, dict[str, Any]]]
@@ -105,6 +106,17 @@ class FrontInvitations:
         """Code de connexion (6 chiffres) : front1 l'envoie avec son gabarit figé, seulement à une adresse invitée."""
         self._internal("auth/code/send", {"email": email, "code": code, "lang": lang})
 
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]:
+        """Invitation ouverte par un code de campagne (`voucher_grants_invite`) : front1 crée l'invitation de cette
+        adresse et l'envoie (lien d'invitation avec `code=` pour le Checkout). Le noyau a déjà refusé ou réservé."""
+        r = self._internal("voucher/invite", {"email": email, "lang": lang, "code": code})
+        return {k: r[k] for k in ("invitation_id", "expires_at") if k in r}
+
+    def send_trial_reminder(self, email: str, lang: str, kind: str, info: dict[str, Any]) -> None:
+        """Rappel de fin d'essai (voucher) : `kind` = `trial_7d` | `trial_2d`, `info` = {plan, first_charge_at, price}.
+        Le front l'envoie avec son gabarit figé (expéditeur commercial, repli beta@)."""
+        self._internal("billing/trial-reminder", {"email": email, "lang": lang, "kind": kind, **info})
+
 
 class MemoryFront:
     """Faux front1 en mémoire (tests de la console et du parcours). Un jeton émis par `send` se lit dans `.tokens`."""
@@ -173,3 +185,13 @@ class MemoryFront:
         if self.fail_send:
             raise FrontError("send_failed", 502)
         self.codes.append((email, code, lang))
+
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]:
+        if self.fail_send:
+            raise FrontError("send_failed", 502)
+        inv_id = len(self.tokens) + 1
+        token = secrets.token_urlsafe(16)
+        self.tokens[token] = {"id": inv_id, "candidature_id": None, "email": email, "lang": lang, "prenom": "",
+                              "redeemed": False, "superseded": False, "voucher": code}
+        self.sent.append({"invitation_id": inv_id, "to": email, "lang": lang, "voucher": code, "actor": "voucher"})
+        return {"invitation_id": inv_id, "expires_at": "2026-10-29T09:00:00Z"}

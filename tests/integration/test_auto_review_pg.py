@@ -29,9 +29,18 @@ def test_auto_review_round_trip_and_isolation(pg, pod_env, monkeypatch):  # noqa
             assert got.auto_review["decision"] == "reject" and got.auto_review["model"] == "m"
             assert approvals.revoke_auto_review(card.id, "us_a").status == "pending"
             assert approvals.get(card.id).auto_review["revoked_by"] == "us_a"
+            approvals.record_rollback(card.id, "us_a", checkpoint_id=card.id, restored=["a"], conflicts=[])
+        import psycopg
+
+        with psycopg.connect(pg["su"]) as conn:
+            row = conn.execute("SELECT data->>'by', data->'restored', data->'conflicts' FROM approval_events "
+                               "WHERE approval_id = %s AND event_type = 'auto_review_rollback'", (card.id,)).fetchone()
+        assert row == ("us_a", ["a"], [])
         with tenant_scope(B):
             assert approvals.get(card.id) is None
             with pytest.raises(ApprovalNotFound):
                 approvals.decide_auto(card.id, "approve", "x")
+            with pytest.raises(ApprovalNotFound):  # un autre locataire n'écrit rien au journal de la carte
+                approvals.record_rollback(card.id, "us_b", checkpoint_id=card.id, restored=[], conflicts=[])
     finally:
         approvals.close()

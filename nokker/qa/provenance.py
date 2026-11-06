@@ -62,6 +62,13 @@ SOURCES: dict[str, tuple[str, Trust]] = {
 
 MAIL_TOOLS = frozenset({"mail_search", "mail_read"})
 WEB_TOOLS = frozenset({"web_search", "web_fetch"})
+# Pack Essentiels (docs/ESSENTIALS.md) : sources publiques récupérées sur le réseau (même rang que le web). Les outils de
+# calcul local du pack (`unit_convert`, `math_calc`, `date_calc`, `holidays`) ne lisent rien d'extérieur : rang « outil ».
+ESSENTIALS_WEB_TOOLS = frozenset({"weather_ch", "pollen", "transit_departures", "transit_trip", "fx_rate",
+                                  "wiki_summary", "avalanche_bulletin",
+                                  # vague 2 (`essentials_v2`) : toutes des sources publiques récupérées sur le réseau
+                                  "weather_alerts_fr", "mobility_nearby", "charging_nearby", "water_status", "air_quality_fr",
+                                  "school_holidays"})
 DELEGATE_TOOLS = frozenset({"delegate", "delegate_status"})
 MEMORY_TOOLS = frozenset({"memory_search", "memory_get", "recall_context"})
 WORKSPACE_TOOLS = frozenset({"read_file", "search_files", "write_file", "patch", "terminal", "process_start",
@@ -283,7 +290,7 @@ class ProvenanceGuard:
     def source_of(self, name: str, spec: Any, arguments: dict[str, Any]) -> str:
         if name in MAIL_TOOLS:
             return "mail"
-        if name in WEB_TOOLS or name.startswith("browser"):
+        if name in WEB_TOOLS or name in ESSENTIALS_WEB_TOOLS or name.startswith("browser"):
             return "web"
         if name in DELEGATE_TOOLS:
             return "sous-agent"

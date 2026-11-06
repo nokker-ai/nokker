@@ -590,3 +590,69 @@ async def test_pages_miroir_seulement_hors_ligne(menv):
     r = await c.get(f"/_auth?token=p.ok3.sig&to=/{PG}", headers=H("jean--pages.nokker.app"), allow_redirects=False)
     assert r.status == 302 and mirror.calls == []  # en ligne : la machine sert, le miroir n'est pas consulté
     task.cancel(); await ws.close()
+
+
+CAST = "/v1/cast/cast_0123456789ab/frame"
+EXP, SIG = "2000000120", "0123456789abcdef0123456789abcdef"
+
+
+async def test_cadre_cast_sans_jeton_motif_exact(env):
+    """La bulle cast charge `<iframe src=/v1/cast/<id>/frame?exp=&sig=>` : sans jeton (l'iframe n'en pose pas), seule
+    route /v1 qui passe ainsi ; la signature est vérifiée par le noyau. Tout chemin voisin reste refusé (401)."""
+    _, c = env
+    seen = []
+    ws, task = await open_tunnel(c, seen=seen)
+    ok = [f"{CAST}?exp={EXP}&sig={SIG}", f"{CAST}?sig={SIG}&exp={EXP}"]
+    for u in ok:
+        r = await c.get(u, headers=H(Authorization="Bearer a.jean.sig", Cookie="x=1"))
+        assert r.status == 200, u
+    assert [f["path"] for f, _ in seen] == ok
+    for f, _ in seen:
+        hdrs = {k.lower() for k, _ in f["headers"]}
+        assert not hdrs & {"authorization", "cookie", "x-nokker-account"}
+    seen.clear()
+    refus = [
+        CAST,                                                   # sans signature
+        f"{CAST}?exp={EXP}",                                    # sig absente
+        f"{CAST}?sig={SIG}",                                    # exp absente
+        f"{CAST}?exp={EXP}&sig={SIG}&x=1",                      # paramètre en plus
+        f"{CAST}?exp={EXP}&sig={SIG}&sig={SIG}",                # sig en double
+        f"{CAST}?exp={EXP}&exp={EXP}&sig={SIG}",                # exp en double
+        f"{CAST}?exp={EXP}&sig={SIG[:-1]}",                     # signature tronquée
+        f"{CAST}?exp={EXP}&sig={SIG.upper()}",                  # pas l'hexa du noyau
+        f"{CAST}?exp=abc&sig={SIG}",                            # exp non numérique
+        f"{CAST}/?exp={EXP}&sig={SIG}",                         # barre finale
+        f"/v1/cast/cast_0123456789ab/frame-url?exp={EXP}&sig={SIG}",
+        f"/v1/cast/cast_0123456789ab/state?exp={EXP}&sig={SIG}",
+        f"/v1/cast/cast_0123456789ab?exp={EXP}&sig={SIG}",
+        f"/v1/cast/cast_0123456789ab/frame/x?exp={EXP}&sig={SIG}",
+        f"/v1/cast/cast_0123456789abc/frame?exp={EXP}&sig={SIG}",   # id trop long
+        f"/v1/cast/CAST_0123456789ab/frame?exp={EXP}&sig={SIG}",
+        f"/v1/threads?exp={EXP}&sig={SIG}",
+        f"/v1/local/sessions?exp={EXP}&sig={SIG}",
+    ]
+    for u in refus:
+        r = await c.get(u, headers=H())
+        assert r.status == 401, u
+    for m in ("POST", "PUT", "DELETE", "HEAD", "OPTIONS"):
+        r = await c.request(m, f"{CAST}?exp={EXP}&sig={SIG}", headers=H())
+        assert r.status == 401, m
+    assert seen == []                     # rien n'est parti vers la machine
+    task.cancel(); await ws.close()
+
+
+def test_cadre_cast_chemin_brut():
+    """Le motif porte sur le chemin BRUT : un client HTTP normalise `..` ou `//` avant l'envoi, mais rien ne garantit
+    qu'un attaquant le fasse ; ni décodage (%2F, %61), ni normalisation par le relais."""
+    from aiohttp.test_utils import make_mocked_request
+    q = f"?exp={EXP}&sig={SIG}"
+    assert R.is_cast_frame(make_mocked_request("GET", CAST + q))
+    for path in ("/v1/cast/x/../cast_0123456789ab/frame", "/v1/cast/./cast_0123456789ab/frame",
+                 "/v1/cast/cast_0123456789ab%2Fframe", "/v1/cast/cast_0123456789ab/fr%61me",
+                 "/v1//cast/cast_0123456789ab/frame", "/v1/cast/cast_0123456789ab/frame/",
+                 "/v1/cast/cast_0123456789ab/frame;x", "/V1/cast/cast_0123456789ab/frame"):
+        assert not R.is_cast_frame(make_mocked_request("GET", path + q)), path
+    for qs in ("?exp=%32000000120&sig=" + SIG, "?exp=" + EXP + "&sig=" + SIG + "&", "?&exp=" + EXP + "&sig=" + SIG,
+               "?exp=" + EXP + ";sig=" + SIG, "?exp=+" + EXP + "&sig=" + SIG, "?"):
+        assert not R.is_cast_frame(make_mocked_request("GET", CAST + qs)), qs
+    assert not R.is_cast_frame(make_mocked_request("HEAD", CAST + q))

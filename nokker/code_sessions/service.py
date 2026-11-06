@@ -120,6 +120,7 @@ class CodeSessions:
     parent_registry: Callable[[], Any] | None = None  # le registre du locataire courant (filtré pour l'enfant)
     emit: Callable[[str, dict[str, Any]], Any] | None = None  # EventBus.publish : subagent.*, skill.untrusted
     parent_observer: Any = None  # BubbleHub : l'enfant le nourrit (son fil y naît au nom du propriétaire)
+    delegate_tier: bool = False  # paramètre `tier` de `delegate` (drapeau `delegate_tier`)
     delegate_fork: bool = False  # mode fork de `delegate` (drapeau `delegate_fork`, nokker/context/fork.py)
     skills_fallback: Callable[[], Any] | None = None  # skills du compte (packs du web), hors session et après le dépôt
     # Injection des secrets à la sortie (`code.egress_secrets`, nokker/egress/kernel.py `EgressSecrets`) ; None = éteint.
@@ -677,7 +678,8 @@ class CodeSessions:
                     lambda registry, thread_id, observer: self.kernel_factory(registry, thread_id, observer),
                     self.tools(), max_children=n, max_background=n, max_live=n, require_isolation=True,
                     background=True, emit=self._emitter(s), parent_observer=self.parent_observer,
-                    note=self.note, state_path=self._subagents_state(s), fork=self.delegate_fork)
+                    note=self.note, state_path=self._subagents_state(s), fork=self.delegate_fork,
+                    tier=self.delegate_tier)
                 d.bind(self._parent_registry)
                 self._delegates[s.id] = d
         return d

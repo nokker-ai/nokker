@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from nokker.core.ports import Completion, RouteState
@@ -60,6 +61,7 @@ def test_small_talk_is_trivial_but_go_never_is():
         assert classify_rules(text).task is not TaskClass.TRIVIAL, text
 
 
+@pytest.mark.skipif(not LABELS.exists(), reason="bench/route absent (arbre public)")
 def test_labelled_bench_has_no_go_on_the_small_tier_and_few_errors():
     rows = yaml.safe_load(LABELS.read_text())
     wrong = []
@@ -88,7 +90,9 @@ def test_model_classifier_never_makes_a_request_after_a_thank_you_trivial():
 # ── type de tour ──
 
 def test_turn_kinds():
-    k = (lambda text, task=TaskClass.CONVERSATION, channel="": turn_kind(text, task, channel))
+    def k(text, task=TaskClass.CONVERSATION, channel=""):
+        return turn_kind(text, task, channel)
+
     assert k("corrige le bug", TaskClass.CODE) == "code"
     assert k("ok vas-y") == "approval"
     assert k("Pourquoi le disque du serveur est plein ?") == "infra_read"

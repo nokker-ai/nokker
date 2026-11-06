@@ -129,6 +129,7 @@ def test_session_block_exact_text():
         "Pièce : Salon\n"
         "Interlocuteur : non identifié (droits de la pièce). Ne dis à voix haute aucune information personnelle "
         "d'un membre (courrier, agenda, messages) ; s'il en faut une, propose de l'envoyer sur son appareil.\n"
+        "Langue : celle de la personne qui parle (pas celle de ce bloc).\n"
         "Sortie : voix dans la pièce. Réponds en une phrase courte, à l'oral, sans mise en forme, ni liste, ni lien : "
         "la personne va parler.\n"
         "[/Session vocale]")

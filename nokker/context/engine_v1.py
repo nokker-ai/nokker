@@ -93,6 +93,9 @@ class ContextEngineV1(ContextEngineV0):
                 parts.append(f"[Rappel mémoire]\n{rappel}\n[/Rappel]")
             if imported:  # lot 30 d : données importées, bloc à part (nokker/context/imported.py)
                 parts.append(render_imported(imported, self.recall_text_limit))
+            notes = self.feature_notes_block(turn)
+            if notes:  # drapeau `feature_notes` : après le rappel mémoire, avant le contexte reçu
+                parts.append(notes)
             if turn.injected:
                 parts.append(render_injected(turn.injected))
             if turn.attached:

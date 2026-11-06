@@ -17,11 +17,11 @@ from nokker.core.turn import Decision, Effect, InputCheck, ToolCall, ToolResult,
 from nokker.qa.invariants import Allowlist, DeterministicInvariants
 from nokker.qa.provenance import ProvenanceGuard, Trust, atoms_of, build_provenance, norm
 
-BENCH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "bench", "provenance")
+BENCH = os.path.join(os.path.dirname(__file__), "prov_rig")
 sys.path.insert(0, os.path.abspath(BENCH))
 
-import prov_harness as harness
-import prov_scenarios as scenarios
+import prov_harness as harness  # noqa: E402
+import prov_scenarios as scenarios  # noqa: E402
 
 # Empreinte de ce que le faux modèle voit sur les 37 scénarios du banc, drapeau ÉTEINT, mesurée sur la BASE
 # (23e3a29, avant ce chantier) avec `NOKKER_BANC_SRC=<arbre de la base> python -I bench/provenance/run.py --seen-only`.

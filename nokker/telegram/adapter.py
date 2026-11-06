@@ -130,6 +130,9 @@ class TelegramAdapter:
     # Foyer du compte pour le lexique de prononciation (docs/VOICE.md §6) : `(compte) -> SpeakScope | None`. None
     # (défaut) : rien n'est passé au fournisseur de voix, comme avant.
     speak_scope: Callable[[Any], Any] | None = None
+    # Conditions à réaccepter (`onboarding.http.terms_outdated_for`) : `(account_id) -> bool`. Vrai : AUCUNE note vocale
+    # (aucun texte chez le fournisseur de voix), texte seul. None (défaut) : rien ne change.
+    terms_outdated: Callable[[str], bool] | None = None
     # Transcription d'une note vocale entrante : `(message Telegram) -> texte | None`. None (défaut du noyau) = une note
     # vocale reçoit « je ne lis que le texte », comme avant ; la STT de la passerelle amont n'est pas dans le noyau.
     transcribe: Callable[[dict[str, Any]], str | None] | None = None
@@ -214,6 +217,15 @@ class TelegramAdapter:
         send_voice = getattr(self.bot, "send_voice", None)
         if send_voice is None:
             return
+        if self.terms_outdated is not None:
+            acc_id = getattr(account, "account_id", None)
+            try:
+                blocked = acc_id is not None and self.terms_outdated(acc_id)  # pas de compte : interne, non bloqué
+            except Exception:  # noqa: BLE001 — état des conditions illisible : pas d'envoi au fournisseur
+                logger.warning("conditions du compte illisibles (chat %s) : texte seul", chat_id, exc_info=True)
+                blocked = True
+            if blocked:
+                return
         scope = None
         if self.speak_scope is not None and account is not None:
             try:

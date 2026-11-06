@@ -13,21 +13,32 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nokker.billing.plans import ACTIVE_STATUSES, Plan
 from nokker.billing.store import BillingStore, ts
 from nokker.billing.stripe import StripeClient, StripeError, verify_signature
+from nokker.billing.voucher import RESERVE_S, VoucherError, Vouchers, trial_end_for
 from nokker.tenancy.context import tenant_scope
 from nokker.tenancy.store import Account
 
 logger = logging.getLogger("nokker.billing")
 
 SUB_EVENTS = ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted")
+CHECKOUT_EVENTS = ("checkout.session.completed", "checkout.session.expired")
 CAPS_TTL_S = 30.0
+# Monnaie du Checkout et des prix affichés (décision produit du 05.11 : CHF partout). Les prix Stripe gardent leurs
+# `currency_options` EUR ; la session impose le franc.
+CURRENCY = "chf"
+PRICE_TTL_S = 3600.0  # prix lus sur Stripe, gardés une heure
+PRICE_RETRY_S = 300.0  # Stripe n'a pas répondu : pas de prix affiché, nouvel essai après 5 min
+# Paliers hors coupon bêta (décision du 05.11 : le coupon ne vaut pas pour BYOK).
+NO_COUPON_PLANS = frozenset({"byok"})
 
 
 class BillingError(Exception):
-    """`code` : `unknown_plan`, `already_subscribed`, `no_customer`, `stripe_unavailable`, `unknown_price`, `bad_event`."""
+    """`code` : `unknown_plan`, `already_subscribed`, `no_customer`, `stripe_unavailable`, `unknown_price`, `bad_event`,
+    et les refus de voucher `code_invalid|code_expired|code_exhausted|code_used|code_customer`."""
 
     def __init__(self, code: str, status: int = 400):
         super().__init__(code)
@@ -36,16 +47,20 @@ class BillingError(Exception):
 
 class Billing:
     def __init__(self, *, store: BillingStore, stripe: StripeClient, plans: dict[str, Plan], prices: dict[str, str],
-                 webhook_secret: str, app_url: str, clock: Callable[[], float] = time.time, coupon: str = "") -> None:
+                 webhook_secret: str, app_url: str, clock: Callable[[], float] = time.time, coupon: str = "",
+                 vouchers: Vouchers | None = None) -> None:
         if not webhook_secret:
             raise ValueError("secret de webhook requis")
         self.store, self.stripe, self.plans, self.prices = store, stripe, plans, prices
         # Coupon de bêta (`billing_coupon`, décision du 25.10) : id d'un coupon Stripe posé sur CHAQUE Checkout. Vide =
         # aucune remise.
         self.coupon = (coupon or "").strip()
+        # Vouchers d'essai (nokker/billing/voucher.py) : None = pas d'essai possible (tout code est `code_invalid`).
+        self.vouchers = vouchers
         self._by_price = {v: k for k, v in prices.items()}
         self._secret, self._app_url, self._clock = webhook_secret, app_url.rstrip("/"), clock
         self._caps: dict[str, tuple[float, str | None, dict[str, int] | None]] = {}
+        self._prices: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._lock = threading.Lock()
 
     # ── état ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -84,7 +99,42 @@ class Billing:
                 "status": sub["status"] if sub else None,
                 "current_period_end": end.isoformat() if end else None,
                 "cancel_at_period_end": bool(sub and sub["cancel_at_period_end"]),
-                "plans": [{"id": p, "caps": self.plans[p].caps} for p in self.prices if p in self.plans]}
+                "trial_end": sub["trial_end"].isoformat() if sub and sub.get("trial_end") else None,
+                "plans": [{"id": p, "caps": self.plans[p].caps, **self._price_field(p)}
+                          for p in self.prices if p in self.plans]}
+
+    # ── prix affichés ─────────────────────────────────────────────────────────────────────────────────────────────
+    def _price_field(self, plan: str) -> dict[str, Any]:
+        info = self.price(plan)
+        return {"price": info} if info else {}
+
+    def price(self, plan: str) -> dict[str, Any] | None:
+        """`{amount, currency, interval}` du palier lu sur Stripe (seule source), en unités de la monnaie (19 = 19 CHF,
+        9.5 = 9,50 CHF), monnaie en majuscules, `interval` de Stripe (`month`). None si Stripe ne répond pas ou si le
+        prix n'a pas de montant en `CURRENCY` : l'écran n'affiche alors pas de prix. Gardé `PRICE_TTL_S`."""
+        pid = self.prices.get(plan)
+        if not pid:
+            return None
+        now = self._clock()
+        with self._lock:
+            hit = self._prices.get(pid)
+        if hit and now < hit[0]:
+            return hit[1]
+        info: dict[str, Any] | None = None
+        try:
+            info = price_info(self.stripe.get_price(pid), CURRENCY)
+            ttl = PRICE_TTL_S if info else PRICE_RETRY_S
+        except StripeError as e:
+            logger.warning("billing: prix %s illisible chez Stripe (%s) : pas de prix affiché pour %s", pid, e.code, plan)
+            ttl = PRICE_RETRY_S
+        with self._lock:
+            self._prices[pid] = (now + ttl, info)
+        return info
+
+    def warm_prices(self) -> None:
+        """Lit les prix de tous les paliers (au démarrage, hors du chemin d'une requête)."""
+        for plan in self.prices:
+            self.price(plan)
 
     # ── Checkout et portail ───────────────────────────────────────────────────────────────────────────────────────
     def _customer(self, account: Account) -> str:
@@ -94,26 +144,70 @@ class Billing:
         created = self.stripe.create_customer(account.email, account.tenant_id, account.account_id)
         return self.store.put_customer(created, account.tenant_id, account.account_id)
 
-    def coupon_for(self, account: Account) -> str | None:
+    def coupon_for(self, account: Account, plan: str = "") -> str | None:
         """Coupon Stripe à appliquer au Checkout de ce compte, ou None. Bêta : le coupon global `billing_coupon` pour
-        tous. L'ouverture publique demandera un coupon PAR COMPTE éligible (docs/LOKKAL-ROADMAP.md, 25.10) : ce
-        résolveur est le seul endroit à changer."""
+        tous les paliers hors `NO_COUPON_PLANS`. L'ouverture publique demandera un coupon PAR COMPTE éligible
+        (docs/LOKKAL-ROADMAP.md, 25.10) : ce résolveur est le seul endroit à changer."""
+        if plan in NO_COUPON_PLANS:
+            return None
         return self.coupon or None
 
-    def checkout(self, account: Account, plan: str) -> str:
+    # ── vouchers d'essai ──────────────────────────────────────────────────────────────────────────────────────────
+    def _voucher_refusal(self, account: Account, code: str) -> str | None:
+        if self.vouchers is None:
+            return "code_invalid"
+        with tenant_scope(account.tenant_id):
+            if self.store.subscription(account.tenant_id) is not None:  # même annulé : l'essai est pour les nouveaux
+                return "code_customer"
+        return self.vouchers.check(code, account.tenant_id, account.email)
+
+    def voucher_status(self, account: Account, code: str) -> dict[str, Any]:
+        """Vérification sans écriture (`GET /v1/billing/voucher`) : `{ok, months, first_charge_on}` ou `{ok: false,
+        error}`. La date est celle d'un Checkout fait maintenant."""
+        why = self._voucher_refusal(account, code)
+        if why:
+            return {"ok": False, "error": why}
+        assert self.vouchers is not None
+        end = trial_end_for(self._clock(), self.vouchers.tz)
+        return {"ok": True, "months": 1, "first_charge_on": end.astimezone(ZoneInfo(self.vouchers.tz)).date().isoformat()}
+
+    def _trial_checkout(self, account: Account, plan: str, code: str) -> str:
+        why = self._voucher_refusal(account, code)
+        if why:
+            raise BillingError(why)
+        assert self.vouchers is not None
+        try:
+            use_id, trial_end = self.vouchers.reserve(code, account.tenant_id, account.email, plan)
+        except VoucherError as e:
+            raise BillingError(e.code, e.status) from None
+        try:
+            customer = self._customer(account)
+            session, url = self.stripe.checkout_trial(
+                customer, self.prices[plan], account.tenant_id, plan, f"{self._app_url}/account?billing=success",
+                f"{self._app_url}/account?billing=cancel", account.lang, trial_end=int(trial_end.timestamp()),
+                expires_at=int(self._clock()) + RESERVE_S, voucher=str(use_id), currency=CURRENCY)
+        except StripeError:
+            self.vouchers.release(use_id)  # le code unique n'est pas perdu si Stripe ne répond pas
+            raise BillingError("stripe_unavailable", 502) from None
+        self.vouchers.attach_session(use_id, session)
+        return url
+
+    def checkout(self, account: Account, plan: str, code: str = "") -> str:
         if plan not in self.prices or plan not in self.plans:
             raise BillingError("unknown_plan")
         with tenant_scope(account.tenant_id):
             if self._live(account.tenant_id):
                 raise BillingError("already_subscribed", 409)  # changer de palier = portail Stripe
-        coupon = self.coupon_for(account)
+        if code:  # essai : jamais de coupon (le coupon bêta n'est pas cumulable)
+            return self._trial_checkout(account, plan, code)
+        coupon = self.coupon_for(account, plan)
         try:
             customer = self._customer(account)
 
             def session(with_coupon: str | None) -> str:
                 return self.stripe.checkout_session(
                     customer, self.prices[plan], account.tenant_id, plan, f"{self._app_url}/account?billing=success",
-                    f"{self._app_url}/account?billing=cancel", account.lang,
+                    f"{self._app_url}/account?billing=cancel", account.lang, currency=CURRENCY,
                     **({"coupon": with_coupon} if with_coupon else {}))
 
             if not coupon:
@@ -189,6 +283,8 @@ class Billing:
         result: dict[str, Any] = {"type": etype}
         if etype in SUB_EVENTS:
             result.update(self._subscription(etype, obj, created))
+        elif etype in CHECKOUT_EVENTS and self.vouchers is not None and (obj.get("metadata") or {}).get("voucher"):
+            result.update(self.vouchers.on_checkout(obj, completed=etype.endswith(".completed")))
         self.store.mark_event(event_id, etype)  # après le traitement : un échec laisse Stripe rejouer l'événement
         return result
 
@@ -210,7 +306,56 @@ class Billing:
             applied = self.store.upsert_subscription({
                 "stripe_subscription": str(obj["id"]), "stripe_customer": str(obj["customer"]), "plan": plan,
                 "status": status, "current_period_end": ts(end),
-                "cancel_at_period_end": bool(obj.get("cancel_at_period_end")), "last_event_at": ts(created)})
+                "cancel_at_period_end": bool(obj.get("cancel_at_period_end")), "last_event_at": ts(created),
+                "trial_end": ts(obj.get("trial_end")) if status == "trialing" else None})
         with self._lock:
             self._caps.pop(tenant_id, None)
-        return {"tenant": tenant_id, "plan": plan, "status": status, "applied": applied}
+        out = {"tenant": tenant_id, "plan": plan, "status": status, "applied": applied}
+        if self.vouchers is not None and applied:
+            moved = self.vouchers.on_subscription(obj, status)
+            if moved:
+                out["voucher"] = moved
+        return out
+
+    # ── rappels de fin d'essai (J+23, J+28) ──────────────────────────────────────────────────────────────────────
+    def remind_trials(self, send: Callable[[str, str, str, dict[str, Any]], None]) -> int:
+        """Envoie les rappels dus : `send(tenant_id, account_id, kind, info)` avec `kind` = `trial_7d` | `trial_2d` et
+        `info` = {plan, first_charge_at (ISO), price}. Marqué envoyé seulement après un envoi réussi ; un client
+        inconnu ou un envoi en échec est retenté au passage suivant. Rend le nombre envoyé."""
+        if self.vouchers is None:
+            return 0
+        self.vouchers.store.expire_reservations(datetime.fromtimestamp(self._clock(), tz=timezone.utc))
+        sent = 0
+        for use, col in self.vouchers.due_reminders():
+            owner = self.store.tenant_for_customer(str(use.get("stripe_customer") or ""))
+            if owner is None:
+                continue
+            with tenant_scope(owner[0]):
+                sub = self.store.subscription(owner[0])
+            if sub is not None and sub.get("cancel_at_period_end"):
+                continue  # essai résilié : rien ne sera débité, pas de rappel (il repart si la résiliation est annulée)
+            kind = "trial_7d" if col == "reminded_23" else "trial_2d"
+            info = {"plan": use["plan"], "first_charge_at": use["trial_end"].isoformat(), "price": self.price(use["plan"])}
+            try:
+                send(owner[0], owner[1], kind, info)
+            except Exception:  # noqa: BLE001 — un envoi raté est retenté ; il ne bloque pas les autres
+                logger.warning("billing: rappel d'essai %s non envoyé", kind, exc_info=True)
+                continue
+            self.vouchers.mark_reminded(use, col)
+            sent += 1
+        return sent
+
+
+def price_info(price: dict[str, Any], currency: str) -> dict[str, Any] | None:
+    """`{amount, currency, interval}` d'un objet Price de Stripe dans `currency` (monnaie principale ou
+    `currency_options`), ou None s'il n'y a pas de montant dans cette monnaie."""
+    cur = currency.lower()
+    if str(price.get("currency") or "").lower() == cur:
+        cents = price.get("unit_amount")
+    else:
+        cents = ((price.get("currency_options") or {}).get(cur) or {}).get("unit_amount")
+    if not isinstance(cents, int):
+        return None
+    amount: float | int = cents // 100 if cents % 100 == 0 else cents / 100
+    interval = str((price.get("recurring") or {}).get("interval") or "") or None
+    return {"amount": amount, "currency": cur.upper(), "interval": interval}

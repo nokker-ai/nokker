@@ -26,8 +26,8 @@ from nokker.approvals.crypto import (
     verify_p1363_signature, verify_telegram_init_data, verify_webauthn_assertion,
 )
 from nokker.approvals.errors import (
-    ApprovalExpired, ApprovalNotFound, ApprovalNotPending, DeviceNotApproved, DeviceNotFound, ProofInvalid,
-    StrongDeviceRequired,
+    ApprovalExpired, ApprovalNotFound, ApprovalNotPending, DeviceNotApproved, DeviceNotFound, NotLocalApproval,
+    ProofInvalid, StrongDeviceRequired,
 )
 from nokker.approvals.notify import ApprovalNotifier, NullNotifier
 from nokker.approvals.types import Device, Session
@@ -36,6 +36,8 @@ from nokker.core.turn import ToolCall, Turn, Verdict
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_of_thread, tenant_scope
 
 GUARDIAN_RULE = "household:guardian"  # = nokker.household.model.GUARDIAN_RULE (sans dépendre du foyer)
+PAY_RULE = "payments:to_pay"  # = nokker.payments.service.PAY_RULE (sans dépendre des paiements)
+LOCAL_PASSKEY_RP_ID = "localhost"
 
 logger = logging.getLogger("nokker.approvals")
 
@@ -87,6 +89,10 @@ class BaseApprovals:
     # §Événements) — `nokker/api/server.py` y branche l'EventBus de `/v1/events` (SSE). `None` = silence
     # (tous les tests unitaires de ce module).
     on_event: Callable[[str, dict], None] | None = None
+    # Bulle `approval` du fil (drapeau `approval_bubbles`, `BubbleHub`) : `approval_pending(carte)` quand la carte part
+    # aux humains (`notify_pending`), `approval_card_changed(carte)` à chaque changement de statut (décision, exécution,
+    # échec, expiration). `None` = aucune bulle (drapeau éteint).
+    card_observer: Any = None
     # Multi-locataire (docs/TENANCY.md §5) : locataire d'un compte `us_…` actif, `None` sinon
     # (`nokker.tenancy.resolve.account_tenant_fn`, câblé par `serve`). `None` = aucun testeur ne décide jamais rien.
     account_tenant: Callable[[str | None], str | None] | None = None
@@ -280,8 +286,18 @@ class BaseApprovals:
             self.notify_pending(approval)
         return approval
 
+    def _observe_card(self, method: str, approval: Approval) -> None:
+        obs = self.card_observer
+        if obs is None:
+            return
+        try:
+            getattr(obs, method)(approval)
+        except Exception:  # noqa: BLE001 — une bulle ratée ne bloque jamais la carte elle-même
+            logger.exception("bulle de la carte %s non suivie (%s)", approval.id, method)
+
     def notify_pending(self, approval: Approval) -> Approval:
         """Pousse la carte aux humains qui la décident (notificateur des opérateurs, ou celui du testeur)."""
+        self._observe_card("approval_pending", approval)
         if self.tenant_of(approval) != INTERNAL_TENANT:
             # Le notificateur Telegram écrit aux opérateurs internes : une carte de testeur ne leur part jamais. La carte
             # d'un profil mineur (X23) ne part pas non plus au mineur : son représentant la décide (/v1/household/approvals).
@@ -344,6 +360,7 @@ class BaseApprovals:
             approval.status = "expired"
             self._store_approval(approval)
             self._append_event(approval.id, "expired", {})
+            self._observe_card("approval_card_changed", approval)
 
     def mark_executed(self, approval_id: str, result_summary: str) -> Approval:
         """Posé par `nokker.approvals.executor.ApprovalExecutor` APRÈS un `decide(..., 'approve')`
@@ -355,6 +372,7 @@ class BaseApprovals:
         approval.status, approval.result_summary, approval.error = "executed", result_summary, None
         self._store_approval(approval)
         self._append_event(approval.id, "executed", {})
+        self._observe_card("approval_card_changed", approval)
         return approval
 
     def mark_failed(self, approval_id: str, error: str) -> Approval:
@@ -364,6 +382,7 @@ class BaseApprovals:
         approval.status, approval.error = "failed", error
         self._store_approval(approval)
         self._append_event(approval.id, "failed", {"error": error})
+        self._observe_card("approval_card_changed", approval)
         return approval
 
     def challenge(self, approval_id: str, ttl_s: float | None = None, *, bind_tool: bool = False) -> Challenge:
@@ -464,6 +483,7 @@ class BaseApprovals:
                 logger.exception("mandat de la carte %s non marqué refusé", approval.id)
         self._emit("approval.decided", {"approval_id": approval.id, "decision": approval.status,
                                         "by": approval.decided_by, "via": approval.decided_via}, approval.thread_id)
+        self._observe_card("approval_card_changed", approval)
 
     def decide(self, approval_id: str, decision: str, proof: Proof) -> Approval:
         with self._decision_lock:
@@ -482,6 +502,45 @@ class BaseApprovals:
                 except ValueError as e:
                     raise ProofInvalid(str(e)) from e
             approval = self._commit(approval, decision, decided_by, decided_via)
+        self._emit_decided(approval)
+        return approval
+
+    def decide_local_passkey(self, approval_id: str, decision: str, proof: Proof, *, origin: str,
+                             local_ok: Callable[[Approval], bool], owner: str) -> Approval:
+        """Décision signée par une passkey LOCALE (Lokkal, rpId `localhost`, origine `http://localhost:<port>`) —
+        docs/PAY-AGENT.md §11. N'est acceptée QUE pour une carte `payments:to_pay` dont le mandat est own_card
+        (`local_ok`) : toute autre carte lève `NotLocalApproval` et continue de se signer chez nokker.ai. Mêmes
+        contrôles que `decide` (défi de CETTE carte, usage unique du nonce, appareil approuvé qui décide, UV exigé), et
+        le mandat est scellé par la même preuve, vérifiée contre l'origine locale."""
+        if urlsplit(origin or "").hostname != LOCAL_PASSKEY_RP_ID:
+            raise ProofInvalid("origine de la passkey locale invalide (http://localhost:<port> attendu)")
+        with self._decision_lock:
+            approval = self._pending_card(approval_id, decision)
+            if approval.rule != PAY_RULE or not local_ok(approval):
+                raise NotLocalApproval("carte non signable en local : à signer sur nokker.ai")
+            device = self._load_device(proof.device_id or "")
+            if device is None:
+                raise ProofInvalid("appareil inconnu")
+            if not proof.webauthn_signature:
+                raise ProofInvalid("preuve WebAuthn attendue (passkey locale)")
+            nonce, decided_via = self.verify_signed_decision(approval, decision, proof, device, origin=origin,
+                                                             rp_id=LOCAL_PASSKEY_RP_ID)
+            if not self._consume_nonce(nonce, approval_id):
+                raise ProofInvalid("nonce de défi invalide, expiré, ou déjà utilisé")
+            decided_by = device.user
+            # Le propriétaire de la machine, sur SA machine (Lokkal : locataire interne) : son appareil seulement, sur
+            # une carte qu'il voit. (`decider_allowed` ne s'applique pas : `local-owner` n'est ni un compte us_… ni un
+            # opérateur de la config.)
+            if decided_by != owner.strip().lower() or self.tenant_of(approval) != INTERNAL_TENANT \
+                    or not self.visible_to(owner, approval):
+                raise ProofInvalid(f"utilisateur non autorisé à décider : {decided_by!r}")
+            if decision == "approve" and self._pays(approval):
+                try:
+                    self.payment_mandates.check_and_seal(approval, proof, device, decided_by, decided_via,
+                                                         origin=origin, rp_id=LOCAL_PASSKEY_RP_ID)
+                except ValueError as e:
+                    raise ProofInvalid(str(e)) from e
+            approval = self._commit(approval, decision, decided_by, "local-passkey")
         self._emit_decided(approval)
         return approval
 
@@ -585,6 +644,20 @@ class BaseApprovals:
         if approval.status == "pending":
             self.notify_pending(approval)
         return approval
+
+    def record_rollback(self, approval_id: str, user: str, *, checkpoint_id: str, restored: list[str],
+                        conflicts: list[str]) -> None:
+        """Journal des approbations : restauration du point de retour d'une approbation automatique révoquée
+        (`POST /v1/approvals/{id}/auto-review/rollback`) — qui, quand, fichiers restaurés, conflits. Événement
+        `auto_review_rollback` et `approval.auto_review_rollback` sur le bus."""
+        with self._decision_lock:
+            approval = self._load_visible(approval_id)
+            if approval is None:
+                raise ApprovalNotFound(approval_id)
+            data = {"by": user, "at": self.clock(), "checkpoint_id": checkpoint_id, "restored": list(restored),
+                    "conflicts": list(conflicts)}
+            self._append_event(approval.id, "auto_review_rollback", data)
+        self._emit("approval.auto_review_rollback", {"approval_id": approval.id, **data}, approval.thread_id)
 
     def decide_remote(self, approval_id: str, decision: str, proof: Proof, device: Device, *, origin: str,
                       decided_by: str, rp_id: str | None = None) -> Approval:

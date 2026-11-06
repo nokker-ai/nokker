@@ -6,13 +6,12 @@ from types import SimpleNamespace
 
 from nokker.api import server
 from nokker.api.events import EventBus
-from nokker.approvals.memory import InMemoryApprovals
 from nokker.bubbles.hub import BubbleHub
 from nokker.bubbles.memory import InMemoryBubbles
 from nokker.code_sessions.store import CodeSession, MemoryCodeStore
 from nokker.config import NokkerConfig
 from nokker.core.ports import Approval
-from nokker.goals.store import Goal, MemoryGoals
+from nokker.goals.store import Goal
 from nokker.presence import http as presence_http
 from nokker.presence.service import PresenceService
 from nokker.presence.tracker import ActivityTracker

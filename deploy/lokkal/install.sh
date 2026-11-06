@@ -151,7 +151,8 @@ if ! docker_ok; then
     if [ ! -f "$self" ]; then
       self=$(mktemp); tmpself=$self; u="https://nokker.ai/install.sh"
       [ -n "$VERSION" ] && u="https://github.com/$REPO/releases/download/lokkal-v$VERSION/install.sh"
-      curl -fsSL "$u" -o "$self" || self=""
+      [ -n "${NOKKER_RELEASE_BASE:-}" ] && u="$NOKKER_RELEASE_BASE/install.sh"   # tests : le même installeur
+      case "$u" in file://*) cp "${u#file://}" "$self" || self="";; *) curl -fsSL "$u" -o "$self" || self="";; esac
     fi
     if [ -n "$self" ] && need sg && sg docker -c "docker info" >/dev/null 2>&1; then
       say "Docker installé : suite de l'installation sous le groupe docker"
@@ -170,6 +171,8 @@ case "$ep" in unix://*) p=${ep#unix://}; case "$p" in /run/user/*|*/.docker/run/
 BASE=${NOKKER_RELEASE_BASE:-}
 if [ -z "$VERSION" ]; then
   if [ -n "$BASE" ] && [ -f "${BASE#file://}/LATEST" ]; then VERSION=$(cat "${BASE#file://}/LATEST")
+  elif [ -n "$BASE" ] && [ "${BASE#file://}" = "$BASE" ]; then
+    VERSION=$(curl -fsSL "$BASE/LATEST" | tr -d '[:space:]') || die "LATEST illisible sur $BASE"
   else
     # La plus HAUTE version (semver, préversions comprises : 0.1.0 > 0.1.0-rc.10 > 0.1.0-rc.9), pas la première de
     # l'API (ordre de création). Clé de tri portable (sans sort -V) : X Y Z puis n° de rc (sans rc = au-dessus).
@@ -210,6 +213,9 @@ esac
 if [ -f "$DIR/.env" ]; then guard_project; else guard_project new; fi
 umask 077
 mkdir -p "$DIR" "$DIR/state" "$DIR/bin" "$CONF_DIR"
+# Liste des hôtes ssh ouverts par egress (écrite par le noyau depuis hosts.yaml validé, lue par egress en lecture
+# seule, par le groupe de l'utilisateur) : à créer ICI, sinon docker la crée en root et le noyau ne peut plus l'écrire.
+mkdir -p "$DIR/state/egress" && chmod 750 "$DIR/state/egress"
 tar -xzf "$TMP/$PKG" -C "$TMP"
 # Mise à jour : la pose des fichiers suit l'installeur de la version CIBLE, pas celui déjà installé (qui peut ignorer
 # un fichier nouveau ou écraser config/). Relancé une seule fois, avec les mêmes choix ; il retélécharge et revérifie.
@@ -367,6 +373,10 @@ chmod 600 "$CONF_DIR/lokkal.json"
 if [ "${NOKKER_SKIP_PULL:-0}" != 1 ]; then
   say "téléchargement des images (première fois : quelques minutes)"
   compose pull -q
+  # Image des bacs à sable : pas un service du compose, donc absente de `compose pull`. Sans elle, le premier tour
+  # qui ouvre un bac à sable la télécharge (98 s mesurées sur une machine de test le 05.11) : tirée ici, une fois.
+  SB_IMAGE=$(getv NOKKER_SANDBOX_IMAGE); SB_IMAGE=${SB_IMAGE:-ghcr.io/nokker-ai/sandbox:$(getv NOKKER_VERSION)}
+  docker pull -q "$SB_IMAGE" >/dev/null 2>&1 || warn "image des bacs à sable non tirée ($SB_IMAGE) : le premier tour la tirera"
 fi
 if [ "$(getv NOKKER_SECRETS_PROVIDER)" = openbao ]; then
   # Coffre d'abord, initialisé HORS du noyau (vault-init), pour que core démarre avec son AppRole.
@@ -436,6 +446,10 @@ if [ "$SETUP_TODO" = 1 ]; then
   else
     say "premier réglage (choisir un modèle) : ouvre ${URL}setup#token=\$(cat $TOKF)"
   fi
+elif [ -r "$TOKF" ]; then
+  # Setup déjà fait (réinstallation) : la racine avec le jeton local dans le FRAGMENT, comme /setup ; sans lui, la racine
+  # montre la connexion du cloud. Ni affiché ni journalisé : seulement passé au navigateur.
+  OPEN_URL="${URL}#token=$(cat "$TOKF")"
 fi
 if [ "$OPEN" = 1 ] && { [ "$MODE" = install ] || [ "$SETUP_TODO" = 1 ]; }; then
   if [ "$os" = darwin ]; then open "$OPEN_URL" 2>/dev/null || true

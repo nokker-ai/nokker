@@ -91,7 +91,8 @@ class Bridge:
             wanted = rooms_cfg.entities()
             presence = StatesPresence(states=lambda: [s for s in ha.states() if s.get("entity_id") in wanted],
                                       cfg=rooms_cfg)
-        ha_ops = HaOps(ha=ha, entities=tuple(str(e) for e in ha_raw.get("entities") or [])) \
+        ha_ops = HaOps(ha=ha, entities=tuple(str(e) for e in ha_raw.get("entities") or []),
+                       notify_services=tuple(str(e) for e in ha_raw.get("notify_services") or [])) \
             if ha is not None and hasattr(ha, "registry") else None
         if watch is None:
             from nokker.homebridge.watch import Watch
@@ -214,6 +215,10 @@ OPS: dict[str, Callable[[Bridge, dict[str, Any]], dict[str, Any]]] = {
     "ha.call_service": _ha_op("call"),
     "ha.write_config": _ha_op("write_config"),
     "ha.events": _ha_op("events"),
+    "ha.query": _ha_op("query"),
+    "ha.history": _ha_op("history"),
+    "ha.logbook": _ha_op("logbook"),
+    "ha.notify": _ha_op("notify"),
     "presence.get": Bridge._presence,
     "audio.play": Bridge._play,
     "eink.publish": Bridge._publish,

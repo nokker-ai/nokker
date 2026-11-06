@@ -37,6 +37,13 @@ logger = logging.getLogger("nokker.cast")
 SOURCE = "builtin:cast"
 DEFAULT_MEMBER = "local-owner"  # = nokker.local.api.LOCAL_OWNER : tour sans expéditeur sur la machine
 BUBBLE_HTML_MAX = 256 * 1024
+# Cadre de l'aperçu servi par le noyau (`GET /v1/cast/{id}/frame`) : SA propre CSP, sans `allow-same-origin` — la page
+# rendue ne lit jamais les cookies ni le stockage de l'application, et le web peut poser une CSP stricte sur la sienne.
+FRAME_CSP = ("sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+             "img-src data: https:")
+FRAME_HEADERS = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": FRAME_CSP,
+                 "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+FRAME_URL_TTL_S = 120
 STATUS_OF = {"pending": "idle", "showing": "working", "stopped": "done", "expired": "done", "refused": "failed",
              "failed": "failed"}
 
@@ -89,6 +96,8 @@ class CastService:
     _casts: dict[str, Cast] = field(default_factory=dict, repr=False)
     _requests: dict[str, str] = field(default_factory=dict, repr=False)  # request id → cast id
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    # clé des URL signées du cadre (`frame_url`) : propre au processus, jamais écrite ; un redémarrage les invalide
+    frame_secret: bytes = field(default_factory=lambda: os.urandom(32), repr=False)
 
     # ─────────────────────────── écrans ───────────────────────────
 
@@ -394,6 +403,50 @@ class CastService:
                 "masked": c.rendered.masked, "version": c.version,
                 "expires_at": _iso(c.expires_at) if c.status == "showing" else None,
                 "error": c.error, "actions": actions}
+
+    # ─────────────────────────── cadre de l'aperçu (CSP propre) ───────────────────────────
+
+    def _frame_sig(self, c: Cast, exp: str) -> str:
+        import hashlib
+        import hmac
+
+        return hmac.new(self.frame_secret, f"{c.cast_id}.{c.owner}.{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+
+    def frame_url(self, cast_id: str, user: str) -> dict[str, Any]:
+        """URL signée (2 min) du cadre de l'aperçu, pour `<iframe src>` (qui ne pose jamais `Authorization`). Le
+        PROPRIÉTAIRE de l'aperçu seulement : `LookupError` (404) pour tout autre, sans dire si l'aperçu existe."""
+        with self._lock:
+            c = self._casts.get(cast_id)
+        if c is None or c.owner != user:
+            raise LookupError("aperçu inconnu")
+        exp = str(int(self.clock() + FRAME_URL_TTL_S))
+        return {"url": f"/v1/cast/{cast_id}/frame?exp={exp}&sig={self._frame_sig(c, exp)}",
+                "expires_at": _iso(float(exp))}
+
+    def frame_html(self, cast_id: str, *, exp: str = "", sig: str = "", user: str | None = None) -> str:
+        """HTML du cadre : EXACTEMENT celui de la bulle (`bubble_state["html"]`). Accès : signature valide et non
+        échue, OU propriétaire authentifié. `LookupError` sinon (404) ; `ValueError` au-delà de 256 Ko (413)."""
+        import hmac
+
+        with self._lock:
+            c = self._casts.get(cast_id)
+        if c is None:
+            raise LookupError("aperçu inconnu")
+        if user is not None:
+            if c.owner != user:
+                raise LookupError("aperçu inconnu")
+        else:
+            try:
+                fresh = int(exp) >= self.clock()
+            except (TypeError, ValueError):
+                fresh = False
+            if not fresh or not hmac.compare_digest(self._frame_sig(c, str(exp)), str(sig or "")):
+                raise LookupError("aperçu inconnu")
+        self._expired(c)
+        html = page(c.rendered, live=False)
+        if len(html.encode()) > BUBBLE_HTML_MAX:
+            raise ValueError("html_too_large")
+        return html
 
     # ─────────────────────────── routes locales ───────────────────────────
 

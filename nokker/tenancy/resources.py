@@ -24,6 +24,34 @@ from nokker.tools.registry import Registry
 logger = logging.getLogger("nokker.tenancy.resources")
 
 
+# Drapeau `voice_read_only` : outils de session de code retirés à la voix (profondeur 0) — elle ne modifie RIEN.
+# Restent read_file et search_files (lire), checkpoint_create/list/diff (aucun fichier touché), skill_list et skill_view
+# (les seules skills de session, en lecture) et le delegate à worktree (faire construire). Un retour à un point passe
+# par la personne (rollback de la carte) : un enfant de delegate n'a jamais checkpoint_* (DENIED_FOR_CHILD).
+VOICE_HIDDEN = frozenset({"write_file", "patch", "terminal", "todo", "execute_code", "checkpoint_restore",
+                          "forge_push"})  # pousse vers la forge : un enfant /sa- d'un fil de session, jamais la voix
+
+
+class HiddenNames:
+    """Source vue sans certains noms : ni schéma (`specs`), ni appel (outil inconnu). Le reste est relayé."""
+
+    def __init__(self, inner: Any, hidden: frozenset[str]) -> None:
+        self._inner, self._hidden = inner, hidden
+
+    def specs(self) -> list[ToolSpec]:
+        return [s for s in self._inner.specs() if s.name not in self._hidden]
+
+    def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if name in self._hidden:
+            from nokker.tools.registry import unknown_tool_result
+
+            return unknown_tool_result(name)
+        return self._inner.call(name, arguments, ctx)
+
+    def __getattr__(self, name: str) -> Any:  # turn_done, refresh, close, available_for… : ceux de la source
+        return getattr(self._inner, name)
+
+
 class TenantRegistry:
     """`core.ports.ToolRegistry` qui délègue au jeu du locataire courant. Partagé tel quel avec le ContextEngine
     (`self.tools`) et l'exécuteur d'approbations : chacun voit le jeu du locataire du tour en cours.
@@ -41,29 +69,80 @@ class TenantRegistry:
         # Profil mineur d'un foyer (lot X23, `nokker/household/guard.py::minor_tool_filter`) : locataire → prédicat des
         # outils offerts (liste blanche des connecteurs et agents), ou None. None (défaut) : rien ne change.
         self.restrict: Any = None
-        self._tenants: dict[str, Registry] = {}
+        # Fil à session de code VIVANTE (`has_session(fil)` : `CodeSessions.is_code_thread`, sous-agents `/sa-` compris) :
+        # les sources marquées `conversation_only` (le delegate de conversation, `delegate_tenants`) n'y sont pas offertes,
+        # pour que `delegate` y soit celui des sessions (worktree, fond, status/cancel). None : un jeu par locataire.
+        self.has_session: Any = None
+        # Drapeau `code_tools_session_only` : hors d'un fil à session vivante, les sources marquées `code_session_only`
+        # (outils des sessions de code) sont absentes du jeu. Faux (défaut) : rien ne change.
+        self.session_only: bool = False
+        # Drapeau `voice_read_only` : la VOIX (fil de profondeur 0, hors sous-agents `/sa-`) ne reçoit des sources de
+        # session de code que `read_file`/`search_files` (+ skills, checkpoints, delegate à worktree) ; les noms de
+        # `VOICE_HIDDEN` sont absents de son jeu. Ses enfants (`child_sources` du registre) gardent tout le jeu.
+        self.voice_read_only: bool = False
+        self._tenants: dict[Any, Registry] = {}
         self._lock = threading.Lock()
+
+    def scope_key(self) -> str:
+        """Périmètre du fil courant (`tools/scope.py`) : `session` (fil à session de code vivante) ; sinon `plain`
+        (drapeau `code_tools_session_only`) ou `all` (jeu du locataire, comme avant)."""
+        from nokker.tools.scope import current_thread
+
+        other = "plain" if self.session_only else "all"
+        thread = current_thread()
+        if not thread or self.has_session is None:
+            return other
+        try:
+            return "session" if self.has_session(thread) else other
+        except Exception:  # noqa: BLE001 — état des sessions illisible : pas de session
+            logger.warning("session de code du fil illisible", exc_info=True)
+            return other
+
+    def _voice(self) -> bool:
+        """La boucle principale (la voix) : fil sans `/sa-` (ou hors tour), drapeau `voice_read_only` allumé."""
+        if not self.voice_read_only:
+            return False
+        from nokker.tools.scope import current_thread
+
+        return "/sa-" not in (current_thread() or "")
+
+    def cache_key(self) -> str:
+        """Clé du jeu offert (empreinte du préfixe, `context/engine.py`) : périmètre du fil, et la voix."""
+        return self.scope_key() + ("|voice" if self._voice() else "")
 
     def current(self) -> Registry:
         tid = current_tenant()
         if tid == INTERNAL_TENANT:
             return self.internal
+        scope = self.scope_key()
+        voice = self._voice()
+        key = tid if scope == "all" and not voice else (tid, scope, voice)
         with self._lock:
-            reg = self._tenants.get(tid)
+            reg = self._tenants.get(key)
         if reg is not None:
             return reg
         sources, sure = self._available(tid)
+        if scope == "session":  # le delegate des sessions (worktree), pas celui de conversation (régression cf497c9)
+            sources = [s for s in sources if not getattr(s, "conversation_only", False)]
+        elif scope == "plain":  # schéma ABSENT hors d'un fil de session, pas seulement refusé à l'appel
+            sources = [s for s in sources if not getattr(s, "code_session_only", False)]
         sources = [*sources, *self.connectors.sources_for(tid)]
         keep = self.restrict(tid) if self.restrict is not None else None
         if keep is not None:
             from nokker.household.guard import FilteredSource
 
             sources = [FilteredSource(src, keep) for src in sources]
+        full = sources
+        if voice:  # la voix lit ; écrire et exécuter passent par ses enfants (delegate)
+            sources = [HiddenNames(src, VOICE_HIDDEN) if getattr(src, "code_session_only", False) else src
+                       for src in sources]
         reg = Registry(sources=sources, overlay=self.internal.overlay)  # variante approuvée : la même pour tous
+        if voice:
+            reg.child_sources = full  # `delegate` : les enfants reçoivent le jeu COMPLET de la session
         if not sure:
             return reg  # disponibilité illisible : rien en cache, on relira au prochain appel
         with self._lock:
-            return self._tenants.setdefault(tid, reg)
+            return self._tenants.setdefault(key, reg)
 
     def _available(self, tid: str) -> tuple[list[ToolSource], bool]:
         """Sources du testeur offertes à CE locataire : une source qui déclare `available_for(tid)` n'y est que si elle
@@ -86,7 +165,8 @@ class TenantRegistry:
 
     def forget(self, tenant_id: str) -> None:
         with self._lock:
-            self._tenants.pop(tenant_id, None)
+            for k in [k for k in self._tenants if k == tenant_id or (isinstance(k, tuple) and k[0] == tenant_id)]:
+                self._tenants.pop(k, None)
 
     # ───────── core.ports.ToolRegistry ─────────
 

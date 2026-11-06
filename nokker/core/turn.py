@@ -159,6 +159,12 @@ class Verdict:
     code: str | None = None
 
 
+# `TurnInput.control` du tour de suite d'une carte décidée (approvals/executor.py) : posé par le noyau SEULEMENT (un
+# client ne pose que `goals.service.CONTROLS`). Le bloc `[Approbation]` est écrit par le noyau et redit une décision
+# déjà prise sur la carte : il ne lève aucun drapeau de domaine (un montant du résultat de `pay_request`, par exemple).
+APPROVAL_CONTINUE = "approval_continue"
+
+
 @dataclass
 class InputCheck:
     """Résultat des invariants d'entrée, AVANT tout enregistrement (PLAN §2.3 étape 1)."""
@@ -166,6 +172,10 @@ class InputCheck:
     text: str  # caviardé
     redacted: list[str] = field(default_factory=list)  # noms des secrets détectés (jamais les valeurs)
     domain_flags: set[str] = field(default_factory=set)  # fiscal, juridique, montant, …
+    # « approval » : le message est le bloc `[Approbation]` ÉCRIT PAR LE NOYAU pour la suite d'une carte décidée
+    # (`APPROVAL_CONTINUE`), pas un texte de la personne. Vide = message de la personne. Exposé aux clients
+    # (`GET /v1/threads/{id}`, champ `origin`) pour ne pas l'afficher comme une bulle de la personne.
+    origin: str = ""
 
 
 @dataclass

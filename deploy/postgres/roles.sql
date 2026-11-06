@@ -2,6 +2,8 @@
 --
 --   nokker_owner : propriétaire des tables, fait les migrations (NOKKER_PG_OWNER_DSN, job d'init seulement).
 --   nokker_app   : le noyau (NOKKER_PG_DSN). NI propriétaire NI BYPASSRLS : la RLS de 006_tenant_rls.sql s'applique.
+--   nokker_pay_agent : l'agent de paiement (docs/PAY-AGENT.md, PAYAGENT_DSN) : tables pay_agent_* seulement, et 4
+--                  colonnes de `devices` en lecture. Aucun droit sur les autres tables ; nokker_app aucun sur les siennes.
 --
 -- Ordre d'application :
 --   1. ce fichier, par un administrateur (superutilisateur, ou CREATEROLE + propriétaire de la base) : rôles, droits
@@ -25,7 +27,10 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nokker_app') THEN
         CREATE ROLE nokker_app LOGIN;
     END IF;
-    EXECUTE format('GRANT CONNECT ON DATABASE %I TO nokker_owner, nokker_app', current_database());
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nokker_pay_agent') THEN
+        CREATE ROLE nokker_pay_agent LOGIN;
+    END IF;
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO nokker_owner, nokker_app, nokker_pay_agent', current_database());
 END
 $$;
 
@@ -33,17 +38,19 @@ $$;
 -- changer ces attributs demande un superutilisateur, qu'un Postgres managé ne donne pas).
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname IN ('nokker_app', 'nokker_owner') AND (rolsuper OR rolbypassrls))
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname IN ('nokker_app', 'nokker_owner', 'nokker_pay_agent')
+               AND (rolsuper OR rolbypassrls))
     THEN
         ALTER ROLE nokker_app NOSUPERUSER NOBYPASSRLS;
         ALTER ROLE nokker_owner NOSUPERUSER NOBYPASSRLS;
+        ALTER ROLE nokker_pay_agent NOSUPERUSER NOBYPASSRLS;
     END IF;
 END
 $$;
 
 GRANT USAGE, CREATE ON SCHEMA public TO nokker_owner;
-GRANT USAGE ON SCHEMA public TO nokker_app;
-REVOKE CREATE ON SCHEMA public FROM nokker_app;
+GRANT USAGE ON SCHEMA public TO nokker_app, nokker_pay_agent;
+REVOKE CREATE ON SCHEMA public FROM nokker_app, nokker_pay_agent;
 
 -- Tables existantes (étape 4) ; pas de TRUNCATE, REFERENCES ni TRIGGER.
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nokker_app;
@@ -54,6 +61,24 @@ ALTER DEFAULT PRIVILEGES FOR ROLE nokker_owner IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO nokker_app;
 ALTER DEFAULT PRIVILEGES FOR ROLE nokker_owner IN SCHEMA public
     GRANT USAGE ON SEQUENCES TO nokker_app;
+
+-- Agent de paiement (063) : APRÈS le GRANT global ci-dessus, qui vient de donner ses tables à nokker_app. Le noyau n'y
+-- a aucun droit ; l'agent, ses tables et 4 colonnes de `devices` (clés publiques des passkeys), rien d'autre.
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['pay_agent_methods', 'pay_agent_tokens', 'pay_agent_events', 'pay_agent_cards',
+                                'pay_agent_3ds', 'pay_agent_links'] LOOP
+        IF to_regclass(t) IS NOT NULL THEN
+            EXECUTE format('REVOKE ALL ON %I FROM nokker_app', t);
+            EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO nokker_pay_agent', t);
+        END IF;
+    END LOOP;
+    IF to_regclass('devices') IS NOT NULL THEN
+        GRANT SELECT (id, "user", public_key_spki, status) ON devices TO nokker_pay_agent;
+    END IF;
+END
+$$;
 
 -- nokker_backup : le dump quotidien (docs/BACKUP-DRP.md §3). LOGIN BYPASSRLS, lecture seule. Créé hors de ce fichier,
 -- avec son mot de passe, par l'administrateur (il faut BYPASSRLS pour l'accorder). Un Postgres managé ne laisse pas

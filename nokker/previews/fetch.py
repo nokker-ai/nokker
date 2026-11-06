@@ -53,7 +53,8 @@ def _default_client_factory(hop: ResolvedHop, timeout_s: float) -> httpx.Client:
 
 def guarded_get(url: str, *, max_bytes: int, timeout_s: float = TIMEOUT_S, max_redirects: int = MAX_REDIRECTS,
                 client_factory: Callable[[ResolvedHop, float], httpx.Client] | None = None,
-                resolver=socket.getaddrinfo, check_pii: bool = True) -> FetchResult:
+                resolver=socket.getaddrinfo, check_pii: bool = True, user_agent: str | None = None,
+                accept: str | None = None, extra_headers: dict[str, str] | None = None) -> FetchResult:
     """GET gardé : PII sur l'URL (chaque hop), SSRF (`resolve_and_check`, chaque hop, connexion
     pinglée à l'IP vérifiée), ≤ `max_redirects` redirections, ≤ `max_bytes` (vérifié dès l'en-tête
     `Content-Length` quand il est présent, ET en streaming — un serveur qui mentirait sur
@@ -61,13 +62,18 @@ def guarded_get(url: str, *, max_bytes: int, timeout_s: float = TIMEOUT_S, max_r
     `timeout_s` par redirection : un site qui redirige 3 fois pour épuiser le délai est traité
     comme un timeout, pas comme 3×5 s).
 
+    `user_agent` / `accept` : en-têtes propres à l'appelant (outils Essentiels, docs/ESSENTIALS.md) ; absents, ceux des
+    aperçus, inchangés. `extra_headers` : en-têtes de plus (jeton d'une API, adresse de contact exigée par une source),
+    jamais journalisés.
+
     Lève `SsrfBlocked` (politique : schéma, IP interdite, PII, trop de redirections, redirection
     sans `Location`) ou `FetchError` (transport, délai dépassé, corps trop gros)."""
     factory = client_factory or _default_client_factory
     deadline = time.monotonic() + timeout_s
     current_url = url
     redirects = 0
-    headers = {"User-Agent": _USER_AGENT, "Accept": "text/html,application/json,image/*,*/*;q=0.8"}
+    headers = {"User-Agent": user_agent or _USER_AGENT,
+               "Accept": accept or "text/html,application/json,image/*,*/*;q=0.8", **(extra_headers or {})}
 
     while True:
         if check_pii:

@@ -120,3 +120,119 @@ def test_account_shows_terms_and_consent_and_consent_can_be_withdrawn():
         assert acc("GET", "/v1/threads") == (False, None)
     finally:
         http.configure(None)
+
+
+def _accepted_account(lang="fr"):
+    front = MemoryFront({1: {"email": "c@example.org", "prenom": "Camille", "lang": lang}})
+    front.send(1, None, "alice")
+    tenancy, acceptances = MemoryTenancy(), MemoryAcceptances()
+    http.configure(Onboarding(front, tenancy, InMemoryApprovals(), acceptances))
+    body = {"token": next(iter(front.tokens)), "terms_sha256": terms.load(lang).sha256,
+            "public_key_spki": gen_keypair()[1], "name": "Mac"}
+    _, (st, out) = call("POST", "/v1/onboarding/accept", body=body)
+    assert st == 201
+    return tenancy.account(out["account_id"]), acceptances
+
+
+def _acc(account, method, path, **kw):
+    h = Handler(**kw)
+    return http.account_route(h, method, path, account), h.out
+
+
+def _changed_terms(monkeypatch):
+    """Conditions modifiées : le texte courant (fr ET en) n'est plus celui qui a été accepté."""
+    real = terms.load
+
+    def load(lang):
+        t = real(lang)
+        new = t.text + "\n- Lecture à voix haute : nouveau paragraphe.\n"
+        import hashlib
+
+        return terms.Terms(lang=t.lang, text=new, sha256=hashlib.sha256(new.encode()).hexdigest())
+
+    monkeypatch.setattr(terms, "load", load)
+    return load
+
+
+def test_account_says_whether_terms_are_current():
+    account, _ = _accepted_account()
+    try:
+        _, (st, me) = _acc(account, "GET", "/v1/account")
+        assert st == 200 and me["terms_outdated"] is False
+        assert me["terms_current"] == {"version": terms.load("fr").sha256, "lang": "fr"}
+    finally:
+        http.configure(None)
+
+
+def test_changed_terms_are_outdated_then_reaccepted(monkeypatch):
+    account, acceptances = _accepted_account()
+    try:
+        old = terms.load("fr").sha256
+        new = _changed_terms(monkeypatch)("fr").sha256
+        _, (st, me) = _acc(account, "GET", "/v1/account")
+        assert me["terms_outdated"] is True and me["terms_current"] == {"version": new, "lang": "fr"}
+        assert me["terms"]["version"] == old  # la dernière acceptation reste lisible
+        # écran périmé (l'ancienne version, ou une version inconnue) : 409, rien d'enregistré
+        for stale in (old, "0" * 64, ""):
+            assert _acc(account, "POST", "/v1/account/terms", body={"version": stale})[1] == \
+                (409, {"error": "stale_version"})
+        assert len(acceptances.for_account(account.account_id)) == 1
+        handled, (st, out) = _acc(account, "POST", "/v1/account/terms", body={"version": new}, ip="198.51.100.9")
+        assert handled and st == 200 and out["terms"]["version"] == new and out["terms_outdated"] is False
+        rows = acceptances.for_account(account.account_id)
+        assert len(rows) == 2 and rows[-1]["invitation_id"] is None and rows[-1]["ip"] == "198.51.100.9"
+        assert rows[-1]["terms_version_sha256"] == new and rows[-1]["lang"] == "fr"
+        assert _acc(account, "GET", "/v1/account")[1][1]["terms_outdated"] is False
+    finally:
+        http.configure(None)
+
+
+def test_accepting_the_current_text_of_the_other_language_is_fine(monkeypatch):
+    account, _ = _accepted_account("fr")
+    try:
+        en = _changed_terms(monkeypatch)("en").sha256
+        _, (st, out) = _acc(account, "POST", "/v1/account/terms", body={"version": en})
+        assert st == 200 and out["terms"]["lang"] == "en" and out["terms_outdated"] is False
+        assert out["terms_current"]["lang"] == "en"
+    finally:
+        http.configure(None)
+
+
+def test_reaccept_without_onboarding_is_503():
+    account, _ = _accepted_account()
+    http.configure(None)
+    assert _acc(account, "POST", "/v1/account/terms", body={"version": "x"})[1] == (503, {"error": "terms_disabled"})
+
+
+def test_public_current_terms_text():
+    h = Handler()
+    assert http.terms_route(h, "GET", "/v1/terms?lang=en")
+    st, out = h.out
+    assert st == 200 and out == {"version": terms.load("en").sha256, "lang": "en", "text": terms.load("en").text}
+    h = Handler()
+    assert http.terms_route(h, "GET", "/v1/terms?lang=xx") and h.out[1]["lang"] == "fr"
+    assert http.terms_route(Handler(), "POST", "/v1/terms") is False
+    assert http.terms_route(Handler(), "GET", "/v1/termsx") is False
+
+
+# Conditions d'avant le §5 « Lecture à voix haute » (ElevenLabs, 03.11.2026) : sha des textes acceptés jusque-là.
+TERMS_BEFORE_SPEECH = {"fr": "185d09cd3a46dc2f4698660a3f16aa712eb03d610f3281127877a6ddd14f46f9",
+                       "en": "487fa447c09fced114931f4fc76198f57a6579d14247c0ce289d7dc24b9b2b6c"}
+
+
+def test_speech_paragraph_changes_the_terms_and_old_acceptances_are_outdated():
+    for lang, old in TERMS_BEFORE_SPEECH.items():
+        t = terms.load(lang)
+        assert t.sha256 != old and "ElevenLabs" in t.text
+        assert terms.lang_of_version(old) is None  # l'ancienne version n'est plus acceptable
+    front = MemoryFront({})
+    tenancy, acceptances = MemoryTenancy(), MemoryAcceptances()
+    http.configure(Onboarding(front, tenancy, InMemoryApprovals(), acceptances))
+    try:
+        acc = tenancy.create_account("ancien@example.org")
+        acceptances.record(acc.account_id, "inv-0", TERMS_BEFORE_SPEECH["fr"], "fr", "198.51.100.2")
+        _, (st, me) = _acc(acc, "GET", "/v1/account")
+        assert st == 200 and me["terms_outdated"] is True
+        assert me["terms_current"] == {"version": terms.load("fr").sha256, "lang": "fr"}
+    finally:
+        http.configure(None)

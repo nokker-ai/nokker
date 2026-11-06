@@ -123,3 +123,48 @@ def test_a_failed_mail_never_leaks_to_the_caller(rig):
     codes, front, _, _ = rig
     front.fail_send = True
     assert codes.start("camille@example.org", "fr", "ip") == {"sent": True}
+
+
+# ── Langue du mail du code (05.11.2026) : compte, sinon invitation, sinon langue reçue (le navigateur) ──
+
+def test_mail_follows_the_account_language_not_the_browser(rig):
+    codes, front, _, _ = rig
+    en = codes.tenancy.create_account("noah@example.org", lang="en")
+    assert codes.start("noah@example.org", "fr", "ip1") == {"sent": True}
+    assert front.codes[-1][0] == en.email and front.codes[-1][2] == "en"
+    assert codes.start("camille@example.org", "en", "ip2") == {"sent": True}  # compte en français, navigateur anglais
+    assert front.codes[-1][2] == "fr"
+
+
+def test_mail_language_falls_back_to_invitation_then_received(rig):
+    import dataclasses
+
+    codes, front, _, acc = rig
+    asked: list[str] = []
+    invites = {"camille@example.org": "en"}
+    codes.invitation_lang = lambda email: asked.append(email) or invites.get(email)
+    no_lang = dataclasses.replace(acc, lang="")
+    real = codes.tenancy.account_by_email
+    codes.tenancy.account_by_email = lambda email: no_lang if email == acc.email else real(email)
+    codes.start("camille@example.org", "fr", "ip1")
+    assert front.codes[-1][2] == "en"  # invitation
+    invites.clear()
+    codes.start("camille@example.org", "en", "ip2")
+    assert front.codes[-1][2] == "en"  # langue reçue
+    codes.start("camille@example.org", "xx", "ip3")
+    assert front.codes[-1][2] == "fr"  # rien d'utilisable : français
+    codes._limits = ec._Limiter()  # 3 envois par adresse : fenêtre neuve pour le dernier cas
+    codes.invitation_lang = lambda email: (_ for _ in ()).throw(RuntimeError("front1 en panne"))
+    codes.start("camille@example.org", "en", "ip4")
+    assert front.codes[-1][2] == "en"  # invitation illisible : langue reçue, l'envoi part quand même
+
+
+def test_language_lookup_never_reveals_an_account(rig):
+    codes, front, _, _ = rig
+    asked: list[str] = []
+    codes.invitation_lang = lambda email: asked.append(email) or "en"
+    n = len(front.codes)
+    assert codes.start("inconnu@example.org", "en", "ip1") == {"sent": True}
+    assert codes.start("camille@example.org", "en", "ip2") == {"sent": True}  # même corps
+    assert len(front.codes) == n + 1 and front.codes[-1][0] == "camille@example.org"
+    assert asked == []  # le compte a sa langue : aucune lecture de l'invitation, et rien pour une adresse inconnue

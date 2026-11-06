@@ -78,7 +78,9 @@ class SessionCheckpoints:
         return _upstream_override() is not None
 
     # ── routage ──
-    def _resolve(self, path: str) -> tuple[str, str, str, Any]:
+    def _ids(self, path: str) -> tuple[str, str, str]:
+        """(locataire, utilisateur, session) d'un chemin sous la racine des sessions, du locataire COURANT ; sinon
+        `PermissionError`."""
         root = os.path.realpath(self.sessions.cfg.workspace_root)
         full = os.path.normpath(os.path.abspath(str(path)))  # un lien du dépôt ne déroute jamais vers une autre session
         rel = os.path.relpath(full, root)
@@ -92,6 +94,16 @@ class SessionCheckpoints:
             raise PermissionError("points de retour : chemin hors d'une session de code") from None
         if tenant != current_tenant():
             raise PermissionError("points de retour : session d'un autre locataire")
+        return tenant, user, session
+
+    def cards_dir(self, root: Any) -> Any:
+        """Dossier des points de retour PAR CARTE du relecteur automatique (`nokker/tools/card_snapshots.py`) pour
+        cette session : `<home des points de la session>/cards`, hors de toute racine montée. Sans l'amont aussi."""
+        tenant, user, session = self._ids(str(root))
+        return self.sessions.checkpoint_home(tenant, user, session) / "cards"
+
+    def _resolve(self, path: str) -> tuple[str, str, str, Any]:
+        tenant, user, session = self._ids(path)
         with self._lock:
             mgr = self._managers.get(session)
             if mgr is None:

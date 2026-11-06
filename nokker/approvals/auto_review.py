@@ -15,7 +15,9 @@ Chaque décision est tracée (`approval_events`, verdict `approvals:auto_review`
 (`Approval.auto_review`, rendu par l'API). Le propriétaire peut la RÉVOQUER après coup
 (`POST /v1/approvals/{id}/auto-review/revoke`) : un refus révoqué rend la carte à l'humain (`pending`) ; une
 approbation révoquée reste exécutée (l'effet a eu lieu, la carte le dit) mais le relecteur n'approuve plus cet outil
-sur ce fil pendant 30 jours (lu dans l'historique des cartes) : les cartes suivantes vont à l'humain.
+sur ce fil pendant 30 jours (lu dans l'historique des cartes) : les cartes suivantes vont à l'humain. Pour une écriture
+de fichier, la révocation propose aussi le point de retour de la carte (`rollback`, `nokker/tools/card_snapshots.py`),
+appliqué seulement par `POST /v1/approvals/{id}/auto-review/rollback`.
 
 Jamais relues (liste FERMÉE, `excluded()`, testée famille par famille) : carte forte, plancher prod `ops:prod*`, envoi
 externe ou de masse, dépense, suppression (effet destructif ou commande qui supprime), publication de page, profil
@@ -56,7 +58,6 @@ EXCLUDED_RULES = frozenset({
     "effect:destructive", "effect:destructive:unauthorized_sender",
     "effect:send_external", "effect:send_bulk", "effect:spend",
     "pages:publish",                       # sortie vers le public
-    "payments:to_pay",                     # arrêt au paiement : carte forte, la personne décide
     "household:guardian",                  # profil mineur : son représentant décide
     "permissions:relayed_connector",       # connecteur d'un compte nokker.ai
     "permissions:relayed_strong",          # tour venu du web
@@ -69,6 +70,7 @@ EXCLUDED_RULES = frozenset({
     "learning:card",                       # skill appris (skill_create|update|revert) : escalade par règle, jamais seul
     "family:calendar",                     # calendrier familial : la relecture des lignes extraites EST la carte
     "provenance:envoi", "provenance:exec", "provenance:recherche",  # valeur lue dans une source non fiable : l humain seul
+    "payments:to_pay",                     # carte « à payer » (et paiement par l'agent de paiement) : passkey seule
 })
 EXCLUDED_RULE_PREFIXES = ("ops:prod",)  # `ops:prod` et `ops:prod:*`
 EXCLUDED_TOOLS = frozenset({"ssh_trust", "account_delete", "forge_push", "send_bulk_email", "agent_arm",

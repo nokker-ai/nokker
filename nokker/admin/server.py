@@ -19,6 +19,11 @@ identifiants et des agrégats, jamais le contenu des conversations.
   GET  /admin/v1/applications/<id>/invite/preview?lang=  aperçu du mail (front1, sans envoi)
   POST /admin/v1/applications/<id>/invite {lang}        ENVOI (ops/owner, en-tête X-Nokker-Console) ; audit après l'appel
 Le rôle `lecteur` ne reçoit jamais une adresse e-mail ni un nom de famille en clair (espace-admin §6).
+Vouchers d'essai (nokker/billing/voucher.py), si le service est passé :
+  GET  /admin/v1/vouchers                               bilan anonyme par campagne et par code partagé (tous rôles)
+  GET  /admin/v1/vouchers/<campagne>/codes?free=1       codes uniques à distribuer (owner ; journalisé voucher.export)
+  POST /admin/v1/vouchers {campaign, kind, code?, count?, max_uses?, expires, note?}   (owner/ops ; voucher.create)
+  POST /admin/v1/vouchers/<code>/disable                (owner/ops ; voucher.disable)
 """
 from __future__ import annotations
 
@@ -40,6 +45,8 @@ logger = logging.getLogger("nokker.admin.server")
 UI_DIR = Path(__file__).resolve().parent / "ui"
 _APP_RE = re.compile(r"^/admin/v1/applications/(\d+)$")
 _INVITE_RE = re.compile(r"^/admin/v1/applications/(\d+)/(invitations|invite/preview|invite)$")
+_VCODES_RE = re.compile(r"^/admin/v1/vouchers/([a-z0-9][a-z0-9_-]{0,47})/codes$")
+_VDISABLE_RE = re.compile(r"^/admin/v1/vouchers/([A-Z0-9][A-Z0-9-]{2,39})/disable$")
 WRITE_ROLES = ("owner", "ops")
 
 
@@ -67,7 +74,7 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
                        overview: Overview | None = None, candidatures: bool = True,
                        candidatures_console: str = "admin.nokker.ai", limits: dict[str, Any] | None = None,
                        billing_plans: dict[str, dict[str, int]] | None = None,
-                       flags: list[str] | None = None) -> type[BaseHTTPRequestHandler]:
+                       flags: list[str] | None = None, vouchers: Any = None) -> type[BaseHTTPRequestHandler]:
     """`front` : client des invitations de front1 (`nokker/onboarding/front.py::FrontInvitations`) ; None = pas
     d'invitation depuis cette console. `candidatures=False` : module candidatures coupé (bêta OVH). `overview` : lecture
     des comptes et de l'usage ; `flags` : drapeaux allumés (noms)."""
@@ -142,6 +149,8 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
                                      "candidatures_note": "" if candidatures else note})
                 elif path in ("/admin/v1/accounts", "/admin/v1/usage", "/admin/v1/flags"):
                     self._beta_get(path, email, role, qs)
+                elif path == "/admin/v1/vouchers" or _VCODES_RE.match(path):
+                    self._vouchers_get(path, email, role, qs)
                 elif not candidatures and (path == "/admin/v1/applications" or _INVITE_RE.match(path)
                                            or _APP_RE.match(path)):
                     self._json(404, {"error": "candidatures_disabled", "detail": note})
@@ -203,6 +212,61 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
             self._json(200, {"accounts": acc["total"], "by_status": acc["by_status"], "by_plan": acc["by_plan"],
                              **usage["totals"], "by_day": usage["by_day"]})
 
+        def _vouchers_get(self, path: str, email: str, role: str, qs: dict[str, str]) -> None:
+            if vouchers is None:
+                self._json(503, {"error": "vouchers_unconfigured"})
+                return
+            if path == "/admin/v1/vouchers":
+                self._json(200, vouchers.report())
+                return
+            if role != "owner":
+                self._json(403, {"error": "role"})
+                return
+            campaign = _VCODES_RE.match(path).group(1)  # type: ignore[union-attr]
+            codes = vouchers.store.codes(campaign, qs.get("free", "1") != "0")
+            store.record(email, "voucher.export", f"campaign:{campaign}", {"count": len(codes)})
+            self._json(200, {"campaign": campaign, "codes": codes})
+
+        def _vouchers_post(self, path: str) -> None:
+            from nokker.billing.voucher import VoucherError
+
+            if self.headers.get("X-Nokker-Console") != "1":
+                self._json(403, {"error": "csrf"})
+                return
+            op = self._operator()
+            if op is None:
+                return
+            email, role = op
+            if role not in WRITE_ROLES:
+                self._json(403, {"error": "role"})
+                return
+            if vouchers is None:
+                self._json(503, {"error": "vouchers_unconfigured"})
+                return
+            if m := _VDISABLE_RE.match(path):
+                ok = vouchers.store.disable(m.group(1), now_utc())
+                if ok:
+                    store.record(email, "voucher.disable", f"voucher:{m.group(1)}")
+                self._json(200 if ok else 404, {"disabled": ok} if ok else {"error": "not_found"})
+                return
+            length = min(int(self.headers.get("Content-Length", 0) or 0), 16_384)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                codes = vouchers.create(campaign=str(body.get("campaign") or ""), kind=str(body.get("kind") or ""),
+                                        expires=str(body.get("expires") or ""), actor=email,
+                                        code=str(body.get("code") or ""), count=int(body.get("count") or 1),
+                                        max_uses=body.get("max_uses"), note=str(body.get("note") or ""))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                self._json(400, {"error": "bad_request"})
+                return
+            except VoucherError as e:
+                self._json(e.status, {"error": e.code})
+                return
+            store.record(email, "voucher.create", f"campaign:{body.get('campaign')}",
+                         {"kind": body.get("kind"), "count": len(codes)})
+            # Un lot de codes uniques ne revient pas ici : il se lit par l'export (owner, journalisé).
+            self._json(201, {"created": len(codes), **({"code": codes[0]} if body.get("kind") == "shared" else {})})
+
         def _front_app(self, app_id: int, role: str) -> dict[str, Any] | None:
             """Candidature venue de front1, opérateur qui peut agir ; sinon répond et None."""
             if role not in WRITE_ROLES:
@@ -237,6 +301,9 @@ def make_admin_handler(store: AdminStore, verifier: AccessVerifier, front: Any =
             from nokker.onboarding.front import FrontError
 
             path = urlparse(self.path).path.rstrip("/")
+            if path == "/admin/v1/vouchers" or _VDISABLE_RE.match(path):
+                self._vouchers_post(path)
+                return
             m = _INVITE_RE.match(path)
             if not m or m.group(2) != "invite":
                 self._json(404, {"error": "not_found"})

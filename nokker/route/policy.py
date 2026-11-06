@@ -91,6 +91,7 @@ class PolicyV1(PolicyV0):
     small_reasoning: bool = False
     # Types de tour confiés au palier `nina` quand il est servi (mode `route`) ; vide = jamais.
     nina_kinds: frozenset = frozenset()
+    relay_voice: bool = False  # drapeau `route_relay_voice` : résumé ou relais d'un document → conversation (classify.py)
     max_threads: int = 2048  # classes gardées (dernier tour par fil), éviction la plus ancienne d'abord
     _turns: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)  # (fil, tour) -> Classified
     _last: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)  # fil -> TaskClass
@@ -108,7 +109,8 @@ class PolicyV1(PolicyV0):
             previous = self._last.get(turn.thread_id)
         if got is None:
             small_ok = Tier.SMALL in self._have()
-            got = classify(turn.input.text, previous, self.classifier if small_ok else None)
+            got = classify(turn.input.text, previous, self.classifier if small_ok else None,
+                           relay_voice=self.relay_voice, first_turn=getattr(turn, "index", None) == 0)
             with self._lock:
                 self._turns[key] = got
                 self._last[turn.thread_id] = got.task

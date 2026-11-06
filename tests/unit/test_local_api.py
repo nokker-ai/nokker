@@ -732,3 +732,16 @@ def test_local_approvals_set_the_tenant_at_the_boundary(tmp_path):
         assert status in (200, 202) and body["approval_id"] == a.id
     finally:
         httpd.shutdown()
+
+
+def test_sandbox_image_from_env_unless_config(monkeypatch):
+    from nokker.local.api import _sandbox_image
+    from nokker.tools.code import DEFAULT_SANDBOX_IMAGE
+
+    monkeypatch.delenv("NOKKER_SANDBOX_IMAGE", raising=False)
+    assert _sandbox_image({}) == DEFAULT_SANDBOX_IMAGE
+    monkeypatch.setenv("NOKKER_SANDBOX_IMAGE", "ghcr.io/nokker-ai/sandbox:0.1.0-rc.9.5")
+    assert _sandbox_image({}) == "ghcr.io/nokker-ai/sandbox:0.1.0-rc.9.5"
+    assert _sandbox_image({"image": "mon/image:1"}) == "mon/image:1"
+    monkeypatch.setenv("NOKKER_SANDBOX_IMAGE", "  ")
+    assert _sandbox_image({}) == DEFAULT_SANDBOX_IMAGE

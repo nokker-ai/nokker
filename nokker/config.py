@@ -17,6 +17,9 @@ DEFAULT_CONFIG_PATH = os.environ.get("NOKKER_CONFIG", "/etc/nokker/config.yaml")
 PRODUCT_PREFIX_PATH = Path(__file__).parent / "prompts" / "prefix-nokker.md"
 
 
+_JUDGE_FALLBACK_WARNED: set[str] = set()  # modèles déjà signalés (un WARNING par modèle et par processus)
+
+
 @dataclass
 class TierConfig:
     base_url: str
@@ -42,6 +45,9 @@ class TierConfig:
     # Fenêtre de contexte servie (jetons, prompt + réponse) ; 0 = inconnue, pas de contrôle. Palier `nina` (70B, KV FP8,
     # 32 k) : un appel qui ne tient pas n'y part pas, il bascule sur Ship (`core/loop.py::_fit_context`).
     max_context_tokens: int = 0
+    # Paramètres d'échantillonnage envoyés tels quels à chaque appel du palier (`temperature`, `top_p`…). Vide = défaut
+    # de l'amont. Seules ces clés passent : rien qui puisse écraser model/messages/tools/stream.
+    sampling: dict[str, Any] = field(default_factory=dict)
 
     def api_key(self) -> str:
         return os.environ.get(self.api_key_env, "")
@@ -110,6 +116,18 @@ class NokkerConfig:
     web_search_engines: list[str] = field(default_factory=lambda: ["exa", "parallel", "firecrawl", "keenable"])
     web_search_budget_s: float = 2.5
     web_search_blocked_terms: list[str] = field(default_factory=list)  # garde PII, en plus des motifs fixes
+    # Pack « Essentiels », vague 1 (docs/ESSENTIALS.md, nokker/tools/essentials/) : météo et pollen suisses (MétéoSuisse
+    # OGD), transports publics (transport.opendata.ch), change (BCE), Wikipédia, bulletin d'avalanches (SLF), jours
+    # fériés suisses, conversions, calculs et dates en local. Sans compte, pour tous les locataires. Éteint (défaut) :
+    # aucune source construite, aucun outil, contexte du modèle inchangé à l'octet.
+    essentials: bool = False
+    # Pack « Essentiels », vague 2 (docs/ESSENTIALS.md §Vague 2) : Grand Genève et France voisine, mobilité partagée,
+    # bornes de recharge, rivières et lacs, qualité de l'air, vacances scolaires. Demande `essentials`. Vide ou
+    # `enabled: false` (défaut) : aucun outil de plus, transit_* sans repli France, contexte inchangé à l'octet.
+    # Clés : `enabled`, `contact_email` (adresse exigée par sharedmobility.ch ; vide = mobility_nearby absent),
+    # `charging_permitted` (accord de l'OFEN pour l'usage commercial ; false = charging_nearby absent),
+    # `navitia_token` (`secret:NOM`, variable d'environnement du pod ; vide ou illisible = pas de repli SNCF).
+    essentials_v2: dict[str, Any] = field(default_factory=dict)
     # Aperçus de liens pour les bulles (nokker/previews/, P1 18.10.2026, docs/BUBBLES.md §5) :
     # OpenGraph/Twitter/oEmbed/Trafilatura, images re-servies par le noyau (cache disque borné).
     previews_enabled: bool = True
@@ -138,8 +156,9 @@ class NokkerConfig:
     # (défaut true), `decisions` ({envoi|fetch|exec: carte|refus}).
     provenance: dict[str, Any] = field(default_factory=dict)
     # Réponses vocales Telegram (docs/VOICE.md, `nokker/voice/tts.py`) : `enabled` (défaut false : aucune voix, aucun
-    # fournisseur construit), `provider` (command | openai_compat), `reply_mode` (voice_in | always | off),
-    # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur.
+    # fournisseur construit), `provider` (command | openai_compat | elevenlabs), `reply_mode` (voice_in | always | off),
+    # `max_chars`, et le bloc du fournisseur. Le fournisseur réel est un choix de l'opérateur. « Écouter » du web (§7,
+    # `nokker/voice/web.py`, fournisseur qui streame seulement) : `web_max_chars` (4000), `web_output_format`.
     tts: dict[str, Any] = field(default_factory=dict)
     # Lexique de prononciation du foyer et normalisation suisse avant la synthèse (docs/VOICE.md §6,
     # `nokker/voice/speak_lexicon.py`) : `enabled` (défaut false : le texte part au TTS tel quel, octet pour octet),
@@ -180,6 +199,9 @@ class NokkerConfig:
     # `qa.calibrate.DEFAULT_THRESHOLDS`, 0,3/0,7).
     judge: TierConfig = field(default_factory=lambda: TierConfig(base_url="https://router.sokkan.ch/v1",
                                                                   model="qwen/qwen3.8-27b"))
+    # Vrai : refuse de démarrer si le juge, le relecteur de cartes (`auto_review`, tier judge) ou un correcteur
+    # (`outcomes_grader: judge`) est allumé sans bloc `judge:` explicite (sinon repli silencieux sur le palier Ship).
+    judge_require_explicit: bool = False
     judge_explicit: bool = False  # posé par `load_config` quand le YAML porte `judge:` (sinon `judge_config()` = Ship)
     judge_thresholds_path: str | None = None
     # ─────────────────────── X8 : juge allumé, multi-modèle (docs/LOKKAL.md §7.17) ───────────────────────
@@ -224,6 +246,12 @@ class NokkerConfig:
     # Fork de sous-agent (veille 01.11 §3.1, `nokker/context/fork.py`) : `delegate(fork=true)` part du contexte exact du
     # dernier appel du parent (même préfixe, cache réutilisé). Défaut false : schéma de `delegate` et noyau inchangés.
     delegate_fork: bool = False
+    # Palier du sous-agent : `delegate(tier=ship|deep)`. Défaut false : schéma et description de `delegate` inchangés ;
+    # un enfant ne dépasse jamais les droits du parent (deep refusé à un compte sans deep).
+    delegate_tier: bool = False
+    # Locataires (ids, ex. `tn_nina`) à qui `delegate` est offert en conversation (hors sessions de code, Lokkal et
+    # CLI qui l'ont déjà). Vide par défaut : rien n'est ouvert.
+    delegate_tenants: list[str] = field(default_factory=list)
 
     # ─────────────────────── P1 : approbations fortes (docs/APPROVALS.md) ───────────────────────
     # Doctrine produit (17.10) : jamais d'action à effet HITL exécutée sans preuve — donc câblé par défaut
@@ -371,6 +399,57 @@ class NokkerConfig:
     # mandate_ttl_s: 86400, timezone: Europe/Zurich, handoff: true}
     payments: bool = False
     payments_settings: dict[str, Any] | None = None
+    # Agent de paiement (docs/PAY-AGENT.md, service SÉPARÉ `python -m payagent`) : avec `payments` allumé, un mandat
+    # signé peut confier le paiement à l'agent (Stripe Shared Payment Tokens) quand le vendeur a un profil Stripe connu
+    # et que l'approbateur a enregistré un moyen de paiement ; sinon la personne paie elle-même, comme sans ce drapeau.
+    # Éteint par défaut : aucune route /v1/payments/method*, description de `pay_request` et mandats inchangés.
+    # pay_agent_settings : {url: http://pay-agent:8790, publishable_key: pk_…, sellers: {shop.example.ch: profile_…}}
+    # Secrets hors YAML : NOKKER_PAY_AGENT_TOKEN, NOKKER_PAY_AGENT_CALLBACK_SECRET.
+    pay_agent: bool = False
+    pay_agent_settings: dict[str, Any] | None = None
+    # Données de carte masquées pour le modèle (docs/PAYMENTS.md §2 bis) : le masquage est TOUJOURS actif ; ce drapeau
+    # n'allume que ses deux textes vus par le modèle (repère « [Masque] n numéro(s)… » en fin de résultat, texte de la
+    # capture refusée). Éteint : pas de repère, ancien texte de capture.
+    card_mask_notice: bool = False
+    # Bulle `approval` posée par le noyau dans le fil à chaque carte qui revient aux humains (docs/BUBBLES.md,
+    # `BubbleHub.approval_pending`), suivie à la décision et à l'expiration ; protégée du modèle et des clients. Éteint :
+    # seule la bulle d'une décision du relecteur automatique existe, comme avant.
+    approval_bubbles: bool = False
+    # Outils des sessions de code (§7.28 : read_file, search_files, write_file, patch, terminal, todo, checkpoints,
+    # skills de session, delegate en fond et delegate_status/delegate_cancel, execute_code) OFFERTS seulement dans un
+    # fil à session de code vivante (`tenancy/resources.py`) : ailleurs, leur schéma est absent (pas seulement refusé).
+    # Éteint (défaut) : le jeu du locataire dans tous ses fils, comme avant.
+    code_tools_session_only: bool = False
+    # La VOIX (boucle principale, profondeur 0) lit seulement parmi les outils des sessions de code : write_file, patch,
+    # terminal, todo et execute_code sont absents de son jeu, même dans un fil de session ; elle fait construire par
+    # `delegate` (worktree), dont les enfants (`/sa-`) gardent tout le jeu. Éteint (défaut) : rien ne change.
+    voice_read_only: bool = False
+    # Routeur de delegate (harnais du 70B) : la voix confie et attend, sans palier ; le noyau lance UN enfant « routeur »
+    # (son modèle : `delegate_router_settings` {model (défaut qwen/qwen3.5-397b-a17b), base_url, api_key_env : ceux du
+    # palier ship par défaut}) qui choisit ship, deep ou les deux et rend UN compte rendu. Éteint (défaut) : inchangé.
+    delegate_router: bool = False
+    delegate_router_settings: dict[str, Any] | None = None
+    # Notes de fonctions (`nokker/guide/notes.py`) : une note standard par fonction du catalogue du Guide (source
+    # unique), 0 à 3 dans un bloc `[Fonctions]` de l'en-tête du tour, filtrées par drapeaux et profil mineur, et l'outil
+    # `feature_get`. Éteint (défaut) : aucun bloc, aucun outil, rien ne change.
+    feature_notes: bool = False
+    feature_notes_settings: dict[str, Any] | None = None  # min_cosine, min_hits, max_notes, budget_chars
+    # Choix de l'outil au paiement (banc du palier 02.11 : pay_request posé 2 fois sur 3 au mieux, le modèle demande une
+    # confirmation en texte) : avec `payments`, description de `pay_request` qui dit d'appeler l'outil au lieu de
+    # répondre ou de demander (la carte EST la confirmation). Éteint par défaut : description inchangée à l'octet.
+    # Sans effet quand l'agent de paiement (`pay_agent`) fournit sa propre description.
+    pay_tool_choice: bool = False
+    # Consigne de langue du préfixe produit (nokker/context/reply_language.py) : la ligne de langue de la section Style
+    # est remplacée par une consigne en tête de section (répondre dans la langue de la personne même si le préfixe, les
+    # blocs, les outils ou les documents sont dans une autre). Éteint par défaut : préfixe identique à l'octet près.
+    reply_language: bool = False
+    # Ligne de langue en fin d'en-tête du tour, juste avant le message (nokker/context/reply_language.py::TAIL_LINE) ;
+    # indépendante de `reply_language`. Éteint par défaut : en-tête du tour identique à l'octet près.
+    reply_language_tail: bool = False
+    # Route v1 (`route.policy: v1`, classeur par règles) : une demande de résumé ou de relais d'un document reste sur le
+    # palier de la voix (conversation) même avec des mots techniques (nokker/route/classify.py::_RELAY_ASK). Aucun texte
+    # vu par le modèle. Éteint par défaut : classement inchangé.
+    route_relay_voice: bool = False
     # Salle Maison (chantier p2/house-room, docs/HOUSE-ROOM.md, nokker/house/) : une salle persistante par foyer, où les
     # membres parlent aux agents de la maison (intendant par défaut, @mention pour un agent) avec les droits de CHAQUE
     # membre ; outil `ask_house` dans les sessions des membres. Demande `household`. Éteint par défaut : aucune route
@@ -516,6 +595,32 @@ class NokkerConfig:
     # Id d'un coupon Stripe appliqué à CHAQUE Checkout (`discounts`), créé chez Stripe à part (bêta : 100 % pendant 3
     # mois, `duration: repeating`). Vide = aucune remise. Pas un secret. Coupon refusé par Stripe : Checkout sans remise.
     billing_coupon: str = ""
+    # Configuration du portail client Stripe (bpc_…) propre à Nokker : sans elle, le portail prend celle par défaut du
+    # compte, partagée avec un autre produit du même compte Stripe (autre titre, autres CGU). Pas un secret.
+    billing_portal_configuration: str = ""
+    # Vouchers d'essai d'un mois (nokker/billing/voucher.py, migration 067) : éteint par défaut (tout code est refusé).
+    # Allumés, ils exigent le sel des empreintes dans l'environnement (`vouchers_salt_env`, 16 caractères au moins ; le
+    # changer rouvre l'essai à tout le monde). `voucher_grants_invite` : un code valide sert aussi d'invitation (décision
+    # attendue, éteint).
+    vouchers_enabled: bool = False
+    vouchers_salt_env: str = "NOKKER_VOUCHER_SALT"
+    voucher_grants_invite: bool = False
+    # ─────────────────────── BYOK cloud (nokker/byok, docs/CLOUD-BYOK.md) ───────────────────────
+    # Un compte de nokker.ai branche sa propre inférence compatible OpenAI au lieu du Router, si sa formule l'inclut.
+    # Éteint par défaut (None ou `enabled: false`) : aucune route /v1/account/models*, aucun tour ne change de modèle.
+    # {enabled, plans: [byok, solo, famille, large] (formules qui l'incluent), open_to_all (dev/banc : tout compte y a droit ; défaut
+    # faux), byok_only_plans: [byok] (formules SANS inférence Nokker : jamais le Router), secrets: {provider:
+    # file|openbao, file: {...}, openbao: {...}} (clés, portée system), state_dir, timeout_s}
+    cloud_byok: dict[str, Any] | None = None
+    # Connecteurs OAuth (docs/CONNECTORS-OAUTH.md) : {microsoft: {client_id, client_secret: secret:NOM, …}, google: {…,
+    # picker: {developer_key, app_id}}} sur les défauts de nokker/connectors/oauth.py. `secret:NOM` = variable
+    # d'environnement NOM du pod (Secret Kubernetes). Éteint sans client_id, sans secret lisible, ou sans
+    # NOKKER_OAUTH_STATE_KEY (signature du `state`).
+    oauth_providers: dict[str, Any] | None = None
+    # Taux USD → CHF du coût affiché (`cost_chf` de `turn.cost` et de `GET /v1/local/cost`, docs/LOKKAL.md §7.8) :
+    # 1 USD = `billing_usd_chf` CHF. Défaut 0,80 (l'inverse du 1 CHF = 1,25 USD du catalogue Router). Lu dans la config
+    # seulement, jamais sur le réseau ; indépendant de `billing_enabled`.
+    billing_usd_chf: float = 0.80
 
     def images_root(self) -> str:
         """Dossier du magasin d'images : `images_dir`, sinon `<local.state_dir>/images` (Lokkal), sinon vide (aucune)."""
@@ -598,6 +703,36 @@ class NokkerConfig:
             return self.judge
         return self.tiers.get("ship") or next(iter(self.tiers.values()), None) or self.judge
 
+    def judge_is_explicit(self) -> bool:
+        return bool(self.judge_explicit or self.judge != TierConfig(base_url="https://router.sokkan.ch/v1",
+                                                                     model="qwen/qwen3.8-27b"))
+
+    def judge_consumers(self) -> list[str]:
+        """Fonctions allumées qui s'appuient sur `judge_config()` (donc sur Ship si `judge:` n'est pas posé)."""
+        out = [n for n in ("judge_enabled", "judge_review", "judge_advice") if getattr(self, n, False)]
+        ar = self.auto_review if isinstance(self.auto_review, dict) else {}
+        if ar.get("enabled") and str(ar.get("tier") or "judge") == "judge":
+            out.append("auto_review")
+        if (self.outcomes_enabled or self.goals_enabled) and str(self.outcomes_grader or "judge") == "judge":
+            out.append("outcomes_grader")
+        return out
+
+    def check_judge_explicit(self) -> None:
+        """Au démarrage : un juge qui retombe sur Ship est dit (WARNING, une fois par modèle) ou, avec
+        `judge_require_explicit`, refusé."""
+        users = self.judge_consumers()
+        if not users or self.judge_is_explicit():
+            return
+        model = self.judge_config().model
+        if self.judge_require_explicit:
+            raise ValueError(f"judge_require_explicit : {', '.join(users)} allumé sans bloc `judge:` explicite "
+                             f"(il retomberait sur le palier Ship, {model}) ; poser `judge:` dans la config")
+        if model not in _JUDGE_FALLBACK_WARNED:
+            _JUDGE_FALLBACK_WARNED.add(model)
+            logging.getLogger("nokker.config").warning(
+                "`judge:` n'est pas posé : %s retombe sur le palier Ship, modèle retenu %s ; poser `judge:` "
+                "(ou judge_require_explicit: true pour refuser ce repli)", ", ".join(users), model)
+
     def go_senders(self) -> frozenset[str]:
         from nokker.qa.invariants import GoAuthorizedSenders
 
@@ -616,6 +751,23 @@ def vision_mode(raw: Any) -> str:
     return "false"
 
 
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                 "repetition_penalty", "seed")
+
+
+def sampling_of(raw: Any) -> dict[str, Any]:
+    """`tiers.<nom>.sampling` → dict validé : clés connues seulement (une clé inconnue est une erreur de config, pas un
+    champ qui partirait en silence à l'amont), valeurs numériques."""
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"sampling : dict attendu, reçu {type(raw).__name__}")
+    unknown = set(raw) - set(SAMPLING_KEYS)
+    if unknown:
+        raise ValueError(f"sampling : clés inconnues {sorted(unknown)} (connues : {', '.join(SAMPLING_KEYS)})")
+    return {k: (int(v) if k in ("top_k", "seed") else float(v)) for k, v in raw.items()}
+
+
 def load_config(path: str | None = None) -> NokkerConfig:
     path = path or DEFAULT_CONFIG_PATH
     p = Path(path)
@@ -627,7 +779,9 @@ def load_config(path: str | None = None) -> NokkerConfig:
                          reasoning_off_body=t.get("reasoning_off_body"),
                          fallback_model=t.get("fallback_model", ""), hedge_after_s=float(t.get("hedge_after_s", 8.0)),
                          cache=str(t.get("cache", "none")), vision=vision_mode(t.get("vision")) == "true",
-                         vision_auto=vision_mode(t.get("vision")) == "auto")
+                         vision_auto=vision_mode(t.get("vision")) == "auto",
+                         max_context_tokens=int(t.get("max_context_tokens", 0) or 0),
+                         sampling=sampling_of(t.get("sampling")))
         for name, t in (raw.get("tiers") or {}).items()
     } or None
     # `api_keys: []` explicite = AUCUNE clé (bêta OVH), pas une clé par défaut ; absente = défaut.
@@ -636,7 +790,9 @@ def load_config(path: str | None = None) -> NokkerConfig:
     judge_raw = raw.get("judge")
     judge = TierConfig(base_url=judge_raw["base_url"], model=judge_raw["model"],
                        api_key_env=judge_raw.get("api_key_env", "ROUTER_KEY"),
-                       reasoning_off_body=judge_raw.get("reasoning_off_body")) if judge_raw else None
+                       reasoning_off_body=judge_raw.get("reasoning_off_body"),
+                       fallback_model=judge_raw.get("fallback_model", ""),
+                       hedge_after_s=float(judge_raw.get("hedge_after_s", 8.0))) if judge_raw else None
     kwargs: dict[str, Any] = {k: v for k, v in raw.items() if k not in ("tiers", "api_keys", "judge")}
     if tiers:
         kwargs["tiers"] = tiers

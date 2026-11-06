@@ -179,3 +179,14 @@ def test_autre_proxy_ou_identite_ecrases():
         env = _env_of([f"HTTPS_PROXY={v}"])
         assert "HTTPS_PROXY=http://egress:3128" in env, v
         assert f"HTTPS_PROXY={v}" not in env, v
+
+
+
+def test_proxy_ssh_pose_par_le_proxy_seulement():
+    """Client ssh des outils `ssh_*` : `NOKKER_SSH_PROXY` = hôte:port d'egress, jamais la valeur du noyau."""
+    env = dp.check_create(sandbox(), CFG)["Env"]
+    assert "NOKKER_SSH_PROXY=egress:3128" in env
+    env = _env_of(["NOKKER_SSH_PROXY=evil:22", "nokker_ssh_proxy=evil:1"])
+    assert [e for e in env if e.lower().startswith("nokker_ssh_proxy=")] == ["NOKKER_SSH_PROXY=egress:3128"]
+    assert not any(e.startswith("NOKKER_SSH_PROXY") for e in dp.check_create(sandbox(hc_NetworkMode="none"),
+                                                                              CFG)["Env"])

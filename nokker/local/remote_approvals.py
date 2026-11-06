@@ -103,6 +103,9 @@ class RemoteApprovals:
     client: Any = None  # httpx.Client injectable (tests)
     clock: Callable[[], float] = time.time
     last_status: int | None = None  # statut HTTP de la dernière relève (None : aucune)
+    # Cartes qui se signent avec la passkey LOCALE et ne sont donc jamais déposées (carte « à payer » own_card,
+    # docs/PAY-AGENT.md §11) ; None : toutes les cartes fortes sont déposées, comme avant.
+    local_only: Callable[[Approval], bool] | None = None
     # approval_id → défi déposé (texte exact) : la preuve est vérifiée contre NOTRE défi, pas celui que rend nokker.ai
     _cards: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _skip: set[str] = field(default_factory=set, init=False, repr=False)  # refusées au dépôt (déjà décidées là-bas)
@@ -210,6 +213,10 @@ class RemoteApprovals:
                 with self._lock:
                     known = a.id in self._cards or a.id in self._skip
                 if a.strength != "strong" or known:
+                    continue
+                if self.local_only is not None and self.local_only(a):
+                    # carte « à payer » own_card (docs/PAY-AGENT.md §11) : elle se signe avec la passkey LOCALE,
+                    # jamais chez nokker.ai — elle n'est donc pas déposée
                     continue
                 if self._deposit(token, a):
                     deposited += 1

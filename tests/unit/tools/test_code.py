@@ -165,8 +165,10 @@ def test_terminal_runs_tests_and_classifies(local):
     src, work = local
     (work / "test_ok.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test(self):\n"
                                      "        self.assertEqual(1 + 1, 2)\n")
-    r = _j(src.call("terminal", {"command": "python3 -m unittest -q test_ok"}, CTX))
-    assert r["returncode"] == 0
+    from tests.unit.tools.fenced import parse
+
+    r = parse(src.call("terminal", {"command": "python3 -m unittest -q test_ok"}, CTX).content)  # sortie clôturée
+    assert r["returncode"] == 0 and r["_kind"] == "terminal:output"
     spec = {s.name: s for s in src.specs()}["terminal"]
     assert spec.effect_for({"command": "ls -la"}) is Effect.READ
     assert spec.effect_for({"command": "python3 -m unittest"}) is Effect.WRITE
@@ -244,3 +246,16 @@ def test_mount_path_is_configurable_for_bench_images(tmp_path):
     assert src._host_path(ws, "/workspace/pkg") is None  # l'ancien montage n'existe pas dans ce bac
     assert host_path(tmp_path, "/testbed/pkg/mod.py", "/testbed") == str(tmp_path / "pkg" / "mod.py")
     assert CodeToolSource(root=str(tmp_path), backend="docker").mount == "/workspace"
+
+
+def test_ops_state_commands_are_reads_but_not_their_writing_forms():
+    from nokker.tools.code import _read_only
+
+    for c in ("uptime", "df -h /", "free -m", "docker ps", "docker ps -a", "docker logs --tail 50 web",
+              "systemctl status nginx", "systemctl is-active ssh", "journalctl -u ssh -n 50", "hostname",
+              "ps aux", "lsblk", "uptime && df -h / && docker ps"):
+        assert _read_only(c), c
+    for c in ("hostname evil", "docker rm web", "docker run alpine", "docker exec web sh", "docker -H tcp://x ps",
+              "systemctl restart nginx", "systemctl stop ssh", "journalctl --vacuum-size=1M", "journalctl --rotate",
+              "df -h / > /tmp/x"):
+        assert not _read_only(c), c

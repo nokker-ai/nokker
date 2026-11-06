@@ -46,7 +46,10 @@ UNSCOPED_OK = {"operators", "admin_audit", "beta_applications", "used_nonces", "
                "billing_events",  # idempotence des webhooks Stripe : identifiant et type d'événement, aucune donnée de compte
                "lokkal_relay_used_jti",  # jti des jetons de pages (035) : empreintes, 10 min au plus, aucun compte
                # canaux Slack/WhatsApp (048) : identifiants d'événements du fournisseur ; fenêtre de 24 h sous empreinte
-               "channel_events", "channel_windows"}
+               "channel_events", "channel_windows",
+               # vouchers d'essai (067) : campagnes, et usages sous empreintes HMAC salées (aucun locataire en clair) ;
+               # gardés à l'effacement : « un essai par personne » doit survivre au compte
+               "vouchers", "voucher_uses"}
 _LAST = ("accounts", "tenants")  # supprimées après tout le reste, dans cet ordre
 # Équipe (X17, migration 023) : un compte membre d'un projet d'un AUTRE locataire y a des lignes au locataire du projet.
 # Elles partent avec lui : la transaction pose aussi `app.account_id` / `app.account_email`, que les politiques d'équipe
@@ -93,6 +96,8 @@ class Report:
     deleted: dict[str, int] = field(default_factory=dict)
     unscoped: list[str] = field(default_factory=list)
     applied: bool = False
+    # Noms des clés BYOK du locataire au coffre du noyau (`byok.<tn_…>.<nom>`, nokker/byok/erase.py) : jamais les valeurs.
+    vault_names: list[str] = field(default_factory=list)
 
     def journal_line(self) -> str:
         return json.dumps({"tenant_id": self.tenant_id,
@@ -106,6 +111,9 @@ class Report:
         lines.append(f"  (tables sans ligne du compte : {', '.join(t for t, n in self.deleted.items() if not n) or '—'})")
         if self.unscoped:
             lines.append(f"  NON CONCERNÉES, à regarder : {', '.join(self.unscoped)}")
+        if self.vault_names:
+            lines.append(f"  clés BYOK du coffre ({'supprimées' if self.applied else 'à supprimer'}, noms seulement) : "
+                         f"{', '.join(self.vault_names)}")
         if self.applied:
             lines += ["À faire hors base :",
                       f"  1. journal des effacements (coffre de l'opérateur) : {self.journal_line()}",
@@ -173,13 +181,16 @@ def _devices(conn: psycopg.Connection, account_id: str) -> list[dict[str, Any]]:
 def erase_scope(config: Any) -> dict[str, Any]:
     """Ce qui vit hors de la base du noyau, d'après la configuration du serveur : à passer à `erase_account` par TOUT
     chemin d'effacement (CLI, file des suppressions demandées par les personnes), pour qu'aucun n'en oublie."""
+    byok = getattr(config, "cloud_byok", None)
     return {"images_root": config.images_root() or None, "code": config.code,
-            "session_memory": dict(config.context_corthexis) if config.context_corthexis else None}
+            "session_memory": dict(config.context_corthexis) if config.context_corthexis else None,
+            "cloud_byok": dict(byok) if byok else None}
 
 
 def erase_account(dsn: str, *, email: str | None = None, account_id: str | None = None,
                   apply: bool = False, confirm: str | None = None, images_root: str | None = None,
                   code: dict[str, Any] | None = None, session_memory: dict[str, Any] | None = None,
+                  cloud_byok: dict[str, Any] | None = None,
                   before_commit: Callable[[Report], None] | None = None) -> Report:
     """`images_root` (X7, `NokkerConfig.images_root()`) : le magasin des images jointes ; le dossier du locataire y est
     supprimé APRÈS la validation de la base (à blanc : seulement compté). `code` (`NokkerConfig.code`, sessions de
@@ -189,13 +200,20 @@ def erase_account(dsn: str, *, email: str | None = None, account_id: str | None 
     AVANT la validation (nokker/context/corthexis_erase.py) ; en échec, `EraseError` et rien n'est validé.
     `before_commit(report)` (validé seulement) : appelé dans la transaction, les suppressions faites, AVANT l'index de
     session et la validation — le journal des effacements de la file (`ErasureJournal`) ; s'il lève, `EraseError` et
-    rien n'est effacé (le compte reste dans la file)."""
+    rien n'est effacé (le compte reste dans la file).
+    `cloud_byok` (`NokkerConfig.cloud_byok`) : les clés BYOK du locataire au coffre du noyau (`byok.<tn_…>.*`), listées
+    par leur nom dans le compte rendu, supprimées après la validation (nokker/byok/erase.py)."""
     report = _erase_db(dsn, email=email, account_id=account_id, apply=apply, confirm=confirm,
                        session_memory=session_memory, before_commit=before_commit)
     if code:
         from nokker.code_sessions.erase import erase_code_tenant
 
         report.deleted.update(erase_code_tenant(code, report.tenant_id, apply=report.applied))
+    if cloud_byok:
+        from nokker.byok.erase import erase_byok_tenant
+
+        report.vault_names = erase_byok_tenant(cloud_byok, report.tenant_id, apply=report.applied)
+        report.deleted["byok: clés du coffre"] = len(report.vault_names)
     if images_root:
         from pathlib import Path
 

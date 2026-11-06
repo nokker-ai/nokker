@@ -99,10 +99,11 @@ def start_bridge(tmp_path, ha, *, entities=ENTITIES, connect="fake", resolve=Non
     return bridge, f"http://127.0.0.1:{api.server_address[1]}"
 
 
-def make(tmp_path, small_replies, ship_replies=(), *, members=None, extra=None, escalate="deep", small_tier=Tier.LOCAL):
+def make(tmp_path, small_replies, ship_replies=(), *, members=None, extra=None, escalate="deep", small_tier=Tier.LOCAL,
+         entities=ENTITIES):
     ha = FakeHomeAssistant()
-    _httpd, url = start_bridge(tmp_path, ha)
-    raw = {"enabled": True, "bridge_url": url, "entities": ENTITIES,
+    _httpd, url = start_bridge(tmp_path, ha, entities=entities)
+    raw = {"enabled": True, "bridge_url": url, "entities": list(entities),
            "members": members or {"alice": "adult", "bob": "teen"}, "journal_path": str(tmp_path / "home.jsonl"),
            "escalate_tier": escalate, **(extra or {})}
     src = HomeAssistantSource.from_config(raw, env={"NOKKER_HOME_BRIDGE_TOKEN": BRIDGE_TOKEN})
@@ -291,16 +292,23 @@ def test_minor_profile_of_household_overrides_the_config(tmp_path):
 
 
 def test_unexposed_and_unlisted_domains_are_refused(tmp_path):
-    src, ha, *_ = make(tmp_path, [plan(("switch", "turn_on", "switch.pompe"), ("light", "turn_on", "light.cuisine"))])
+    # prises et interrupteurs : directs par défaut ; retirés des domaines directs par la config, refusés
+    src, ha, *_ = make(tmp_path, [plan(("switch", "turn_on", "switch.pompe"), ("light", "turn_on", "light.cuisine"))],
+                       extra={"direct_domains": ["light", "cover", "climate", "media_player"]})
     r = src.call("maison", {"demande": "allume la pompe"}, ctx())
     assert ha.calls == [] and "domaine non autorisé : switch" in r.content and "hors de la carte" in r.content
+    src, ha, *_ = make(tmp_path, [plan(("switch", "turn_on", "switch.pompe"))])
+    src.call("maison", {"demande": "allume la pompe"}, ctx())
+    assert ha.calls == [("switch", "turn_on", ["switch.pompe"], {})]
 
 
 def test_knx_bus_write_is_refused_by_default_and_strong_when_listed(tmp_path):
     from nokker.home.policy import HomePolicy
 
     p = HomePolicy.from_config({"entities": ["*"]})
-    attrs = lambda e: {}
+    def attrs(e):
+        return {}
+
     assert p.classify("knx", "send", ["knx.x"], {}, attrs).klass == "deny"
     p = HomePolicy.from_config({"entities": ["*"], "direct_domains": ["light", "knx"]})
     assert p.classify("knx", "send", ["knx.x"], {}, attrs).klass == "strong"

@@ -32,6 +32,18 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 logger = logging.getLogger("nokker.homebridge.ha")
 EVENT_BUFFER = 1000
 MAX_POLL_S = 30.0
+# Services d'intégration dont la cible est une entité d'un AUTRE domaine (Music Assistant pilote des media_player).
+TARGET_DOMAIN: dict[str, str] = {"music_assistant": "media_player"}
+# Clés de `data` qui désignent d'autres entités (grouper des enceintes, parler sur une enceinte) : chacune doit être
+# dans la liste blanche et du domaine indiqué.
+ENTITY_REF_KEYS: dict[str, str] = {"group_members": "media_player", "media_player_entity_id": "media_player",
+                                   "source_player": "media_player"}
+TARGET_KEYS = frozenset({"entity_id", "area_id", "device_id", "floor_id", "label_id"})
+# Services à réponse (lecture) servis par `ha.query` : liste fermée.
+QUERY_SERVICES = frozenset({("weather", "get_forecasts"), ("calendar", "get_events"), ("todo", "get_items"),
+                            ("media_player", "search_media"), ("music_assistant", "search"),
+                            ("music_assistant", "get_queue")})
+MAX_HISTORY_H = 24 * 7
 
 
 class HaError(RuntimeError):
@@ -245,11 +257,27 @@ class HomeAssistant:
         return self._with(get)
 
     def call_service(self, domain: str, service: str, data: dict[str, Any] | None = None,
-                     entity_ids: list[str] | None = None) -> Any:
+                     entity_ids: list[str] | None = None, return_response: bool = False) -> Any:
         payload: dict[str, Any] = {"domain": domain, "service": service, "service_data": dict(data or {})}
         if entity_ids is not None:
             payload["target"] = {"entity_id": list(entity_ids)}
+        if return_response:
+            payload["return_response"] = True
         return self._with(lambda s: s.command("call_service", **payload))
+
+    def history(self, entity_ids: list[str], start: str, end: str | None = None) -> Any:
+        """WebSocket `history/history_during_period` (compte non administrateur suffisant, vérifié sur 2026.11)."""
+        payload: dict[str, Any] = {"start_time": start, "entity_ids": list(entity_ids), "minimal_response": True,
+                                   "no_attributes": True, "significant_changes_only": False}
+        if end:
+            payload["end_time"] = end
+        return self._with(lambda s: s.command("history/history_during_period", **payload))
+
+    def logbook(self, entity_ids: list[str], start: str, end: str | None = None) -> Any:
+        payload: dict[str, Any] = {"start_time": start, "entity_ids": list(entity_ids)}
+        if end:
+            payload["end_time"] = end
+        return self._with(lambda s: s.command("logbook/get_events", **payload))
 
     def write_config(self, kind: str, config_id: str, config: dict[str, Any]) -> None:
         token = (self.admin_token or self.token).get()
@@ -295,6 +323,8 @@ class HaOps:
 
     ha: HomeAssistant
     entities: tuple[str, ...] = ()
+    # Services notify déclarés (home.yaml `notify_services`, ex. `mobile_app_pixel`) en plus des entités `notify.*`.
+    notify_services: tuple[str, ...] = ()
     _events: collections.deque = field(default_factory=lambda: collections.deque(maxlen=EVENT_BUFFER), init=False)
     _seq: int = field(default=0, init=False)
     _cond: threading.Condition = field(default_factory=threading.Condition, init=False)
@@ -311,21 +341,87 @@ class HaOps:
         reg = self.ha.registry()
         return {"areas": [{"area_id": a.get("area_id"), "name": a.get("name")} for a in reg["areas"]],
                 "devices": [{"id": d.get("id"), "area_id": d.get("area_id")} for d in reg["devices"]],
-                "entities": [{k: e.get(k) for k in ("entity_id", "area_id", "device_id", "hidden_by", "disabled_by")}
+                "entities": [{k: e.get(k) for k in ("entity_id", "area_id", "device_id", "hidden_by", "disabled_by",
+                                                     "platform")}
                              for e in reg["entities"] if self.allowed(str(e.get("entity_id") or ""))]}
 
-    def call(self, p: dict[str, Any]) -> dict[str, Any]:
+    def _targets(self, p: dict[str, Any]) -> tuple[str, str, list[str], dict[str, Any]]:
         domain, service = str(p.get("domain") or ""), str(p.get("service") or "")
         ids, data = p.get("entity_ids"), p.get("data") or {}
-        if not isinstance(ids, list) or not ids or not isinstance(data, dict):
-            raise ValueError("entity_ids (liste non vide) et data (objet)")
-        if {"entity_id", "area_id", "device_id", "floor_id", "label_id"} & set(data):
+        if not isinstance(ids, list) or not ids or not isinstance(data, dict) or len(ids) > 10:
+            raise ValueError("entity_ids (liste non vide, 10 au plus) et data (objet)")
+        if TARGET_KEYS & set(data):
             raise PermissionError("cible dans data refusée")
-        bad = [str(e) for e in ids if not self.allowed(str(e)) or str(e).split(".", 1)[0] != domain]
+        tdom = TARGET_DOMAIN.get(domain, domain)
+        bad = [str(e) for e in ids if not self.allowed(str(e)) or str(e).split(".", 1)[0] != tdom]
+        for key, ref_domain in ENTITY_REF_KEYS.items():
+            if key in data:
+                refs = data[key] if isinstance(data[key], list) else [data[key]]
+                bad += [str(r) for r in refs if not self.allowed(str(r)) or str(r).split(".", 1)[0] != ref_domain]
         if bad:
             raise PermissionError(f"entité hors liste ou d'un autre domaine : {', '.join(bad)[:200]}")
-        self.ha.call_service(domain, service, data, [str(e) for e in ids])
+        return domain, service, [str(e) for e in ids], data
+
+    def call(self, p: dict[str, Any]) -> dict[str, Any]:
+        domain, service, ids, data = self._targets(p)
+        if (domain, service) in QUERY_SERVICES:
+            raise PermissionError("service à réponse : ha.query")
+        self.ha.call_service(domain, service, data, ids)
         return {"ok": True}
+
+    def query(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Service à réponse de la liste fermée QUERY_SERVICES (météo, agenda, liste, recherche de média)."""
+        domain, service, ids, data = self._targets(p)
+        if (domain, service) not in QUERY_SERVICES:
+            raise PermissionError(f"service à réponse non permis : {domain}.{service}")
+        got = self.ha.call_service(domain, service, data, ids, return_response=True) or {}
+        resp = got.get("response") if isinstance(got, dict) else None
+        return {"response": {k: v for k, v in (resp or {}).items() if self.allowed(str(k))}}
+
+    def notify(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Notification : entité `notify.*` de la liste blanche (notify.send_message) ou service notify déclaré."""
+        target, message = str(p.get("target") or ""), str(p.get("message") or "")
+        title = str(p.get("title") or "")
+        if not message or len(message) > 1000 or len(title) > 200:
+            raise ValueError("message (1 000 caractères au plus) et title (200)")
+        data = {"message": message, **({"title": title} if title else {})}
+        if target.startswith("notify.") and self.allowed(target):
+            self.ha.call_service("notify", "send_message", data, [target])
+        elif target.removeprefix("notify.") in self.notify_services:
+            self.ha.call_service("notify", target.removeprefix("notify."), data, None)
+        else:
+            raise PermissionError("destinataire de notification non déclaré")
+        return {"ok": True}
+
+    def _period(self, p: dict[str, Any]) -> tuple[list[str], str, str | None]:
+        import datetime as _dt
+
+        ids = p.get("entity_ids")
+        if not isinstance(ids, list) or not ids or len(ids) > 10:
+            raise ValueError("entity_ids (liste non vide, 10 au plus)")
+        bad = [str(e) for e in ids if not self.allowed(str(e))]
+        if bad:
+            raise PermissionError(f"entité hors liste : {', '.join(bad)[:200]}")
+        try:
+            hours = float(p.get("hours", 24))
+        except (TypeError, ValueError):
+            raise ValueError("hours numérique") from None
+        hours = max(0.1, min(hours, MAX_HISTORY_H))
+        start = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).isoformat()
+        return [str(e) for e in ids], start, None
+
+    def history(self, p: dict[str, Any]) -> dict[str, Any]:
+        ids, start, end = self._period(p)
+        got = self.ha.history(ids, start, end) or {}
+        return {"history": {k: [{"s": r.get("s"), "lu": r.get("lu") or r.get("lc")} for r in v][-200:]
+                            for k, v in got.items() if self.allowed(str(k)) and isinstance(v, list)}}
+
+    def logbook(self, p: dict[str, Any]) -> dict[str, Any]:
+        ids, start, end = self._period(p)
+        got = self.ha.logbook(ids, start, end) or []
+        keep = ("when", "entity_id", "state", "name", "message")
+        return {"entries": [{k: e.get(k) for k in keep if k in e} for e in got
+                            if isinstance(e, dict) and self.allowed(str(e.get("entity_id") or ""))][-200:]}
 
     def write_config(self, p: dict[str, Any]) -> dict[str, Any]:
         kind, cid, cfg = str(p.get("type") or ""), str(p.get("id") or ""), p.get("config")
@@ -385,5 +481,5 @@ class HaOps:
         self._stop.set()
 
 
-__all__ = ["HaError", "HaOps", "HaSession", "HomeAssistant", "TokenSource", "Transport", "WebSocketTransport",
+__all__ = ["ENTITY_REF_KEYS", "QUERY_SERVICES", "TARGET_DOMAIN", "HaError", "HaOps", "HaSession", "HomeAssistant", "TokenSource", "Transport", "WebSocketTransport",
            "from_config", "oauth_exchange", "ws_url"]

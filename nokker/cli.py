@@ -86,7 +86,8 @@ def _cmd_code(args: argparse.Namespace) -> int:
     delegate = DelegateToolSource(  # sous-agents : copies du noyau parent sur le registre filtré (hooks : héritage
         lambda registry, thread_id, observer: dataclasses.replace(  # explicite seulement, voir nokker/tools/hooks.py)
             parent["k"], observer=observer, tools=hooks["r"].wrap(registry) if "r" in hooks else registry),
-        source, fork=bool(getattr(config, "delegate_fork", False)))
+        source, fork=bool(getattr(config, "delegate_fork", False)),
+        tier=bool(getattr(config, "delegate_tier", False)))
     memory_tools = [ProjectMemoryTools(project_memory)] if project_memory is not None else []
     skill_tools = []
     if getattr(args, "project_skills", False) or local.get("project_skills", False):
@@ -795,6 +796,15 @@ def build_parser() -> argparse.ArgumentParser:
     review_p = sub.add_parser("review", help="relecture d'un diff ou d'une PR par le juge, par ligne (lot X13)")
     add_review_arguments(review_p).set_defaults(func=_cmd_review, unscoped=True)
 
+    ar_p = sub.add_parser("auto-review", help="relecteur automatique des cartes : export d'opérateur (lecture seule)")
+    ar_sub = ar_p.add_subparsers(dest="auto_review_command", required=True)
+    ar_exp = ar_sub.add_parser("export", help="JSON lignes de TOUTES les décisions APPROUVER du relecteur "
+                                              "(revue humaine) : date, locataire, carte, outil, règle, effet, "
+                                              "arguments résumés, raison, modèle réel, trajectoire (noms d'outils)")
+    ar_exp.add_argument("--since", required=True, metavar="ISO", help="début inclus (ISO 8601 ; sans fuseau : UTC)")
+    ar_exp.add_argument("--until", metavar="ISO", help="fin exclue (défaut : maintenant)")
+    ar_exp.set_defaults(func=_cmd_auto_review, unscoped=True)
+
     mcp_p = sub.add_parser("mcp", help="Nokker comme serveur MCP : `mcp serve` sur stdio (docs/MCP-SERVER.md)")
     mcp_p.add_argument("mcp_args", nargs=argparse.REMAINDER)
     mcp_p.set_defaults(func=_cmd_mcp, unscoped=True)
@@ -919,6 +929,21 @@ def _cmd_mandate_verify(args: argparse.Namespace) -> int:
     out = verify_envelope(env, trusted_spki=args.device_key, expected_origin=args.origin).to_json()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0 if out["valid"] else 1
+
+
+def _cmd_auto_review(args: argparse.Namespace) -> int:
+    from nokker.approvals.auto_review_export import main as export_main
+
+    dsn = _admin_dsn(args)
+    if not dsn:
+        return 1
+    try:
+        n = export_main(dsn, args.since, args.until, sys.stdout)
+    except ValueError as e:
+        print(f"[erreur: date ISO illisible ({e})]", file=sys.stderr)
+        return 2
+    print(f"[{n} décision(s) approuvée(s)]", file=sys.stderr)
+    return 0
 
 
 def _cmd_mcp(args: argparse.Namespace) -> int:

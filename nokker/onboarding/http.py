@@ -11,6 +11,10 @@ comporte alors exactement comme avant). Routes publiques (le testeur n'a pas enc
     GET  /v1/onboarding/terms?lang=fr|en        → {lang, sha256, text}
     POST /v1/onboarding/accept                  → 201 {account_id, device_id, lang}
          {token, terms_sha256, public_key_spki, name, training_consent?}   (la clé privée ne quitte jamais l'appareil)
+    POST /v1/onboarding/voucher {code, email, lang}  → 200 {sent: true} | 400 code_* | 503 front_unavailable
+         Code de campagne qui sert d'invitation (`voucher_grants_invite`, sinon 404) : refus ou réservation du code
+         AVANT tout compte, puis invitation envoyée par front1 (le lien prouve l'adresse). Adresse qui a déjà un
+         compte : 200 sans rien faire (la réponse ne dit pas si un compte existe).
 
 Connexion par code e-mail (nokker/onboarding/emailcode.py), publiques elles aussi :
 
@@ -19,6 +23,7 @@ Connexion par code e-mail (nokker/onboarding/emailcode.py), publiques elles auss
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -37,6 +42,8 @@ RATE_MAX, RATE_WINDOW_S = 30, 60.0
 
 _onboarding: Onboarding | None = None
 _codes: EmailCodes | None = None
+_vouchers: Any = None  # nokker.billing.voucher.Vouchers (posé par configure_billing quand les vouchers sont allumés)
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
 _hits: dict[str, deque[float]] = defaultdict(deque)
 _lock = threading.Lock()
 
@@ -49,6 +56,41 @@ _is_minor: Any = None
 def configure_minors(is_minor: Any) -> None:
     global _is_minor
     _is_minor = is_minor
+
+
+def configure_vouchers(vouchers: Any) -> None:
+    global _vouchers
+    _vouchers = vouchers
+
+
+def _voucher_signup(ob: Onboarding, handler: Any) -> None:
+    from nokker.billing.voucher import VoucherError
+    from nokker.onboarding.front import FrontError
+
+    body = handler._read_json_body()
+    email = str(body.get("email") or "").strip()[:254]
+    lang = body.get("lang") if body.get("lang") in ("fr", "en") else "fr"
+    if not _EMAIL_RE.match(email):
+        handler._json(400, {"error": "bad_email"})
+        return
+    if ob.tenancy.account_by_email(email) is not None:
+        handler._json(200, {"sent": True})  # même réponse qu'une invitation partie : rien ne trahit un compte
+        return
+    try:
+        use_id, held = _vouchers.invite_hold(str(body.get("code") or "")[:64], email)
+    except VoucherError as e:
+        handler._json(e.status, {"error": e.code})
+        return
+    try:
+        from nokker.billing.voucher import norm_code
+
+        ob.front.voucher_invite(email, lang, norm_code(str(body.get("code") or "")))
+    except FrontError:
+        if not held:  # le code n'est pas perdu si la PREMIÈRE invitation ne part pas ; une redemandée garde la sienne
+            _vouchers.release(use_id)
+        handler._json(503, {"error": "front_unavailable"})
+        return
+    handler._json(200, {"sent": True})
 
 
 def configure(onboarding: Onboarding | None, codes: EmailCodes | None = None) -> None:
@@ -117,6 +159,10 @@ def handle(handler: Any, method: str, path: str) -> bool:
         elif method == "GET" and route == "terms":
             t = terms.load((query.get("lang") or ["fr"])[0])
             handler._json(200, {"lang": t.lang, "sha256": t.sha256, "text": t.text})
+        elif method == "POST" and route == "voucher":
+            if _vouchers is None or not getattr(_vouchers, "grants_invite", False):
+                return False
+            _voucher_signup(ob, handler)
         elif method == "POST" and route == "accept":
             body = handler._read_json_body()
             out = ob.accept(str(body.get("token") or ""), str(body.get("terms_sha256") or ""),
@@ -138,6 +184,39 @@ def _iso(value: Any) -> str | None:
     return value.isoformat()
 
 
+def _terms_state(account: Any, accepted: list[dict]) -> dict[str, Any]:
+    """Version courante des conditions pour ce compte (langue de sa dernière acceptation, sinon la sienne) et si son
+    acceptation est périmée : la dernière version acceptée n'est plus le texte courant d'AUCUNE langue (fr ou en). Un
+    compte sans aucune acceptation (créé hors invitation) n'est pas bloqué : rien à « réaccepter »."""
+    last = accepted[-1] if accepted else None
+    lang = (last or {}).get("lang") or getattr(account, "lang", None) or "fr"
+    cur = terms.load(lang)
+    outdated = bool(last) and terms.lang_of_version(str(last["terms_version_sha256"])) is None
+    return {"terms_current": {"version": cur.sha256, "lang": cur.lang}, "terms_outdated": outdated}
+
+
+def terms_outdated_for(account_id: str | None) -> bool:
+    """Le compte doit-il réaccepter les conditions (même règle que `terms_outdated` de GET /v1/account) ? Faux sans
+    onboarding (Lokkal, développement), sans compte, ou sans AUCUNE acceptation (compte créé hors invitation). Garde des
+    envois à un sous-traitant que la version courante annonce (lecture à voix haute, §5)."""
+    ob = _onboarding
+    if ob is None or not account_id:
+        return False
+    accepted = ob.acceptances.for_account(account_id)
+    return bool(accepted) and terms.lang_of_version(str(accepted[-1]["terms_version_sha256"])) is None
+
+
+def terms_route(handler: Any, method: str, path: str) -> bool:
+    """`GET /v1/terms?lang=fr|en` (public : le texte des conditions l'est) → `{version, lang, text}` ; la version est le
+    SHA-256 des octets rendus, celle que `POST /v1/account/terms` attend."""
+    if urlsplit(path).path != "/v1/terms" or method != "GET":
+        return False
+    lang = (parse_qs(urlsplit(path).query).get("lang") or ["fr"])[0]
+    t = terms.load(lang)
+    handler._json(200, {"version": t.sha256, "lang": t.lang, "text": t.text})
+    return True
+
+
 def account_route(handler: Any, method: str, path: str, account: Any) -> bool:
     """« Mon compte » (docs/CLIENT-API.md), appelé par `_account_route` du serveur : session vérifiée, locataire fixé,
     compte `us_…`. `GET /v1/account` et `PUT /v1/account/consent` (retrait ou accord du consentement d'usage des
@@ -152,7 +231,25 @@ def account_route(handler: Any, method: str, path: str, account: Any) -> bool:
             "email": account.email, "lang": account.lang, "created_at": _iso(account.created_at),
             "status": account.status,
             "terms": {"version": last["terms_version_sha256"], "accepted_at": _iso(last["accepted_at"])} if last else None,
+            **_terms_state(account, accepted),
             "consents": {"training": training, **({"training_locked": "minor"} if minor else {})}})
+        return True
+    if path == "/v1/account/terms" and method == "POST":
+        # Réacceptation (conditions modifiées) : la version DOIT être le texte courant d'une langue, sinon 409
+        # `stale_version` (l'écran affiché est périmé). Ajout seul : une ligne de plus, avec l'IP, sans invitation.
+        if ob is None:
+            handler._json(503, {"error": "terms_disabled"})
+            return True
+        version = str(handler._read_json_body().get("version") or "")
+        lang = terms.lang_of_version(version)
+        if lang is None:
+            handler._json(409, {"error": "stale_version"})
+            return True
+        ob.acceptances.record(account.account_id, None, version, lang, client_ip(handler))
+        accepted = ob.acceptances.for_account(account.account_id)
+        handler._json(200, {"terms": {"version": version, "lang": lang,
+                                      "accepted_at": _iso(accepted[-1]["accepted_at"]) if accepted else None},
+                            **_terms_state(account, accepted)})
         return True
     if path == "/v1/account/consent" and method == "PUT":
         if ob is None or ob.consents is None:

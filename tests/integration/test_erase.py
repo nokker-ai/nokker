@@ -16,6 +16,9 @@ from tests.integration.test_rls import A, B, pg, requires_pg  # noqa: F401  (pg 
 
 ACC = {A: "us_aaaaaaaaaaaa", B: "us_bbbbbbbbbbbb"}
 CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connector_credentials": {"kind": "mail"},
+           # partages de connecteurs (068) : nature et niveau contraints ; journal : événement contraint
+           "connector_grants": {"kind": "mail", "level": "read"}, "connector_grant_events": {"event": "granted"},
+           "oauth_accounts": {"state": "ok"},
            # foyer (039) : une attestation est toujours attestée, pour un profil mineur
            "parental_consents": {"attested": True, "profile": "teen"}, "account_minors": {"profile": "teen"},
            # foyers autorisés aux profils mineurs (043) : l'audit n'accepte que allow | revoke

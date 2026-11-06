@@ -45,7 +45,7 @@ def _delegate_effect(args: dict[str, Any]) -> Effect:
     return Effect.DESTRUCTIVE if args.get("isolate", True) is False else Effect.WRITE
 
 
-_PROTO = DelegateToolSource(lambda *a: None, None, background=True)
+_PROTO = DelegateToolSource(lambda *a: None, None, background=True, routable=False)  # schéma d'avant, toujours
 _SPECS = tuple(ToolSpec(name=s.name, description=s.description, parameters=s.parameters, effect=s.effect, core=False,
                         source=DELEGATE_SOURCE, fresh=s.fresh,
                         effect_of=_delegate_effect if s.name == "delegate" else None)
@@ -103,7 +103,13 @@ class SessionSubagents:
         self.sessions = sessions
 
     def specs(self) -> list[ToolSpec]:
-        return list(_SPECS) if self.sessions.cfg.max_subagents > 0 else []
+        if self.sessions.cfg.max_subagents <= 0:
+            return []
+        from nokker.tools.delegate import router_on, voice_delegate_spec, voice_thread
+
+        if router_on() and voice_thread():  # `delegate_router` : la voix confie et attend (ni palier ni fond)
+            return [voice_delegate_spec()]
+        return list(_SPECS)
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         def err(text: str) -> ToolResult:

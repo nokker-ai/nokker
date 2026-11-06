@@ -188,3 +188,86 @@ def test_code_json_cost_is_the_turn_cost_with_this_run_subagents(cat):
     assert body["calls"] == 2 and body["subagent_calls"] == 1 and body["total_tokens"] == 3_150
     assert body == {"thread_id": "code-1", "turn_id": "code-1:0", **turn_cost(
         turn.calls, cat, subagents=[r for r in map(row_from_call, [_call(OVH, 2_000, 100)])])}
+
+
+# ── Montant CHF à côté (`cost_chf`, 05.11.2026 : le web cloud n'affiche que du CHF) ──
+
+SHIP = "qwen/qwen3.8-27b"
+
+
+@pytest.fixture
+def usd_chf_reset():
+    from nokker.ledger import turn_cost as tc
+
+    yield tc
+    tc.set_usd_chf(tc.DEFAULT_USD_CHF)
+
+
+def test_cost_chf_converts_usd_at_default_rate_and_keeps_cost(cat, usd_chf_reset):
+    body = turn_cost([_call(SHIP, 10_000, 2_000, tier=Tier.SHIP)], cat)
+    usd = round((10_000 * 0.20 + 2_000 * 2.50) / 1_000_000, 6)
+    assert body["cost"] == {"USD": usd}  # contrat existant inchangé
+    assert body["usd_chf"] == 0.80 == usd_chf_reset.DEFAULT_USD_CHF
+    assert body["cost_chf"] == round(usd * 0.80, 6)
+    assert body["models"][0]["cost_chf"] == round(usd * 0.80, 6)
+
+
+def test_cost_chf_follows_the_configured_rate(cat, usd_chf_reset):
+    assert usd_chf_reset.set_usd_chf(0.90) == 0.90
+    body = turn_cost([_call(SHIP, 1_000_000, 0, tier=Tier.SHIP)], cat)
+    assert body["usd_chf"] == 0.90 and body["cost_chf"] == round(0.20 * 0.90, 6)
+    # Explicite par appel : l'emporte sur le taux posé.
+    assert summarize([row_from_call(_call(SHIP, 1_000_000, 0))], cat, usd_chf=1.0)["cost_chf"] == 0.2
+    for bad in (0, -1, "abc", float("nan"), float("inf")):
+        assert usd_chf_reset.set_usd_chf(bad) == usd_chf_reset.DEFAULT_USD_CHF
+    assert usd_chf_reset.set_usd_chf(None) == usd_chf_reset.DEFAULT_USD_CHF
+
+
+def test_cost_chf_adds_router_chf_as_is(cat, usd_chf_reset):
+    body = turn_cost([_call(SHIP, 1_000, 10, chf=0.0123), _call(SHIP, 1_000_000, 0)], cat)
+    assert body["cost"] == {"CHF": 0.0123, "USD": 0.2}
+    assert body["cost_chf"] == round(0.0123 + 0.2 * 0.80, 6)
+
+
+def test_cost_chf_is_null_without_known_rate_or_price(cat, usd_chf_reset):
+    eur = turn_cost([_call(OVH, 1_000, 10), _call(SHIP, 1_000, 10)], cat)
+    assert eur["cost_chf"] is None  # EUR : aucun taux connu, jamais inventé
+    assert next(m for m in eur["models"] if m["model"] == SHIP)["cost_chf"] is not None
+    assert next(m for m in eur["models"] if m["model"] == OVH)["cost_chf"] is None
+    unknown = turn_cost([_call("acme/inconnu-9b", 5_000, 200)], cat)
+    assert unknown["cost_chf"] is None and unknown["models"][0]["cost_chf"] is None
+    assert turn_cost([], cat)["cost_chf"] == 0.0  # aucun appel : zéro
+
+
+def test_build_kernel_sets_rate_from_config(usd_chf_reset):
+    from nokker.config import NokkerConfig
+
+    assert NokkerConfig().billing_usd_chf == 0.80
+    # Le noyau pose le taux de sa config au démarrage (`build_kernel`).
+    from nokker.api.server import set_usd_chf as wired
+
+    assert wired is usd_chf_reset.set_usd_chf
+
+
+def test_local_cost_route_has_chf(tmp_path, cat, usd_chf_reset):
+    from nokker.api.server import make_handler
+    from nokker.approvals.memory import InMemoryApprovals
+    from nokker.local.api import LOCAL_OWNER
+    from tests.unit.api.test_approvals_routes import make_kernel_with_approvals
+    from tests.unit.test_local_api import _api, _req
+
+    kernel, _ = make_kernel_with_approvals(InMemoryApprovals())
+    led = InMemoryLedger(cat)
+    led.record("th_c", 0, _call(SHIP, 1_000_000, 0))
+    api = _api(tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, led, local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        status, body = _req(port, "/v1/local/cost?thread_id=th_c", token=api.token)
+        assert status == 200
+        assert body["session"]["cost"] == {"USD": 0.2} and body["session"]["cost_chf"] == 0.16
+        assert body["session"]["usd_chf"] == 0.80 and body["day"]["cost_chf"] == 0.16
+    finally:
+        httpd.shutdown()

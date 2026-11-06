@@ -336,15 +336,22 @@ class CheckpointingToolSource:
     Délègue `specs`, `call`, `turn_done` et `close` à `inner`. Autour de `call` : `new_turn()` quand `turn_index`
     change pour ce fil ; `ensure_checkpoint(root, "avant <outil>")` si `call_effect` n'est pas READ ;
     `record_agent_write(chemin hôte)` après un `write_file`/`patch` réussi. Un échec de capture est journalisé et
-    n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente."""
+    n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente.
+
+    `cards` (`nokker/tools/card_snapshots.py`) : un `write_file`/`patch` approuvé par le relecteur automatique
+    (`ctx.auto_approval_id`) reçoit en plus un point de retour PAR CARTE (copie des fichiers visés juste avant l'outil),
+    avec ou sans l'amont : la révocation de cette approbation propose de le restaurer."""
 
     def __init__(self, inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None,
                  manager: Any | None = None, links: TurnLinks | None = None,
-                 emit: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
+                 emit: Callable[[str, dict[str, Any]], Any] | None = None, cards: Any = None) -> None:
         self.inner = inner
         self.root_of = root_of
         self.manager = manager if manager is not None else make_manager(home)
         self.links = links
+        self.cards = cards  # CardSnapshots | None
+        if cards is not None:  # chemins vus par l'outil → chemins hôte, comme le ledger ci-dessous
+            cards.mount = lambda: getattr(self.inner, "mount", WORKSPACE_MOUNT)
         self.emit = emit  # `checkpoint.created` (posé par le serveur local)
         self._turns: dict[str, int] = {}
         self._mu = threading.Lock()
@@ -381,9 +388,35 @@ class CheckpointingToolSource:
             logger.warning("capture avant %s en échec", name, exc_info=True)
         return root
 
+    def _card_before(self, name: str, args: dict[str, Any], ctx: ToolContext) -> Path | None:
+        """Point de retour de la carte approuvée automatiquement (avant l'outil) ; la racine, ou None."""
+        approval_id = getattr(ctx, "auto_approval_id", None)
+        if self.cards is None or not approval_id or name not in WRITE_TOOLS:
+            return None
+        from nokker.tools.card_snapshots import touched_paths
+
+        root = self._root(ctx.thread_id)
+        if root is None:
+            return None
+        mount = getattr(self.inner, "mount", WORKSPACE_MOUNT)
+        try:
+            self.cards.before(approval_id, ctx.thread_id, root, name,
+                              [host_path(root, p, mount) for p in touched_paths(name, args)])
+        except Exception:  # noqa: BLE001 — la capture ne fait jamais échouer l'outil
+            logger.warning("point de retour de la carte %s en échec", approval_id, exc_info=True)
+        return root
+
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         root = self._before(name, arguments, ctx)
-        result = self.inner.call(name, arguments, ctx)
+        card_root = self._card_before(name, arguments, ctx)
+        try:
+            result = self.inner.call(name, arguments, ctx)
+        finally:
+            if card_root is not None:
+                try:
+                    self.cards.after(ctx.auto_approval_id, card_root)
+                except Exception:  # noqa: BLE001
+                    logger.warning("empreintes après %s en échec", name, exc_info=True)
         if root is not None and name in WRITE_TOOLS and not result.is_error:
             try:
                 for p in _written_paths(name, arguments):
@@ -572,10 +605,15 @@ def checkpoint_sources(inner: ToolSource, root_of: Callable[[str], Path | None],
                        emit: Callable[[str, dict[str, Any]], Any] | None = None
                        ) -> tuple[CheckpointingToolSource, CheckpointToolSource]:
     """Enveloppe + outils, sur le MÊME gestionnaire et les MÊMES liens point ↔ tour : `Registry(sources=[wrapper,
-    tools, …])`. `emit(nom, données)` publie `checkpoint.created`."""
+    tools, …])`. `emit(nom, données)` publie `checkpoint.created`. Les points par carte du relecteur automatique vont
+    sous `<état>/checkpoints/cards` (`wrapper.cards`)."""
+    from nokker.tools.card_snapshots import CardSnapshots
+
     manager = make_manager(home)
     links = TurnLinks(links_path(home))
-    return (CheckpointingToolSource(inner, root_of, home, manager, links=links, emit=emit),
+    cards_dir = links_path(home).parent / "cards"  # état local de la machine, hors du dossier de travail
+    cards = CardSnapshots(root_of, lambda _root: cards_dir)
+    return (CheckpointingToolSource(inner, root_of, home, manager, links=links, emit=emit, cards=cards),
             CheckpointToolSource(root_of, home, manager, links=links, emit=emit))
 
 

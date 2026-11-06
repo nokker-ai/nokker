@@ -92,6 +92,14 @@ def _network_name(code: dict) -> str | None:
     return code.get("network_name")
 
 
+def _sandbox_image(code: dict) -> str:
+    """Image des bacs à sable : `code.image` de la config, sinon NOKKER_SANDBOX_IMAGE posée par le compose Lokkal
+    (ghcr.io/nokker-ai/sandbox:<version> : ssh par egress, nss_wrapper pour un uid inconnu, LSP), sinon le défaut du
+    code. Avant le 05.11, l'env était ignorée : Lokkal tournait sur l'image par défaut, sans ProxyCommand ni nc, et les
+    outils ssh n'atteignaient aucun hôte (test réel, uid 1001)."""
+    return str(code.get("image") or os.environ.get("NOKKER_SANDBOX_IMAGE", "").strip() or DEFAULT_SANDBOX_IMAGE)
+
+
 def _project_skills(local: dict[str, Any], state_dir: Path) -> Any:
     """`ProjectSkills` si `local.project_skills` est allumé (confiance écrite dans les réglages de l'utilisateur)."""
     if not local.get("project_skills", False):
@@ -283,6 +291,9 @@ class LocalApi:
     # make_handler), `remote_approvals` le nokker.local.remote_approvals.RemoteApprovals posé par serve.
     apply_decision: Any = None
     remote_approvals: Any = None
+    # Passkeys LOCALES (nokker.local.passkeys.LocalPasskeys, docs/PAY-AGENT.md §11), posées par serve quand les paiements
+    # sont allumés ; None sinon (routes /v1/local/passkeys* en 404).
+    passkeys: Any = None
     # Pages de session (docs/BUBBLES.md §10) : ÉTEINTES par défaut tant que les clients publiés ne savent pas afficher
     # un kind de bulle inconnu (la CLI rc.5 plante sur `artifact`) ; `local.pages: true` les allume.
     pages_enabled: bool = False
@@ -442,7 +453,7 @@ class LocalApi:
                    allowed_hosts=frozenset(h.lower() for h in hosts),
                    code=SessionCodeTools(backend=code.get("backend", "docker"),
                                          instance=local.get("instance") or _instance_id(state_dir),
-                                         image=code.get("image") or DEFAULT_SANDBOX_IMAGE,
+                                         image=_sandbox_image(code),
                                          network_name=_network_name(code), host_roots=host_roots,
                                          background=bool(local.get("background_processes", False)),
                                          state_dir=str(state_dir), lsp=_lsp_manager(local),
@@ -483,7 +494,10 @@ class LocalApi:
         self.ssh = SshToolSource(sandbox=self.code.run_hook, secret=secret,
                                  hosts_path=Path(local.get("hosts_path") or conf / "hosts.yaml").expanduser(),
                                  known_hosts_path=Path(local.get("known_hosts_path") or conf / "known_hosts")
-                                 .expanduser(), workspace_path=self.code.workspace_path)
+                                 .expanduser(), workspace_path=self.code.workspace_path,
+                                 # Lokkal : dossier `state/egress` posé par l'installeur, monté en lecture seule par egress
+                                 egress_allow_path=Path(local.get("egress_allow_path")
+                                                        or conf / "egress" / "ssh-hosts.json").expanduser())
         self.audit = AuditLog(Path(local.get("audit_path") or default_path(self.state_dir or conf)).expanduser())
 
     def tool_sources(self) -> list[Any]:

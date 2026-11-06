@@ -5,7 +5,8 @@
 
 Ce que voit l'appelant ne dépend jamais de l'existence du compte : même corps, même code HTTP, même délai (l'envoi
 part dans un fil à part), même 429. Le code (6 chiffres) n'est émis que pour un compte actif ; il vit 10 minutes, sert
-une fois, et 5 essais faux le brûlent. front1 l'envoie avec un gabarit figé, seulement à une adresse invitée.
+une fois, et 5 essais faux le brûlent. front1 l'envoie avec un gabarit figé, seulement à une adresse invitée, dans la langue du COMPTE (sinon celle de
+l'invitation, sinon celle reçue de la page de connexion, c'est-à-dire du navigateur).
 
 Un appareil né d'un code se connecte et discute, mais ne décide JAMAIS d'une approbation (`approved_via`
 « email-code:… », refusé par `BaseApprovals._verify_proof`) : l'approbation forte reste à l'appareil de l'invitation
@@ -37,6 +38,7 @@ TTL = timedelta(minutes=10)
 MAX_ATTEMPTS = 5
 # Limites (fenêtre glissante) : par adresse pour les envois, par IP pour tout. Un seul pod noyau en bêta : en mémoire.
 START_PER_EMAIL, START_PER_IP, VERIFY_PER_IP, WINDOW_S = 3, 10, 30, 900.0
+_LANGS = ("fr", "en")  # langues du gabarit de front1 (site/beta-api/authcodes.py)
 
 
 class CodeError(Exception):
@@ -145,6 +147,10 @@ class EmailCodes:
     store: CodeStore
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
     dispatch: Callable[[Callable[[], None]], None] = _send_in_background  # synchrone dans les tests
+    # Langue de l'invitation d'une adresse (`email → "fr"|"en"|None`), repli quand le compte n'a pas de langue
+    # utilisable. None : pas de repli par l'invitation (le compte porte déjà celle de son invitation, posée à la
+    # création par `OnboardingService.accept`).
+    invitation_lang: Callable[[str], str | None] | None = None
     _limits: _Limiter = field(default_factory=_Limiter, repr=False)
 
     def start(self, email: str, lang: str, ip: str | None) -> dict[str, bool]:
@@ -157,7 +163,7 @@ class EmailCodes:
         account = self.tenancy.account_by_email(email) if "@" in email else None
         if account is not None and account.status == "active":
             code = f"{secrets.randbelow(10**6):06d}"
-            lang = "en" if lang == "en" else "fr"
+            lang = self._mail_lang(account, email, lang)
 
             def send() -> None:  # écriture ET envoi hors de la requête : même délai que pour une adresse inconnue
                 try:
@@ -168,6 +174,26 @@ class EmailCodes:
 
             self.dispatch(send)
         return {"sent": True}
+
+    def _mail_lang(self, account: Any, email: str, received: str) -> str:
+        """Langue du mail du code : celle du compte, sinon celle de l'invitation, sinon celle reçue (le navigateur).
+        Lue seulement pour un compte actif (aucun mail sinon) : la réponse et le délai n'en dépendent pas."""
+        own = getattr(account, "lang", None)
+        if own in _LANGS:
+            return str(own)
+        invited = self._invitation_lang(email)  # lue seulement si le compte n'a pas de langue utilisable
+        if invited in _LANGS:
+            return str(invited)
+        return received if received in _LANGS else "fr"
+
+    def _invitation_lang(self, email: str) -> str | None:
+        if self.invitation_lang is None:
+            return None
+        try:
+            return self.invitation_lang(email)
+        except Exception:  # invitation illisible : langue reçue
+            logger.warning("langue de l'invitation illisible", exc_info=True)
+            return None
 
     def verify(self, email: str, code: str, name: str, public_key_spki: str, ip: str | None) -> dict[str, str]:
         if not self._limits.ok(f"verify-ip:{ip or '?'}", VERIFY_PER_IP):

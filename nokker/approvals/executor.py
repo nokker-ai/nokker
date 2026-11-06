@@ -35,7 +35,7 @@ from nokker.core.loop import DIRECT_CHANNEL, Kernel
 from nokker.tools.mcp_apps import APP_CHANNEL
 from nokker.tenancy.context import tenant_of_thread, tenant_scope
 from nokker.core.ports import Approval, ToolContext
-from nokker.core.turn import Turn, TurnInput
+from nokker.core.turn import APPROVAL_CONTINUE, Turn, TurnInput
 
 logger = logging.getLogger("nokker.approvals.executor")
 
@@ -105,7 +105,9 @@ class ApprovalExecutor:
         `rejected` (sinon : erreur de l'appelant, pas de ce module)."""
         # La carte appartient au locataire de son fil (docs/TENANCY.md §3) : l'outil et la suite du tour tournent là, quel
         # que soit le fil d'exécution de l'appelant.
-        with tenant_scope(tenant_of_thread(approval.thread_id)):
+        from nokker.tools.scope import thread_scope
+
+        with tenant_scope(tenant_of_thread(approval.thread_id)), thread_scope(approval.thread_id):
             handler = self.handlers.get(approval.tool_name)
             if handler is not None:
                 return self._handle(approval, handler)
@@ -230,7 +232,8 @@ class ApprovalExecutor:
         # Fil d'un passage d'agent : son noyau repose l'identité du passage (son propriétaire), pas celle du décideur.
         kernel = self._k(approval.thread_id)
         return kernel.run_turn(TurnInput(thread_id=approval.thread_id, user_text=block,
-                                         channel=approval.channel, sender=approval.decided_by))
+                                         channel=approval.channel, sender=approval.decided_by,
+                                         control=APPROVAL_CONTINUE))
 
 
 __all__ = ["CHILD_GONE", "ApprovalExecutor"]

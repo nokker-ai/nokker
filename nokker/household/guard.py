@@ -73,7 +73,8 @@ class MinorGates:
 # que les skills des packs du web, qui restent ceux du compte).
 CODE_SESSION_TOOLS = frozenset({"terminal", "write_file", "patch", "read_file", "search_files", "checkpoint_create",
                                 "checkpoint_list", "checkpoint_diff", "checkpoint_restore", "delegate",
-                                "delegate_status", "delegate_cancel"})
+                                "delegate_status", "delegate_cancel",
+                                "execute_code"})  # bac à sable de la session du fil (§7.31) : jamais pour un mineur
 CODE_SESSION_SOURCES = frozenset({"builtin:code-skills"})
 
 

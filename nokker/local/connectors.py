@@ -104,7 +104,7 @@ class LocalConnectorStore:
         if row is None:
             return None
         return Credential(account_id, kind, dict(row["settings"]), _iso(row["created_at"]), _iso(row.get("last_ok_at")),
-                          str(row["secret"]))
+                          secret=str(row["secret"]))
 
     def statuses(self, account_id: str) -> list[Status]:
         return [Status(account_id, k, dict(r["settings"]), _iso(r["created_at"]), _iso(r.get("last_ok_at")))

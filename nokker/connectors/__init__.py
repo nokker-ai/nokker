@@ -23,6 +23,10 @@ def build_connector(kind: str, settings: dict[str, Any], secret: str, *, localit
 
         return MailConnector(settings, secret, locality=locality)
     if kind == "calendar":
+        if settings.get("mode") in ("google", "graph"):  # agendas reliés par OAuth (docs/CONNECTORS-OAUTH.md)
+            from nokker.connectors.cloudcal import ApiCalendar
+
+            return ApiCalendar(settings, secret, locality=locality)
         from nokker.connectors.calendar import CalendarConnector
 
         return CalendarConnector(settings, secret, locality=locality)
@@ -38,7 +42,10 @@ class TestResult:
     code: str | None = None
 
 
-def test_connection(kind: str, settings: dict[str, Any], secret: str) -> TestResult:
+TEST_DEADLINE_S = 20.0  # bien sous les délais des mandataires (ingress 60 s, Cloudflare 100 s) : le web a son JSON
+
+
+def _test_once(kind: str, settings: dict[str, Any], secret: str) -> TestResult:
     try:
         return TestResult(True, build_connector(kind, settings, secret).test())  # type: ignore[attr-defined]
     except ConnectorError as exc:
@@ -47,6 +54,21 @@ def test_connection(kind: str, settings: dict[str, Any], secret: str) -> TestRes
         return TestResult(False, scrub(f"{exc.__class__.__name__}", secret), "protocol_error")
 
 
+def test_connection(kind: str, settings: dict[str, Any], secret: str, *, deadline_s: float = TEST_DEADLINE_S
+                    ) -> TestResult:
+    """Essai de connexion borné à `deadline_s` AU TOTAL (redirections, IMAP puis SMTP compris) : au-delà, réponse
+    `unreachable` tout de suite ; l'essai en cours finit seul, borné par ses propres délais réseau."""
+    import concurrent.futures
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="connector-test")
+    try:
+        return pool.submit(_test_once, kind, settings, secret).result(timeout=deadline_s)
+    except concurrent.futures.TimeoutError:
+        return TestResult(False, f"le serveur ne répond pas assez vite (plus de {int(deadline_s)} s)", "unreachable")
+    finally:
+        pool.shutdown(wait=False)
+
+
 test_connection.__test__ = False  # type: ignore[attr-defined]
 
-__all__ = ["LOCALITIES", "ConnectorError", "TestResult", "build_connector", "test_connection"]
+__all__ = ["LOCALITIES", "TEST_DEADLINE_S", "ConnectorError", "TestResult", "build_connector", "test_connection"]

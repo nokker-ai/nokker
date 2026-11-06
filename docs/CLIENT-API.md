@@ -39,10 +39,13 @@ iPhone Duo), Mini App Telegram. Base `https://<hôte>/v1`, JSON, flux en SSE. Co
 | POST | `/v1/devices/{id}/confirm` | confirme un appareil `pending` par TOTP (alternative à `python -m nokker devices approve <code>`) |
 | POST | `/v1/devices/{id}/session-challenge` | défi de connexion (sans identité préalable — c'est lui qui en établit une) |
 | POST | `/v1/sessions` | jeton de session contre ce défi signé (brut ou WebAuthn) |
-| POST | `/v1/auth/email/start` | `{email, lang}` → **toujours** `200 {sent:true}` (même corps, même délai, même `429` que l'adresse ait un compte ou non) ; code à 6 chiffres envoyé par front1 seulement à un compte actif — 10 min, usage unique |
+| POST | `/v1/auth/email/start` | `{email, lang}` → **toujours** `200 {sent:true}` (même corps, même délai, même `429` que l'adresse ait un compte ou non) ; code à 6 chiffres envoyé par front1 seulement à un compte actif — 10 min, usage unique. **Langue du mail** (05.11.2026) : celle du compte, sinon celle de l'invitation, sinon `lang` reçu (langue du navigateur) ; `fr` à défaut. Le gabarit de front1 ne change pas, seule la langue passée suit cette règle |
 | POST | `/v1/auth/email/verify` | `{email, code, name, public_key_spki}` → `200 {device_id, user}` ; toute erreur = `401 {error:"invalid_code"}` ; 5 essais puis code brûlé. L'appareil créé se connecte (`session-challenge` → `/v1/sessions`) mais **ne décide jamais** d'une approbation : `403 {"error":{"message":"strong_device_required"}}` |
 | POST | `/v1/auth/oidc/start` · `/v1/auth/oidc/callback` | SSO OIDC d'une équipe (drapeau `sso`, docs/LOKKAL.md §7.24) : `start {connection \| email, public_key_spki, name}` → `{authorize_url, state}` ; `callback {state, code, signature de "<state>.oidc"}` → `{device_id, user, projects}`. Appareil de connexion seulement (`sso:<connexion>`), comme le code e-mail |
-| GET | `/v1/account` | compte `us_…` exigé → `{email, lang, created_at, status, terms: {version, accepted_at} \| null, consents: {training}}` |
+| GET | `/v1/account` | compte `us_…` exigé → `{email, lang, created_at, status, terms: {version, accepted_at} \| null, terms_current: {version, lang}, terms_outdated: bool, consents: {training}}` ; `terms_outdated` = la dernière version acceptée n'est plus le texte courant d'aucune langue (conditions modifiées : écran bloquant de réacceptation) ; faux sans aucune acceptation |
+| GET | `/v1/capabilities` | toute identité vérifiée (session cloud, jeton local, propriétaire relayé ; sinon `401`) → `200 {version: 1, mode: "cloud"\|"lokkal", features: {<drapeau>: bool, …}}` : fonctions actives POUR L'APPELANT, à lire au démarrage au lieu de sonder les routes — §Capacités |
+| GET | `/v1/terms?lang=fr\|en` | public → `{version, lang, text}` ; `version` = SHA-256 des octets de `text` (langue inconnue : `fr`) |
+| POST | `/v1/account/terms` | `{version}` → `200 {terms: {version, lang, accepted_at}, terms_current, terms_outdated}` : réacceptation, une ligne de plus (`terms_acceptances`, avec l'IP, sans invitation) ; `409 {error: "stale_version"}` si `version` n'est le texte courant d'aucune langue (écran périmé : relire `/v1/terms`) ; `503 {error: "terms_disabled"}` sans onboarding |
 | PUT | `/v1/account/consent` | `{scope: "training", granted: bool}` → `200 {scope, granted}` ; session normale (pas d'appareil fort) ; une ligne `data_consents` seulement quand le choix change ; `400 {error:"invalid"}` |
 | GET | `/v1/account/usage` | compte `us_…` exigé (sinon 403) → `{tz, mode: soft\|hard, plan, today: {day, resets_at, turns: {used, cap, over, hard_cap}}, week: {starts, resets_at, turns: {used, cap, over}}}` ; heures en Europe/Zurich, jour de quota 12:00 UTC → 12:00 UTC, semaine lundi 06:00 UTC ; `cap` null = sans limite ; `over` = used > cap |
 | POST | `/v1/account/export` | compte `us_…`, session normale (tout appareil) → `202 {id, status: "ready", created_at, expires_at, size, download}` : l'export est construit tout de suite et gardé **24 h** ; **une demande par 24 h** → sinon `429 {error: "export_limit", retry_at}` ; `503 {error: "export_disabled"}` si le service n'est pas configuré |
@@ -54,6 +57,43 @@ iPhone Duo), Mini App Telegram. Base `https://<hôte>/v1`, JSON, flux en SSE. Co
 docs/BUBBLES.md (§1-§6 pour les fils/bulles/aperçus, §9 pour les comblements du 18.10.2026). Export d'un fil et liens
 partagés (`/v1/threads/{id}/export`, `/v1/threads/{id}/shares`, `/v1/shares/{id}`, `/v1/public/shares/{jeton}`) :
 §Export et partage d'un fil ci-dessous.
+
+## Capacités : `GET /v1/capabilities` (05.11.2026, branche `p2/kernel-cloud-polish`)
+
+Le web lit cette route une fois après connexion au lieu de sonder `/v1/house`, `/v1/local/cost`, `/v1/speech`… (404
+en série). Authentifiée (même identité que `/v1/speech` : session cloud, jeton local, propriétaire relayé), `401` sinon,
+`403` si l'expéditeur n'a pas de locataire. Corps :
+
+```
+{"version": 1, "mode": "cloud" | "lokkal",
+ "features": {"account": bool, "agents": bool, "approvals": bool, "billing": bool, "cloud_byok": bool, "code": bool,
+              "connectors_multi": bool, "connectors_oauth": bool, "consolidation": bool, "family_calendar": bool, "glance": bool, "guide": bool, "house": bool,
+              "household": bool, "household_paper": bool, "learning": bool, "local": bool, "local_cost": bool,
+              "long_memory": bool, "operate": bool, "packs": bool, "pay": bool, "pay_agent": bool, "plan": bool,
+              "presence": bool, "share": bool, "show_me": bool, "speech": bool, "sso": bool, "steer": bool,
+              "team": bool, "threads": bool, "turn_cost": bool, "who_does_what": bool}}
+```
+
+- `true` = les routes de la fonction répondent à CET appelant (installation et profil). Clés triées, toujours
+  présentes ; une clé inconnue du client s'ignore, une clé absente vaut `false` (contrat additif, `version` monte
+  seulement si un sens change).
+- **Compte `us_…` exigé** (routes montées par `_account_route` ou qui refusent `account_required`) : `account`
+  (`/v1/account*`), `code` (`/v1/code*`, sessions de code), `presence` (`/v1/presence`, « Qui fait quoi » ;
+  `who_does_what` = même valeur, nom du drapeau de config), `team`, `packs`, `learning`, `long_memory`,
+  `consolidation`, `sso`, `household_paper`, `family_calendar`, `pay` (`/v1/payments*`), `pay_agent`.
+- **`glance`** (`/v1/glance/devices`, lunettes) : en Lokkal le propriétaire de la machine, en cloud un compte.
+- **Toute identité vérifiée** : `operate` (`/v1/incidents*`, `/v1/alerts*`, drapeau `operate`), `plan` (`/v1/plan*`,
+  cartes du plan), `guide`, `approvals`, `agents`, `threads`, `turn_cost`, `share`, `steer`, `show_me`, `speech`.
+- Par appelant aussi : `billing` (compte + facturation configurée),
+  `cloud_byok` (compte + bloc `cloud_byok.enabled`, jamais en Lokkal ; le droit selon la formule reste rendu par
+  `/v1/account/models`), `household` (compte + foyer allumé), `house` (salle Maison allumée ET l'appelant est membre
+  d'un foyer : seule lecture en base, faite dans le locataire de l'appelant ; foyer illisible → `false`), `local_cost`
+  (Lokkal + propriétaire de la machine + ledger : `GET /v1/local/cost`).
+- Détail : `local` (Lokkal), `speech` (voix web, `/v1/speech` donne le détail, dont `terms_outdated`), `pay_agent`
+  (`/v1/payments/method*`), `approvals` (`/v1/approvals*`, `/v1/devices*`), `agents` (`/v1/agents*`), `threads`
+  (`/v1/threads*`, `/v1/bubbles*`), `turn_cost` (événement `turn.cost`, docs/LOKKAL.md §7.8, avec `cost_chf`), `share`
+  (export et liens partagés).
+- Jamais : identifiant, réglage, quota, clé, ni rien d'un autre locataire. Aucun appel modèle, aucune écriture.
 
 ## Export et partage d'un fil (01.11.2026, branche `p2/export-share`)
 
@@ -85,6 +125,9 @@ Code : `nokker/threads/export.py` (document et rendus), `nokker/threads/shares.p
   "page": {"before": null, "limit": 100, "next_before": null, "truncated": false} }
 ```
 
+- un message `user` porte `"origin": "approval"` quand c'est le bloc `[Approbation]` écrit par le noyau pour la
+  suite d'une carte décidée (docs/APPROVALS.md §2) : à afficher comme un repère du système, pas comme une bulle de la
+  personne. Absent pour un message de la personne.
 - `messages` reprend `GET /v1/threads/{id}` (même `index` de tour) en y ajoutant, avec `include_tools=1` (défaut de
   l'export), les étapes d'outils du tour lues dans `Turn.messages` : message assistant porteur de `tool_calls`
   (`arguments` = JSON en texte), puis un message `tool` par résultat. Les notes internes du noyau et les brouillons

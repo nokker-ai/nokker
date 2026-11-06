@@ -63,9 +63,17 @@ MAX_OUTPUT_CHARS = 30_000  # sortie de commande gardée (tête + queue) ; le ré
 # n'est READ que si CHAQUE segment l'est et qu'aucune redirection n'écrit.
 _READ_ONLY = {"ls", "cat", "head", "tail", "wc", "pwd", "grep", "rg", "file", "stat", "tree", "du", "which",
               "echo", "diff", "sort", "uniq", "cut", "basename", "dirname", "realpath", "env", "printenv",
-              "id", "whoami", "groups", "uname", "nproc"}
-# Lecture seulement SANS argument : `env CMD…` lance CMD.
-_READ_ONLY_BARE = {"env"}
+              "id", "whoami", "groups", "uname", "nproc",
+              # état d'un hôte (ops, ssh_run : test réel du 05.11, « uptime » demandait une carte)
+              "uptime", "df", "free", "w", "who", "ps", "lsblk", "vmstat", "hostname"}
+# Lecture seulement SANS argument : `env CMD…` lance CMD, `hostname NOM` renomme la machine.
+_READ_ONLY_BARE = {"env", "hostname"}
+# Sous-commandes de lecture (comme `git`) : docker et systemctl ; journalctl sauf ses options qui écrivent.
+_DOCKER_READ = {"ps", "images", "logs", "inspect", "version", "info", "stats"}
+_SYSTEMCTL_READ = {"status", "is-active", "is-enabled", "is-failed", "list-units", "list-timers", "list-unit-files",
+                   "show", "cat"}
+_JOURNALCTL_WRITES = re.compile(r"--(?:vacuum-\w+|rotate|flush|sync|relinquish-var|smart-relinquish-var|setup-keys|"
+                                r"update-catalog)\b")
 # Options qui font écrire une commande de lecture (fichier de sortie, base magique compilée).
 _WRITES_WITH = {"sort": ("-o", "--output"), "tree": ("-o",), "file": ("-C", "--compile"), "uniq": ()}
 _GIT_READ = {"status", "diff", "log", "show", "blame", "rev-parse", "ls-files", "branch", "grep"}
@@ -120,6 +128,14 @@ def _read_only(command: str) -> bool:
                 return False
         elif head == "find":
             if _FIND_WRITES.search(seg):
+                return False
+        elif head in ("docker", "systemctl"):
+            allowed = _DOCKER_READ if head == "docker" else _SYSTEMCTL_READ
+            sub = next((w for w in words[1:] if not w.startswith("-")), "")
+            if sub not in allowed:
+                return False
+        elif head == "journalctl":
+            if _JOURNALCTL_WRITES.search(seg):
                 return False
         elif head not in _READ_ONLY:
             return False
@@ -303,6 +319,14 @@ class SharedEnv:
         if name in ("_inner", "cwd"):
             raise AttributeError(name)
         return getattr(self._inner, name)
+
+
+def _logs_result(logs: dict[str, Any]) -> str:
+    """Journal d'un processus : métadonnées hors clôture, sortie (stdout et stderr) dans la clôture commune."""
+    from nokker.qa.untrusted import fenced_result
+
+    meta = {k: v for k, v in logs.items() if k != "output"}
+    return fenced_result(meta, "process:output", str(logs.get("output") or ""))
 
 
 def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -730,8 +754,11 @@ class CodeToolSource:
             return out(f"REFUSÉ, jamais exécuté même approuvé : {why}", True)
         timeout = max(1, min(int(a.get("timeout") or 120), 600))
         r = ws.env.execute(command, timeout=timeout, bounded_capture=True)
-        code = r.get("returncode")
-        return out({"returncode": code, "output": _clip(str(r.get("output") or ""))}, False)
+        from nokker.qa.untrusted import fenced_result
+
+        # La sortie d'une commande est un contenu de TIERS (fichiers du dépôt, réponses réseau, journaux) : clôturée.
+        return out(fenced_result({"returncode": r.get("returncode")}, "terminal:output",
+                                 _clip(str(r.get("output") or ""))), False)
 
     # ── commandes en arrière-plan (lot X6) ──
     def _process_dir(self, thread_id: str) -> str:
@@ -790,7 +817,7 @@ class CodeToolSource:
             hint = "la suite : process_logs ; l'arrêter : process_stop ; il s'arrête aussi à la fin du fil"
             if port:
                 hint += f" ; le port {port} est proposé à l'utilisateur en aperçu privé (ne donne pas d'URL)"
-            return out({**first, "hint": hint})
+            return out(_logs_result({**first, "hint": hint}))
         table = self.processes(ws, thread_id)
         if name == "process_list":
             return out({"processes": [p.view() for p in table.list()]})
@@ -798,7 +825,7 @@ class CodeToolSource:
         if not proc_id:
             raise KeyError("id")
         if name == "process_logs":
-            return out(table.logs(proc_id, int(a.get("tail") or 200)))
+            return out(_logs_result(table.logs(proc_id, int(a.get("tail") or 200))))
         return out(table.stop(proc_id).view())
 
 

@@ -109,7 +109,7 @@ def test_erase_account_wires_the_session_index(monkeypatch):
     cfg.context_corthexis = {"enabled": True, "root_dir": "/var/lib/nokker/session-memory"}
     scope = erase_scope(cfg)
     assert scope["session_memory"] == {"enabled": True, "root_dir": "/var/lib/nokker/session-memory"}
-    assert set(scope) == {"images_root", "code", "session_memory"}
+    assert set(scope) == {"images_root", "code", "session_memory", "cloud_byok"}
 
 
 def test_cli_erase_passes_the_scope(monkeypatch, tmp_path, capsys):

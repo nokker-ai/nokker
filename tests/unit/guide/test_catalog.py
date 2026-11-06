@@ -5,6 +5,8 @@ import dataclasses
 import typing
 from pathlib import Path
 
+import pytest
+
 from nokker.config import NokkerConfig
 from nokker.guide import catalog as C
 from nokker.guide.texts import ALL_MODEL_TEXTS
@@ -61,6 +63,7 @@ def test_flag_on_reads_fields_and_dotted_paths():
     assert not C.flag_on(NokkerConfig(), "cloud_link") and C.flag_on(NokkerConfig(cloud_link={"x": 1}), "cloud_link")
 
 
+@pytest.mark.skipif(not (ROOT / "tests/guard-words.txt").exists(), reason="liste interne absente (arbre public : l'export la contrôle lui-même)")
 def test_no_guard_word_in_catalog_or_model_texts():
     words = [w.strip().lower() for w in (ROOT / "tests/guard-words.txt").read_text(encoding="utf-8").splitlines()
              if w.strip() and not w.startswith("#")]

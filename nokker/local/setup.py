@@ -116,6 +116,9 @@ class LocalSetup:
     detect: Any = detect_local_models
     test: Any = test_endpoint
     state: dict[str, Any] = field(default_factory=dict)
+    # Modèle affiché pour « router » sans choix explicite : le palier Ship de la config (posé par `serve`). Le lien
+    # ne fige alors AUCUN modèle : Ship et Deep gardent les paliers de la config (Nina sur Ship, Deep en escalade).
+    router_default: str = ""
 
     def __post_init__(self) -> None:
         if self.state_path.is_file():
@@ -134,7 +137,7 @@ class LocalSetup:
         names = set(self.vault.names())
         return {"done": bool(self.state["done"]),
                 "models": {"router": {"linked": "router" in names, "account": self.state.get("account"),
-                                      "model": self.state.get("router_model") or "qwen/qwen3.5-397b-a17b"},
+                                      "model": self.state.get("router_model") or self.router_default or None},
                            "byok": [{"name": b["name"], "base_url": b["base_url"], "model": b.get("model"),
                                      "ok": b.get("ok"), "models": b.get("models") or [], "has_key": f"byok:{b['name']}" in names}
                                     for b in self.state["byok"]],
@@ -219,7 +222,8 @@ class LocalSetup:
             chosen = self.provider_for_default()
         except SecretsError:
             return False
-        return chosen is not None and bool(chosen[2])
+        # « router » sans modèle choisi : les paliers de la config servent (modèle vide voulu)
+        return chosen is not None and (bool(chosen[2]) or self.state.get("default") == "router")
 
     def has_model(self, tier_keys: bool = False) -> bool:
         """Au moins un modèle joignable en principe : compte relié au Router, entrée byok avec modèle, modèle par défaut
@@ -244,7 +248,8 @@ class LocalSetup:
         if d == "router":
             key = self.vault.get("router")
             base = self.state.get("inference_base") or ROUTER_URL
-            return (base, key, self.state.get("router_model") or "qwen/qwen3.5-397b-a17b") if key else None
+            # modèle vide : « les paliers de la config » (default_model_applier), jamais un modèle figé ici
+            return (base, key, self.state.get("router_model") or "") if key else None
         if d.startswith("byok:"):
             name = d[5:]
             b = next((x for x in self.state["byok"] if x["name"] == name), None)

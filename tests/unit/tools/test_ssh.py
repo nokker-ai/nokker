@@ -32,6 +32,7 @@ from nokker.core.turn import (
 from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates, Rule
 from nokker.tools.hosts import append_known, fingerprint, known_entries, known_lines, load_inventory
 from nokker.tools.ssh import SshToolSource
+from tests.unit.tools.fenced import parse
 
 TH = "th_ops"
 CTX = ToolContext(thread_id=TH, turn_index=0, channel="api", sender="local-owner")
@@ -342,7 +343,7 @@ def test_key_goes_by_stdin_into_a_0600_temp_file_and_is_erased(tmp_path):
     sandbox = FakeSandbox((0, "web1\n"))
     src = _source(tmp_path, sandbox)
     r = src.call("ssh_run", {"host": "web1", "command": "hostname"}, CTX)
-    assert not r.is_error and json.loads(r.content)["output"] == "web1\n"
+    assert not r.is_error and parse(r.content)["output"] == "web1\n"
     ran = sandbox.ran[0]
     assert ran["stdin"] == KEY  # la clé : sur l'entrée standard seulement
     script = ran["script"]
@@ -489,6 +490,87 @@ def test_jump_host_uses_its_own_key_and_a_proxy_command(tmp_path):
     assert "-W %h:%p -l jump" not in ran["script"] and "-l jump -W %h:%p 192.0.2.10" in ran["script"]
 
 
+def _bash_vars(script: str, env: dict) -> dict:
+    """Joue les lignes PX/JPX du script (seules) sous bash et rend leurs valeurs."""
+    lines = [ln for ln in script.splitlines() if ln.startswith(("PX=", "JPX="))]
+    out = subprocess.run(["bash", "-c", "\n".join(lines) + '\nprintf "%s\\n%s" "$PX" "$JPX"'],
+                         capture_output=True, text=True, env={"PATH": os.environ.get("PATH", ""), **env}, check=True)
+    px, jpx = (out.stdout.split("\n") + [""])[:2]
+    return {"PX": px, "JPX": jpx}
+
+
+def test_egress_proxy_command_only_in_the_docker_sandbox(tmp_path):
+    """Bac à sable docker de Lokkal : le client sort par egress (CONNECT), `NOKKER_SSH_PROXY` posé par dockerproxy ;
+    absent (backend local) ou d'une autre forme : connexion directe, rien d'injecté."""
+    sandbox = FakeSandbox()
+    src = _source(tmp_path, sandbox)
+    src.call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX)
+    script = sandbox.ran[0]["script"]
+    assert '${PX:+"-oProxyCommand=nc -X connect -x $PX %h %p"}' in script
+    assert _bash_vars(script, {"NOKKER_SSH_PROXY": "egress:3128"})["PX"] == "egress:3128"
+    assert _bash_vars(script, {})["PX"] == ""
+    for evil in ("egress:3128; id", "$(id)", "a b:1", "egress:3128 -oX=y", "x`id`"):
+        assert _bash_vars(script, {"NOKKER_SSH_PROXY": evil})["PX"] == "", evil
+    # derrière un saut : le SAUT sort par egress (`%%h` : développé par le ssh extérieur en `%h` pour celui du saut) ;
+    # la cible, elle, passe par le saut (une seule ProxyCommand)
+    src.call("ssh_run", {"host": "db1", "command": "uptime"}, CTX)
+    jump = sandbox.ran[1]["script"]
+    assert '"-oProxyCommand=ssh ' in jump and " $JPX -p 22 -l jump -W %h:%p 192.0.2.10" in jump
+    assert "${PX:+" not in jump
+    assert _bash_vars(jump, {"NOKKER_SSH_PROXY": "egress:3128"})["JPX"] == \
+        "'-oProxyCommand=nc -X connect -x egress:3128 %%h %%p'"
+    assert _bash_vars(jump, {})["JPX"] == ""
+
+
+def test_egress_allow_list_written_at_session_open(tmp_path):
+    """Le noyau écrit pour egress l'adresse et le port des hôtes joints depuis le bac à sable : pas ceux derrière un
+    saut (le saut les joint), jamais un nom, un utilisateur ou une clé. Dossier absent (hors Lokkal) : rien."""
+    (tmp_path / "conf" / "egress").mkdir(parents=True)
+    src = _source(tmp_path)
+    src.egress_allow_path = tmp_path / "conf" / "egress" / "ssh-hosts.json"
+    src.open_session(TH)
+    data = json.loads(src.egress_allow_path.read_text())
+    assert data == {"v": 1, "hosts": [{"address": "10.0.0.5", "port": 22}, {"address": "192.0.2.10", "port": 22},
+                                      {"address": "dev.example.lan", "port": 2222}]}
+    assert oct(src.egress_allow_path.stat().st_mode & 0o777) == "0o640"
+    text = src.egress_allow_path.read_text()
+    assert "secret" not in text and "SSH_" not in text and "deploy" not in text and "10.0.0.9" not in text
+    # l'inventaire change : la liste suit à la session suivante
+    (tmp_path / "conf" / "hosts.yaml").write_text(HOSTS.splitlines()[0] + "\n" + HOSTS.splitlines()[2] + "\n")
+    src.open_session("th_autre")
+    assert json.loads(src.egress_allow_path.read_text())["hosts"] == [{"address": "dev.example.lan", "port": 2222}]
+    other = tmp_path / "ailleurs" / "ssh-hosts.json"
+    src.egress_allow_path = other
+    src.open_session("th_3")
+    assert not other.exists() and not other.parent.exists()
+
+
+def test_unknown_uid_gets_a_passwd_entry_by_nss_wrapper(tmp_path):
+    sandbox = FakeSandbox()
+    _source(tmp_path, sandbox).call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX)
+    script = sandbox.ran[0]["script"]
+    assert 'if ! getent passwd "$(id -u)"' in script and "libnss_wrapper.so" in script
+    assert 'NSS_WRAPPER_PASSWD="$d/pw"' in script
+    assert script.index("libnss_wrapper") < script.index("$T ssh")  # avant le client
+
+
+def test_egress_refusal_gets_a_clear_hint(tmp_path):
+    out = 'nc: Proxy error: "HTTP/1.1 403 Forbidden"\r\nConnection closed by UNKNOWN port 65535\n'
+    src = _source(tmp_path, FakeSandbox((255, out)))
+    r = parse(src.call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX).content)
+    assert "hosts.yaml" in r["hint"] and "egress" in r["hint"]
+    src = _source(tmp_path, FakeSandbox((255, 'nc: Proxy error: "HTTP/1.1 502 Bad Gateway"\n')))
+    r = parse(src.call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX).content)
+    assert "injoignable" in r["hint"]
+
+
+def test_first_contact_refused_by_egress_says_why(tmp_path):
+    out = 'nc: Proxy error: "HTTP/1.1 403 Forbidden"\r\nkex_exchange_identification: Connection closed\n'
+    src = _source(tmp_path, FakeSandbox((255, out + "@@nokker-known-hosts@@\n")), known=())
+    r = json.loads(src.call("ssh_trust", {"host": "dev1"}, CTX).content)
+    assert "aucune clé" in r["error"] and "hosts.yaml" in r["hint"]
+
+
 def test_first_contact_is_refused_then_shown_then_trusted_on_a_card(tmp_path):
     def keyscan(script):
         return 255, f"Permission denied (none).\n@@nokker-known-hosts@@\n[dev.example.lan]:2222 ssh-ed25519 {OTHER_B64}\n"
@@ -528,7 +610,7 @@ def test_jump_must_be_trusted_before_the_host_behind_it(tmp_path):
 
 def test_changed_host_key_gets_a_clear_hint(tmp_path):
     src = _source(tmp_path, FakeSandbox((255, "Host key verification failed.\n")))
-    r = json.loads(src.call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX).content)
+    r = parse(src.call("ssh_run", {"host": "dev1", "command": "uptime"}, CTX).content)
     assert r["returncode"] == 255 and "interception" in r["hint"]
 
 
@@ -538,7 +620,8 @@ def test_changed_host_key_gets_a_clear_hint(tmp_path):
 def test_copy_reads_or_writes_into_the_workspace(tmp_path):
     sandbox = FakeSandbox((0, "x" * 30))
     src = _source(tmp_path, sandbox)
-    r = json.loads(src.call("ssh_copy", {"host": "web1", "remote_path": "/etc/motd", "max_bytes": 10}, CTX).content)
+    r = parse(src.call("ssh_copy", {"host": "web1", "remote_path": "/etc/motd", "max_bytes": 10}, CTX).content,
+              "content")
     assert r["truncated"] and r["content"] == "x" * 10 and "head -c 11 -- /etc/motd" in sandbox.ran[0]["script"]
     sandbox.result = (0, "1234\n")
     r = json.loads(src.call("ssh_copy", {"host": "web1", "remote_path": "/var/log/app.log", "local_path": "logs/a.log"},
@@ -642,7 +725,7 @@ def test_real_sshd_first_contact_trust_run_copy_and_prod_floor(real, monkeypatch
     assert fp.startswith("SHA256:") and not (src.known_hosts_path.exists() and src.known_hosts_path.read_text())
     assert _decide(gates, src, "ssh_trust", host="box", fingerprint=fp).rule == "ops:trust_host"
     assert json.loads(src.call("ssh_trust", {"host": "box", "fingerprint": fp}, CTX).content)["trusted"]
-    r = json.loads(src.call("ssh_run", {"host": "box", "command": "echo nokker-$((40+2)); id -un"}, CTX).content)
+    r = parse(src.call("ssh_run", {"host": "box", "command": "echo nokker-$((40+2)); id -un"}, CTX).content)
     assert r["returncode"] == 0 and "nokker-42" in r["output"]
     # la clé n'est restée nulle part : ni dans le bac à sable (container du fil, ou l'hôte en local), ni dans la sortie
     rc, listing = code.run_hook(TH, 'ls -a "${XDG_RUNTIME_DIR:-/tmp}"', "", 10)
@@ -654,11 +737,11 @@ def test_real_sshd_first_contact_trust_run_copy_and_prod_floor(real, monkeypatch
     behind = json.loads(src.call("ssh_trust", {"host": "behind"}, CTX).content)
     assert behind["keys"][0]["fingerprint"] == fp  # même sshd, même clé d'hôte
     assert json.loads(src.call("ssh_trust", {"host": "behind", "fingerprint": fp}, CTX).content)["trusted"]
-    r = json.loads(src.call("ssh_run", {"host": "behind", "command": "echo saut-ok"}, CTX).content)
+    r = parse(src.call("ssh_run", {"host": "behind", "command": "echo saut-ok"}, CTX).content)
     assert r["returncode"] == 0 and "saut-ok" in r["output"], r
     # lecture et copie d'un fichier distant
     src.call("ssh_run", {"host": "box", "command": "printf 'bonjour\\n' > /tmp/nokker-essai.txt"}, CTX)
-    got = json.loads(src.call("ssh_copy", {"host": "box", "remote_path": "/tmp/nokker-essai.txt"}, CTX).content)
+    got = parse(src.call("ssh_copy", {"host": "box", "remote_path": "/tmp/nokker-essai.txt"}, CTX).content, "content")
     assert got["content"] == "bonjour\n" and not got["truncated"]
     cp = json.loads(src.call("ssh_copy", {"host": "box", "remote_path": "/tmp/nokker-essai.txt",
                                           "local_path": "copie.txt"}, CTX).content)
@@ -672,5 +755,5 @@ def test_real_sshd_first_contact_trust_run_copy_and_prod_floor(real, monkeypatch
         is Decision.DENY
     # une clé d'hôte qui change est refusée (known_hosts de l'utilisateur jamais réécrit en silence)
     src.known_hosts_path.write_text(src.known_hosts_path.read_text().split()[0] + f" ssh-ed25519 {OTHER_B64}\n")
-    bad = json.loads(src.call("ssh_run", {"host": "box", "command": "hostname"}, CTX).content)
+    bad = parse(src.call("ssh_run", {"host": "box", "command": "hostname"}, CTX).content)
     assert bad["returncode"] == 255 and "interception" in bad.get("hint", "")

@@ -140,6 +140,9 @@ class Plan:
     # Veille du foyer (docs/HOME-WATCH.md §6, drapeau `home_watch`) : membre → bloc texte `maison_veille` du brief, ou
     # None. None (drapeau éteint) : `plan_brief` rend exactement ce qu'il rendait.
     home_watch: Callable[[str | None], str | None] | None = None
+    # Flux d'événements de la maison (docs/HOME-ASSISTANT.md §8, `home_assistant.feeds`) : membre → bloc texte
+    # `maison_evenements` du brief, ou None. None : `plan_brief` rend exactement ce qu'il rendait.
+    home_events: Callable[[str | None], str | None] | None = None
     clock: Callable[[], float] = time.time
     cache_ttl_s: float = 30.0
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -594,6 +597,13 @@ class Plan:
                 watch = None
             if watch:
                 out["maison_veille"] = watch
+        if self.home_events is not None:
+            try:
+                events = self.home_events(sender)
+            except Exception:  # noqa: BLE001 — un flux en panne ne casse jamais le brief
+                events = None
+            if events:
+                out["maison_evenements"] = events
         return out
 
     def get_brief(self, owner: str) -> Any:

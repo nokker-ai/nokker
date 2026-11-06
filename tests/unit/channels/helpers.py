@@ -2,7 +2,14 @@
 from __future__ import annotations
 
 from nokker.approvals.memory import InMemoryApprovals
-from nokker.channels.common import ChannelCore, Dispatcher, MemoryDedup, MemoryPairing, MemoryWindows, RateLimiter
+from nokker.channels.common import (
+    ChannelCore,
+    Dispatcher,
+    MemoryDedup,
+    MemoryPairing,
+    MemoryWindows,
+    RateLimiter,
+)
 from nokker.channels.slack import SlackAdapter
 from nokker.channels.whatsapp import WhatsAppAdapter
 from nokker.core.turn import Decision, Gate, InputCheck, ToolCall, Turn, Verdict
@@ -133,3 +140,12 @@ def card_for_account(account, approvals: InMemoryApprovals, strength: str = "str
         return approvals.request(turn, ToolCall(id="c", name="files_delete", arguments={"path": "/x"}),
                                  Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=rule,
                                          reason="suppression demandée", strength=strength), None)
+
+
+class FakeResolver:
+    def __init__(self, values):
+        self.values, self.reads = values, []
+
+    def value(self, name):
+        self.reads.append(name)
+        return self.values[name]

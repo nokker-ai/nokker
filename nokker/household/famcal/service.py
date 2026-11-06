@@ -18,7 +18,6 @@ Journaux : identifiants seulement (`fc_…`), jamais un titre ni un lieu.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
@@ -31,6 +30,7 @@ from zoneinfo import ZoneInfo
 from nokker.household.famcal import ics as ics_mod
 from nokker.household.famcal import review as rv
 from nokker.household.famcal.store import DEFAULT_TZ, Draft, Settings
+from nokker.connectors.calendar import parse_events_result
 from nokker.qa.untrusted import inline
 from nokker.tenancy.context import current_tenant
 
@@ -146,7 +146,7 @@ class FamilyCalendar:
             res = src.call("calendar_events", {"days": rv.window_days(lines, today), "calendar": "all"}, _ctx())
             if res.is_error:
                 raise ValueError("lecture refusée")
-            evs = json.loads(res.content).get("events") or []
+            evs = parse_events_result(res.content).get("events") or []
         except Exception:  # noqa: BLE001 — agenda illisible : on le dit, on ne bloque pas
             return None, "agenda illisible : doublons non vérifiés"
         note = "doublons vérifiés sur un an seulement" if rv.beyond_window(lines, today) else ""

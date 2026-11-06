@@ -107,7 +107,9 @@ def message_dict(msg: Any) -> dict[str, Any]:
 
 
 def verdict_dict(v: Any) -> dict[str, Any]:
-    val = (lambda x: getattr(x, "value", x))
+    def val(x):
+        return getattr(x, "value", x)
+
     return {"gate": val(v.gate), "decision": val(v.decision), "layer": v.layer, "rule": v.rule, "reason": v.reason,
             "subject": v.subject, "strength": v.strength, "probability": v.probability, "judge_model": v.judge_model}
 
@@ -360,7 +362,9 @@ class TraceRecorder:
 
 
 def _same_message(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    ids = (lambda m: [tc.get("id") for tc in m.get("tool_calls") or []])
+    def ids(m):
+        return [tc.get("id") for tc in m.get("tool_calls") or []]
+
     return (a.get("content") or "") == (b.get("content") or "") and ids(a) == ids(b)
 
 

@@ -86,7 +86,7 @@ from nokker.core.turn import RELAY_CHANNEL, Decision, Gate, Tier, Turn, TurnInpu
 from nokker.core.turn_lock import TurnLocks
 from nokker.ledger.costs import InMemoryLedger, LedgerBackend, PostgresLedger
 from nokker.ledger.metrics import render as render_metrics
-from nokker.ledger.turn_cost import root_thread
+from nokker.ledger.turn_cost import root_thread, set_usd_chf
 from nokker.memory.corthexis import CorthexisMemory  # noqa: F401 — nom public du module (tests, appelants)
 from nokker.memory.corthexis import from_config as memory_from_config
 from nokker.memory.corthexis import status_of as memory_status
@@ -97,7 +97,7 @@ from nokker.qa.calibrate import DEFAULT_THRESHOLDS, load_thresholds_file
 from nokker.qa.escalate import EscalatorV0
 from nokker.qa.gates import GatesV0, GatesV1
 from nokker.qa.invariants import Allowlist, DeterministicInvariants, GoAuthorizedSenders
-from nokker.qa.judge import HttpJudgeTransport, OpenAICompatJudge
+from nokker.qa.judge import HedgedJudgeTransport, HttpJudgeTransport, OpenAICompatJudge
 from nokker.qa.provenance import build_provenance
 from nokker.qa.review import CardAdvisor, DiffReviewer, parse_advice
 from nokker.qa.secrets import KnownSecrets
@@ -128,6 +128,8 @@ from nokker.memory.consolidation import http as consolidation_http
 from nokker.sso import http as sso_http
 from nokker.code_sessions import http as code_http
 from nokker.account import http as account_http
+from nokker.byok import http as byok_http
+from nokker.api import capabilities as capabilities_mod
 from nokker.telegram import http as telegram_http
 from nokker.connectors.provider import ConnectorProvider as ConnectorsForTenant
 from nokker.connectors.service import Connectors
@@ -192,6 +194,8 @@ _RE_APPROVAL_CHALLENGE = re.compile(r"^/v1/approvals/([^/]+)/challenge$")
 _RE_APPROVAL_KNOCK_ARM = re.compile(r"^/v1/approvals/([^/]+)/knock-arm$")  # heurtoir (docs/KNOCK.md §5.3)
 _RE_APPROVAL_DECISION = re.compile(r"^/v1/approvals/([^/]+)/decision$")
 _RE_APPROVAL_AUTO_REVOKE = re.compile(r"^/v1/approvals/([^/]+)/auto-review/revoke$")
+# Restauration explicite du point de retour d'une écriture approuvée automatiquement puis révoquée (§8).
+_RE_APPROVAL_AUTO_ROLLBACK = re.compile(r"^/v1/approvals/([^/]+)/auto-review/rollback$")
 # Attente maximale de `POST /v1/approvals/{id}/decision` (Mini App, web) : sous les 100 s de Cloudflare, tour en cours
 # sur le fil compris ; au-delà, la carte part telle qu'elle est (`approved`) et l'exécution suit en fond.
 DECISION_WAIT_S = 45.0
@@ -221,6 +225,7 @@ DIRECT_TOOLS = frozenset({"checkpoint_list", "checkpoint_diff", "checkpoint_crea
 NOKKER_VERSION = "0.1.0"
 MIN_CLIENT_VERSION = "0.1.0"
 _RE_THREAD_SUB = re.compile(r"^/v1/threads/([^/]+)/(messages|bubbles)$")
+_RE_THREAD_SPEECH = re.compile(r"^/v1/threads/([^/]+)/messages/(\d{1,9})/speech$")  # « Écouter » (docs/VOICE.md §7)
 _RE_THREAD_IMAGE = re.compile(r"^/v1/threads/([^/]+)/images/([0-9a-f]{64})$")
 # Export d'un fil et liens partagés (docs/CLIENT-API.md « Export et partage d'un fil », nokker/threads/shares.py).
 _RE_THREAD_EXPORT = re.compile(r"^/v1/threads/([^/]+)/export$")
@@ -247,6 +252,9 @@ def build_invariants(config: NokkerConfig) -> DeterministicInvariants:
     known = KnownSecrets.load(env_prefix=config.known_secrets_env_prefix, file_path=config.known_secrets_file)
     allowlist = Allowlist.load(domains=config.allowlist_domains, addresses=config.allowlist_addresses)
     go_senders = GoAuthorizedSenders(senders=config.go_senders())
+    from nokker.payments import cardmask
+
+    cardmask.configure(notice=bool(getattr(config, "card_mask_notice", False)))  # repère « [Masque] », PAYMENTS §2 bis
     return DeterministicInvariants(known=known, allowlist=allowlist, go_senders=go_senders)
 
 
@@ -327,16 +335,23 @@ def build_agents(config: NokkerConfig, events: EventBus | None = None) -> Agents
     return AgentsHub(store=store, publish=events.publish if events is not None else None)
 
 
-def judge_transport(config: NokkerConfig, timeout_s: float = 30.0, known: Any = None) -> HttpJudgeTransport:
+def judge_transport(config: NokkerConfig, timeout_s: float = 30.0, known: Any = None) -> Any:
     """Transport du juge (`config.judge_config()` : `judge:` du YAML, sinon le palier Ship). Raisonnement coupé par
     `reasoning_off_body` du juge s'il est posé, sinon `reasoning_effort: "none"` (SEULE variante qui coupe vraiment le
     raisonnement sur le Router SOKKAN, cf `providers/sokkan.py`) ; un amont qui le refuse (gpt-oss, clé de
     l'utilisateur) est repris sans (`HttpJudgeTransport`, X8). `top_logprobs=1` (plafond mesuré du Router). `known` :
-    coffre des invariants, pour le caviardage de tout ce que le juge envoie (motifs seuls sans lui)."""
+    coffre des invariants, pour le caviardage de tout ce que le juge envoie (motifs seuls sans lui). Avec
+    `fallback_model` (même amont et même clé), le transport est un `HedgedJudgeTransport` : repli après
+    `hedge_after_s` ou en cas d'échec ; `data["model"]` y dit le modèle qui a réellement répondu."""
     j = config.judge_config()
     extra = j.reasoning_off_body if j.reasoning_off_body is not None else {"reasoning_effort": "none"}
-    return HttpJudgeTransport(base_url=j.base_url, model=j.model, api_key=j.api_key(), extra_body=dict(extra),
-                              top_logprobs=1, timeout_s=timeout_s, known=known)
+    primary = HttpJudgeTransport(base_url=j.base_url, model=j.model, api_key=j.api_key(), extra_body=dict(extra),
+                                 top_logprobs=1, timeout_s=timeout_s, known=known)
+    if not j.fallback_model or j.fallback_model == j.model:
+        return primary
+    fallback = HttpJudgeTransport(base_url=j.base_url, model=j.fallback_model, api_key=j.api_key(),
+                                  extra_body=dict(extra), top_logprobs=1, timeout_s=timeout_s, known=known)
+    return HedgedJudgeTransport(primary, fallback, hedge_after_s=j.hedge_after_s)
 
 
 def build_judge(config: NokkerConfig, known: Any = None) -> OpenAICompatJudge:
@@ -488,7 +503,8 @@ def build_policy(config: NokkerConfig, providers: dict) -> PolicyV0:
     return PolicyV1(available=lambda: tuple(providers), classifier=classifier,
                     vision=lambda: tuple(t for t, p in providers.items() if getattr(p, "vision", False) is True),
                     code_to_deep=bool(route.get("code_to_deep", True)),
-                    deep_tool_failures=int(route.get("deep_tool_failures", 3)), nina_kinds=nina_kinds)
+                    deep_tool_failures=int(route.get("deep_tool_failures", 3)), nina_kinds=nina_kinds,
+                    relay_voice=bool(getattr(config, "route_relay_voice", False)))
 
 
 def build_gates(config: NokkerConfig, invariants: Invariants) -> GatesV0 | GatesV1:
@@ -746,7 +762,7 @@ def configure_cloud_link(config: NokkerConfig, tenancy: Tenancy, approvals: Any,
                                redact=invariants.redact_result if invariants is not None else None,
                                record=record_relay, verifier=approvals,
                                devices_of=(lambda acc: approvals.list_devices(acc)) if approvals is not None else None,
-                               cards=relay_store, origin=links.base_url)
+                               cards=relay_store, origin=links.base_url, grouped=_relay_grouped(connector_store))
     mirror_allowed = (lambda acc: "*" in cl.get("mirror_accounts", []) or acc in cl.get("mirror_accounts", [])) \
         if cl.get("mirror") else None
     crew = None
@@ -910,8 +926,10 @@ def configure_household(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, 
     kernel.gates = MinorGates(inner=kernel.gates, minor_state=house.minor_state)
     if code_http.service() is not None:  # un profil mineur n'ouvre pas de session de code (§7.28)
         code_http.service().minor = house.is_minor
-    if hasattr(kernel.tools, "restrict"):
-        kernel.tools.restrict = minor_tool_filter(house)
+    reg = tenant_registry_of(kernel.tools)  # SOUS l'enveloppe des hooks : posé sur HookedTools, il n'atteignait rien
+    if reg is not None:
+        reg.restrict = minor_tool_filter(house)
+        reg.refresh()  # jeux déjà en cache : reconstruits avec le filtre
     if hasattr(kernel.context, "young_profile"):
         kernel.context.young_profile = profiles
     if approvals is not None:
@@ -948,6 +966,95 @@ def configure_ambient(config: NokkerConfig, kernel: Any) -> None:
     ambient_http.configure(build(raw, scrub=kernel.invariants.scrub_output, tts_raw=config.tts,
                                  dsn=config.pg_dsn() or None, bridge=HomeBridge.from_env(),
                                  household_name=household_name))
+
+
+def _relay_grouped(connector_store: Any) -> Any:
+    """Relais Lokkal (X20) sur un magasin multi (068) : la source regroupée par nature, partages compris."""
+    from nokker.connectors.provider import ConnectorProvider
+    from nokker.connectors.store import is_multi
+
+    if connector_store is None or not is_multi(connector_store):
+        return None
+
+    def shared(account_id: str) -> list[Any]:
+        svc = connectors_http.service()
+        return svc.shared(account_id) if svc is not None and svc.multi else []
+
+    prov = ConnectorProvider(connector_store, lambda _t: None, locality="cloud", shared=shared)
+    prov.oauth_from = lambda: getattr(connectors_http.service(), "oauth", None)  # jetons OAuth : ceux du service
+    return prov
+
+
+def _build_oauth(config: NokkerConfig, dsn: str | None, svc: Any) -> Any:
+    """Connecteurs OAuth (docs/CONNECTORS-OAUTH.md) : allumés seulement avec un fournisseur configuré (client_id et
+    secret `secret:NOM` lisible dans l'environnement du pod) ET la clé de signature du `state`."""
+    from nokker.connectors.crypto import SecretBox
+    from nokker.connectors.errors import ConnectorError
+    from nokker.connectors.oauth import MemoryOAuthStore, OAuth, PgOAuthStore, providers_from_config
+    from nokker.tenancy.context import current_tenant
+
+    raw = getattr(config, "oauth_providers", None)
+    key = os.environ.get("NOKKER_OAUTH_STATE_KEY", "")
+    if not raw:
+        return None
+    if len(key) < 32:
+        logger.warning("oauth_providers sans NOKKER_OAUTH_STATE_KEY (32 caractères au moins) : connecteurs OAuth éteints")
+        return None
+    providers = providers_from_config(raw, lambda ref: os.environ.get(ref[len("secret:"):], ""))
+    if not providers:
+        logger.warning("oauth_providers : aucun fournisseur allumé (client_id ou secret manquant)")
+        return None
+    try:
+        box = SecretBox.from_env()
+    except ConnectorError:
+        return None
+    store = PgOAuthStore(dsn, box) if dsn else MemoryOAuthStore(box, current_tenant)
+    logger.info("connecteurs OAuth : %s", ", ".join(sorted(providers)))
+    return OAuth(providers, store, key.encode(), on_linked=svc.on_oauth_linked)
+
+
+def configure_connectors_multi(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, approvals: Any,
+                               connector_store: Any, provider: Any) -> None:
+    """Plusieurs boîtes mail et agendas par compte, partage dans le foyer (docs/CONNECTORS-MULTI.md). nokker.ai
+    seulement (magasin Postgres multi, 068). Après le foyer : son crochet de sortie fait tomber les partages.
+    Sans magasin multi (Lokkal, canari sans clé) : rien ne change, routes et outils d'avant."""
+    from nokker.connectors.boxes import MailSenderGates
+    from nokker.connectors.grants import MemoryGrantStore, PgGrantStore
+    from nokker.connectors.household import HouseholdLink
+    from nokker.connectors.service import Connectors
+    from nokker.connectors.store import is_multi
+    from nokker.tenancy.context import current_tenant, current_tenant_or_none
+
+    if connector_store is None or not is_multi(connector_store):
+        return
+    dsn = config.pg_dsn()
+    link = HouseholdLink(household_http.service, tenancy)
+
+    def tenant_of(account_id: str) -> str | None:
+        acc = tenancy.account(account_id)
+        return acc.tenant_id if acc is not None else None
+
+    forget = getattr(kernel.tools, "forget", None)
+    svc = Connectors(connector_store, locality="cloud",
+                     grants=PgGrantStore(dsn) if dsn else MemoryGrantStore(current_tenant),
+                     households=link, approvals=approvals, tenant_of=tenant_of, on_change=forget)
+    connectors_http.configure(svc)
+    if provider is not None:
+        provider.shared = svc.shared
+    oauth = _build_oauth(config, dsn, svc)
+    if oauth is not None:
+        svc.oauth = oauth
+        if provider is not None:
+            provider.oauth = oauth
+    house = household_http.service()
+    if house is not None:
+        house.on_member_gone = lambda hid, aid, rows: svc.member_gone(hid, aid, link.members(rows))
+    if provider is not None:
+        def boxes() -> list[Any] | None:
+            tid = current_tenant_or_none()
+            return provider.boxes_for(tid) if tid else None
+
+        kernel.gates = MailSenderGates(inner=kernel.gates, boxes=boxes)
 
 
 def configure_household_paper(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy) -> None:
@@ -1043,6 +1150,44 @@ def configure_family_calendar(config: NokkerConfig, kernel: Kernel, tenancy: Ten
     famcal_http.configure(svc)
 
 
+def build_router_provider(config: NokkerConfig) -> Any:
+    """Modèle de l'enfant routeur (`delegate_router`) : `delegate_router_settings`, sinon base et clé du palier ship,
+    modèle `ROUTER_MODEL`. La clé est lue dans la variable nommée, jamais dans la config."""
+    from nokker.tools.delegate import ROUTER_MODEL
+
+    raw = config.delegate_router_settings or {}
+    ship = config.tiers.get("ship") if isinstance(config.tiers, dict) else None
+    base_url = str(raw.get("base_url") or (ship.base_url if ship is not None else ""))
+    key_env = str(raw.get("api_key_env") or (ship.api_key_env if ship is not None else "ROUTER_KEY"))
+    extra = {"reasoning_off_body": ship.reasoning_off_body} if ship is not None and ship.reasoning_off_body else {}
+    return SokkanProvider(base_url=base_url, api_key=os.environ.get(key_env, ""),
+                          model=str(raw.get("model") or ROUTER_MODEL), **extra)
+
+
+def tenant_registry_of(tools: Any) -> TenantRegistry | None:
+    """Le `TenantRegistry` sous les enveloppes du noyau (`HookedTools`… : `.inner`). Un attribut posé sur l'enveloppe
+    ne l'atteint pas (l'enveloppe relaie la LECTURE seulement)."""
+    seen = 0
+    while tools is not None and not isinstance(tools, TenantRegistry) and seen < 8:
+        tools, seen = getattr(tools, "inner", None), seen + 1
+    return tools if isinstance(tools, TenantRegistry) else None
+
+
+def configure_speech(config: NokkerConfig, kernel: Kernel) -> None:
+    """« Écouter » dans le web (`nokker/voice/web.py`, docs/VOICE.md §7) : seulement si `tts.enabled` et un fournisseur
+    qui sait streamer (ElevenLabs). Sinon rien : `GET /v1/speech` répond 404, la route de lecture 503 `tts_off`."""
+    from nokker.tenancy.limits import MemoryUsage, PgUsage
+    from nokker.voice import web as voice_web
+
+    dsn = config.pg_dsn()
+    if speak_lexicon_mod.service() is None:  # comme l'ambiant : posé une seule fois, partagé avec Telegram
+        speak_lexicon_mod.setup(getattr(config, "speak_lexicon", None), dsn or None)
+    sl = speak_lexicon_mod.service()  # None (drapeau éteint) : texte sans lexique
+    voice_web.configure(voice_web.from_config(config.tts, kernel.invariants.scrub_output,
+                                              prepare=sl.prepare if sl is not None else None,
+                                              usage=PgUsage(dsn) if dsn else MemoryUsage()))
+
+
 def configure_payments(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, approvals: Any,
                        events: Any = None) -> None:
     """Paiements « l'agent prépare, l'humain paie » (docs/PAYMENTS.md, nokker/payments/) : drapeau `payments`, éteint
@@ -1076,7 +1221,13 @@ def configure_payments(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, a
         for i, src in enumerate(srcs):
             if isinstance(src, BrowserPoolSource):
                 srcs[i] = CheckoutWatch(inner=src, payments=svc)
-        srcs.append(PayTools(payments=svc))
+        srcs.append(PayTools(payments=svc, tool_choice=bool(getattr(config, "pay_tool_choice", False))))
+        internal = getattr(kernel.tools, "internal", None)
+        if config.local is not None and internal is not None and hasattr(internal, "sources"):
+            # Lokkal (own_card, docs/PAY-AGENT.md §11) : le propriétaire de la machine travaille dans le locataire
+            # interne, servi par le registre interne : l'outil `pay_request` y est offert aussi.
+            internal.sources.append(PayTools(payments=svc,
+                                             tool_choice=bool(getattr(config, "pay_tool_choice", False))))
         kernel.tools.refresh()
 
     def device_key(device_id: str) -> str | None:
@@ -1084,6 +1235,18 @@ def configure_payments(config: NokkerConfig, kernel: Kernel, tenancy: Tenancy, a
         return dev.public_key_spki if dev is not None and dev.status == "approved" else None
 
     payments_http.configure(svc, device_key=device_key, origin=config.webauthn_origin)
+    if getattr(config, "pay_agent", False):
+        from nokker.payments.agent import CALLBACK_SECRET_ENV, TOKEN_ENV, AgentSettings, PayAgentClient
+
+        agent_cfg = AgentSettings.from_config(config.pay_agent_settings)
+        token, secret = os.environ.get(TOKEN_ENV, ""), os.environ.get(CALLBACK_SECRET_ENV, "")
+        if not (agent_cfg.url and token and secret):
+            logger.warning("drapeau pay_agent sans url, %s ou %s : agent de paiement éteint", TOKEN_ENV,
+                           CALLBACK_SECRET_ENV)
+        else:
+            svc.agent, svc.agent_settings = PayAgentClient(agent_cfg.url, token), agent_cfg
+            payments_http.configure_agent(secret)
+            kernel.tools.refresh()  # description de pay_request : celle de l'agent
 
 
 def house_room_on(config: NokkerConfig) -> bool:
@@ -1163,6 +1326,47 @@ def configure_presence(config: NokkerConfig, kernel: Any, *, events: Any = None,
                           code=code_http.service(), agents=agents, room=room, tracker=tracker)
     presence_http.configure(svc)
     return svc
+
+
+def configure_feature_notes(config: NokkerConfig, kernel: Any) -> Any:
+    """Notes de fonctions (`nokker/guide/notes.py`) : drapeau `feature_notes`. Éteint : rien (ni bloc, ni outil).
+    Allumé : notes EN MÉMOIRE générées du catalogue au commit du noyau (jamais écrites dans CortHeXis), bloc
+    `[Fonctions]` dans l'en-tête du tour, outil READ `feature_get` dans l'index. Choix : embeddings du service
+    CortHeXis (`CORTHEXIS_EMBED_URLS`), calculés en arrière-plan au démarrage ; sans eux, score lexical local.
+    Réglages : `feature_notes_settings` {min_cosine, min_hits, max_notes, budget_chars}."""
+    if not getattr(config, "feature_notes", False):
+        return None
+    import os
+
+    from nokker.guide.notes import FeatureGetSource, FeatureNotes
+    from nokker.traces.recorder import kernel_sha
+
+    raw = getattr(config, "feature_notes_settings", None) or {}
+    embedder: Any = None
+    if os.environ.get("CORTHEXIS_EMBED_URLS"):
+        from nokker.memory.tenant_long import CorthexisEmbedder
+
+        cx = CorthexisEmbedder()
+        embedder = cx if cx.available() else None
+    if embedder is None:
+        logger.warning("notes de fonctions : pas de service d'embed CortHeXis — choix lexical")
+    notes = FeatureNotes(config=config, sha=kernel_sha()[:12] or "?", embedder=embedder,
+                         min_cosine=float(raw.get("min_cosine", 0.5)), min_hits=int(raw.get("min_hits", 2)),
+                         max_notes=int(raw.get("max_notes", 3)), budget=int(raw.get("budget_chars", 2400)))
+    if embedder is not None:
+        threading.Thread(target=notes.warm, name="feature-notes-embed", daemon=True).start()
+    if hasattr(kernel.context, "feature_notes"):
+        kernel.context.feature_notes = notes
+    context = kernel.context
+
+    def minor() -> bool:
+        young = getattr(context, "_young", None)
+        return young is not None and young() is not None
+
+    if hasattr(kernel.tools, "tester_sources"):
+        kernel.tools.tester_sources.append(FeatureGetSource(notes=notes, minor=minor))
+        kernel.tools.refresh()
+    return notes
 
 
 def configure_guide(config: NokkerConfig, kernel: Any, *, events: Any = None, tenancy: Any = None) -> Any:
@@ -1545,7 +1749,12 @@ def configure_code_sessions(config: NokkerConfig, kernel: Kernel, *, hub: Any = 
     # l'instance ; amont sans home par contexte : enveloppe transparente, outils « indisponibles ».
     mgr = SessionCheckpoints(svc)
     svc.checkpoints = mgr
-    wrapper = CheckpointingToolSource(svc.tools(), svc.root_of, manager=mgr)
+    from nokker.tools.card_snapshots import CardSnapshots
+
+    cards = CardSnapshots(svc.root_of, mgr.cards_dir)  # points PAR CARTE du relecteur automatique, sans l'amont aussi
+    if isinstance(getattr(kernel, "card_snapshots", None), list):
+        kernel.card_snapshots.append(cards)
+    wrapper = CheckpointingToolSource(svc.tools(), svc.root_of, manager=mgr, cards=cards)
     checkpoints = CheckpointToolSource(svc.root_of, manager=mgr)
     if not mgr.available():
         wrapper.manager = checkpoints.manager = None
@@ -1553,12 +1762,21 @@ def configure_code_sessions(config: NokkerConfig, kernel: Kernel, *, hub: Any = 
     skills, subagents = svc.skill_tools(), svc.subagent_tools()
     # `skill_list`/`skill_view` : AVANT les packs du web (configure_packs, plus tard) qui portent les mêmes noms ; hors
     # session, la source des packs répond telle quelle (`skills_fallback`).
+    for src in (wrapper, checkpoints, skills, subagents):
+        src.code_session_only = True  # drapeau `code_tools_session_only` : offerts dans les fils de session seulement
     kernel.tools.tester_sources.extend([wrapper, checkpoints, skills, subagents])
+    reg = tenant_registry_of(kernel.tools)
+    if reg is not None:  # fil à session vivante : le delegate des sessions, pas celui de conversation (cf497c9)
+        reg.has_session = svc.is_code_thread
+        reg.session_only = bool(getattr(config, "code_tools_session_only", False))
+        reg.voice_read_only = bool(getattr(config, "voice_read_only", False))
     if config.execute_code_enabled:
         # execute_code (docs/LOKKAL.md §7.31) : dans le bac à sable de la session du fil, propriétaire seulement.
         from nokker.tools.execute_code import ExecuteCodeSource
 
-        kernel.tools.tester_sources.append(ExecuteCodeSource.from_config(svc.tools().script_source, config.execute_code))
+        exec_src = ExecuteCodeSource.from_config(svc.tools().script_source, config.execute_code)
+        exec_src.code_session_only = True
+        kernel.tools.tester_sources.append(exec_src)
     kernel.tools.refresh()
 
     def packs_source() -> Any:
@@ -1573,6 +1791,7 @@ def configure_code_sessions(config: NokkerConfig, kernel: Kernel, *, hub: Any = 
     svc.skills_fallback = packs_source
     svc.kernel_factory = child_kernel
     svc.delegate_fork = bool(getattr(config, "delegate_fork", False))
+    svc.delegate_tier = bool(getattr(config, "delegate_tier", False))
     svc.parent_registry = lambda: kernel.tools.current()  # le jeu du locataire courant (TenantRegistry)
     svc.emit = events.publish if events is not None else None
     svc.parent_observer = hub
@@ -1602,7 +1821,9 @@ def configure_code_sessions(config: NokkerConfig, kernel: Kernel, *, hub: Any = 
         forge_triggers = ForgeTriggers(sessions=svc, store=PgForgeStore(dsn) if dsn else MemoryForgeStore(),
                                        run_turn=forge_turn, tenants=(lambda: known_tenants(dsn)) if dsn else None,
                                        scrub=getattr(inv, "scrub_output", None), executor=make_executor())
-        kernel.tools.tester_sources.append(forge_triggers.tools())
+        forge_src = forge_triggers.tools()
+        forge_src.code_session_only = True  # forge_push : fils de session seulement, et jamais à la voix (VOICE_HIDDEN)
+        kernel.tools.tester_sources.append(forge_src)
         kernel.tools.refresh()
     code_http.configure(svc, forge_triggers)
     return svc
@@ -1655,7 +1876,88 @@ def build_shares(config: NokkerConfig) -> ThreadShares:
     return ThreadShares(PgShares(dsn) if dsn else MemoryShares(), base_url=config.share_base_url)
 
 
-def configure_billing(config: NokkerConfig) -> None:
+def configure_cloud_byok(config: NokkerConfig, kernel: Kernel) -> None:
+    """BYOK cloud (docs/CLOUD-BYOK.md, nokker/byok/) : bloc `cloud_byok` avec `enabled: true`, comptes de nokker.ai
+    seulement (Lokkal a son propre BYOK, /v1/local/setup*). Éteint : aucune route /v1/account/models*, aucun tour ne
+    change de fournisseur. Droit d'usage : palier actif lu dans la facturation (`cloud_byok.plans`, défaut byok + solo).
+    Clés : coffre du noyau, portée `system` (`cloud_byok.secrets`, même forme que `sso_settings.secrets`)."""
+    from pathlib import Path
+
+    from nokker.byok.service import (
+        DEFAULT_BYOK_ONLY_PLANS,
+        DEFAULT_BYOK_PLANS,
+        ByokSecrets,
+        CloudByok,
+        byok_entitled,
+        byok_only_plan,
+    )
+    from nokker.byok.store import MemoryByokStore, PgByokStore
+    from nokker.secrets.vault import build_provider, chosen_provider
+
+    settings = dict(config.cloud_byok or {})
+    if not settings.get("enabled"):
+        byok_http.configure(None)
+        kernel.byok = None
+        return
+    plans = tuple(str(p) for p in (settings.get("plans") or DEFAULT_BYOK_PLANS))
+    open_to_all = settings.get("open_to_all") is True
+
+    def entitled(tenant_id: str) -> bool:
+        return byok_entitled(tenant_id, billing=billing_http.service(), plans=plans, open_to_all=open_to_all)
+
+    only_plans = tuple(str(p) for p in (settings.get("byok_only_plans") or DEFAULT_BYOK_ONLY_PLANS))
+
+    def byok_only(tenant_id: str) -> bool:
+        return byok_only_plan(tenant_id, billing=billing_http.service(), plans=only_plans)
+
+    scfg = dict(settings.get("secrets") or {})
+    state_dir = Path(str(settings.get("state_dir") or "~/.config/nokker/byok")).expanduser()
+    provider = build_provider(chosen_provider(scfg), "system", scfg, state_dir)
+    dsn = config.pg_dsn()
+    svc = CloudByok(store=PgByokStore(dsn) if dsn else MemoryByokStore(), secrets=ByokSecrets(provider),
+                    entitled=entitled, byok_only=byok_only, timeout_s=float(settings.get("timeout_s", 120.0)))
+    byok_http.configure(svc)
+    kernel.byok = svc
+    logger.info("BYOK cloud allumé (formules : %s%s)", ", ".join(plans), " ; ouvert à tous" if open_to_all else "")
+
+
+def _front_client(config: NokkerConfig) -> Any:
+    """Client du relais front (mails à gabarit figé), ou None s'il n'est pas configuré."""
+    from nokker.onboarding.front import FrontInvitations
+
+    token = os.environ.get(config.front_token_env, "")
+    if not (config.front_url and token):
+        return None
+    cf_id, cf_secret = os.environ.get(config.front_access_id_env, ""), os.environ.get(config.front_access_secret_env, "")
+    access = {"CF-Access-Client-Id": cf_id, "CF-Access-Client-Secret": cf_secret} if cf_id and cf_secret else None
+    return FrontInvitations(config.front_url, token, extra_headers=access)
+
+
+TRIAL_REMIND_EVERY_S = 3600.0
+
+
+def start_trial_reminders(billing: Any, tenancy: Any, front: Any, every_s: float = TRIAL_REMIND_EVERY_S) -> None:
+    """Rappels de fin d'essai (J+23, J+28) : une passe par heure ; l'adresse et la langue viennent du compte."""
+    def send(tenant_id: str, account_id: str, kind: str, info: dict[str, Any]) -> None:
+        acc = tenancy.account(account_id)
+        if acc is None or acc.tenant_id != tenant_id:
+            raise LookupError("compte introuvable")
+        front.send_trial_reminder(acc.email, acc.lang if acc.lang in ("fr", "en") else "fr", kind, info)
+
+    def loop() -> None:
+        while True:
+            try:
+                n = billing.remind_trials(send)
+                if n:
+                    logger.info("billing: %d rappel(s) de fin d'essai envoyé(s)", n)
+            except Exception:  # noqa: BLE001 — la boucle ne meurt jamais ; la passe suivante reprend
+                logger.exception("billing: passe des rappels d'essai en échec")
+            time.sleep(every_s)
+
+    threading.Thread(target=loop, name="billing-trial-reminders", daemon=True).start()
+
+
+def configure_billing(config: NokkerConfig, tenancy: Any = None) -> None:
     """Abonnements Stripe, seulement si `billing_enabled` ET les deux secrets posés. Jamais de clé live par défaut."""
     from nokker.billing.plans import plans_from_config
     from nokker.billing.service import Billing
@@ -1673,10 +1975,32 @@ def configure_billing(config: NokkerConfig) -> None:
     if key.startswith(("sk_live_", "rk_live_")) and not config.billing_live:
         raise RuntimeError("billing: clé Stripe live refusée (billing_live est faux)")
     dsn = config.pg_dsn()
-    billing_http.configure(Billing(store=PgBilling(dsn) if dsn else MemoryBilling(), stripe=StripeClient(key),
-                                   plans=plans_from_config(config.billing_plans), prices=dict(config.billing_prices),
-                                   webhook_secret=webhook, app_url=config.app_url,
-                                   coupon=str(getattr(config, "billing_coupon", "") or "")))
+    vouchers = None
+    if getattr(config, "vouchers_enabled", False):
+        from nokker.billing.voucher import MemoryVouchers, PgVouchers, Vouchers
+
+        salt = os.environ.get(config.vouchers_salt_env, "")
+        if len(salt) < 16:
+            logger.warning("vouchers_enabled sans %s (16 caractères au moins) : vouchers éteints", config.vouchers_salt_env)
+        else:
+            vouchers = Vouchers(PgVouchers(dsn) if dsn else MemoryVouchers(), salt, clock=time.time,
+                                grants_invite=bool(getattr(config, "voucher_grants_invite", False)))
+    billing = Billing(store=PgBilling(dsn) if dsn else MemoryBilling(), stripe=StripeClient(key, portal_configuration=str(getattr(config, "billing_portal_configuration", "") or "")),
+                      plans=plans_from_config(config.billing_plans), prices=dict(config.billing_prices),
+                      webhook_secret=webhook, app_url=config.app_url,
+                      coupon=str(getattr(config, "billing_coupon", "") or ""), vouchers=vouchers)
+    billing_http.configure(billing)
+    # Prix affichés (Mon compte) lus sur Stripe hors du chemin d'une requête ; un échec laisse les cartes sans prix.
+    threading.Thread(target=billing.warm_prices, name="billing-prices", daemon=True).start()
+    if vouchers is not None:
+        from nokker.onboarding import http as onboarding_http_mod
+
+        onboarding_http_mod.configure_vouchers(vouchers)  # code de campagne qui sert d'invitation (si réglé)
+        front = _front_client(config)
+        if front is not None and tenancy is not None:
+            start_trial_reminders(billing, tenancy, front)
+        else:
+            logger.warning("vouchers allumés sans relais front : aucun rappel de fin d'essai")
 
 
 def configure_feedback(config: NokkerConfig, kernel: Kernel) -> None:
@@ -1725,6 +2049,7 @@ def configure_telegram(config: NokkerConfig, tenancy: Tenancy, kernel: Kernel, h
         return speak_lexicon.SpeakScope(got[1].tenant_id, got[1].id) if got is not None else None
 
     adapter = TelegramAdapter(tenancy=tenancy, pairing=pairing, run_turn=run_turn, bot=bot,
+                              terms_outdated=onboarding_http.terms_outdated_for,
                               feedback=feedback_mod.service(),
                               voice=voice_from_config(config.tts, kernel.invariants.scrub_output,
                                                       prepare=sl.prepare if sl is not None else None),
@@ -1807,7 +2132,8 @@ def start_admin(config: NokkerConfig) -> Any:
                             overview=PgOverview(dsn) if dsn else MemoryOverview(),
                             candidatures=config.admin_candidatures,
                             candidatures_console=config.admin_candidatures_console, limits=config.tenant_limits,
-                            billing_plans=config.billing_plans, flags=enabled_flags(config))
+                            billing_plans=config.billing_plans, flags=enabled_flags(config),
+                            vouchers=getattr(billing_http.service(), "vouchers", None))
         if pull and token:
             bot = os.environ.get(config.admin_notify_token_env, "")
             notify = TelegramText(bot, config.admin_notify_ids()).send \
@@ -1969,10 +2295,12 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     `secrets` : le coffre de Lokkal (`nokker.secrets.Vault`, lot X4) — ses valeurs entrent au caviardage des
     invariants, et les références `secret:NOM` des serveurs MCP (`token`, `headers`) sont résolues à chaque
     connexion. None : ni l'un ni l'autre (une référence échoue à l'usage)."""
+    config.check_judge_explicit()
     # Politique réseau des clients sortants (bloc `ssrf:`, mode strict ÉTEINT par défaut : nokker/previews/ssrf.py).
     from nokker.previews.ssrf import configure as _ssrf_configure
 
     _ssrf_configure(config.ssrf)
+    set_usd_chf(getattr(config, "billing_usd_chf", None))  # taux de `cost_chf` (docs/LOKKAL.md §7.8), sans réseau
     dsn = config.pg_dsn()
     store = PgStore(dsn) if dsn else MemoryStore()
     if dsn:
@@ -1996,6 +2324,12 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
     if config.web_search_enabled:
         web_sources.append(WebToolSource(engines=list(config.web_search_engines), budget_s=config.web_search_budget_s,
                                          blocked_terms=list(config.web_search_blocked_terms)))
+    if getattr(config, "essentials", False):  # docs/ESSENTIALS.md ; éteint : aucune source, rien ne change
+        from nokker.tools.essentials import build_essentials
+
+        # Vague 2 (`essentials_v2`, éteinte par défaut) : jetons `secret:NOM` lus dans l'environnement du pod.
+        web_sources.append(build_essentials(getattr(config, "essentials_v2", None) or {},
+                                            lambda ref: os.environ.get(ref[len("secret:"):], "")))
     bubble_sources = []
     if hub is not None:
         previews_svc = None
@@ -2028,8 +2362,28 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         from nokker.goals.tools import GoalToolSource
 
         goal_sources = [GoalToolSource(service=goals)]
+    # `delegate_tenants` : `delegate` offert en conversation aux locataires nommés (canari de Nina), sans dossier de
+    # travail ni worktree. Vide (défaut) : aucune source, rien ne change.
+    delegate_holder: dict[str, Any] = {}
+    from nokker.tools import delegate as delegate_mod
+
+    delegate_mod.ROUTER["provider"] = build_router_provider(config) if config.delegate_router else None
+    delegate_conv = None
+    if config.delegate_tenants:
+        import dataclasses as _dcd
+
+        from nokker.tools.delegate import DelegateToolSource
+
+        delegate_conv = DelegateToolSource(
+            lambda registry, thread_id, observer: _dcd.replace(delegate_holder["k"], tools=registry, observer=observer),
+            None, fork=bool(getattr(config, "delegate_fork", False)), tier=bool(getattr(config, "delegate_tier", False)),
+            # `["*"]` : tous les locataires (testeurs aux ids `tn_` aléatoires), comme `mirror_accounts`.
+            tenants=None if "*" in config.delegate_tenants else frozenset(config.delegate_tenants))
+        delegate_conv.conversation_only = True  # jamais dans un fil à session de code (tenancy/resources.py)
+    delegate_internal = [delegate_conv] if delegate_conv is not None and (
+        INTERNAL_TENANT in config.delegate_tenants or "*" in config.delegate_tenants) else []
     internal_tools = Registry(sources=[core_source, *advise_sources, *context_sources, *memory_sources, *mcp_sources,
-                                       *web_sources, *bubble_sources, *goal_sources, *(extra_sources or [])])
+                                       *web_sources, *bubble_sources, *goal_sources, *(extra_sources or []), *delegate_internal])
     # Pool de navigateurs de la bêta (docs/BROWSER-POOL.md) : un Chrome isolé par testeur, seulement si l'adresse du
     # gestionnaire est posée (secret du déploiement) ; l'interne garde son navigateur partagé.
     browser_sources = []
@@ -2041,7 +2395,9 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         browser_sources.append(BrowserPoolSource(base_url=pool_url, api_token=lambda: os.environ.get(token_env, "")))
     # Testeur : JAMAIS mcp_sources (workspace, navigateur partagé de l'opérateur) ni memory_sources (sokkan-memory).
     tools = TenantRegistry(internal=internal_tools, tester_sources=[core_source, *context_sources, *web_sources,
-                                                                    *bubble_sources, *goal_sources, *browser_sources],
+                                                                    *bubble_sources, *goal_sources, *browser_sources,
+                                                                    *([delegate_conv] if delegate_conv is not None
+                                                                      else [])],
                            connectors=connectors)
 
     inv = invariants or build_invariants(config)
@@ -2061,10 +2417,14 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         ctx_manager.go_authorized = getattr(inv, "go_authorized", None)
         context: ContextEngineV0 = ContextEngineV1(tools=tools, prefix_path=config.prefix_path,
                                                    profile_path=config.profile_path, manager=ctx_manager,
-                                                   product_prefix_path=config.product_prefix())
+                                                   product_prefix_path=config.product_prefix(),
+                                                   reply_language=bool(getattr(config, "reply_language", False)),
+                                                   reply_language_tail=bool(getattr(config, "reply_language_tail", False)))
     else:
         context = ContextEngineV0(tools=tools, prefix_path=config.prefix_path, profile_path=config.profile_path,
-                                  product_prefix_path=config.product_prefix())
+                                  product_prefix_path=config.product_prefix(),
+                                  reply_language=bool(getattr(config, "reply_language", False)),
+                                  reply_language_tail=bool(getattr(config, "reply_language_tail", False)))
 
     providers: dict[Tier, Any] = {}
     nina_mode = str(((config.route or {}).get("nina") or {}).get("mode", "off"))
@@ -2086,6 +2446,8 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
                         "en attente du lien de compte" if config.local else "ignoré")
             continue
         extra = {"reasoning_off_body": tier_cfg.reasoning_off_body} if tier_cfg.reasoning_off_body is not None else {}
+        if tier_cfg.sampling:  # `tiers.<nom>.sampling` (ex. palier nina à T=0,3), repli compris
+            extra["sampling_body"] = dict(tier_cfg.sampling)
         probe = None
         if tier_cfg.vision_auto:  # vision `auto` : une sonde au premier tour avec image (§7.6)
             from nokker.providers.vision_probe import VisionProbe
@@ -2129,6 +2491,13 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
                     auto_reviewer=build_auto_reviewer(config, known=getattr(inv, "known", None)) if appr is not None
                     else None,
                     traces=build_recorder(config, inv))
+    if delegate_conv is not None:
+        delegate_holder["k"] = kernel
+        if config.delegate_router:  # reprise après une carte sous un routeur : note hors tour dans le fil de la voix
+            delegate_conv.note = getattr(kernel, "add_owner_note", None)
+        # Le registre du locataire COURANT, lu à l'appel : `TenantRegistry` n'est pas un `Registry` (pas de `sources`),
+        # le lier tel quel rendait « registre du parent non lié » à chaque `delegate` en conversation.
+        delegate_conv.bind(kernel.tools.current if hasattr(kernel.tools, "current") else kernel.tools)
     if nina_provider is not None:
         from nokker.route.nina import build_shadow
 
@@ -2240,6 +2609,27 @@ def user_to_json(user_id: str) -> dict[str, str]:
     """Forme de `GET /v1/users` (docs/BUBBLES.md §9.2) : identifiant + nom affichable + initiales."""
     name = _display_name(user_id)
     return {"id": user_id, "name": name, "initials": _initials(name)}
+
+
+def _approval_out(kernel: Any, card: Approval) -> dict[str, Any]:
+    """`approval_to_json`, plus `rollback` pour une approbation automatique RÉVOQUÉE (proposition, ou état « déjà
+    restauré » : `applied`, `restored`, `conflicts`)."""
+    out = approval_to_json(card)
+    rec = card.auto_review or {}
+    if rec.get("decision") == "approve" and rec.get("revoked_by"):
+        out["rollback"] = _rollback_offer(kernel, card)
+    return out
+
+
+def _rollback_offer(kernel: Any, card: Approval) -> dict[str, Any]:
+    """Point de retour PAR CARTE d'une approbation automatique révoquée (`nokker/tools/card_snapshots.py`)."""
+    from nokker.tools.card_snapshots import find_offer
+
+    hit = find_offer(getattr(kernel, "card_snapshots", None) or [], card.id, card.thread_id)
+    if hit is None:
+        return {"available": False, "checkpoint_id": None, "applied": False,
+                "reason": "aucun point de retour pour cette carte"}
+    return hit[1]
 
 
 def _approvals_error_status(exc: Exception) -> int:
@@ -2466,6 +2856,11 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             return k if k is not None else (before_house(thread_id) if before_house is not None else None)
 
         executor.kernel_for = _house_or
+    if executor is not None and connectors_http.service() is not None and connectors_http.service().multi:
+        # Partage d'une boîte ou d'un agenda dans le foyer (docs/CONNECTORS-MULTI.md) : geste du noyau sur carte forte.
+        from nokker.connectors.service import GRANT_TOOL
+
+        executor.handlers[GRANT_TOOL] = connectors_http.service().on_grant_decision
     if executor is not None and plan_http.service() is not None and plan_http.service().delivery is not None:
         # Brief du matin par e-mail (§7.18.5) : la carte forte qui arme la livraison est un geste du noyau.
         from nokker.plan.delivery import DELIVERY_TOOL
@@ -2613,10 +3008,67 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return False
             return True
 
+        def _cast_frame(self, method: str) -> bool:
+            """Cadre d'un aperçu d'écran (docs/SCREEN-CAST.md) : `POST /v1/cast/{id}/frame-url` (jeton local, ou jeton
+            d'accès du compte lié par le relais <nom>.nokker.app ; propriétaire de l'aperçu) → URL signée 2 min ; `GET /v1/cast/{id}/frame?exp=&sig=` (ou jeton local) → le
+            HTML de la bulle sous SA PROPRE CSP (sandbox allow-scripts, sans allow-same-origin)."""
+            from urllib.parse import parse_qs
+
+            from nokker.cast.service import FRAME_HEADERS
+
+            parsed = urlparse(self.path)
+            parts = parsed.path[len("/v1/cast/"):].strip("/").split("/")
+            cast = getattr(local_api, "cast", None) if local_api is not None else None
+            if cast is None or len(parts) != 2 or parts[1] not in ("frame", "frame-url"):
+                self._json(404, {"error": {"message": "aperçu inconnu"}})
+                return True
+            auth = self.headers.get("Authorization")
+
+            def owner() -> bool:
+                # jeton local sur la machine, ou jeton d'ACCÈS du compte lié par la passerelle (même règle que les autres
+                # routes relayées) ; jamais un jeton de délégation (`lokkal:session`, X21) : il n'ouvre que sa session
+                if not self._local_owner():
+                    return False
+                return not (self._via_relay() and local_api.delegation_claims(auth) is not None)
+
+            try:
+                if parts[1] == "frame-url" and method == "POST":
+                    if not owner():
+                        self._json(401, {"error": {"message": "jeton local requis"}})
+                        return True
+                    self._json(200, cast.frame_url(parts[0], LOCAL_OWNER))
+                    return True
+                if parts[1] == "frame" and method == "GET":
+                    q = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
+                    if "sig" in q:
+                        html = cast.frame_html(parts[0], exp=q.get("exp", ""), sig=q["sig"])
+                    elif owner():
+                        html = cast.frame_html(parts[0], user=LOCAL_OWNER)
+                    else:
+                        raise LookupError("aperçu inconnu")
+                    body = html.encode("utf-8")
+                    self.send_response(200)
+                    for k, v in FRAME_HEADERS.items():
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return True
+            except LookupError:
+                self._json(404, {"error": {"message": "aperçu inconnu"}})
+                return True
+            except ValueError:
+                self._json(413, {"error": {"code": "html_too_large", "message": "aperçu trop lourd (256 Ko au plus)"}})
+                return True
+            self._json(405, {"error": {"message": "méthode non permise"}})
+            return True
+
         def _local_route(self, method: str, path: str) -> bool:
             """Routes `/v1/local/*` (Nokker Lokkal) ; True si la requête a reçu sa réponse."""
             if self._glance_gate(method, path):  # jeton glance (lunettes) : 403 hors de GET /v1/glance
                 return True
+            if path.startswith("/v1/cast/"):  # cadre d'un aperçu d'écran, CSP propre (docs/SCREEN-CAST.md)
+                return self._cast_frame(method)
             if ambient_http.is_glance_path(path):  # vue glance : appairage et appareils du titulaire
                 if ambient_http.handle_glance_claim(self, method, path):
                     return True
@@ -2654,6 +3106,20 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
 
                     ambient_http.handle_member(self, method, path, Membership(
                         account_id="local", household_id="local", household_tenant=INTERNAL_TENANT, profile="adult"))
+                return True
+            if local_api is not None and payments_http.is_payments_path(path) \
+                    and path.split("?", 1)[0].rstrip("/") != payments_http.agent_callback_path():
+                # /v1/payments/* sur Lokkal (docs/PAY-AGENT.md §11) : le propriétaire, SUR la machine (jamais par la
+                # passerelle : la carte et ses codes ne transitent pas par nokker.app), locataire interne.
+                if self._via_relay():
+                    self._json(403, {"error": {"code": "local_only", "message": "paiements : sur la machine seulement"}})
+                elif not local_api.is_owner(self.headers.get("Authorization")):
+                    self._json(401, {"error": {"message": "jeton local requis"}})
+                else:
+                    from types import SimpleNamespace
+
+                    with tenant_scope(INTERNAL_TENANT):
+                        payments_http.handle(self, method, path, SimpleNamespace(account_id=LOCAL_OWNER))
                 return True
             if local_api is not None and path.startswith("/v1/pages/public/"):
                 self._public_page_route(method, path)
@@ -2707,7 +3173,12 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._process_route(method, path)
                 return True
             if path.startswith("/v1/local/approvals") and self._local_owner():
-                self._local_approvals(method, path)
+                with tenant_scope(INTERNAL_TENANT):  # cartes des sessions locales : locataire interne (backend Postgres)
+                    self._local_approvals(method, path)
+                return True
+            if path.startswith("/v1/local/passkeys") and self._local_owner():
+                with tenant_scope(INTERNAL_TENANT):  # appareil du propriétaire : locataire interne, comme la décision
+                    self._local_passkeys(method, path)
                 return True
             if path == "/v1/local/tools/call" and method == "POST":
                 self._local_tool_call()
@@ -3094,6 +3565,95 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return local_api.relayed_owner(auth) is not None
             return local_api.is_owner(auth)
 
+        def _local_passkey_decision(self, approval_id: str, step: str) -> None:
+            """Carte « à payer » own_card signée avec la passkey LOCALE (docs/PAY-AGENT.md §11) : défi, puis décision.
+            Sur la machine seulement (jamais par la passerelle) ; toute autre carte : 409 `not_local`."""
+            from nokker.approvals.errors import NotLocalApproval
+            from nokker.core.ports import Proof
+
+            pk = getattr(local_api, "passkeys", None)
+            pay = payments_http.service()
+            if self._via_relay() or pk is None or pay is None:
+                self._json(404, {"error": {"code": "not_found", "message": "not found"}})
+                return
+            card = approvals.get(approval_id)
+            if card is None:
+                self._json(404, {"error": {"code": "not_found", "message": "carte inconnue"}})
+                return
+            if card.status != "pending":
+                self._json(409, {"error": {"code": "not_pending", "message": "carte déjà décidée"}})
+                return
+            if not pay.local_passkey_ok(card):
+                self._json(409, {"error": {"code": "not_local", "message": "carte non signable en local : à signer "
+                                                                          "sur nokker.ai"}})
+                return
+            if step == "challenge":
+                allow = pk.allow_credentials()
+                if not allow:
+                    self._json(412, {"error": {"code": "no_passkey", "message": "aucune passkey locale enregistrée"}})
+                    return
+                with tenant_scope(tenant_of_thread(card.thread_id)):  # le défi lit le mandat de la carte
+                    ch = approvals.challenge(card.id)
+                self._json(200, {"challenge": ch.canonical(), "nonce": ch.nonce, "exp": ch.exp, "rp_id": "localhost",
+                                 "allow_credentials": allow})
+                return
+            body = self._read_json_body()
+            wa = body.get("webauthn") if isinstance(body.get("webauthn"), dict) else {}
+            decision = str(body.get("decision") or "")
+            if decision not in ("approve", "reject") or not wa or not body.get("challenge") or not body.get("device_id"):
+                self._json(400, {"error": {"code": "invalid", "message": "decision, device_id, challenge et webauthn "
+                                                                        "attendus"}})
+                return
+            proof = Proof(device_id=str(body["device_id"]), challenge=str(body["challenge"]),
+                          webauthn_client_data_json=str(wa.get("client_data_json") or ""),
+                          webauthn_authenticator_data=str(wa.get("authenticator_data") or ""),
+                          webauthn_signature=str(wa.get("signature") or ""))
+            try:
+                with tenant_scope(tenant_of_thread(card.thread_id)):
+                    decided = approvals.decide_local_passkey(card.id, decision, proof, origin=pk.origin,
+                                                             local_ok=pay.local_passkey_ok, owner=pk.owner)
+            except NotLocalApproval as e:
+                self._json(409, {"error": {"code": "not_local", "message": str(e)}})
+                return
+            except ApprovalNotPending as e:
+                self._json(409, {"error": {"code": "not_pending", "message": str(e)}})
+                return
+            except ApprovalNotFound as e:
+                self._json(404, {"error": {"code": "not_found", "message": str(e)}})
+                return
+            except (ProofInvalid, ApprovalExpired) as e:
+                self._json(403, {"error": {"code": "proof_invalid", "message": str(e)}})
+                return
+            # Comme `/decide` (§7.4.9) : l'outil approuvé (pay_request → mandat, agent de paiement) et la suite du tour
+            # tournent en fond, dans la file du fil.
+            continuation, _ = schedule_decision(decided)
+            final = approvals.get(decided.id) or decided
+            self._json(202 if continuation != "none" else 200,
+                       {**approval_to_json(final), "approval_id": decided.id, "continuation": continuation})
+
+        def _local_passkeys(self, method: str, path: str) -> None:
+            """Passkeys LOCALES (docs/PAY-AGENT.md §11) : liste, options d'enregistrement, enregistrement, suppression.
+            Sur la machine seulement, jamais par la passerelle."""
+            from nokker.local.passkeys import PasskeyError
+
+            pk = getattr(local_api, "passkeys", None)
+            if pk is None or self._via_relay():
+                self._json(404, {"error": {"code": "not_found", "message": "not found"}})
+                return
+            try:
+                if path == "/v1/local/passkeys" and method == "GET":
+                    self._json(200, {"passkeys": pk.list()})
+                elif path == "/v1/local/passkeys/options" and method == "POST":
+                    self._json(200, pk.options())
+                elif path == "/v1/local/passkeys" and method == "POST":
+                    self._json(201, pk.register(self._read_json_body()))
+                elif (m := re.match(r"^/v1/local/passkeys/([0-9a-f-]{36})$", path)) and method == "DELETE":
+                    self._json(200, {"removed": pk.delete(m.group(1))})
+                else:
+                    self._json(404, {"error": {"code": "not_found", "message": "not found"}})
+            except PasskeyError as e:
+                self._json(e.status, {"error": {"code": e.code, "message": e.message}})
+
         def _local_approvals(self, method: str, path: str) -> None:
             """Cartes des sessions locales, décidées avec le jeton local (docs/LOKKAL.md §7.4.3). Le propriétaire local
             est le locataire interne : les approbations sont en Postgres sous RLS, le locataire se fixe ICI, à la
@@ -3113,13 +3673,24 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 # (machine non liée, relais éteint, dépôt pas encore fait) : elle se décide au terminal. Un dépôt
                 # plus tard publie `approval.forwarded`.
                 relay = local_api.remote_approvals if local_api is not None else None
-                self._json(200, {"approvals": [
-                    {**approval_to_json(a),
-                     "suggested_rules": (rules := suggested_rules(a.tool_name, a.arguments, a.strength, a.rule)),
-                     # libellé juste côté client (01.11) : `tool` | `file` | `dir` | `prefix` | `exact`, même ordre
-                     "suggested_rule_kinds": [rule_kind(r) for r in rules],
-                     "forwarded": a.strength == "strong" and relay is not None and relay.forwarded(a.id)}
-                    for a in approvals.pending()]})
+                pay = payments_http.service()
+                local_pk = (lambda a: pay.local_passkey_ok(a)) if pay is not None else (lambda a: False)  # noqa: E731
+                out = []
+                for a in approvals.pending():
+                    lp = local_pk(a)  # carte « à payer » own_card : passkey LOCALE, jamais déposée (PAY-AGENT §11)
+                    out.append({**approval_to_json(a),
+                                "suggested_rules": (rules := suggested_rules(a.tool_name, a.arguments, a.strength,
+                                                                             a.rule)),
+                                # libellé juste côté client (01.11) : `tool` | `file` | `dir` | `prefix` | `exact`
+                                "suggested_rule_kinds": [rule_kind(r) for r in rules],
+                                "forwarded": (not lp and a.strength == "strong" and relay is not None
+                                              and relay.forwarded(a.id)),
+                                **({"local_passkey": True} if lp else {})})
+                self._json(200, {"approvals": out})
+                return
+            m = re.match(r"^/v1/local/approvals/([^/]+)/(challenge|decision)$", path)
+            if m and method == "POST":
+                self._local_passkey_decision(m.group(1), m.group(2))
                 return
             m = re.match(r"^/v1/local/approvals/([^/]+)/decide$", path)
             if not (m and method == "POST"):
@@ -3334,7 +3905,12 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if m and shares is not None:  # lien partagé : public, sans connexion (nokker/threads/shares.py)
                 self._public_share(m.group(1), (m.group(2) or ".json")[1:])
                 return
+            if connectors_http.handle_public(self, "GET", self.path):  # retour OAuth : public, lié par le state signé
+                return
             if self._local_route("GET", path):
+                return
+            if path == "/v1/capabilities":  # fonctions actives pour l'appelant (docs/CLIENT-API.md §Capacités)
+                self._capabilities()
                 return
             if path == "/v1/approvals/suggestions" or path.startswith("/v1/approvals/suggestions/"):
                 self._suggestions_route("GET", path)  # avant `/v1/approvals/{id}` (docs/APPROVALS.md §7)
@@ -3378,6 +3954,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return
 
             # Onboarding (nokker/onboarding/http.py) : routes publiques, sans session (le testeur n'a pas encore de compte).
+            if onboarding_http.terms_route(self, "GET", self.path):  # texte courant des conditions (réacceptation)
+                return
             if onboarding_http.handle(self, "GET", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                 return
             if path.startswith("/v1/connectors") or path in ("/v1/account", "/v1/account/usage") \
@@ -3393,7 +3971,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or payments_http.is_payments_path(path) \
                     or (house_http.enabled() and house_http.is_house_path(path)) \
                     or (presence_http.enabled() and presence_http.is_presence_path(path)) \
-                    or account_http.matches(path) \
+                    or account_http.matches(path) or byok_http.matches(path) \
                     or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                 self._account_route("GET", path)
                 return
@@ -3405,6 +3983,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
 
             if guide_http.enabled() and guide_http.is_guide_path(path):  # Guide (docs/GUIDE.md), drapeau `guide`
                 self._guide_route("GET", path, {})
+                return
+
+            if path == "/v1/speech":  # « Écouter » : capacité (docs/VOICE.md §7)
+                self._speech_capability()
                 return
 
             if hub is not None and (path.startswith(("/v1/threads", "/v1/bubbles")) or path == "/v1/notifications"
@@ -3511,32 +4093,92 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 approvals.mark_suggestion(item.id, sender, "accepted", item.rule, provenance)
                 self._json(200, {"id": item.id, "state": "accepted", "rule": item.rule, "provenance": provenance})
 
-        def _auto_review_revoke(self, approval_id: str) -> None:
-            """`POST /v1/approvals/{id}/auto-review/revoke` : le propriétaire révoque une décision du relecteur
-            automatique (docs/APPROVALS.md §8). 404 si le relecteur est éteint ou la carte d'un autre locataire."""
+        def _auto_review_card(self, approval_id: str) -> tuple[str, str, Any] | None:
+            """Préambule commun révocation / restauration : relecteur allumé, identité, locataire, carte visible.
+            Rend (expéditeur, locataire, carte) ou None (réponse déjà écrite)."""
             reviewer = getattr(kernel, "auto_reviewer", None)
             if approvals is None or reviewer is None:
                 self._json(404, {"error": {"message": "not found"}})
-                return
+                return None
             body = self._read_json_body()
             sender = self._resolve_identity(body if isinstance(body, dict) else {})
             if sender is None:
                 self._json(401, {"error": {"message": "unauthorized"}})
-                return
+                return None
             tid = self._tenant_for(sender)
             if tid is None:
-                return
+                return None
             with tenant_scope(tid):
                 card = approvals.get(approval_id)
                 if card is None or not approvals.visible_to(sender, card):
                     self._json(404, {"error": {"message": "approbation inconnue"}})
-                    return
+                    return None
+            return sender, tid, card
+
+        def _auto_review_revoke(self, approval_id: str) -> None:
+            """`POST /v1/approvals/{id}/auto-review/revoke` : le propriétaire révoque une décision du relecteur
+            automatique (docs/APPROVALS.md §8). 404 si le relecteur est éteint ou la carte d'un autre locataire.
+            Approbation d'une écriture de fichier révoquée : la réponse porte `rollback: {available, checkpoint_id,
+            files, reason?}` (point de retour PAR CARTE) ; rien n'est restauré ici, `…/auto-review/rollback` le fait."""
+            found = self._auto_review_card(approval_id)
+            if found is None:
+                return
+            sender, tid, _card = found
+            with tenant_scope(tid):
                 try:
                     card = approvals.revoke_auto_review(approval_id, sender)
                 except (ApprovalError, DeviceError) as e:
                     self._json(_approvals_error_status(e), {"error": {"message": str(e)}})
                     return
-                self._json(200, approval_to_json(card))
+                if hub is not None:  # bulle `approval` du fil : révoquée
+                    try:
+                        hub.approval_changed(card)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("bulle de la carte %s non mise à jour", card.id, exc_info=True)
+                self._json(200, _approval_out(kernel, card))
+
+        def _auto_review_rollback(self, approval_id: str) -> None:
+            """`POST /v1/approvals/{id}/auto-review/rollback` : applique, sur demande explicite, le point de retour de
+            la carte (approbation automatique d'une écriture de fichier, DÉJÀ révoquée). Un fichier modifié depuis
+            l'écriture n'est pas écrasé (`conflicts`). 409 : pas révoquée, pas de point, point incomplet ou déjà
+            appliqué."""
+            from nokker.tools.card_snapshots import RollbackUnavailable, find_offer
+
+            found = self._auto_review_card(approval_id)
+            if found is None:
+                return
+            sender, tid, card = found
+            rec = card.auto_review or {}
+            if rec.get("decision") != "approve" or not rec.get("revoked_by"):
+                self._json(409, {"error": {"message": "révoquer d'abord l'approbation automatique"}})
+                return
+            if not approvals.decider_allowed(sender, approvals.tenant_of(card), card):
+                self._json(403, {"error": {"message": "utilisateur non autorisé"}})
+                return
+            with tenant_scope(tid):
+                hit = find_offer(getattr(kernel, "card_snapshots", None) or [], card.id, card.thread_id)
+                if hit is None:
+                    self._json(409, {"error": {"message": "aucun point de retour pour cette carte"}})
+                    return
+                try:
+                    done = hit[0].apply(card.id, card.thread_id)
+                except RollbackUnavailable as e:
+                    self._json(409, {"error": {"message": str(e)}})
+                    return
+                try:  # journal des approbations : qui, quand, fichiers restaurés, conflits
+                    approvals.record_rollback(card.id, sender, checkpoint_id=done["checkpoint_id"],
+                                              restored=done["restored"], conflicts=done["conflicts"])
+                except Exception:  # noqa: BLE001 — la restauration a eu lieu : on le dit, journal ou pas
+                    logger.warning("restauration de la carte %s non journalisée", card.id, exc_info=True)
+            if hub is not None:  # bulle `approval` du fil : restaurée
+                try:
+                    with tenant_scope(tid):
+                        hub.approval_changed(card, rollback_applied=True)
+                except Exception:  # noqa: BLE001
+                    logger.warning("bulle de la carte %s non mise à jour", card.id, exc_info=True)
+            logger.info("restauration de la carte %s par %s : %d fichier(s), %d conflit(s)", card.id, sender,
+                        len(done["restored"]), len(done["conflicts"]))
+            self._json(200, {"approval_id": card.id, **done})
 
         def _approvals_get(self, path: str, sender: str) -> None:
             assert approvals is not None
@@ -3549,7 +4191,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 # gagne »), contrairement aux appareils (`GET /v1/devices`, propres à un utilisateur). Multi-locataire :
                 # `pending()` ne rend que les cartes du locataire courant.
                 # Carte d'une session de code : à son propriétaire seulement (`thread_owner`, §7.28).
-                self._json(200, [approval_to_json(a) for a in approvals.pending() if approvals.visible_to(sender, a)])
+                self._json(200, [_approval_out(kernel, a) for a in approvals.pending() if approvals.visible_to(sender, a)])
                 return
 
             m = _RE_APPROVAL_ONE.match(path)
@@ -3560,7 +4202,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 if approval is None:
                     self._json(404, {"error": {"message": "approbation inconnue"}})
                     return
-                self._json(200, approval_to_json(approval))
+                self._json(200, _approval_out(kernel, approval))
                 return
 
             if path == "/v1/devices":
@@ -3696,6 +4338,105 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self._bubbles_error(e)
             except ShareNotFound:
                 self._json(404, {"error": {"message": "partage inconnu"}})
+
+        def _capabilities(self) -> None:
+            sender = self._resolve_identity({})
+            if sender is None:
+                self._json(401, {"error": {"message": "unauthorized"}})
+                return
+            tid = self._tenant_for(sender)
+            if tid is None:
+                return
+            with tenant_scope(tid):  # seule lecture en base : appartenance à un foyer (`house`)
+                body = capabilities_mod.for_caller(
+                    str(sender), local=local_api is not None, local_owner=local_api is not None and self._local_owner(),
+                    ledger=ledger is not None, hub=hub is not None, approvals=approvals is not None,
+                    agents=agents is not None, shares=shares is not None)
+            self._json(200, body)
+
+        def _speech_capability(self) -> None:
+            """`GET /v1/speech` : toute identité vérifiée (session, jeton local). 404 si la voix web est éteinte."""
+            from nokker.voice import web as voice_web
+
+            sender = self._resolve_identity({})
+            if sender is None:
+                self._json(401, {"error": {"message": "unauthorized"}})
+                return
+            svc = voice_web.service()
+            if svc is None:
+                self._json(404, {"error": {"code": "tts_off", "message": "lecture à voix haute indisponible"}})
+                return
+            tid = self._tenant_for(sender)  # frontière : les acceptations sont sous RLS (502 NoTenant en rév. 33)
+            if tid is None:
+                return
+            cap = svc.capability()
+            with tenant_scope(tid):
+                outdated = onboarding_http.terms_outdated_for(str(sender))
+            if outdated:  # conditions à réaccepter (§5 : sous-traitant de voix)
+                cap = {**cap, "available": False, "reason": "terms_outdated"}
+            self._json(200, cap)
+
+        def _speech_error(self, status: int, code: str, retry_after: int | None = None) -> None:
+            body = json.dumps({"error": {"code": code}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if retry_after is not None:
+                self.send_header("Retry-After", str(retry_after))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _speech_route(self, thread_id: str, index: int, body: dict[str, Any], sender: str) -> None:
+            """`POST /v1/threads/{id}/messages/{index}/speech` `{lang?}` (docs/VOICE.md §7) : MEMBRES du fil (contrôle de
+            `GET /v1/threads/{id}`), le noyau lit la réponse du tour `index` (le client n'envoie aucun texte) et relaie
+            l'audio MP3 au fil des octets. Erreurs JSON avant le premier octet seulement."""
+            from nokker.voice import web as voice_web
+
+            svc = voice_web.service()
+            if svc is None:
+                self._speech_error(503, "tts_off")
+                return
+            hub.require_member(thread_id, sender)  # ThreadError → 403/404 comme GET /v1/threads/{id}
+            if onboarding_http.terms_outdated_for(str(sender)):  # aucun texte au fournisseur avant la réacceptation
+                self._speech_error(403, "terms_outdated")
+                return
+            turn = next((t for t in kernel.store.history(thread_id) if t.index == index), None)
+            if turn is None:
+                self._speech_error(404, "not_found")
+                return
+            if not (turn.reply or "").strip():
+                self._speech_error(409, "not_a_reply")
+                return
+            lang = body.get("lang") if isinstance(body.get("lang"), str) else None
+            scope = None
+            house = household_http.service()
+            if house is not None and str(sender).startswith("us_"):
+                got = house.membership(sender)
+                if got is not None:
+                    scope = speak_lexicon_mod.SpeakScope(got[1].tenant_id, got[1].id)
+            try:
+                chunks = svc.open(account=str(sender), tenant=current_tenant(), reply=turn.reply, lang=lang,
+                                  scope=scope)
+            except voice_web.SpeechError as e:
+                self._speech_error(e.status, e.code, e.retry_after)
+                return
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(200)
+            self.send_header("Content-Type", voice_web.WEB_MIME)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                for chunk in chunks:
+                    self._write_chunk(chunk)
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):  # le client a arrêté l'écoute
+                pass
 
         def _guide_route(self, method: str, path: str, body: dict[str, Any]) -> None:
             """`/v1/guide*` (docs/GUIDE.md) : toute identité vérifiée (compte, propriétaire Lokkal), dans son locataire."""
@@ -3835,6 +4576,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            m = _RE_THREAD_SPEECH.match(path)
+            if m and method == "POST":
+                self._speech_route(sid(m.group(1)), int(m.group(2)), body, sender)
                 return
             m = _RE_THREAD_SUB.match(path)
             if m:
@@ -4006,7 +4751,7 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
                     or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
-                    or payments_http.is_payments_path(path):
+                    or payments_http.is_payments_path(path) or byok_http.matches(path):
                 self._account_route("PUT", path)
                 return
             self._json(404, {"error": {"message": "not found"}})
@@ -4178,6 +4923,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                         self._json(200, usage)
                 elif account_http.route(self, method, path, account, tid):
                     pass
+                elif byok_http.route(self, method, path):  # BYOK cloud (docs/CLOUD-BYOK.md), drapeau `cloud_byok`
+                    pass
                 elif onboarding_http.account_route(self, method, path, account) \
                         or sso_http.handle(self, method, path, account) \
                         or team_http.handle(self, method, path, account) \
@@ -4209,7 +4956,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (sso_http.enabled() and sso_http.is_sso_path(path)) \
                     or (household_http.enabled() and household_http.is_household_path(path)) \
                     or (paper_http.enabled() and paper_http.is_paper_path(path)) \
-                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)):
+                    or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
+                    or path.startswith("/v1/connectors/"):  # 068 : renommer, défaut, niveau d'un partage
                 self._account_route("PATCH", path)
                 return
             if agents is not None and path.startswith("/v1/agents/"):
@@ -4277,6 +5025,10 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
             if m:
                 self._auto_review_revoke(m.group(1))  # relecteur automatique (docs/APPROVALS.md §8)
                 return
+            m = _RE_APPROVAL_AUTO_ROLLBACK.match(path)
+            if m:
+                self._auto_review_rollback(m.group(1))  # restauration proposée à la révocation (§8)
+                return
             if incidents_http.handle(self, "POST", path) or plan_http.handle(self, "POST", path):  # X18, drapeaux
                 return
             if code_http.handle(self, "POST", path):  # sessions de code multi-utilisateur (§7.28), bloc `code`
@@ -4285,6 +5037,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                 return
             if path != "/v1/chat/completions":
                 if billing_http.handle_webhook(self, "POST", path):  # public : authentifié par la signature Stripe
+                    return
+                if payments_http.handle_agent_callback(self, "POST", path):  # agent de paiement : HMAC, drapeau pay_agent
                     return
                 if onboarding_http.handle(self, "POST", self.path):  # chemin COMPLET : ?t= et ?lang= y sont
                     return
@@ -4308,7 +5062,8 @@ def make_handler(kernel: Kernel, api_keys: dict[str, str], ledger: LedgerBackend
                     or (famcal_http.enabled() and famcal_http.is_famcal_path(path)) \
                         or (house_http.enabled() and house_http.is_house_path(path)) \
                         or (presence_http.enabled() and presence_http.is_presence_path(path)) \
-                        or account_http.matches(path) \
+                        or account_http.matches(path) or path == "/v1/account/terms" or byok_http.matches(path) \
+                        or payments_http.is_payments_post_path(path) \
                         or (path.startswith("/v1/billing/") and billing_http.service() is not None):
                     self._account_route("POST", path)
                     return
@@ -5169,18 +5924,34 @@ def default_model_applier(config: NokkerConfig, kernel: Kernel, link_endpoint_fn
     def same(a: str, b: str) -> bool:
         return a.rstrip("/") == b.rstrip("/")
 
-    def use_default_model(base_url: str, api_key: str, model: str) -> None:
-        # Le modèle choisi à l'onboarding sert les deux paliers, en direct (pas de redémarrage).
+    def provider_for(base_url: str, api_key: str, model: str, cfg: Any = None) -> SokkanProvider:
         mode = config.vision_mode_for_model(model)  # palier de la config qui sert ce modèle, sinon local.vision
         probe = None
         if mode == "auto":
             from nokker.providers.vision_probe import VisionProbe
 
             probe = VisionProbe(base_url, model, config.vision_probe_path())
-        provider = SokkanProvider(base_url=base_url, api_key=api_key, model=model, vision=mode == "true",
-                                  vision_probe=probe)
-        kernel.providers[Tier.SHIP] = provider
-        kernel.providers[Tier.DEEP] = provider
+        extra = ({"reasoning_off_body": cfg.reasoning_off_body}
+                 if cfg is not None and getattr(cfg, "reasoning_off_body", None) is not None else {})
+        return SokkanProvider(base_url=base_url, api_key=api_key, model=model, vision=mode == "true",
+                              vision_probe=probe, **extra)
+
+    def use_default_model(base_url: str, api_key: str, model: str) -> None:
+        # Modèle choisi à l'onboarding (BYOK, local, ou modèle du lien posé explicitement) : il sert les deux paliers,
+        # en direct (pas de redémarrage). Modèle VIDE = le lien du compte sans modèle choisi : Ship et Deep gardent
+        # CHACUN le modèle de leur palier dans la config (Nina sur Ship 27B, Deep 397B en escalade), sur le point
+        # d'accès et la clé du lien. Avant le 05.11, le setup figeait le 397B et l'imposait aux deux paliers.
+        if model:
+            provider = provider_for(base_url, api_key, model)
+            kernel.providers[Tier.SHIP] = provider
+            kernel.providers[Tier.DEEP] = provider
+        else:
+            for name, tier in (("ship", Tier.SHIP), ("deep", Tier.DEEP)):
+                cfg = config.tiers.get(name) or config.tiers.get("ship")
+                if cfg is not None:
+                    kernel.providers[tier] = provider_for(base_url, api_key, cfg.model, cfg)
+            ship_cfg = config.tiers.get("ship")
+            model = ship_cfg.model if ship_cfg is not None else ""
         link = link_endpoint_fn()
 
         def endpoint_of(cfg: Any) -> tuple[str, str] | None:
@@ -5261,6 +6032,7 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
 
         config = with_user_extensions(config, user_home(local_api.state_dir))
     events = EventBus() if (config.approvals_enabled or config.bubbles_enabled or config.agents_enabled) else None
+    capabilities_mod.configure(config)  # GET /v1/capabilities : drapeaux lus dans la config
     hub = build_hub(config, events) if config.bubbles_enabled else None
     # Crew minimal (docs/BUBBLES.md §9.4) : indépendant de `hub`/`approvals` — posé sur `hub.agents_hub`
     # ci-dessous pour que l'activation d'un `agent_draft` (côté `hub`) y accède.
@@ -5314,7 +6086,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                 background=True, note=note_parent,
                 # état des enfants dans l'état local : au redémarrage, `interrupted / restart` et worktree conservé
                 state_path=(local_api.state_dir / "subagents.json") if local_api.state_dir is not None else None,
-                fork=bool(getattr(config, "delegate_fork", False)))
+                fork=bool(getattr(config, "delegate_fork", False)),
+                tier=bool(getattr(config, "delegate_tier", False)))
             local_api.subagents = delegate  # annulation d'un fil → ses sous-agents ; `delegate_status` hors tour
             local_api.emit = events.publish if events is not None else None  # `checkpoint.created` (§7.4.7)
             if getattr(local_api.code, "lsp", None) is not None and hub is not None:
@@ -5383,6 +6156,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         if delegate is not None:
             parent["k"] = kernel
             delegate.bind(getattr(kernel.tools, "internal", kernel.tools))
+        # Points PAR CARTE du relecteur automatique (Lokkal) : portés par l'enveloppe des points de retour.
+        kernel.card_snapshots.extend(src.cards for src in (extra or []) if getattr(src, "cards", None) is not None)
         if local_api is not None and (config.local or {}).get("folder_mode", False):
             # Mode dossier (docs/FOLDER-MODE.md, drapeau `local.folder_mode`) : chaque passage tourne sur une copie du
             # noyau qui ne voit que les outils du dossier (`folder_kernel`), lue au moment du passage.
@@ -5400,10 +6175,12 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
                                   if connector_store else None)
         configure_onboarding(config, tenancy, approvals)
         configure_account(config, kernel, approvals)
-        configure_billing(config)
+        configure_billing(config, tenancy)
         if billing_http.service() is not None and kernel.limits is not None:
             # Plafonds du palier payé (docs/TENANCY.md) : un abonné actif a ceux de son plan, les autres ceux de la bêta.
             kernel.limits.caps_for = billing_http.service().caps_for
+        if local_api is None:  # BYOK cloud : comptes de nokker.ai seulement (Lokkal : /v1/local/setup*)
+            configure_cloud_byok(config, kernel)
         configure_cloud_link(config, tenancy, approvals, ledger, store=kernel.store,
                              connector_store=connector_store if local_api is None else None,
                              invariants=kernel.invariants, limits=kernel.limits)
@@ -5416,11 +6193,14 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         # le mode sans repasser par les portes internes), et le foyer branche le refus d'une session à un mineur.
         configure_code_sessions(config, kernel, hub=hub, events=events)
         configure_household(config, kernel, tenancy, approvals)
+        if local_api is None:  # plusieurs boîtes et partages (068) : après le foyer, dont le crochet de sortie sert
+            configure_connectors_multi(config, kernel, tenancy, approvals, connector_store, provider)
         if local_api is None:  # papiers du foyer : comptes de nokker.ai seulement
             configure_household_paper(config, kernel, tenancy)
         if local_api is None:  # calendrier familial : comptes de nokker.ai (après les papiers : PDF importés)
             configure_family_calendar(config, kernel, tenancy)
         configure_payments(config, kernel, tenancy, approvals, events)  # après le foyer (portes des mineurs dedans)
+        configure_speech(config, kernel)
         if cloud_http._cloud is not None:  # skill « sessions Lokkal » (§6.4) pour les comptes liés : outil DESTRUCTIVE
             from nokker.cloud.lokkal_session import LokkalSessionTools
 
@@ -5455,6 +6235,7 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         room = configure_house_room(config, kernel, events)  # après le foyer : portes des mineurs déjà posées
         configure_presence(config, kernel, events=events, hub=hub, approvals=approvals, agents=agents_hub, room=room)
         configure_guide(config, kernel, events=events, tenancy=tenancy)
+        configure_feature_notes(config, kernel)  # après le foyer (profils mineurs posés)
     configure_ambient(config, kernel)  # écrans e-ink et voix de la pièce : éteints par défaut
     if hub is not None:
         hub.agents_hub = agents_hub
@@ -5497,6 +6278,8 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         use_default_model = default_model_applier(config, kernel, link_endpoint_fn)
 
         local_api.on_default_model = use_default_model
+        if local_api.setup is not None and config.tiers.get("ship") is not None:
+            local_api.setup.router_default = config.tiers["ship"].model  # affiché par /v1/local/setup
         try:
             chosen = local_api.setup.provider_for_default() if local_api.setup is not None else None
         except Exception:  # noqa: BLE001 — coffre sans clé : les paliers de la config restent
@@ -5509,7 +6292,10 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             if t is not None and not t.api_key:  # ni ROUTER_KEY ni lien de compte : le juge échouera à chaque appel
                 logger.warning("%s sans clé du juge (ROUTER_KEY ni lien de compte) : carte sans avis et diff non relu",
                                flag)
-        if config.local.get("reasoning", True):  # banc L0 (L01, 23.10) : sans raisonnement, le 397B pense à voix haute
+        # Raisonnement de Ship : COUPÉ par défaut (05.11, comme la bêta, D1 du 25.10 : Ship = 27B, reasoning_effort
+        # none). Allumé, le 27B pensait 150 à 260 jetons sur un « OK » (4 à 7 s par appel, mesuré sur une machine de test). Deep garde
+        # son raisonnement (escalade). `local.reasoning: true` le rallume (banc L0 du 23.10, fait pour le 397B).
+        if config.local.get("reasoning", False):
             getattr(kernel.policy, "inner", kernel.policy).ship_reasoning = True
         from nokker.tools.code import CODE_TOOLS
 
@@ -5583,7 +6369,11 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         if home is not None:  # maison : sa porte enveloppe les permissions (mode plan et règles deny gardent le refus)
             from nokker.home.source import install as install_home
 
-            install_home(kernel, home, hub)
+            _plan = plan_http.service()
+            _delivery = getattr(_plan, "delivery", None) if _plan is not None else None
+            install_home(kernel, home, hub, _delivery.deliver if _delivery is not None else None)
+            if _plan is not None and home.feeds is not None:  # brief : bloc `maison_evenements` (flux de la maison)
+                _plan.home_events = home.feeds.brief_text
         if home_watch is not None:  # veille du foyer : sa porte enveloppe les permissions (refus intérieurs gardés)
             configure_home_watch(kernel, home_watch, hub)
         # Apprentissage (docs/LEARNING.md) : la carte obligatoire enveloppe les permissions et les planchers.
@@ -5629,6 +6419,9 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
         from nokker.knock.bridge import configure_knock
 
         knock_hub = configure_knock(config, kernel, approvals, local=local_api is not None)
+    if config.approval_bubbles and hub is not None and approvals is not None:
+        hub.approval_bubbles = True  # bulle de chaque carte qui revient aux humains (docs/BUBBLES.md)
+        approvals.card_observer = hub
     handler = make_handler(kernel, api_keys, ledger, approvals=approvals, events=events, open_api=config.dev_open_api,
                            telegram_bot_token=config.telegram_bot_token() or None, telegram_ids=config.telegram_ids,
                            hub=hub, previews=register_previews_routes(config), agents=agents_hub,
@@ -5751,11 +6544,23 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             scrub=kernel.invariants.scrub_output, decided_by=LOCAL_OWNER, state=setup.state, save=setup._save,
             # Décision produit (26.10) : une carte approuvée dans la Mini App Telegram est acceptée sur attestation de
             # nokker.ai ; `local.remote_approvals_attested: false` la refuse (seule une passkey, vérifiée ici, décide).
-            attested=bool(config.local.get("remote_approvals_attested", True)))
+            attested=bool(config.local.get("remote_approvals_attested", True)),
+            # carte « à payer » own_card : passkey LOCALE, jamais déposée chez nokker.ai (docs/PAY-AGENT.md §11)
+            local_only=lambda a: (pay := payments_http.service()) is not None and pay.local_passkey_ok(a))
         approvals.notifier = ChainNotifier((approvals.notifier, local_api.remote_approvals))
         if local_api.relayed is not None:  # X20b : la signature vérifiée d'une carte forte part avec l'appel relayé
             local_api.relayed.signed = local_api.remote_approvals.signed_proof
         local_api.remote_approvals.start()
+    if local_api is not None and approvals is not None and payments_http.service() is not None:
+        # Passkey LOCALE (docs/PAY-AGENT.md §11) : signe les cartes « à payer » own_card sur la machine, rien d'autre.
+        from nokker.local.passkeys import LocalPasskeys, local_origin
+
+        try:
+            local_api.passkeys = LocalPasskeys(approvals, Path(str(local_api.state_dir or "~/.config/nokker"))
+                                               .expanduser() / "local-passkeys.json",
+                                               local_origin(config.local), LOCAL_OWNER)
+        except ValueError as e:
+            logger.warning("passkey locale désactivée : %s", e)
     if local_api is not None and config.local.get("relay_url"):
         # Gardé pour lancer le tunnel à l'approbation du lien (LocalApi.link_approved), sans redémarrage.
         local_api.tunnel_args = (config.local["relay_url"], f"http://127.0.0.1:{config.port}",

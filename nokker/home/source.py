@@ -32,7 +32,7 @@ from typing import Any
 
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, ToolResult, Turn, Verdict
-from nokker.home.agent import HomeAgent, Plan, PlanError, untrusted_block
+from nokker.home.agent import READING_DOMAIN, HomeAgent, Plan, PlanError, Reading, untrusted_block
 from nokker.home.client import BridgeHome, HomeError
 from nokker.home.policy import (
     CONFIG_KINDS,
@@ -40,14 +40,18 @@ from nokker.home.policy import (
     DIRECT,
     READ,
     STRONG,
+    SECRET_DATA_KEYS,
     HomePolicy,
     domain_of,
+    is_media_uri,
+    media_ref,
     services_for,
+    target_domain,
 )
 
 logger = logging.getLogger(__name__)
 
-HOME_TOOLS = frozenset({"maison", "maison_action_forte", "maison_config"})
+HOME_TOOLS = frozenset({"maison", "maison_action_forte", "maison_config", "maison_notifier"})
 STRONG_RULE = "home:strong"
 MEMBER_RULE = "home:member"
 DENY_RULE = "home:deny"
@@ -62,26 +66,39 @@ BUBBLE_ATTRS = ("device_class", "unit_of_measurement", "brightness", "color_mode
                 "media_title", "media_artist", "volume_level", "is_volume_muted", "battery_level")
 _MAP_ATTRS = ("device_class", "brightness", "current_temperature", "temperature", "hvac_action", "current_position",
               "unit_of_measurement", "media_title")
-_NEVER_ATTRS = frozenset({"access_token", "entity_picture", "stream_source", "token"})
+_NEVER_ATTRS = frozenset({"access_token", "entity_picture", "stream_source", "token", "entity_picture_local",
+                          "media_image_url"})
+# MediaPlayerEntityFeature.SEARCH_MEDIA (homeassistant/components/media_player/const.py, 2026.11 : 4194304).
+SEARCH_MEDIA = 1 << 22
+# Type demandé par l'agent → `media_type` de Music Assistant / classe de média de HA.
+MEDIA_TYPES = {"track": "track", "music": "track", "song": "track", "titre": "track", "artist": "artist",
+               "artiste": "artist", "album": "album", "playlist": "playlist", "radio": "radio", "podcast": "podcast"}
+DEFAULT_TZ = "Europe/Zurich"
 
-MAISON_DESC = ("Pilote la maison (Home Assistant) : un petit agent local traduit la demande en actions et rend un "
-               "résumé. Lumières, volets, climat et médias : exécutés tout de suite ; serrures, alarmes, garage, "
-               "portail, caméras, scripts, automatisations et chauffage hors bornes : proposés à confirmer.")
+MAISON_DESC = ("Pilote la maison (Home Assistant) : un petit agent local traduit la demande en actions et en lectures, "
+               "et rend un résumé. Lumières, prises, volets, climat, musique et enceintes (titre, artiste ou playlist, "
+               "Spotify compris), annonces vocales, listes de courses, aspirateurs : exécutés tout de suite ; serrures, "
+               "alarmes, garage, portail, caméras, vannes, sirènes, scènes, scripts, automatisations et chauffage hors "
+               "bornes : proposés à confirmer. Lit aussi l'historique, le journal, l'agenda, les listes, la météo et les "
+               "derniers événements de la maison. La météo et l'agenda : préférer weather_ch et calendar_events quand "
+               "ils sont disponibles ; la lecture maison seulement pour une entité de la maison (station météo du "
+               "jardin, agenda HA). Listes de courses et tâches : tasks_* quand la personne nomme un compte (Todoist, "
+               "Google, Microsoft) ou qu'aucune maison n'est reliée, sinon la liste de la maison (todo HA).")
 MAISON_PARAMS: dict[str, Any] = {
     "type": "object",
     "properties": {
         "demande": {"type": "string", "description": "ce que l'utilisateur veut, en une phrase (ex. « éteins le "
                                                      "salon », « quelle température dans la chambre ? »)"},
         "zone": {"type": "string", "description": "pièce ou zone Home Assistant pour filtrer (facultatif)"},
-        "domaine": {"type": "string", "description": "domaine Home Assistant pour filtrer : light, cover, climate, "
-                                                     "media_player, lock… (facultatif)"},
+        "domaine": {"type": "string", "description": "domaine Home Assistant pour filtrer : light, switch, cover, "
+                                                     "climate, media_player, todo, calendar, lock… (facultatif)"},
         "bulle": {"type": "boolean", "description": "true = affiche l'état des entités concernées en bulle dans le "
                                                     "fil"},
     },
     "required": ["demande"],
 }
-FORTE_DESC = ("Demande une action sensible de la maison (serrure, alarme, garage, portail, caméra, script, "
-              "automatisation, chauffage hors bornes) : carte forte, l'utilisateur l'approuve sur son appareil. "
+FORTE_DESC = ("Demande une action sensible de la maison (serrure, alarme, garage, portail, caméra, vanne, sirène, "
+              "scène, script, automatisation, chauffage hors bornes) : carte forte, l'utilisateur l'approuve sur son appareil. "
               "Arguments tels que proposés par l'outil maison.")
 FORTE_PARAMS: dict[str, Any] = {
     "type": "object",
@@ -95,6 +112,20 @@ FORTE_PARAMS: dict[str, Any] = {
 }
 CONFIG_DESC = ("Crée ou modifie une automatisation ou un script Home Assistant : toujours une carte forte à approuver "
                "sur l'appareil de l'utilisateur.")
+NOTIFIER_DESC = ("Envoie une notification par Home Assistant (application mobile du foyer ou autre service de "
+                 "notification déclaré) à un destinataire déclaré : l'utilisateur confirme l'envoi.")
+
+
+def notifier_params(names: list[str]) -> dict[str, Any]:
+    return {"type": "object",
+            "properties": {"destinataire": {"type": "string", "enum": list(names),
+                                            "description": "destinataire déclaré dans la config de la maison"},
+                           "message": {"type": "string", "description": "texte de la notification (500 caractères au "
+                                                                         "plus)"},
+                           "titre": {"type": "string", "description": "titre court (facultatif)"}},
+            "required": ["destinataire", "message"]}
+
+
 CONFIG_PARAMS: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -122,6 +153,7 @@ class Snapshot:
     area_of: dict[str, str]
     hidden: frozenset[str]
     at: float
+    platform_of: dict[str, str] = field(default_factory=dict)  # intégration de l'entité (registre) : music_assistant…
 
     def attributes(self, entity_id: str) -> dict[str, Any] | None:
         st = self.states.get(entity_id)
@@ -137,6 +169,15 @@ def _clean_attrs(attrs: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]
             and isinstance(attrs[k], (str, int, float, bool))}
 
 
+def _redact(v: Any) -> Any:
+    """Code d'alarme ou de serrure jamais écrit au journal."""
+    if isinstance(v, dict):
+        return {k: ("[caviardé]" if k in SECRET_DATA_KEYS else _redact(x)) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_redact(x) for x in v]
+    return v
+
+
 @dataclass
 class HomeJournal:
     """Journal « qui, quoi, quand » de la maison. `log` : `AuditLog` (fichier chaîné) ou toute liste avec `append`."""
@@ -146,7 +187,7 @@ class HomeJournal:
 
     def write(self, event: str, who: str | None, what: dict[str, Any], outcome: str, **extra: Any) -> None:
         record = {"event": f"home.{event}", "who": who or "inconnu",
-                  "what": json.loads(self.scrub(json.dumps(what, ensure_ascii=False, default=str))),
+                  "what": json.loads(self.scrub(json.dumps(_redact(what), ensure_ascii=False, default=str))),
                   "outcome": outcome, **{k: v for k, v in extra.items() if v is not None}}
         try:
             self.log.append(record)
@@ -172,7 +213,13 @@ class HomeAssistantSource:
     scrub: Callable[[str], str] = lambda s: s
     hub: Any = None
     clock: Callable[[], float] = time.monotonic
-    _registry: tuple[float, dict[str, str], frozenset[str]] | None = field(default=None, init=False, repr=False)
+    tz: str = DEFAULT_TZ
+    # Destinataires de `maison_notifier` : nom → cible HA (entité `notify.*` de la liste blanche, ou service notify
+    # déclaré dans home.yaml `notify_services`, ex. `mobile_app_pixel`). Vide : pas d'outil.
+    notify_targets: dict[str, str] = field(default_factory=dict)
+    feeds: Any = None  # HomeFeeds (nokker/home/feeds.py) si `home_assistant.feeds` est posé
+    _registry: tuple[float, dict[str, str], frozenset[str], dict[str, str]] | None = field(default=None, init=False,
+                                                                                            repr=False)
     _snap: Snapshot | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     watcher: Any = field(default=None, init=False, repr=False)
@@ -205,9 +252,11 @@ class HomeAssistantSource:
         if ref:
             if resolve is None:
                 raise HomeError("home_assistant.bridge_token : pas de coffre sur cette instance", "no_token")
-            token = (lambda r=str(ref): resolve(r))
+            def token(r=str(ref)):
+                return resolve(r)
         else:
-            token = (lambda: env.get(TOKEN_ENV, ""))
+            def token():
+                return env.get(TOKEN_ENV, "")
         bridge = HomeBridge(url=url, token=token, timeout_s=float(raw.get("timeout_s", 10.0)))
         if opener is not None:
             bridge.opener = opener
@@ -221,10 +270,17 @@ class HomeAssistantSource:
         tier = raw.get("tier", ("local", "small"))
         tiers = tuple(str(t) for t in ([tier] if isinstance(tier, str) else tier) if t)
         esc = raw.get("escalate_tier", "deep")
-        return cls(client=client, policy=policy, journal=HomeJournal(AuditLog(path.expanduser())),
-                   tiers=tiers or ("local", "small"), escalate_tier=str(esc) if esc else None,
-                   grammar=str(raw.get("grammar") or "json_schema"), constrain_ids=bool(raw.get("constrain_ids", True)),
-                   max_entities=int(raw.get("max_entities", 60)))
+        from nokker.home.feeds import HomeFeeds, parse_rules
+
+        rules = parse_rules(raw.get("feeds"))
+        src = cls(client=client, policy=policy, journal=HomeJournal(AuditLog(path.expanduser())),
+                  tiers=tiers or ("local", "small"), escalate_tier=str(esc) if esc else None,
+                  grammar=str(raw.get("grammar") or "json_schema"), constrain_ids=bool(raw.get("constrain_ids", True)),
+                  max_entities=int(raw.get("max_entities", 60)), tz=str(raw.get("tz") or DEFAULT_TZ),
+                  notify_targets={str(k): str(v) for k, v in (raw.get("notify_targets") or {}).items()})
+        if rules:
+            src.feeds = HomeFeeds(source=src, rules=rules)
+        return src
 
     def bind(self, kernel: Any, hub: Any = None) -> None:
         """Paliers, ledger, approbations et caviardage du noyau, lus à l'usage (Lokkal peut changer de modèle)."""
@@ -245,7 +301,10 @@ class HomeAssistantSource:
                 ToolSpec(name="maison_action_forte", description=FORTE_DESC, parameters=FORTE_PARAMS,
                          effect=Effect.DESTRUCTIVE, source="builtin:home"),
                 ToolSpec(name="maison_config", description=CONFIG_DESC, parameters=CONFIG_PARAMS,
-                         effect=Effect.DESTRUCTIVE, source="builtin:home")]
+                         effect=Effect.DESTRUCTIVE, source="builtin:home")] + (
+            [ToolSpec(name="maison_notifier", description=NOTIFIER_DESC,
+                      parameters=notifier_params(sorted(self.notify_targets)), effect=Effect.SEND_EXTERNAL,
+                      source="builtin:home")] if self.notify_targets else [])
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
@@ -255,6 +314,8 @@ class HomeAssistantSource:
                 return self._forte(arguments, ctx)
             if name == "maison_config":
                 return self._config(arguments, ctx)
+            if name == "maison_notifier" and self.notify_targets:
+                return self._notifier(arguments, ctx)
         except HomeError as e:
             self.journal.write("error", ctx.sender, {"tool": name}, "failed", reason=e.code,
                                thread_id=ctx.thread_id)
@@ -262,13 +323,14 @@ class HomeAssistantSource:
         return _result(name, f"outil inconnu : {name}", True)
 
     # ── données ──
-    def _registries(self, session: Any) -> tuple[dict[str, str], frozenset[str]]:
+    def _registries(self, session: Any) -> tuple[dict[str, str], frozenset[str], dict[str, str]]:
         now = self.clock()
         if self._registry is not None and now - self._registry[0] < self.registry_ttl_s:
-            return self._registry[1], self._registry[2]
+            return self._registry[1], self._registry[2], self._registry[3]
         areas = {a.get("area_id"): str(a.get("name") or a.get("area_id")) for a in session.areas()}
         devices = {d.get("id"): d.get("area_id") for d in session.device_registry()}
         area_of: dict[str, str] = {}
+        platform_of: dict[str, str] = {}
         hidden: set[str] = set()
         for e in session.entity_registry():
             eid = str(e.get("entity_id") or "")
@@ -277,8 +339,10 @@ class HomeAssistantSource:
             aid = e.get("area_id") or devices.get(e.get("device_id"))
             if aid in areas:
                 area_of[eid] = areas[aid]
-        self._registry = (now, area_of, frozenset(hidden))
-        return area_of, frozenset(hidden)
+            if e.get("platform"):
+                platform_of[eid] = str(e["platform"])
+        self._registry = (now, area_of, frozenset(hidden), platform_of)
+        return area_of, frozenset(hidden), platform_of
 
     def snapshot(self, session: Any | None = None, fresh: bool = False) -> Snapshot:
         with self._lock:
@@ -287,14 +351,15 @@ class HomeAssistantSource:
             own = session is None
             session = session or self.client.session()
             try:
-                area_of, hidden = self._registries(session)
+                area_of, hidden, platform_of = self._registries(session)
                 states = {str(s.get("entity_id")): s for s in session.states()
                           if self.policy.exposed(str(s.get("entity_id") or ""))
                           and str(s.get("entity_id")) not in hidden}
             finally:
                 if own:
                     session.close()
-            self._snap = Snapshot(states=states, area_of=area_of, hidden=hidden, at=self.clock())
+            self._snap = Snapshot(states=states, area_of=area_of, hidden=hidden, at=self.clock(),
+                                  platform_of=platform_of)
             return self._snap
 
     def entity_map(self, snap: Snapshot, sender: str | None, zone: str, domaine: str) -> tuple[list[str], str]:
@@ -329,7 +394,7 @@ class HomeAssistantSource:
         for eid in keep:
             if self.policy.actionable(sender, eid):
                 by_domain.setdefault(domain_of(eid), []).append(eid)
-        return plan_schema(by_domain, {d: services_for(d) for d in by_domain})
+        return plan_schema(by_domain, {d: services_for(d) for d in by_domain}, readable=keep)
 
     # ── `maison` ──
     def _agent(self) -> HomeAgent:
@@ -394,10 +459,11 @@ class HomeAssistantSource:
                 self.journal.write("plan", who, {"demande": demande}, "failed", reason=str(e), thread_id=ctx.thread_id)
                 return _result("maison", f"maison : l'agent maison n'a pas produit de plan valide ({e})", True)
             self._record_calls(plan.calls, ctx, hashlib.sha256(HOME_AGENT_PROMPT.encode()).hexdigest())
-            if not plan.actions:
+            if not plan.actions and not plan.lectures:
                 self.journal.write("read", who, {"demande": demande, "entities": len(keep)}, "answered",
                                    tier=plan.tier, thread_id=ctx.thread_id)
-            done, propose, refused, failed = self._apply(plan, snap, session, ctx, set(keep))
+            done, propose, refused, failed, notes = self._apply(plan, snap, session, ctx, set(keep))
+            readings = self._read(plan.lectures, snap, session, ctx, set(keep), refused)
             touched = [a.entity_id for a in plan.actions if a.entity_id in snap.states]
             after = self.snapshot(session, fresh=True) if done else snap
         finally:
@@ -405,35 +471,80 @@ class HomeAssistantSource:
         if args.get("bulle"):
             shown = touched or (keep if len(keep) <= 3 else [])
             self._bubbles(ctx, after, shown[:3])
-        return _result("maison", self._summary(plan, done, propose, refused, failed, after, touched, keep))
+        return _result("maison", self._summary(plan, done, propose, refused, failed, after, touched, keep,
+                                               notes, readings))
+
+    def _resolve_media(self, domain: str, service: str, eid: str, data: dict[str, Any], snap: Snapshot,
+                       session: Any) -> tuple[str, str, dict[str, Any], str | None]:
+        """Un `media_player.play_media` dont le contenu est un TEXTE (« Bohemian Rhapsody de Queen ») devient un appel
+        jouable, sans modèle : lecteur Music Assistant → `music_assistant.play_media` (MA cherche lui-même) ; lecteur
+        qui sait chercher (SEARCH_MEDIA) → `media_player.search_media` puis `play_media` du premier résultat jouable ;
+        sinon refus explicite. Une URI (spotify:…, media-source://…) passe telle quelle. Rend (domaine, service, data,
+        note) ; la note (titre trouvé) vient de la maison : donnée non fiable."""
+        if not (domain == "media_player" and service == "play_media"):
+            return domain, service, data, None
+        cid, ctype = media_ref(data)
+        extra = {k: data[k] for k in ("enqueue", "announce") if k in data}
+        kind = MEDIA_TYPES.get(ctype.lower(), "") if ctype else ""
+        if not cid or is_media_uri(cid):
+            return domain, service, {"media_content_id": cid, "media_content_type": ctype or "music", **extra}, None
+        if snap.platform_of.get(eid) == "music_assistant":
+            ma = {"media_id": cid, **({"media_type": kind} if kind else {})}
+            if "enqueue" in extra:
+                ma["enqueue"] = extra["enqueue"]
+            return "music_assistant", "play_media", ma, None
+        attrs = snap.attributes(eid) or {}
+        try:
+            features = int(attrs.get("supported_features") or 0)
+        except (TypeError, ValueError):
+            features = 0
+        if not features & SEARCH_MEDIA:
+            raise HomeError("ce lecteur ne sait pas chercher un titre (ni Music Assistant, ni recherche de Home "
+                            "Assistant) : donner une URI spotify:… ou un lien open.spotify.com", "no_search")
+        got = session.query("media_player", "search_media", [eid], {"search_query": cid[:200]})
+        results = list(((got.get(eid) or {}).get("result")) or [])
+        playable = [r for r in results if isinstance(r, dict) and r.get("can_play") and r.get("media_content_id")]
+        if kind:
+            playable.sort(key=lambda r: 0 if str(r.get("media_class") or "") == kind else 1)
+        if not playable:
+            raise HomeError(f"aucun résultat jouable pour « {cid[:80]} »", "no_result")
+        r = playable[0]
+        return domain, service, {"media_content_id": str(r["media_content_id"]),
+                                 "media_content_type": str(r.get("media_content_type") or ctype or "music"),
+                                 **extra}, f"« {cid[:80]} » → {str(r.get('title') or '')[:80]}"
 
     def _apply(self, plan: Plan, snap: Snapshot, session: Any, ctx: ToolContext, visible: set[str]
-               ) -> tuple[list[str], list[tuple[dict[str, Any], str]], list[str], list[str]]:
+               ) -> tuple[list[str], list[tuple[dict[str, Any], str]], list[str], list[str], list[str]]:
         done: list[str] = []
         propose: list[tuple[dict[str, Any], str]] = []
         refused: list[str] = []
         failed: list[str] = []
+        notes: list[str] = []
         who = ctx.sender
+
+        def refuse(label: str, why: str, what: dict[str, Any]) -> None:
+            refused.append(f"{label} — {why}")
+            self.journal.write("action", who, what, "refused", reason=why, tier=plan.tier, thread_id=ctx.thread_id)
+
         for a in plan.actions:
             what = a.arguments()
             label = f"{a.domain}.{a.service} {a.entity_id}"
             if a.entity_id not in visible:
-                refused.append(f"{label} — entité hors de la carte")
-                self.journal.write("action", who, what, "refused", reason="hors carte", tier=plan.tier,
-                                   thread_id=ctx.thread_id)
+                refuse(label, "entité hors de la carte", what)
                 continue
             c = self.policy.classify(a.domain, a.service, [a.entity_id], a.data, snap.attributes)
             if c.klass == DENY:
-                refused.append(f"{label} — {c.reason}")
-                self.journal.write("action", who, what, "refused", reason=c.reason, tier=plan.tier,
-                                   thread_id=ctx.thread_id)
+                refuse(label, c.reason, what)
                 continue
             level = STRONG if c.klass == STRONG else DIRECT
-            if not self.policy.allowed(who, level, a.domain):
-                why = f"droit du membre ({self.policy.role_of(who)}) : {level} sur {a.domain} non permis"
-                refused.append(f"{label} — {why}")
-                self.journal.write("action", who, what, "refused", reason=why, tier=plan.tier,
-                                   thread_id=ctx.thread_id)
+            tdom = target_domain(a.domain)
+            if not self.policy.allowed(who, level, tdom):
+                refuse(label, f"droit du membre ({self.policy.role_of(who)}) : {level} sur {tdom} non permis", what)
+                continue
+            bad_ref = next((r for r in c.refs if r not in snap.states
+                            or not self.policy.allowed(who, DIRECT, domain_of(r))), None)
+            if bad_ref is not None:
+                refuse(label, f"droit du membre ({self.policy.role_of(who)}) : {bad_ref} non permis", what)
                 continue
             if c.klass == STRONG:
                 propose.append((what, c.reason))
@@ -441,18 +552,115 @@ class HomeAssistantSource:
                                    thread_id=ctx.thread_id)
                 continue
             try:
-                session.call_service(a.domain, a.service, [a.entity_id], a.data)
+                domain, service, data, note = self._resolve_media(a.domain, a.service, a.entity_id, dict(a.data),
+                                                                  snap, session)
+                if (domain, service) != (a.domain, a.service) or data != a.data:
+                    c2 = self.policy.classify(domain, service, [a.entity_id], data, snap.attributes)
+                    if c2.klass != DIRECT:
+                        refuse(label, c2.reason, what)
+                        continue
+                session.call_service(domain, service, [a.entity_id], data)
             except HomeError as e:
                 failed.append(f"{label} — {e}")
                 self.journal.write("action", who, what, "failed", reason=e.code, tier=plan.tier,
                                    thread_id=ctx.thread_id)
                 continue
-            done.append(label)
-            self.journal.write("action", who, what, "executed", tier=plan.tier, thread_id=ctx.thread_id)
-        return done, propose, refused, failed
+            done.append(label if domain == a.domain else f"{label} (par {domain}.{service})")
+            if note:
+                notes.append(note)
+            self.journal.write("action", who, {**what, **({"resolved": f"{domain}.{service}"}
+                                                          if domain != a.domain else {})},
+                               "executed", tier=plan.tier, thread_id=ctx.thread_id)
+        return done, propose, refused, failed, notes
+
+    # ── lectures (historique, journal, agenda, liste, météo, événements) ──
+    def _fmt_ts(self, value: Any, date: bool = True) -> str:
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+
+        try:
+            if isinstance(value, (int, float)):
+                t = dt.datetime.fromtimestamp(float(value), dt.UTC)
+            else:
+                raw = str(value)
+                t = dt.datetime.fromisoformat(raw) if "T" in raw else dt.datetime.fromisoformat(raw + "T00:00:00")
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=dt.UTC) if "T" in raw else t.replace(tzinfo=ZoneInfo(self.tz))
+            t = t.astimezone(ZoneInfo(self.tz))
+        except (ValueError, TypeError, OverflowError, KeyError):
+            return str(value)[:25]
+        return t.strftime("%d.%m %H:%M" if date else "%H:%M")
+
+    def _read(self, readings: list[Reading], snap: Snapshot, session: Any, ctx: ToolContext, visible: set[str],
+              refused: list[str]) -> list[str]:
+        out: list[str] = []
+        who = ctx.sender
+        for r in readings:
+            dom = READING_DOMAIN.get(r.type)
+            what = {"lecture": r.type, "entity_id": r.entity_id, "heures": r.heures}
+            if dom != "":
+                if r.entity_id not in visible or (dom and domain_of(r.entity_id) != dom) \
+                        or not self.policy.allowed(who, READ, domain_of(r.entity_id)):
+                    refused.append(f"lecture {r.type} {r.entity_id or '?'} — entité hors de la carte ou non lisible")
+                    self.journal.write("read", who, what, "refused", thread_id=ctx.thread_id)
+                    continue
+            try:
+                lines = self._reading(r, snap, session, who)
+            except HomeError as e:
+                refused.append(f"lecture {r.type} {r.entity_id} — échec : {e}")
+                self.journal.write("read", who, what, "failed", reason=e.code, thread_id=ctx.thread_id)
+                continue
+            self.journal.write("read", who, what, "read", thread_id=ctx.thread_id)
+            title = f"{r.type} {r.entity_id} ({snap.name(r.entity_id)[:60]})" if r.entity_id else r.type
+            out.append(f"{title} :")
+            out.extend(f"  {ln}" for ln in (lines or ["(rien)"]))
+        return out
+
+    def _reading(self, r: Reading, snap: Snapshot, session: Any, who: str | None) -> list[str]:
+        eid = r.entity_id
+        if r.type == "historique":
+            hours = r.heures or 24
+            rows = (session.history([eid], hours).get(eid) or [])[-40:]
+            return [f"{self._fmt_ts(x.get('lu'))} {str(x.get('s'))[:40]}" for x in rows]
+        if r.type == "journal":
+            hours = r.heures or 24
+            rows = session.logbook([eid], hours)[-30:]
+            return [f"{self._fmt_ts(x.get('when'))} {str(x.get('message') or x.get('state') or '')[:80]}"
+                    for x in rows]
+        if r.type == "agenda":
+            hours = r.heures or 48
+            got = session.query("calendar", "get_events", [eid], {"duration": {"hours": hours}})
+            evs = list((got.get(eid) or {}).get("events") or [])[:20]
+            return [f"{self._fmt_ts(e.get('start'))} → {self._fmt_ts(e.get('end'))} {str(e.get('summary'))[:80]}"
+                    + (f" ({str(e.get('location'))[:60]})" if e.get("location") else "") for e in evs]
+        if r.type == "liste":
+            got = session.query("todo", "get_items", [eid], {})
+            items = list((got.get(eid) or {}).get("items") or [])[:40]
+            return [f"[{'x' if i.get('status') == 'completed' else ' '}] {str(i.get('summary'))[:80]}" for i in items]
+        if r.type == "meteo":
+            hours = r.heures or 72
+            kind = "hourly" if hours <= 24 else "daily"
+            try:
+                got = session.query("weather", "get_forecasts", [eid], {"type": kind})
+            except HomeError:
+                kind = "daily" if kind == "hourly" else "hourly"
+                got = session.query("weather", "get_forecasts", [eid], {"type": kind})
+            fc = list((got.get(eid) or {}).get("forecast") or [])[:8 if kind == "daily" else 12]
+            unit = str((snap.attributes(eid) or {}).get("temperature_unit") or "°C")
+            return [f"{self._fmt_ts(f.get('datetime'))} {f.get('condition')} {f.get('temperature')}{unit}"
+                    + (f" (min {f.get('templow')}{unit})" if f.get("templow") is not None else "")
+                    + (f", pluie {f.get('precipitation_probability')} %" if f.get("precipitation_probability")
+                       is not None else "") for f in fc]
+        if r.type == "evenements":
+            if self.feeds is None:
+                return ["aucun flux d'événements configuré (home_assistant.feeds)"]
+            return [f"{self._fmt_ts(e['at'])} {e['text']}"
+                    for e in self.feeds.recent(hours=r.heures or 24, readable=lambda d: self.policy.allowed(who, READ, d))]
+        return []
 
     def _summary(self, plan: Plan, done: list[str], propose: list[tuple[dict[str, Any], str]], refused: list[str],
-                 failed: list[str], snap: Snapshot, touched: list[str], keep: list[str]) -> str:
+                 failed: list[str], snap: Snapshot, touched: list[str], keep: list[str],
+                 notes: list[str] | None = None, readings: list[str] | None = None) -> str:
         out = [f"[Maison] palier : {plan.tier}" + (" (repli après une sortie invalide du petit palier)"
                                                    if plan.escalated else "")]
         for title, rows in (("Fait", done), ("Refusé", refused), ("Échec", failed)):
@@ -469,6 +677,11 @@ class HomeAssistantSource:
             st = snap.states.get(eid)
             if st is not None:
                 data_lines.append(f"{eid} ({snap.name(eid)[:60]}) : {str(st.get('state'))[:40]}")
+        for n in notes or []:
+            data_lines.append(f"média trouvé : {n}")
+        if readings:
+            data_lines.append("lectures :")
+            data_lines.extend(readings)
         if plan.reponse:
             data_lines.append(f"réponse de l'agent maison : {plan.reponse}")
         if data_lines:
@@ -540,6 +753,29 @@ class HomeAssistantSource:
                            thread_id=ctx.thread_id)
         return _result("maison_config", f"[Maison] {kind} {cid} enregistré")
 
+    def _notifier(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Envoi déjà passé par la porte : droit `direct` sur `notify` (porte maison), puis la carte d'envoi externe du
+        noyau (effet SEND_EXTERNAL). Ici : destinataire déclaré, texte borné, opération nommée `ha.notify`."""
+        name = str(args.get("destinataire") or "")
+        target = self.notify_targets.get(name)
+        message = self.scrub(str(args.get("message") or "").strip())[:500]
+        title = self.scrub(str(args.get("titre") or "").strip())[:80]
+        what = {"destinataire": name, "target": target, "chars": len(message)}
+        if target is None or not message:
+            self.journal.write("notify", ctx.sender, what, "refused", reason="destinataire non déclaré ou message vide",
+                               thread_id=ctx.thread_id)
+            return _result("maison_notifier", "refusé : destinataire non déclaré ou message vide", True)
+        if not self.policy.allowed(ctx.sender, DIRECT, "notify"):
+            self.journal.write("notify", ctx.sender, what, "refused", reason="droit", thread_id=ctx.thread_id)
+            return _result("maison_notifier", "refusé : le membre n'a pas ce droit", True)
+        session = self.client.session()
+        try:
+            session.notify(target, message, title)
+        finally:
+            session.close()
+        self.journal.write("notify", ctx.sender, what, "sent", approval_id=ctx.approval_id, thread_id=ctx.thread_id)
+        return _result("maison_notifier", f"[Maison] notification envoyée à {name}")
+
     # ── porte (avant l'appel, sans modèle) ──
     def verdict(self, call: ToolCall, turn: Turn) -> Verdict | None:
         if call.name not in HOME_TOOLS:
@@ -551,6 +787,13 @@ class HomeAssistantSource:
                            strength=strength)
 
         rights = self.policy.rights(sender)
+        if call.name == "maison_notifier":
+            if not self.policy.allowed(sender, DIRECT, "notify"):
+                return v(Decision.DENY, MEMBER_RULE, f"droit du membre ({self.policy.role_of(sender)}) : notification "
+                                                     "non permise")
+            if str(call.arguments.get("destinataire") or "") not in self.notify_targets:
+                return v(Decision.DENY, DENY_RULE, "destinataire non déclaré")
+            return None  # envoi externe : la porte du noyau pose la carte (effet SEND_EXTERNAL)
         if call.name == "maison":
             if not rights.any_right():
                 return v(Decision.DENY, MEMBER_RULE, "aucun droit sur la maison pour ce membre")
@@ -676,10 +919,16 @@ def home_source(config: Any, *, lokkal: bool, resolve: Callable[[str], str] | No
     return HomeAssistantSource.from_config(raw, resolve=resolve, state_dir=state_dir)
 
 
-def install(kernel: Any, source: HomeAssistantSource, hub: Any = None) -> None:
-    """Branche la source sur le noyau (paliers, ledger, approbations) et enveloppe ses portes."""
+def install(kernel: Any, source: HomeAssistantSource, hub: Any = None,
+            push: Callable[[str, str, str], Any] | None = None) -> None:
+    """Branche la source sur le noyau (paliers, ledger, approbations), enveloppe ses portes et démarre le flux
+    d'événements s'il est configuré (`home_assistant.feeds`)."""
     source.bind(kernel, hub)
     kernel.gates = HomeGates(inner=kernel.gates, source=source)
+    if source.feeds is not None:
+        if push is not None:
+            source.feeds.push = push
+        source.feeds.start()
 
 
 __all__ = ["BUBBLE_KIND", "HOME_TOOLS", "HUMAN_STRONG_VIA", "MEMBER_RULE", "STRONG_RULE", "HomeAssistantSource",

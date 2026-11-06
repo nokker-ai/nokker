@@ -49,7 +49,7 @@ NOTIFY_TTL_S = 600.0
 # Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
 # `pack_agents` (pack retiré, ses agents créés : désarmer / supprimer / garder) : ses actions touchent des agents.
 KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents", "home",
-                          "home_watch", "cast", "pointer"})
+                          "home_watch", "cast", "pointer", "approval"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
@@ -132,6 +132,9 @@ class BubbleHub:
     # Never clear (docs/NEVER-CLEAR.md §3) : `nokker.context.manager.ContextManager` ; posé par `build_kernel`.
     # `None` = les bulles `episode` ne sont pas créées et leur transfert ne copie pas de transcription.
     context_manager: Any = None
+    # Drapeau `approval_bubbles` (posé par `serve`) : bulle `approval` de chaque carte qui revient aux humains, et
+    # bulles `approval` réservées au noyau (ni créées par un client, ni modifiées par le modèle).
+    approval_bubbles: bool = False
     spawn: Callable[[Callable[[], None]], None] = _spawn_thread
     notify_ttl_s: float = NOTIFY_TTL_S
     clock: Callable[[], float] = time.time
@@ -323,6 +326,8 @@ class BubbleHub:
         for t in turns:
             user = {"index": t.index, "role": "user", "content": t.input.text, "sender": t.sender,
                     "channel": t.channel}
+            if getattr(t.input, "origin", ""):  # « approval » : bloc du noyau (suite d'une carte), pas la personne
+                user["origin"] = t.input.origin
             if t.images:  # X7 : références ; octets par GET /v1/threads/{id}/images/{sha256}
                 user["images"] = [i.to_dict() for i in t.images]
             out.append(user)
@@ -376,6 +381,86 @@ class BubbleHub:
                                 actions=actions, created_by="nina")
         self._emit_bubble("bubble.created", b)
         return b
+
+    # ── bulle `approval` d'une décision du relecteur automatique (docs/APPROVALS.md §8) ──
+
+    @staticmethod
+    def _approval_state(a: Any, rollback_applied: bool | None = None) -> dict[str, Any]:
+        rec = dict(getattr(a, "auto_review", None) or {})
+        state: dict[str, Any] = {"approval_id": a.id, "tool_name": a.tool_name, "status": a.status,
+                                 "decision": rec.get("decision"), "decided_via": a.decided_via,
+                                 "reason": rec.get("reason") or "", "revoked": bool(rec.get("revoked_by"))}
+        if rollback_applied is not None:
+            state["rollback_applied"] = rollback_applied
+        return state
+
+    def auto_review_decided(self, turn: Turn, approval: Any) -> None:
+        """Le relecteur automatique a approuvé une carte (et l'outil a tourné) : bulle `approval` dans le fil, état
+        de la décision (`decided_via: auto-review`, raison) ; on la voit et on la révoque depuis le fil. Pas de
+        notification push ; rien de vu par le modèle (bulle du noyau, aucun texte ajouté au tour)."""
+        if approval is None or (approval.auto_review or {}).get("decision") != "approve":
+            return
+        own = self._card_bubble(approval) if self.approval_bubbles else None  # la bulle de la carte, si elle existe
+        if own is not None:
+            self.update_from_kernel(own.id, status="done", state=self._approval_state(approval))
+            return
+        self.create_kernel_bubble(turn.thread_id, kind="approval", title=str(approval.tool_name)[:200],
+                                  status="done", state=self._approval_state(approval))
+
+    # ── bulle `approval` de chaque carte qui revient aux humains (drapeau `approval_bubbles`) ──
+
+    def _card_bubble(self, approval: Any) -> Bubble | None:
+        return next((b for b in self.bubbles.list_thread(approval.thread_id)
+                     if b.kind == "approval" and (b.state or {}).get("approval_id") == approval.id), None)
+
+    @staticmethod
+    def _card_bubble_status(status: str) -> str:
+        """Carte en attente : `working` ; décidée (approuvée, exécutée, refusée) : `done` ; expirée ou en échec : `failed`."""
+        return "working" if status == "pending" else "failed" if status in ("expired", "failed") else "done"
+
+    def approval_pending(self, approval: Any) -> None:
+        """La carte part aux humains (`Approvals.notify_pending`, à la pose ou à l'escalade du relecteur) : bulle
+        `approval` dans SON fil, état minimal `{approval_id, tool_name, status}` (la carte se relit par GET), sans
+        notification push. Fil inconnu des bulles (crew, sous-agent…) : rien. Aucun texte vu par le modèle."""
+        if not self.approval_bubbles:
+            return
+        with tenant_scope(tenant_of_thread(approval.thread_id)):
+            if self.threads.get(approval.thread_id) is None:
+                return
+            state = {"approval_id": approval.id, "tool_name": approval.tool_name, "status": approval.status}
+            own = self._card_bubble(approval)
+            if own is not None:
+                self.update_from_kernel(own.id, state={**(own.state or {}), **state},
+                                        status=self._card_bubble_status(approval.status))
+                return
+            self.create_kernel_bubble(approval.thread_id, kind="approval", title=str(approval.tool_name)[:200],
+                                      status=self._card_bubble_status(approval.status), state=state)
+
+    def approval_card_changed(self, approval: Any) -> None:
+        """Décision, exécution, échec, expiration : `bubble.updated` de la bulle de la carte (statut, moyen de la
+        décision). Pas de bulle (drapeau éteint, carte jamais passée aux humains) : rien."""
+        if not self.approval_bubbles:
+            return
+        with tenant_scope(tenant_of_thread(approval.thread_id)):
+            own = self._card_bubble(approval)
+            if own is None:
+                return
+            state = {**(own.state or {}), "status": approval.status}
+            if getattr(approval, "decided_via", None):
+                state["decided_via"] = approval.decided_via
+            self.update_from_kernel(own.id, state=state, status=self._card_bubble_status(approval.status))
+
+    def approval_changed(self, approval: Any, *, rollback_applied: bool | None = None) -> int:
+        """Révocation ou restauration : met à jour les bulles `approval` de cette carte dans son fil
+        (`bubble.updated`). Rend le nombre de bulles touchées."""
+        n = 0
+        for b in self.bubbles.list_thread(approval.thread_id):
+            if b.kind == "approval" and (b.state or {}).get("approval_id") == approval.id:
+                prev = (b.state or {}).get("rollback_applied")
+                self.update_from_kernel(b.id, state=self._approval_state(
+                    approval, rollback_applied if rollback_applied is not None else prev))
+                n += 1
+        return n
 
     def notify_user(self, user: str, *, title: str, text: str, from_thread: str | None = None) -> Bubble:
         """Notification (`notify`, sans fil, §4) à une identité, venue du noyau (brief du matin, X18)."""
@@ -788,6 +873,11 @@ class BubbleHub:
     def tool_bubble_update(self, thread_id: str, bubble_id: str, *, title: str | None = None,
                            state: dict[str, Any] | None = None, status: str | None = None) -> Bubble:
         b = self.bubbles.require(bubble_id)
+        if b.kind == "approval":
+            # Bulle d'une carte : tenue par le noyau seul. Pour le modèle, elle n'existe pas, dans son fil comme ailleurs
+            # (classe et texte EXISTANTS, aucun mot nouveau vu par le modèle) ; il n'en voit jamais l'id (les bulles du
+            # fil n'entrent pas dans son contexte, bubble_show ne rend que la bulle qu'il crée).
+            raise BubbleNotFound(bubble_id)
         if b.thread_id != thread_id:
             raise BubbleForbidden("cette bulle n'appartient pas au fil courant")
         return self.update_from_kernel(bubble_id, title=title, state=state, status=status)

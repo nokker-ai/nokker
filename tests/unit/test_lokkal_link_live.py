@@ -299,3 +299,33 @@ def test_a_failing_effect_does_not_break_the_link_nor_log_the_key(api, caplog):
     body = _approve(api)
     assert body["state"] == "approved" and KEY not in caplog.text
     assert "RuntimeError" in caplog.text and api.setup.vault.get("router") == KEY
+
+
+# ── modèle des paliers une fois lié (05.11 : le setup figeait le 397B sur Ship ET Deep) ──
+
+
+def test_link_without_chosen_model_keeps_the_config_tiers_ship_27b_and_deep_397b(api, monkeypatch):
+    """Lien du compte, aucun modèle choisi : Nina sur Ship (27B de la config livrée), Deep (397B) en escalade, chacun
+    sur le point d'accès et la clé du lien ; le setup affiche le modèle de Ship, et reste utilisable."""
+    api.setup.vault.put("router", KEY)
+    api.setup.state.update({"default": "router", "inference_base": INFERENCE})
+    cfg, kernel = _real_kernel(monkeypatch)
+    assert (cfg.tiers["ship"].model, cfg.tiers["deep"].model) == ("qwen/qwen3.8-27b", "qwen/qwen3.5-397b-a17b")
+    chosen = api.setup.provider_for_default()
+    assert chosen == (INFERENCE, KEY, "")
+    default_model_applier(cfg, kernel, _endpoint_fn(api))(*chosen)
+    assert kernel.providers[Tier.SHIP].model == "qwen/qwen3.8-27b"
+    assert kernel.providers[Tier.DEEP].model == "qwen/qwen3.5-397b-a17b"
+    _assert_all_on_the_link(kernel, cfg)
+    assert api.setup.usable()
+    api.setup.router_default = cfg.tiers["ship"].model
+    assert api.setup.view()["models"]["router"]["model"] == "qwen/qwen3.8-27b"
+
+
+def test_explicit_router_model_still_serves_both_tiers(api, monkeypatch):
+    api.setup.vault.put("router", KEY)
+    api.setup.state.update({"default": "router", "inference_base": INFERENCE, "router_model": "qwen/autre"})
+    cfg, kernel = _real_kernel(monkeypatch)
+    default_model_applier(cfg, kernel, _endpoint_fn(api))(*api.setup.provider_for_default())
+    assert kernel.providers[Tier.SHIP].model == kernel.providers[Tier.DEEP].model == "qwen/autre"
+    assert api.setup.view()["models"]["router"]["model"] == "qwen/autre"

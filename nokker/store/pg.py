@@ -114,11 +114,15 @@ def _dec_verdict(d: dict[str, Any]) -> Verdict:
 
 
 def _enc_input(i: InputCheck) -> dict[str, Any]:
-    return {"text": i.text, "redacted": i.redacted, "domain_flags": sorted(i.domain_flags)}
+    out = {"text": i.text, "redacted": i.redacted, "domain_flags": sorted(i.domain_flags)}
+    if i.origin:
+        out["origin"] = i.origin
+    return out
 
 
 def _dec_input(d: dict[str, Any]) -> InputCheck:
-    return InputCheck(text=d["text"], redacted=d.get("redacted", []), domain_flags=set(d.get("domain_flags", [])))
+    return InputCheck(text=d["text"], redacted=d.get("redacted", []), domain_flags=set(d.get("domain_flags", [])),
+                      origin=str(d.get("origin") or ""))
 
 
 def turn_to_dict(turn: Turn) -> dict[str, Any]:

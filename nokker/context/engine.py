@@ -87,12 +87,22 @@ class ContextEngineV0:
     # `child` | None. Posé (drapeau `household_minors`) : le préfixe produit d'un profil mineur reçoit l'addendum
     # `prompts/prefix-young.md` et sa tranche d'âge. None (défaut) : rien ne change.
     young_profile: Any = None
+    # Drapeau `reply_language` (`context/reply_language.py`) : consigne de langue en tête de la section Style du préfixe,
+    # appliquée au chargement (avant toute empreinte). False (défaut) : préfixe lu tel quel, à l'octet près.
+    reply_language: bool = False
+    # Drapeau `reply_language_tail` : ligne `reply_language.TAIL_LINE` en fin d'en-tête du tour (après la date, le rappel et
+    # les pièces jointes, juste avant le message). Le préfixe ne change pas. False (défaut) : en-tête inchangé à l'octet.
+    reply_language_tail: bool = False
+    # Drapeau `feature_notes` (`nokker/guide/notes.py::FeatureNotes`) : bloc `[Fonctions]` (0 à 3 notes choisies pour le
+    # message, filtrées par drapeaux et profil mineur) dans l'en-tête du tour, après le rappel mémoire et avant le
+    # contexte reçu. None (défaut) : en-tête inchangé à l'octet.
+    feature_notes: Any = None
 
     def __post_init__(self) -> None:
-        self._layers = {"internal": (self._load(self.prefix_path),
+        self._layers = {"internal": (self._load_prefix(self.prefix_path),
                                      self._load(self.profile_path) if self.profile_path else "")}
         if self.product_prefix_path is not None:
-            self._layers["product"] = (self._load(self.product_prefix_path), "")
+            self._layers["product"] = (self._load_prefix(self.product_prefix_path), "")
         # Hash par locataire, figé au premier assemblage du locataire : ne dépend d'aucun tour, palier ou horloge
         # (invariant testé). Sans préfixe produit : calculé à la construction, comme avant.
         self._sha_by_tenant: dict[str, str] = {}
@@ -137,13 +147,23 @@ class ContextEngineV0:
 
     @property
     def _prefix_sha256(self) -> str:
-        key = "" if self.product_prefix_path is None else f"{current_tenant()}|{self._young() or ''}"
+        scope = getattr(self.tools, "cache_key", None) or getattr(self.tools, "scope_key", None)  # outils selon le fil
+        key = "" if self.product_prefix_path is None else \
+            f"{current_tenant()}|{self._young() or ''}|{scope() if callable(scope) else ''}"
         sha = self._sha_by_tenant.get(key)
         if sha is None:
             sha = _compute_prefix_sha256(self._prefix_text, self.tools.core())
             with self._sha_lock:
                 sha = self._sha_by_tenant.setdefault(key, sha)
         return sha
+
+    def _load_prefix(self, path: str | None) -> str:
+        text = self._load(path)
+        if self.reply_language:
+            from nokker.context import reply_language
+
+            text = reply_language.apply(text)
+        return text
 
     @staticmethod
     def _load(path: str | None) -> str:
@@ -191,12 +211,27 @@ class ContextEngineV0:
             logger.exception("plan : bloc indisponible")
             return ""
 
-    @staticmethod
-    def turn_head(turn: Turn, compute: Callable[[], list[str]]) -> str:
+    def feature_notes_block(self, turn: Turn) -> str:
+        """Bloc `[Fonctions]` du tour, ou "" (drapeau éteint, rien de pertinent, service en panne)."""
+        if self.feature_notes is None:
+            return ""
+        try:
+            return self.feature_notes.block_for(turn.input.text, minor=self._young() is not None)
+        except Exception:  # les notes ne cassent jamais un assemblage
+            logger.exception("notes de fonctions : bloc indisponible")
+            return ""
+
+    def turn_head(self, turn: Turn, compute: Callable[[], list[str]]) -> str:
         """En-tête du tour, calculé au premier assemblage puis figé sur le tour (`Turn.head`) : les appels suivants
-        du même tour et l'historique des tours suivants le reprennent à l'identique."""
+        du même tour et l'historique des tours suivants le reprennent à l'identique. Drapeau `reply_language_tail` :
+        une ligne de langue en dernier, juste avant le message de l'utilisateur."""
         if not turn.head:
-            turn.head = "\n\n".join(compute())
+            parts = compute()
+            if self.reply_language_tail:
+                from nokker.context.reply_language import TAIL_LINE
+
+                parts = [*parts, TAIL_LINE]
+            turn.head = "\n\n".join(parts)
         return turn.head
 
     def images_kept(self, history: list[Turn], turn: Turn) -> set[tuple[int, str]]:
@@ -298,6 +333,9 @@ class ContextEngineV0:
                 # Données importées d'un autre agent (lot 30 d, texte validé par la relecture du format) : bloc à part, après le rappel,
                 # jamais mêlées à la mémoire de Nokker. Seulement si `local.import_codex_memory` les a produites.
                 parts.append(render_imported(imported, self.recall_text_limit))
+            notes = self.feature_notes_block(turn)
+            if notes:  # drapeau `feature_notes` : après le rappel mémoire, avant le contexte reçu
+                parts.append(notes)
             if turn.injected:
                 # Contexte reçu d'un autre fil (docs/BUBBLES.md §3-§4, docs/CONTEXT-FORMAT.md) : après le rappel.
                 parts.append(render_injected(turn.injected))

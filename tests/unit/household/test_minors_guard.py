@@ -136,7 +136,8 @@ def test_connectors_and_agents_follow_the_household_whitelist(w):
     assert [keep(s) for s in (SEND, READ, draft, web)] == [False, False, False, True]  # suspendu : plus rien d'ouvert
     # Outils des sessions de code (§7.28) : jamais pour un mineur, même avec une liste blanche ouverte.
     code = [ToolSpec(name=n, description="", parameters={}) for n in ("terminal", "write_file", "patch", "read_file",
-                                                                       "search_files", "checkpoint_restore")]
+                                                                       "search_files", "checkpoint_restore",
+                                                                       "execute_code")]
     w.hh.put_policy(w.pay, {"minor_connectors": ["calendar"], "minor_agents": ["devoirs"]})
     assert not any(restrict(w.kid.tenant_id)(spec) for spec in code)
     # Sous-agents et skills du dépôt d'une session (§7.28) : jamais non plus ; les skills des packs du web (même nom,

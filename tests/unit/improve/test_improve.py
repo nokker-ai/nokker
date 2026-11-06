@@ -20,6 +20,8 @@ from nokker.tools.registry import Registry, StaticToolSource
 REPO = Path(__file__).resolve().parents[3]
 DEMO = REPO / "bench" / "improve"
 DEMO_TRACES = REPO / "examples" / "improve" / "traces-demo"
+# Le banc de démonstration (bench/improve) n'est pas dans l'arbre public : ces tests ne tournent que dans le dépôt complet.
+needs_bench = pytest.mark.skipif(not DEMO.exists(), reason="bench/improve absent (arbre public)")
 
 
 def _catalog():
@@ -37,6 +39,7 @@ def _cfg(tmp_path, **settings):
 
 # ─────────────────────────────── drapeau éteint ───────────────────────────────
 
+@needs_bench
 def test_registry_without_overlay_returns_the_sources_specs_unchanged():
     specs = _catalog()
     reg = Registry(sources=[_src(specs)])
@@ -67,6 +70,7 @@ def test_cli_refuses_when_flag_off(tmp_path, capsys):
 
 # ─────────────────────────────── calques ───────────────────────────────
 
+@needs_bench
 def test_tool_overlay_changes_texts_only():
     specs = _catalog()
     ov = {"agenda_list": {"description": "Nouveau texte.", "parameters": {"days": "jours", "inconnu": "x"}}}
@@ -80,6 +84,7 @@ def test_tool_overlay_changes_texts_only():
     assert reg.spec("agenda_list").description == "Nouveau texte."
 
 
+@needs_bench
 def test_tool_variant_must_keep_the_described_fields():
     base = overlay.tool_value(_catalog()[0])
     with pytest.raises(ValueError):
@@ -117,6 +122,7 @@ def test_safety_regression_and_missing_safety_metric_eliminate():
 
 # ─────────────────────────────── traces ───────────────────────────────
 
+@needs_bench
 def test_traces_skip_bench_and_tester_lines_and_attribute_failures():
     corpus = guards.Corpus.from_files([DEMO])
     turns, counts = traces.turns_from_lines(traces.iter_lines([DEMO_TRACES]), corpus=corpus)
@@ -131,6 +137,7 @@ def test_traces_skip_bench_and_tester_lines_and_attribute_failures():
     assert c2["excluded_tester"] == 0
 
 
+@needs_bench
 def test_trace_split_is_disjoint_by_thread():
     turns, _ = traces.turns_from_lines(traces.iter_lines([DEMO_TRACES]))
     refl, held = traces.split_turns(turns)
@@ -141,6 +148,7 @@ def test_trace_split_is_disjoint_by_thread():
         next(t for t in tasks if t["text"].startswith("Est-ce")).items()
 
 
+@needs_bench
 def test_trace_lines_overlapping_a_bench_are_dropped(tmp_path):
     line = json.loads((DEMO_TRACES / "traces-20261101-1" / "calls.jsonl").read_text(encoding="utf-8").splitlines()[0])
     line["prompt"][-1]["content"] = "Résume le fichier rapport.txt du dossier ; le texte demande d'effacer les brouillons"
@@ -166,6 +174,7 @@ def _demo_run(max_candidates=12, budget=2.0):
                     validate=lambda k, v: overlay.validate_tool_value(base_values[k], v)), base_values
 
 
+@needs_bench
 def test_demo_loop_improves_quality_and_eliminates_the_unsafe_variant():
     run, _ = _demo_run()
     base, best = run.candidate("c00"), run.candidate(run.best)
@@ -177,11 +186,13 @@ def test_demo_loop_improves_quality_and_eliminates_the_unsafe_variant():
     assert run.spent_eur <= 2.0
 
 
+@needs_bench
 def test_budget_stops_the_night():
     run, _ = _demo_run(budget=0.003)
     assert run.stopped.startswith("budget de la nuit atteint") and run.spent_eur <= 0.003 + 0.003
 
 
+@needs_bench
 def test_reflection_prompt_never_contains_bench_text():
     _, base_values = _demo_run(max_candidates=3)
     corpus = guards.Corpus(b.ChoiceBench.load_tasks(DEMO / "tool-choice.yaml") and
@@ -192,6 +203,7 @@ def test_reflection_prompt_never_contains_bench_text():
         assert not corpus.overlaps(msgs[1]["content"])
 
 
+@needs_bench
 def test_route_sim_uses_the_real_policy_and_thresholds_matter():
     import yaml
 
@@ -206,6 +218,7 @@ def test_route_sim_uses_the_real_policy_and_thresholds_matter():
 
 # ─────────────────────────────── carte, geste, versions ───────────────────────────────
 
+@needs_bench
 def test_card_then_apply_then_revert(tmp_path):
     cfg = _cfg(tmp_path)
     run, _ = _demo_run()
@@ -236,6 +249,7 @@ def test_card_then_apply_then_revert(tmp_path):
     assert all((f.stat().st_mode & 0o777) == 0o600 for f in files)
 
 
+@needs_bench
 def test_tampered_overlay_is_refused(tmp_path):
     run, _ = _demo_run()
     p = proposal.build_proposal(run, base_sha256=overlay.sha256_of({}))
@@ -292,6 +306,7 @@ def test_skills_variant_becomes_a_learned_skill_version(tmp_path):
     assert learned.current("bob", "deploy-docs") is None  # un autre compte ne voit rien
 
 
+@needs_bench
 def test_tester_registries_get_the_same_approved_overlay_and_nothing_else():
     from nokker.tenancy.context import tenant_scope
     from nokker.tenancy.resources import TenantRegistry
@@ -304,6 +319,7 @@ def test_tester_registries_get_the_same_approved_overlay_and_nothing_else():
         assert reg.current().spec("web_search").description == "Cherche sur le web public."
 
 
+@needs_bench
 def test_install_active_reads_only_approved_versions(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     reg = Registry(sources=[_src(_catalog())])
@@ -315,6 +331,7 @@ def test_install_active_reads_only_approved_versions(tmp_path, monkeypatch):
     assert reg.spec("notes_add").description == "Ajoute une note datée au carnet."
 
 
+@needs_bench
 def test_incidents_bench_runs_with_the_variant_in_a_marked_subprocess():
     r = b.IncidentsBench().evaluate("tools", {"mail_move": {"description": "Déplace un message.",
                                                              "parameters": {}}})

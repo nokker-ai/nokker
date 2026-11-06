@@ -58,6 +58,7 @@ class Budget:
 class MemoryPaymentStore:
     _mandates: dict[str, dict[str, MandateRecord]] = field(default_factory=dict)
     _budgets: dict[str, dict[str, Budget]] = field(default_factory=dict)
+    _agent: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _m(self) -> dict[str, MandateRecord]:
@@ -90,6 +91,16 @@ class MemoryPaymentStore:
     def get_budget(self, account: str) -> Budget | None:
         with self._lock:
             return self._budgets.setdefault(current_tenant(), {}).get(account)
+
+    # État du paiement par l'agent (drapeau `pay_agent`, colonne `pay_mandates.agent` de la migration 063) : lu et
+    # écrit à part, pour que le chemin du drapeau éteint ne lise jamais cette colonne.
+    def get_agent(self, mandate_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._agent.get((current_tenant(), mandate_id)) or {}) or None
+
+    def put_agent(self, mandate_id: str, state: dict[str, Any]) -> None:
+        with self._lock:
+            self._agent[(current_tenant(), mandate_id)] = dict(state)
 
     def put_budget(self, b: Budget) -> None:
         with self._lock:
@@ -197,6 +208,17 @@ class PgPaymentStore:
         with self._lock:
             cur = self._db.get().execute("DELETE FROM pay_budgets WHERE account = %s", (account,))
             return (cur.rowcount or 0) > 0
+
+    def get_agent(self, mandate_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.get().execute("SELECT agent FROM pay_mandates WHERE id = %s", (mandate_id,)).fetchone()
+        return dict(row[0]) if row and row[0] else None
+
+    def put_agent(self, mandate_id: str, state: dict[str, Any]) -> None:
+        from psycopg.types.json import Jsonb
+
+        with self._lock:
+            self._db.get().execute("UPDATE pay_mandates SET agent = %s WHERE id = %s", (Jsonb(dict(state)), mandate_id))
 
 
 __all__ = ["LIVE", "Budget", "MandateRecord", "MemoryPaymentStore", "PgPaymentStore"]

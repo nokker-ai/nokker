@@ -6,6 +6,7 @@ et ports passent par `net.check_endpoint` (SSRF) et la connexion est épinglée 
 message d'erreur ni dans un résultat d'outil. `mail_send` est SEND_EXTERNAL : la carte d'approbation du noyau passe avant."""
 from __future__ import annotations
 
+import base64
 import email
 import email.policy
 import email.utils
@@ -30,11 +31,68 @@ from nokker.core.turn import Effect, ToolResult
 from nokker.previews.ssrf import ResolvedHop
 from nokker.tools.effects import is_trash_destination, mail_move_effect
 
+# Préréglages par mot de passe (d'application quand le fournisseur l'exige). L'essai de connexion à l'enregistrement
+# reste obligatoire : c'est lui qui valide les hôtes. Pas ici : Outlook / Hotmail / Microsoft 365 (OAuth2 XOAUTH2
+# obligatoire), Proton (Bridge local seulement), Tuta (pas d'IMAP).
+# Clés en plus des hôtes : `imap_user: "local"` = identifiant IMAP = partie locale de l'adresse (iCloud, page Apple
+# 102525 ; l'identifiant SMTP reste l'adresse complète) ; `smtp_auth: "plain"` = jamais CRAM-MD5 (bluewin : LOGIN/PLAIN).
 PRESETS: dict[str, dict[str, Any]] = {
     "gmail": {"imap_host": "imap.gmail.com", "imap_port": 993, "smtp_host": "smtp.gmail.com", "smtp_port": 465},
-    "icloud": {"imap_host": "imap.mail.me.com", "imap_port": 993, "smtp_host": "smtp.mail.me.com", "smtp_port": 587},
+    "icloud": {"imap_host": "imap.mail.me.com", "imap_port": 993, "smtp_host": "smtp.mail.me.com", "smtp_port": 587,
+               "imap_user": "local"},
     "infomaniak": {"imap_host": "mail.infomaniak.com", "imap_port": 993, "smtp_host": "mail.infomaniak.com", "smtp_port": 465},
     "fastmail": {"imap_host": "imap.fastmail.com", "imap_port": 993, "smtp_host": "smtp.fastmail.com", "smtp_port": 465},
+    "yahoo": {"imap_host": "imap.mail.yahoo.com", "imap_port": 993, "smtp_host": "smtp.mail.yahoo.com", "smtp_port": 465},
+    "aol": {"imap_host": "imap.aol.com", "imap_port": 993, "smtp_host": "smtp.aol.com", "smtp_port": 465},
+    "posteo": {"imap_host": "posteo.de", "imap_port": 993, "smtp_host": "posteo.de", "smtp_port": 465},
+    "mailbox_org": {"imap_host": "imap.mailbox.org", "imap_port": 993, "smtp_host": "smtp.mailbox.org", "smtp_port": 465},
+    "gmx": {"imap_host": "imap.gmx.net", "imap_port": 993, "smtp_host": "mail.gmx.net", "smtp_port": 587},
+    "web_de": {"imap_host": "imap.web.de", "imap_port": 993, "smtp_host": "smtp.web.de", "smtp_port": 587},
+    "zoho": {"imap_host": "imap.zoho.eu", "imap_port": 993, "smtp_host": "smtp.zoho.eu", "smtp_port": 465},
+    "bluewin": {"imap_host": "imaps.bluewin.ch", "imap_port": 993, "smtp_host": "smtpauths.bluewin.ch", "smtp_port": 465,
+                "smtp_auth": "plain"},
+    "hostpoint": {"imap_host": "imap.mail.hostpoint.ch", "imap_port": 993, "smtp_host": "asmtp.mail.hostpoint.ch",
+                  "smtp_port": 465},
+    "sunrise": {"imap_host": "imap.sunrise.ch", "imap_port": 993, "smtp_host": "smtp2.sunrise.ch", "smtp_port": 465},
+    # Outlook / Hotmail / Microsoft 365 : SEULEMENT par la connexion Microsoft (OAuth, XOAUTH2) — l'authentification
+    # par mot de passe y est coupée. Posé par le callback OAuth, jamais par la route des mots de passe.
+    "outlook": {"imap_host": "outlook.office365.com", "imap_port": 993, "smtp_host": "smtp.office365.com",
+                "smtp_port": 587, "auth": "oauth"},
+}
+# Centre de données Zoho (réglage `region`) : les hôtes .eu par défaut.
+ZOHO_REGIONS = ("eu", "com")
+# Aide d'une ligne sous le champ du mot de passe (web) : quel mot de passe, et où le créer.
+PRESET_HELP: dict[str, dict[str, str]] = {
+    "gmail": {"fr": "Mot de passe d'application : Compte Google → Sécurité → Validation en deux étapes → Mots de passe des applications.",
+              "en": "App password: Google Account → Security → 2-Step Verification → App passwords."},
+    "icloud": {"fr": "Mot de passe pour app : account.apple.com → Connexion et sécurité → Mots de passe pour app.",
+               "en": "App-specific password: account.apple.com → Sign-In and Security → App-Specific Passwords."},
+    "infomaniak": {"fr": "Le mot de passe de l'adresse e-mail, ou un mot de passe d'application si la double authentification est active.",
+                   "en": "The email address password, or an app password if two-factor authentication is on."},
+    "fastmail": {"fr": "Mot de passe d'application : Réglages → Confidentialité et sécurité → Mots de passe d'application (IMAP et SMTP).",
+                 "en": "App password: Settings → Privacy & Security → App passwords (IMAP and SMTP)."},
+    "yahoo": {"fr": "Mot de passe d'application : Sécurité du compte Yahoo → Générer un mot de passe d'application.",
+              "en": "App password: Yahoo Account Security → Generate app password."},
+    "aol": {"fr": "Mot de passe d'application : Sécurité du compte AOL → Générer un mot de passe d'application.",
+            "en": "App password: AOL Account Security → Generate app password."},
+    "posteo": {"fr": "Mot de passe d'application créé dans les réglages Posteo (ou ton mot de passe Posteo).",
+               "en": "App password created in Posteo settings (or your Posteo password)."},
+    "mailbox_org": {"fr": "Ton mot de passe mailbox.org, ou un mot de passe d'application si la double authentification est active.",
+                    "en": "Your mailbox.org password, or an app password if two-factor authentication is on."},
+    "gmx": {"fr": "Ton mot de passe GMX ; active d'abord l'accès POP3/IMAP dans les réglages e-mail de GMX.",
+            "en": "Your GMX password; first turn on POP3/IMAP access in the GMX email settings."},
+    "web_de": {"fr": "Ton mot de passe WEB.DE ; active d'abord l'accès POP3/IMAP dans les réglages e-mail de WEB.DE.",
+               "en": "Your WEB.DE password; first turn on POP3/IMAP access in the WEB.DE email settings."},
+    "zoho": {"fr": "Mot de passe d'application Zoho (Mon compte → Sécurité → Mots de passe d'application) ; choisis ton centre de données.",
+             "en": "Zoho app password (My Account → Security → App passwords); choose your data center."},
+    "bluewin": {"fr": "Le mot de passe e-mail dédié à cette adresse, pas ton Swisscom Login ; identifiant = adresse complète.",
+                "en": "The dedicated email password for this address, not your Swisscom Login; username = full address."},
+    "hostpoint": {"fr": "Le mot de passe de cette adresse e-mail, défini dans le Control Panel Hostpoint.",
+                  "en": "This email address's password, set in the Hostpoint Control Panel."},
+    "sunrise": {"fr": "Le mot de passe de ton adresse e-mail Sunrise.",
+                "en": "Your Sunrise email address password."},
+    "outlook": {"fr": "Pas de mot de passe : connecte ton compte Microsoft (Outlook, Hotmail, Microsoft 365).",
+                "en": "No password: connect your Microsoft account (Outlook, Hotmail, Microsoft 365)."},
 }
 MAX_RESULTS = 25
 MAX_BODY_CHARS = 20_000
@@ -61,11 +119,28 @@ def normalize_settings(settings: dict[str, Any]) -> dict[str, Any]:
     if preset != "custom" and preset not in PRESETS:
         raise ConnectorError("bad_settings", f"préréglage inconnu : {preset}")
     base = dict(PRESETS.get(preset, {}))
+    if preset == "zoho":
+        region = str(settings.get("region") or "eu")
+        if region not in ZOHO_REGIONS:
+            raise ConnectorError("bad_settings", f"centre de données Zoho inconnu : {region}")
+        base = {**base, "imap_host": f"imap.zoho.{region}", "smtp_host": f"smtp.zoho.{region}", "region": region}
     out = {**base, **{k: v for k, v in settings.items() if v not in (None, "")}}
     address = str(out.get("address", "")).strip()
     if not _ADDR_RE.match(address):
         raise ConnectorError("bad_settings", "adresse e-mail invalide")
     norm: dict[str, Any] = {"preset": preset, "address": address, "username": str(out.get("username") or address)}
+    if base.get("imap_user") == "local" and not settings.get("username"):
+        norm["imap_username"] = address.split("@", 1)[0]
+    if base.get("smtp_auth") == "plain":
+        norm["smtp_auth"] = "plain"
+    if base.get("auth") == "oauth" or settings.get("auth") == "oauth":
+        # boîte OAuth (XOAUTH2) : le « secret » est un jeton d'accès frais, donné à chaque construction
+        norm["auth"] = "oauth"
+        for k in ("provider", "oauth_account"):
+            if settings.get(k):
+                norm[k] = str(settings[k])
+    if preset == "zoho":
+        norm["region"] = base["region"]
     for key in ("imap_host", "smtp_host"):
         if not out.get(key):
             raise ConnectorError("bad_settings", f"{key} requis")
@@ -115,6 +190,20 @@ def _auth_or_protocol(exc: Exception, secret: str) -> ConnectorError:
     return ConnectorError("protocol_error", text[:200] or exc.__class__.__name__)
 
 
+def xoauth2(user: str, token: str) -> bytes:
+    """Chaîne SASL XOAUTH2 (Microsoft, Google) : user=…^Aauth=Bearer …^A^A."""
+    return f"user={user}\x01auth=Bearer {token}\x01\x01".encode()
+
+
+def _smtp_oauth_refusal(code: int, resp: Any) -> ConnectorError:
+    text = resp.decode("utf-8", "replace") if isinstance(resp, bytes) else str(resp)
+    if "SmtpClientAuthentication is disabled" in text or "5.7.139" in text:
+        return ConnectorError("smtp_auth_disabled", "l'envoi SMTP est désactivé pour cette organisation Microsoft 365 : "
+                                                    "la boîte lit et prépare des brouillons, mais n'envoie pas (l'administrateur "
+                                                    "peut activer « SMTP authentifié » pour ce compte)")
+    return ConnectorError("auth_failed", f"connexion Microsoft refusée par le serveur d'envoi (code {code})")
+
+
 def connect_imap(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo) -> Any:
     hop = check_endpoint(s["imap_host"], s["imap_port"], "imap", resolver=resolver)
     tls = ("imap", hop.port) in IMPLICIT_TLS
@@ -122,7 +211,10 @@ def connect_imap(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo)
         m = _PinnedIMAP(hop, tls, TIMEOUT_S)
         if not tls:
             m.starttls(tls_context())
-        m.login(s["username"], secret)
+        if s.get("auth") == "oauth":
+            m.authenticate("XOAUTH2", lambda _challenge: xoauth2(s["username"], secret))
+        else:
+            m.login(s.get("imap_username") or s["username"], secret)
     except ConnectorError:
         raise
     except Exception as exc:  # noqa: BLE001 — imaplib/ssl/socket lèvent des types variés
@@ -138,6 +230,18 @@ def connect_smtp(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo)
         m.connect(hop.hostname, hop.port)
         if not tls:
             m.starttls(context=tls_context())
+        if s.get("auth") == "oauth":
+            m.ehlo_or_helo_if_needed()
+            code, resp = m.docmd("AUTH", "XOAUTH2 " + base64.b64encode(xoauth2(s["username"], secret)).decode())
+            if code == 334:  # le serveur rend un détail d'erreur en base64 : on termine l'échange
+                code, resp = m.docmd("")
+            if code != 235:
+                raise _smtp_oauth_refusal(code, resp)
+            return m
+        if s.get("smtp_auth") == "plain":  # LOGIN/PLAIN seulement : retire CRAM-MD5 de ce qu'annonce le serveur
+            m.ehlo_or_helo_if_needed()
+            if m.has_extn("auth"):
+                m.esmtp_features["auth"] = " ".join(a for a in m.esmtp_features["auth"].split() if a.upper() != "CRAM-MD5")
         m.login(s["username"], secret)
     except ConnectorError:
         raise
@@ -695,5 +799,5 @@ class MailConnector:
         return f"IMAP et SMTP ok ({count} messages dans la boîte de réception)"
 
 
-__all__ = ["MailConnector", "PRESETS", "WATCH_FOLDER", "connect_imap", "connect_smtp", "normalize_settings",
+__all__ = ["MailConnector", "PRESETS", "PRESET_HELP", "ZOHO_REGIONS", "xoauth2", "WATCH_FOLDER", "connect_imap", "connect_smtp", "normalize_settings",
            "translate_query"]

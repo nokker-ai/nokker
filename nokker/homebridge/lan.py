@@ -1,10 +1,12 @@
-"""Accès au réseau du foyer, TOUJOURS par la liste blanche (`Allowlist`) : HTTP vers une adresse vérifiée (l'IP
-résolue une fois est celle qu'on joint : pas de second tour DNS), TCP brut pour Snapcast. Rien d'autre ne sort."""
+"""Accès au réseau du foyer, TOUJOURS par la liste blanche (`Allowlist`) : HTTP(S) vers une adresse vérifiée (l'IP
+résolue une fois est celle qu'on joint : pas de second tour DNS, y compris en HTTPS où seuls le certificat et le SNI
+portent le nom), TCP brut pour Snapcast. Rien d'autre ne sort."""
 from __future__ import annotations
 
 import http.client
 import json
 import socket
+import ssl
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,6 +18,25 @@ MAX_REPLY = 8 * 1024 * 1024
 
 class LanError(RuntimeError):
     pass
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS vers l'IP déjà vérifiée par la liste blanche : la connexion TCP va sur `ip` (aucune nouvelle résolution,
+    donc pas de rebinding DNS entre le contrôle et la connexion), le certificat et le SNI restent vérifiés sur le nom."""
+
+    def __init__(self, host: str, ip: str, port: int, *, timeout: float,
+                 context: ssl.SSLContext | None = None) -> None:
+        super().__init__(host, port, timeout=timeout, context=context or ssl.create_default_context())
+        self.pinned_ip = ip
+        self.tls_context: ssl.SSLContext = self._context  # type: ignore[attr-defined]
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.pinned_ip, self.port), self.timeout, self.source_address)
+        try:
+            self.sock = self.tls_context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
 
 
 @dataclass
@@ -32,8 +53,8 @@ class Lan:
         ip = self.allow.check(parts.hostname, port)
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         hdrs = {"Host": parts.netloc, **(headers or {})}
-        if parts.scheme == "https":  # certificat au nom de l'hôte : on garde le nom (vérifié ci-dessus)
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(parts.hostname, port, timeout=self.timeout_s)
+        if parts.scheme == "https":  # TCP sur l'IP vérifiée, certificat et SNI au nom de l'hôte
+            conn: http.client.HTTPConnection = PinnedHTTPSConnection(parts.hostname, ip, port, timeout=self.timeout_s)
         else:
             conn = http.client.HTTPConnection(ip, port, timeout=self.timeout_s)
         try:
@@ -61,4 +82,4 @@ class Lan:
             raise LanError(f"{host}:{port} injoignable ({type(e).__name__})") from None
 
 
-__all__ = ["Lan", "LanError"]  # Home Assistant : nokker/homebridge/ha.py (client unique)
+__all__ = ["Lan", "LanError", "PinnedHTTPSConnection"]  # Home Assistant : nokker/homebridge/ha.py (client unique)

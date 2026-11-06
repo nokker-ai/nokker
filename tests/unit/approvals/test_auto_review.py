@@ -146,9 +146,22 @@ class Notifier:
         self.sent.append(approval.id)
 
 
+class SnapshotsOK:
+    """Magasin de points de retour qui couvre tout fil (pas de point, pas d'approbation automatique d'écriture)."""
+
+    @staticmethod
+    def root_of(_thread_id):
+        return "/"
+
+    @staticmethod
+    def check(_root, _tool, _args):
+        return None
+
+
 def kernel(script, reviewer=None, backend=None):
     backend = backend if backend is not None else InMemoryApprovals(notifier=Notifier())
     k, tools = make_kernel(script, approvals=backend)
+    k.card_snapshots = [SnapshotsOK()]
     tools.specs["patch"] = ToolSpec("patch", "patch", {}, Effect.WRITE)
     tools.specs["terminal"] = ToolSpec("terminal", "terminal", {}, Effect.WRITE)
     tools.specs["secret_get"] = ToolSpec("secret_get", "secret", {}, Effect.SECRET)

@@ -8,6 +8,7 @@ import pytest
 
 from nokker.connectors import imap_utf7
 from nokker.connectors.errors import ConnectorError
+from nokker.connectors.net import IMPLICIT_TLS
 from nokker.connectors.mail import (
     MailConnector, _PinnedIMAP, _PinnedSMTP, normalize_settings, translate_query,
 )
@@ -149,6 +150,37 @@ def test_normalize_presets_and_validation():
                 {"preset": "custom", "address": "a@b.org"}):
         with pytest.raises(ConnectorError):
             normalize_settings(bad)
+
+
+def test_presets_table_help_and_endpoints():
+    from nokker.connectors.mail import PRESET_HELP, PRESETS
+    from nokker.connectors.net import check_endpoint
+
+    assert set(PRESET_HELP) == set(PRESETS)
+    assert {"hotmail", "office365", "proton", "tuta"}.isdisjoint(PRESETS)  # Bridge / pas d'IMAP
+    assert PRESETS["outlook"]["auth"] == "oauth"  # Outlook : connexion Microsoft seulement (XOAUTH2)
+    for name, p in PRESETS.items():
+        assert PRESET_HELP[name]["fr"] and PRESET_HELP[name]["en"] and "\n" not in PRESET_HELP[name]["fr"]
+        n = normalize_settings({"preset": name, "address": "a.b@example.org"})
+        public = lambda *a, **k: [(2, 1, 6, "", ("93.184.215.14", 0))]  # noqa: E731 — IP publique factice
+        for proto in ("imap", "smtp"):
+            hop = check_endpoint(n[f"{proto}_host"], n[f"{proto}_port"], proto, resolver=public)
+            assert hop.hostname == p[f"{proto}_host"] or name == "zoho"
+    assert PRESETS["icloud"]["smtp_port"] == 587 and ("smtp", 587) not in IMPLICIT_TLS  # STARTTLS
+    assert PRESETS["gmx"]["smtp_port"] == 587 and PRESETS["web_de"]["smtp_port"] == 587
+
+
+def test_preset_specials_icloud_zoho_bluewin():
+    ic = normalize_settings({"preset": "icloud", "address": "jo.apple@icloud.com"})
+    assert ic["imap_username"] == "jo.apple" and ic["username"] == "jo.apple@icloud.com"  # IMAP : partie locale
+    assert "imap_username" not in normalize_settings({"preset": "icloud", "address": "jo@icloud.com", "username": "x"})
+    z = normalize_settings({"preset": "zoho", "address": "a@example.org"})
+    assert (z["imap_host"], z["smtp_host"], z["region"]) == ("imap.zoho.eu", "smtp.zoho.eu", "eu")
+    z = normalize_settings({"preset": "zoho", "address": "a@example.org", "region": "com"})
+    assert (z["imap_host"], z["smtp_host"]) == ("imap.zoho.com", "smtp.zoho.com")
+    with pytest.raises(ConnectorError):
+        normalize_settings({"preset": "zoho", "address": "a@example.org", "region": "evil.example"})
+    assert normalize_settings({"preset": "bluewin", "address": "a@bluewin.ch"})["smtp_auth"] == "plain"
 
 
 def test_translate_query():

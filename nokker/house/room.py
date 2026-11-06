@@ -376,7 +376,9 @@ class HouseRoom:
         msg = self._append(m, RoomMessage(id=0, household_id=m.household_id, tenant_id=m.household_tenant,
                                           kind="member", text=clean, at=self.clock(), author_account=m.account_id,
                                           author_label=m.label(), audience=agent.audience, origin=origin))
-        run = lambda: self._answer(m, agent, clean, origin=origin, reply_to=msg.id, depth=0)
+        def run():
+            return self._answer(m, agent, clean, origin=origin, reply_to=msg.id, depth=0)
+
         sync = self.spawn is None if wait is None else wait
         if sync:
             reply = run()

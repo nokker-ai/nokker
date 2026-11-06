@@ -18,6 +18,7 @@ from typing import Any
 
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
+from nokker.payments.cardmask import mask_card_text, mask_tool_text
 from nokker.qa.secrets import KnownSecrets, _type_name, redact, redact_messages
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
@@ -354,12 +355,29 @@ class DeterministicInvariants:
 
     def check_input(self, text: str) -> InputCheck:
         red = redact(text, self.known)
-        return InputCheck(text=red.text, redacted=red.names, domain_flags=domain_flags(text))
+        # Numéro de carte collé dans le chat : chiffres masqués avant le modèle et le store (PAYMENTS §2 bis).
+        return InputCheck(text=mask_card_text(red.text), redacted=red.names, domain_flags=domain_flags(text))
 
     def check_action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> Verdict:
         # Outil sans spec déclarée → traité comme WRITE (PLAN §2.3 étape 5, ports.py docstring).
         effect = call_effect(spec, call.arguments)
         subject = call.id
+
+        # Données de carte (PAYMENTS §2 bis), drapeau `payments` allumé ou non : un outil `browser_*` du modèle ne
+        # tape jamais un numéro de carte ni dans un champ de carte — le remplissage appartient à l'agent de paiement.
+        # Même règle et même texte que les portes de paiement (`payments:card_field`).
+        if call.name.startswith("browser_"):
+            from nokker.payments.detect import looks_like_pan
+            from nokker.payments.gates import CARD_REASON, CARD_RULE, browser_verdict
+
+            v = None
+            if call.name in ("browser_type", "browser_fill", "browser_fill_form", "browser_select_option"):
+                v = browser_verdict(None, call, turn.thread_id)
+            elif call.name == "browser_evaluate" and looks_like_pan(str((call.arguments or {}).get("function") or "")):
+                v = Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule=CARD_RULE,
+                            reason=CARD_REASON.format(term="numéro de carte"), subject=subject)
+            if v is not None:
+                return v
 
         if effect is Effect.SEND_BULK:
             return Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="effect:send_bulk",
@@ -432,12 +450,26 @@ class DeterministicInvariants:
         effect = spec.effect if spec is not None else Effect.WRITE
         if effect is Effect.SECRET:
             return self._seal_secret_result(result)
+        result = self._mask_cards(result)
         red = redact(result.content, self.known, weak=False)
         if not red.names:
             return result
         handles = list(dict.fromkeys([*result.secret_handles, *red.names]))
         return ToolResult(call_id=result.call_id, name=result.name, content=red.text, is_error=result.is_error,
                           reservoir_id=result.reservoir_id, secret_handles=handles, app=result.app)
+
+    @staticmethod
+    def _mask_cards(result: ToolResult) -> ToolResult:
+        """Numéros de carte et valeurs des champs de carte masqués (PAYMENTS §2 bis), pour TOUT résultat d'outil :
+        instantané, texte de page, résultat d'un script… Rien d'ajouté au texte, seulement des « • »."""
+        if not isinstance(result.content, str):
+            return result
+        masked = mask_tool_text(result.content)  # + repère « [Masque] » en fin, drapeau `card_mask_notice`
+        if masked == result.content:
+            return result
+        return ToolResult(call_id=result.call_id, name=result.name, content=masked, is_error=result.is_error,
+                          reservoir_id=result.reservoir_id, secret_handles=list(result.secret_handles),
+                          reason=result.reason, app=result.app)
 
     def _seal_secret_result(self, result: ToolResult) -> ToolResult:
         """Résultat d'un outil d'effet `SECRET` (01.11.2026, banc credentiels-pas-de-fuite) : le modèle n'en reçoit
@@ -476,7 +508,7 @@ class DeterministicInvariants:
                           reservoir_id=result.reservoir_id, secret_handles=handles)
 
     def scrub_output(self, text: str) -> str:
-        return redact(text, self.known).text
+        return mask_card_text(redact(text, self.known).text)
 
     def redact_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Filet du fil (`core/loop.py::_wire_messages`, juste avant chaque appel modèle) : coffre + motifs forts sur
@@ -493,7 +525,7 @@ class DeterministicInvariants:
         def scrub(text: str) -> str:
             got = cache.get(text)
             if got is None:
-                got = redact(text, known, weak=False, wire=True).text  # le fil : rien de ce que refuse le Router
+                got = mask_card_text(redact(text, known, weak=False, wire=True).text)  # le fil : rien de ce que refuse le Router ; aucune carte
                 cache[text] = got
             return got
 

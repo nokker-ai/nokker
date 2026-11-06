@@ -379,6 +379,7 @@ _SAFE_HEX_LENGTHS = {7, 8, 10, 12, 32, 40, 64}
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _ENTROPY_CANDIDATE_RE = re.compile(r"\b[A-Za-z0-9+/_]{20,100}={0,2}\b")
+_SSH_FP_RE = re.compile(r"[A-Za-z0-9+/]{43}=?")
 _ENTROPY_THRESHOLD = 3.5  # bits/caractère (Shannon) — repli, pas une preuve
 
 
@@ -507,6 +508,11 @@ def _entropy_candidates(text: str) -> list[str]:
         token = m.group(0)
         in_url = any(start <= m.start() < end for start, end in urls)
         if _looks_like_safe_token(token, in_url):
+            continue
+        # Empreinte de clé d'hôte ssh (`SHA256:` + 43 caractères base64) : publique, et c'est ce qu'on doit COMPARER
+        # avant d'approuver un premier contact (ssh_trust) ; caviardée, la carte affichait « SHA256:[secret:entropy-…] »
+        # (test réel du 05.11). Une valeur connue du coffre reste caviardée par la passe exacte, avant celle-ci.
+        if text[max(0, m.start() - 7):m.start()] == "SHA256:" and _SSH_FP_RE.fullmatch(token):
             continue
         classes = sum(bool(re.search(p, token)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
         if classes < 2:

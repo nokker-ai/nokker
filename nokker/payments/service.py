@@ -26,12 +26,19 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from nokker.payments.mandate import (
+    AGENT_PAY_VIA_CARD,
+    AGENT_PAY_VIA_OWN,
     FORMAT,
     Cart,
     MandateError,
+    agent_card_block,
+    agent_own_block,
+    agent_pay_block,
+    agent_pay_of,
     build_mandate,
     format_minor,
     mandate_sha256,
+    merchant_id,
     new_mandate_id,
     parse_cart,
     principal_handle,
@@ -39,6 +46,7 @@ from nokker.payments.mandate import (
     verify_envelope,
 )
 from nokker.payments.store import Budget, MandateRecord
+from nokker.qa.untrusted import inline
 from nokker.tenancy.context import current_tenant_or_none, tenant_of_thread, tenant_scope
 
 logger = logging.getLogger("nokker.payments")
@@ -146,6 +154,9 @@ class Payments:
     people: Any = field(default_factory=SoloPeople)
     publish: Callable[[str, dict], Any] | None = None  # EventBus.publish (filtré par `_tenant`)
     clock: Callable[[], float] = time.time
+    # Agent de paiement (drapeau `pay_agent`, docs/PAY-AGENT.md) : None = la personne paie toujours elle-même.
+    agent: Any = None  # nokker.payments.agent.PayAgentClient
+    agent_settings: Any = None  # nokker.payments.agent.AgentSettings
     # Instantanés navigateur par fil (posés par `CheckoutWatch`) : références `eN` → libellé, page de paiement vue.
     _refs: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict, init=False, repr=False)
     _checkout: set[tuple[str, str]] = field(default_factory=set, init=False, repr=False)
@@ -342,6 +353,21 @@ class Payments:
     def covers(approval: Any) -> bool:
         return getattr(approval, "tool_name", None) == PAY_TOOL
 
+    def local_passkey_ok(self, approval: Any) -> bool:
+        """Lokkal (docs/PAY-AGENT.md §11) : cette carte se signe-t-elle avec une passkey LOCALE ? Seulement une carte
+        `payments:to_pay` dont le mandat confie le paiement à l'agent avec la carte de la personne (own_card), agent
+        de paiement own_card configuré. Toute autre carte : non (elle se signe chez nokker.ai)."""
+        if not self.covers(approval) or getattr(approval, "rule", None) != PAY_RULE or self.agent is None:
+            return False
+        if getattr(self.agent_settings, "issuer", "") != "own_card":
+            return False
+        try:
+            with tenant_scope(tenant_of_thread(approval.thread_id)):
+                rec = self.store.by_approval(approval.id)
+        except Exception:  # noqa: BLE001 — base illisible : pas de signature locale
+            return False
+        return rec is not None and (agent_pay_of(rec.mandate) or {}).get("via") == AGENT_PAY_VIA_OWN
+
     def on_request(self, approval: Any, account: str | None) -> MandateRecord | None:
         """Carte « à payer » posée : construit le mandat (non signé), l'enregistre, annonce `payment.to_pay`."""
         if not self.covers(approval):
@@ -352,7 +378,8 @@ class Payments:
         valid_until = min(now + self.settings.mandate_ttl_s, float(approval.expires_at))
         mid = new_mandate_id()
         mandate = build_mandate(cart, mandate_id=mid, approval_id=approval.id, args_sha256=approval.args_sha256,
-                                account=account, approver=approver, created_at=now, valid_until=valid_until)
+                                account=account, approver=approver, created_at=now, valid_until=valid_until,
+                                agent_pay=self._agent_pay_for(cart, approver))
         rec = MandateRecord(id=mid, approval_id=approval.id, account=account, approver=approver, status="pending",
                             amount_minor=cart.amount_minor, currency=cart.currency, merchant=cart.merchant,
                             created_at=now, valid_until=valid_until, mandate=mandate,
@@ -424,6 +451,177 @@ class Payments:
             self._emit("payment.rejected", {"mandate_id": rec.id, "approval_id": approval.id,
                                             "thread_id": approval.thread_id, "account": rec.account})
 
+    # ───────────────────────── agent de paiement (drapeau `pay_agent`) ─────────────────────────
+
+    def _agent_pay_for(self, cart: Cart, approver: str | None) -> dict[str, Any] | None:
+        """Bloc `agent_pay` du mandat si l'agent de paiement peut payer : vendeur au profil Stripe connu, source
+        navigateur, moyen enregistré par l'approbateur. Sinon None : la personne paie elle-même (rien ne change)."""
+        if self.agent is None or self.agent_settings is None or cart.source != "browser" or not approver:
+            return None
+        if self.agent_settings.issuer in ("wise", "own_card"):
+            # Carte émise pour cet achat (wise) ou carte de la personne (own_card, Lokkal) : tout marchand https hors
+            # liste de refus, sur l'hôte EXACT du mandat.
+            host = self.agent_settings.card_host(cart.url)
+            if not host or host != merchant_id(cart):
+                return None
+            if self.agent_settings.issuer == "wise":
+                make = lambda: agent_card_block("wise", host)  # noqa: E731
+            else:
+                make = lambda: agent_own_block(host)  # noqa: E731
+        else:
+            profile = self.agent_settings.seller_profile(cart.url)
+            if not profile:
+                return None
+            make = lambda: agent_pay_block(profile)  # noqa: E731
+        try:
+            if not self.agent.method(approver):
+                return None
+            return make()
+        except Exception:  # agent injoignable ou profil mal formé : la personne paie elle-même
+            logger.warning("agent de paiement indisponible à la pose de la carte", exc_info=True)
+            return None
+
+    def active_duplicate(self, account: str | None, cart: Cart) -> str | None:
+        """Drapeau `pay_agent` : mandat ACTIF du même compte pour le même panier chez le même marchand (carte en attente
+        non expirée, ou mandat signé dont le jeton n'est ni désactivé ni utilisé), ou None. Panier = articles (nom,
+        quantité), montant et devise ; marchand = `merchant_id` (hôte du lien, sinon nom) : un lien ou une référence qui
+        change ne fait pas un autre panier."""
+        if self.agent is None or not account:
+            return None
+        key = _cart_key(cart)
+        now = self.clock()
+        for rec in self.store.list_mandates(account):
+            try:
+                other = parse_cart(rec.mandate.get("cart") or {})
+            except MandateError:
+                continue
+            if _cart_key(other) != key or merchant_id(other) != merchant_id(cart):
+                continue
+            if rec.status == "pending" and rec.valid_until > now:
+                return rec.id
+            if rec.status == "signed" and rec.valid_until > now:
+                state = self.store.get_agent(rec.id) or {}
+                if state.get("status") != "deactivated" and not state.get("used"):
+                    return rec.id
+        return None
+
+    def agent_execute(self, rec: MandateRecord) -> tuple[dict[str, Any] | None, str | None]:
+        """Mandat signé qui confie le paiement à l'agent : transmet l'ENVELOPPE (l'agent la revérifie seul).
+        Rend (état du jeton sans numéro de SPT, None) ou (None, code d'erreur)."""
+        from nokker.payments.agent import AgentUnavailable, agent_state
+
+        if self.agent is None or rec.envelope is None or agent_pay_of(rec.mandate) is None:
+            return None, "unreachable"
+        try:
+            tok = self.agent.issue(rec.approver or rec.account or "", rec.envelope,
+                                   kernel_ref=current_tenant_or_none() or "")
+        except AgentUnavailable as e:
+            logger.warning("agent de paiement : jeton refusé pour %s (%s %s)", rec.id, e.status, e.code)
+            return None, e.code
+        state = agent_state(tok)
+        self.store.put_agent(rec.id, state)
+        self._emit_agent(rec, state, tok.get("next_action"))
+        return state, None
+
+    def _emit_agent(self, rec: MandateRecord, state: dict[str, Any], next_action: str | None = None) -> None:
+        data = {"mandate_id": rec.id, "approval_id": rec.approval_id, "account": rec.account,
+                "merchant": rec.merchant, "amount_minor": rec.amount_minor, "currency": rec.currency, "agent": state}
+        if next_action:
+            data["next_action"] = next_action  # à passer à stripe.handleNextAction({hashedValue}) dans le web
+        self._emit("payment.agent", data)
+
+    def on_agent_callback(self, data: dict[str, Any]) -> bool:
+        """Rappel signé de l'agent (3-D Secure demandé, jeton actif, utilisé, désactivé). Faux si mandat inconnu."""
+        mid, ref = str(data.get("mandate_id") or ""), str(data.get("kernel_ref") or "")
+        if not mid or not ref:
+            return False
+        with tenant_scope(ref):
+            rec = self.store.get_mandate(mid)
+            if rec is None or (rec.approver or rec.account) != data.get("account"):
+                return False
+            state = dict(self.store.get_agent(mid) or {})
+            state.update({k: data[k] for k in ("status", "used", "deactivated_reason") if k in data})
+            # émetteur `wise` : défi 3-D Secure en attente (détails de l'émetteur), retiré dès qu'il est tranché
+            if data.get("event") == "3ds_pending" and isinstance(data.get("threeds"), dict):
+                state["threeds"] = _threeds_view(data["threeds"])
+            elif data.get("event") in ("3ds_done", "used", "deactivated"):
+                state.pop("threeds", None)
+            # own_card : ce que la banque demande à la personne (cvv, otp, bank_app) et son échéance, jamais une valeur
+            p = data.get("prompt")
+            if data.get("event") == "prompt" and isinstance(p, dict) and p.get("kind") in ("cvv", "otp", "bank_app"):
+                state["prompt"] = {"kind": p["kind"], "expires_at": p.get("expires_at")}
+            elif data.get("event") in ("prompt_done", "used", "deactivated", "handoff"):
+                state.pop("prompt", None)
+            self.store.put_agent(mid, state)
+            self._emit_agent(rec, state, data.get("next_action") if data.get("event") == "requires_action" else None)
+        return True
+
+    def agent_threeds(self, actor_account: str, mandate_id: str) -> dict[str, Any]:
+        """Défi 3-D Secure en attente pour un mandat payé par carte (approbateur seulement) : détails tels que
+        l'émetteur les envoie et défi à signer avec la passkey (construit par l'agent, pas par le noyau)."""
+        from nokker.payments.agent import AgentUnavailable
+
+        rec = self._agent_rec(actor_account, mandate_id)
+        try:
+            return self.agent.threeds(actor_account, rec.id)
+        except AgentUnavailable as e:
+            raise PaymentError(404 if e.status == 404 else 502, "agent", "aucune confirmation en attente") from None
+
+    def agent_answer_threeds(self, actor_account: str, mandate_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Réponse de la personne au défi 3-D Secure : relayée telle quelle, l'agent vérifie la passkey seul."""
+        from nokker.payments.agent import AgentUnavailable, agent_state
+
+        rec = self._agent_rec(actor_account, mandate_id)
+        proof = body.get("proof") if isinstance(body.get("proof"), dict) else None
+        try:
+            tok = self.agent.answer_threeds(actor_account, rec.id, challenge_id=str(body.get("challenge_id") or ""),
+                                            proof=proof, decline=body.get("decline") is True)
+        except AgentUnavailable as e:
+            code = e.code if e.code in ("proof", "expired", "not_found", "invalid") else "agent"
+            raise PaymentError(e.status if 400 <= e.status < 500 else 502, code, e.message) from None
+        state = agent_state(tok)
+        self.store.put_agent(rec.id, state)
+        self._emit_agent(rec, state)
+        return {**self._route_view(actor_account, rec), "agent": state}
+
+    def agent_provide(self, actor_account: str, mandate_id: str, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        """own_card : CVV ou code de la banque donné par la personne pour CE paiement, relayé tel quel à l'agent de
+        paiement ; le noyau ne le garde pas et ne le journalise pas."""
+        from nokker.payments.agent import AgentUnavailable
+
+        rec = self._agent_rec(actor_account, mandate_id)
+        try:
+            return self.agent.provide(actor_account, rec.id, kind, body.get("value"))
+        except AgentUnavailable as e:
+            raise PaymentError(e.status if 400 <= e.status < 500 else 502, e.code, e.message) from None
+
+    def _agent_rec(self, actor_account: str, mandate_id: str) -> MandateRecord:
+        if self.agent is None:
+            raise PaymentError(404, "not_found", "mandat inconnu")
+        rec = self._find(actor_account, mandate_id, None)
+        block = agent_pay_of(rec.mandate)
+        if block is None or block.get("via") not in (AGENT_PAY_VIA_CARD, AGENT_PAY_VIA_OWN) \
+                or (rec.approver or rec.account) != actor_account:
+            raise PaymentError(404, "not_found", "mandat inconnu")
+        return rec
+
+    def agent_revoke(self, actor_account: str, mandate_id: str) -> dict[str, Any]:
+        from nokker.payments.agent import AgentUnavailable, agent_state
+
+        if self.agent is None:
+            raise PaymentError(404, "not_found", "mandat inconnu")
+        rec = self._find(actor_account, mandate_id, None)
+        if agent_pay_of(rec.mandate) is None or (rec.approver or rec.account) != actor_account:
+            raise PaymentError(404, "not_found", "mandat inconnu")
+        try:
+            tok = self.agent.revoke(actor_account, mandate_id)
+        except AgentUnavailable as e:
+            raise PaymentError(502 if e.status >= 500 else 409, "agent", "révocation impossible pour l'instant") from None
+        state = agent_state(tok)
+        self.store.put_agent(rec.id, state)
+        self._emit_agent(rec, state)
+        return {**self._route_view(actor_account, rec), "agent": state}
+
     # ───────────────────────── lecture ─────────────────────────
 
     def _status(self, rec: MandateRecord) -> str:
@@ -439,6 +637,10 @@ class Payments:
                "valid_until": rec.mandate.get("valid_until"), "mandate_sha256": rec.mandate_sha256,
                "handoff": {"kind": "browser", "url": cart.get("url")}
                if (cart.get("source") or "browser") == "browser" else {"kind": cart.get("source")}}
+        if agent_pay_of(rec.mandate) is not None:  # drapeau `pay_agent` : l'agent paie (clés absentes sinon)
+            out["pay_by"] = "agent"
+            out["handoff"] = {"kind": "agent"}
+            out["agent"] = self.store.get_agent(rec.id)
         if approval is not None:
             out["thread_id"] = approval.thread_id
             out["strength"] = approval.strength
@@ -505,6 +707,20 @@ class Payments:
         trusted = device_key(dev) if device_key is not None and dev else None
         out = verify_envelope(rec.envelope, now=self.clock(), trusted_spki=trusted, expected_origin=origin)
         return {"mandate_id": rec.id, "status": self._status(rec), **out.to_json()}
+
+
+def _threeds_view(d: dict[str, Any]) -> dict[str, Any]:
+    """Défi 3-D Secure gardé par le noyau et montré au web : champs connus seulement, marchand en une ligne."""
+    from nokker.payments.agent import MERCHANT_MAX
+
+    out = {k: d.get(k) for k in ("challenge_id", "amount_minor", "currency", "expires_at") if k in d}
+    out["merchant"] = inline(str(d.get("merchant") or ""), MERCHANT_MAX)
+    return out
+
+
+def _cart_key(cart: Cart) -> tuple:
+    items = tuple(sorted((str(i.get("name", "")).strip().lower(), int(i.get("quantity", 1))) for i in cart.items))
+    return (cart.amount_minor, cart.currency, items)
 
 
 __all__ = ["GUARDIAN_RULE", "PAY_RULE", "PAY_TOOL", "HouseholdPeople", "PaymentError", "Payments", "Person",

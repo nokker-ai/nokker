@@ -23,15 +23,26 @@ class FakeStripe(StripeClient):
         self.subs = {}
         self.gone = set()
         self.bad_coupons = {}
+        self.currencies = []
+        self.price_objs = {}
+        self.price_reads = []
+
+    def get_price(self, price_id):
+        self.price_reads.append(price_id)
+        if self.fail or price_id not in self.price_objs:
+            raise StripeError("unavailable" if self.fail else "resource_missing", 0 if self.fail else 404)
+        return self.price_objs[price_id]
 
     def create_customer(self, email, tenant_id, account_id):
         self.n += 1
         self.calls.append(("customer", email))
         return f"cus_{self.n}"
 
-    def checkout_session(self, customer, price_id, tenant_id, plan, success_url, cancel_url, lang, coupon=None):
+    def checkout_session(self, customer, price_id, tenant_id, plan, success_url, cancel_url, lang, coupon=None,
+                         currency=None):
         if self.fail:
             raise StripeError("unavailable")
+        self.currencies.append(currency)
         self.calls.append(("checkout", customer, price_id, success_url, lang) + ((coupon,) if coupon else ()))
         if coupon and coupon in self.bad_coupons:  # Stripe refuse la requête (coupon inconnu ou expiré)
             raise StripeError(self.bad_coupons[coupon], 400)
@@ -175,7 +186,7 @@ def test_tenants_do_not_see_each_others_subscription(b):
 
 def test_plans_from_config_overrides_caps_without_losing_keys():
     p = plans_from_config({"solo": {"deep_per_day": 40}, "pro": {"turns_per_day": 500, "deep_per_day": 60}})
-    assert p["solo"].caps == {"turns_per_day": 150, "deep_per_day": 40} and p["pro"].caps["turns_per_day"] == 500
+    assert p["solo"].caps == {"turns_per_day": 40, "turns_per_week": 200, "deep_per_day": 40} and p["pro"].caps["turns_per_day"] == 500
     assert DEFAULT_PLANS["solo"].caps["deep_per_day"] == 20
 
 
@@ -324,3 +335,74 @@ def test_refused_coupon_never_blocks_the_subscription(caplog):
     with pytest.raises(BillingError) as e:
         bill.checkout(A, "solo")
     assert e.value.code == "stripe_unavailable"
+
+
+# ─────────────────────── décisions du 05.11 : CHF, quotas des CGU, BYOK ───────────────────────
+CHF_EUR = {"id": "price_solo", "currency": "chf", "unit_amount": 1900, "recurring": {"interval": "month"},
+           "currency_options": {"chf": {"unit_amount": 1900}, "eur": {"unit_amount": 1900}}}
+
+
+def test_solo_suit_les_cgu_et_byok_n_a_pas_de_plafond_propre():
+    assert DEFAULT_PLANS["solo"].caps == {"turns_per_day": 40, "turns_per_week": 200, "deep_per_day": 20}
+    assert DEFAULT_PLANS["byok"].caps == {}  # {} = plafonds par défaut de la bêta (limits.py), pas « illimité »
+
+
+def test_checkout_impose_le_franc(b):
+    b.checkout(A, "solo")
+    assert b.stripe.currencies == ["chf"]
+
+
+def test_le_coupon_beta_ne_vaut_pas_pour_byok():
+    bill = Billing(store=MemoryBilling(), stripe=FakeStripe(), plans=plans_from_config(None),
+                   prices={**PRICES, "byok": "price_byok"}, webhook_secret=SECRET, app_url="https://app.nokker.ai/",
+                   clock=lambda: NOW, coupon="COUPON_TEST")
+    assert bill.coupon_for(A, "byok") is None and bill.coupon_for(A, "solo") == "COUPON_TEST"
+    bill.checkout(A, "byok")
+    assert [c for c in bill.stripe.calls if c[0] == "checkout"][0][-1] == "fr"  # aucun coupon envoyé
+
+
+def test_prix_lu_sur_stripe_en_chf_garde_une_heure_puis_relu(b):
+    b.stripe.price_objs["price_solo"] = CHF_EUR
+    plans = {p["id"]: p for p in b.status(A.tenant_id)["plans"]}
+    assert plans["solo"]["price"] == {"amount": 19, "currency": "CHF", "interval": "month"}
+    assert "price" not in plans["essentiel"]  # prix inconnu de Stripe : carte sans prix
+    reads = len(b.stripe.price_reads)
+    b.status(A.tenant_id)
+    assert len(b.stripe.price_reads) == reads  # cache (y compris l'échec, 5 min)
+    b.clock[0] += 3601
+    b.status(A.tenant_id)
+    assert b.stripe.price_reads.count("price_solo") == 2
+
+
+def test_prix_absent_si_stripe_ne_repond_pas_et_reessaye_apres_cinq_minutes(b):
+    b.stripe.fail = True
+    assert all("price" not in p for p in b.status(A.tenant_id)["plans"])
+    b.stripe.fail = False
+    b.stripe.price_objs["price_solo"] = CHF_EUR
+    b.clock[0] += 299
+    assert b.price("solo") is None
+    b.clock[0] += 2
+    assert b.price("solo") == {"amount": 19, "currency": "CHF", "interval": "month"}
+
+
+def test_price_info_lit_currency_options_et_les_centimes():
+    from nokker.billing.service import price_info
+
+    eur_first = {"currency": "eur", "unit_amount": 900, "recurring": {"interval": "month"},
+                 "currency_options": {"chf": {"unit_amount": 950}}}
+    assert price_info(eur_first, "chf") == {"amount": 9.5, "currency": "CHF", "interval": "month"}
+    assert price_info({"currency": "eur", "unit_amount": 900}, "chf") is None
+
+
+def test_client_stripe_envoie_currency_et_lit_le_prix():
+    sent = []
+
+    def transport(method, url, body, headers, timeout):
+        sent.append((method, url, body.decode()))
+        return 200, {"url": "https://checkout.stripe.test/s", **CHF_EUR}
+
+    c = StripeClient("sk_test_x", transport=transport)
+    c.checkout_session("cus_1", "price_solo", "tn_a", "solo", "s", "c", "fr", currency="chf")
+    assert "currency=chf" in sent[0][2]
+    assert c.get_price("price_solo")["unit_amount"] == 1900
+    assert sent[1][:2] == ("GET", "https://api.stripe.com/v1/prices/price_solo?expand[]=currency_options")

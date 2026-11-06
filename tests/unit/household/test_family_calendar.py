@@ -38,7 +38,7 @@ from nokker.household.paper.pdftext import extract_text
 from nokker.household.paper.service import Paper
 from nokker.household.paper.store import MemoryPaperStore
 from nokker.tenancy.context import tenant_scope
-from tests.unit.household.test_paper_service import Registry, Scripted, _Inner
+from tests.unit.household.helpers import Registry, Scripted, _Inner
 
 FIX = Path(__file__).parent / "fixtures" / "famcal"
 PDF = (FIX / "planning-club.pdf").read_bytes()

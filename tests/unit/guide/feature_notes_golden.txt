@@ -1,0 +1,83 @@
+[Fonction] web_search · version SHA
+Quoi : Chercher sur le web et lire des pages, avec les sources.
+Quand : La réponse demande un fait récent ou une source vérifiable.
+Qui fait : voix
+Comment : web_search(query) pour trouver, puis web_fetch(urls) pour lire les pages retenues ; citer les sources.
+Jamais : Jamais présenter comme vérifié ce qui n'a pas été lu dans une source.
+Exemple : « Trouve les horaires d'ouverture de la piscine et donne la source. »
+
+[Fonction] bubbles · version SHA
+Quoi : Montrer une page (profil, article, site) dans une carte d'aperçu qui reste dans le fil.
+Quand : La personne demande d'afficher ou de montrer une page (profil, article, site).
+Qui fait : voix
+Comment : bubble_show(url) ouvre la bulle, le noyau remplit la carte ; bubble_update(bubble_id) ne met à jour qu'une bulle existante du fil courant.
+Jamais : Jamais de bubble_update ni de navigation juste après bubble_show.
+La personne voit : une carte d'aperçu cliquable (image, titre, description) dans le fil.
+Exemple : « Montre-moi le profil Instagram de l'artiste. »
+
+[Fonction] show_me · version SHA
+Quoi : L'agent montre où cliquer au lieu de le faire à ta place.
+Quand : La personne demande où cliquer ou comment faire dans l'interface.
+Qui fait : voix
+Comment : point_at(caption, ui) montre l'élément de l'interface ; caption dit le geste à faire.
+Jamais : Jamais faire le geste à la place de la personne : on montre, elle fait.
+La personne voit : un repère sur l'élément de l'interface, avec la légende.
+Exemple : « Montre-moi où joindre un fichier. »
+
+[Fonction] approvals · version SHA
+Quoi : Rien d'important ne part sans ton accord : envoi, achat, suppression.
+Quand : Une action forte ou sensible attend l'accord de la personne.
+Qui fait : carte de la personne
+Comment : Le noyau pose la carte quand l'outil l'exige ; l'outil répond EN ATTENTE : dire ce qu'on attend et terminer le tour.
+Jamais : Jamais rappeler l'outil ni escalader pendant qu'une carte attend.
+La personne voit : une carte dans le fil, à approuver ou refuser.
+Exemple : « Prépare le mail, je validerai. »
+
+[Fonction] subagents · version SHA
+Quoi : Confier un travail technique ou une analyse à l'équipe, qui rend un compte rendu.
+Quand : Un travail technique ou une analyse doit être confié et suivi jusqu'au compte rendu.
+Qui fait : équipe via delegate
+Comment : delegate(tasks=[{goal, context}]) ; avant l'appel, dire en une phrase ce qui est confié et qu'on attend la réponse ; ensuite transmettre le compte rendu fidèlement en disant qui a répondu.
+Jamais : Jamais conclure avant le compte rendu ; jamais déléguer un paiement ni une question simple à laquelle la voix sait répondre.
+Exemple : « Compare les offres des trois opérateurs internet pour la maison. »
+
+[Fonction] crew · version SHA
+Quoi : Des agents qui travaillent seuls à heure fixe : veille, brief du matin.
+Quand : La personne veut un agent qui revient régulièrement (veille, rapport).
+Qui fait : voix, carte de la personne
+Comment : agent_draft(name, role, instructions) propose la carte de l'agent ; la personne l'active.
+La personne voit : une carte de création d'agent, qu'elle active.
+Exemple : « Chaque lundi, fais-moi un point sur mes mails. »
+
+[Fonction] rubric · version SHA
+Quoi : Donner des critères vérifiables ; une réponse est notée et reprise si elle ne les remplit pas.
+Quand : Un objectif mérite des critères de réussite vérifiables.
+Qui fait : voix
+Comment : rubric_propose(criteria, objective) propose les critères à la personne.
+Exemple : « La lettre doit tenir sur une page et citer l'annonce. »
+
+[Fonction] code · version SHA
+Quoi : Travailler sur un dépôt de code dans un bac à sable.
+Quand : Un travail porte sur un dépôt de code, dans une session de code.
+Qui fait : voix, équipe via delegate
+Comment : Dans le fil de la session : lire avec read_file et search_files ; faire construire avec delegate (un worktree par sous-agent).
+Jamais : Jamais modifier un fichier soi-même : la voix lit, l'équipe construit ; aucun outil de code hors d'un fil de session de code.
+Exemple : « Ouvre une session sur mon dépôt et corrige le test qui casse. »
+
+[Fonction] connectors · version SHA
+Quoi : Lire, trier et préparer tes mails ; gérer ton agenda.
+Quand : La demande porte sur le mail ou l'agenda de la personne.
+Qui fait : voix, carte de la personne
+Comment : Lire avec mail_search et mail_read, l'agenda avec calendar_events ; préparer avec mail_draft ; créer ou modifier un événement avec calendar_create et calendar_update quand ces outils sont dans ta liste (sinon l'agenda est en lecture seule : dis-le) ; mail_send et calendar_delete posent une carte.
+Jamais : Jamais d'envoi externe ni de suppression sans la carte de la personne.
+La personne voit : pour un envoi, une carte d'approbation avant que le mail parte.
+Exemple : « Qu'est-ce que j'ai reçu d'important aujourd'hui ? »
+
+[Fonction] payments · version SHA
+Quoi : Laisser l'agent acheter dans un budget, chaque achat confirmé.
+Quand : Une demande mène à payer : achat, facture, abonnement.
+Qui fait : voix, carte de la personne
+Comment : pay_request(merchant, amount, currency, items, url) prépare la carte « à payer » ; la carte EST la confirmation : appeler l'outil plutôt que demander en texte. La personne approuve avec sa passkey.
+Jamais : Jamais saisir un numéro de carte ; jamais confier un paiement à un sous-agent.
+La personne voit : une carte « à payer » (marchand, montant, articles), approuvée avec sa passkey.
+Exemple : « Commande les cartouches d'encre habituelles. »

@@ -22,34 +22,119 @@ from typing import Any
 
 READ, DIRECT, STRONG, DENY = "read", "direct", "strong", "deny"
 
-DEFAULT_DIRECT_DOMAINS = ("light", "cover", "climate", "media_player")
-DEFAULT_STRONG_DOMAINS = ("lock", "alarm_control_panel", "camera", "script", "automation")
+DEFAULT_DIRECT_DOMAINS = ("light", "cover", "climate", "media_player", "switch", "fan", "humidifier", "water_heater",
+                          "vacuum", "lawn_mower", "remote", "tts", "assist_satellite", "todo", "calendar",
+                          "input_boolean", "input_select", "input_number", "input_text", "input_datetime", "timer")
+DEFAULT_STRONG_DOMAINS = ("lock", "alarm_control_panel", "camera", "script", "automation", "scene", "valve", "siren",
+                          "button", "input_button", "select", "number", "text")
 # Volets roulants : directs ; porte de garage et portail (classe d'appareil HA) : carte forte.
-STRONG_COVER_CLASSES = frozenset({"garage", "gate"})
+STRONG_COVER_CLASSES = frozenset({"garage", "gate", "door"})
 # Bus physiques écrits directement (KNX, écriture sur le bus depuis HA 2026.10) : jamais une action directe. Absents des
 # listes (défaut) : refusés ; listés par l'utilisateur dans `direct_domains` ou `strong_domains` : carte forte.
 PHYSICAL_BUS_DOMAINS = frozenset({"knx"})
 CONFIG_KINDS = ("automation", "script")
 # Services permis par domaine (grammaire du sous-agent ET politique) ; un domaine ajouté par l'utilisateur sans entrée
-# ici n'a que DEFAULT_SERVICES.
+# ici n'a que DEFAULT_SERVICES. Inventaire vérifié sur Home Assistant 2026.11.0 (`get_services`, intégration demo).
+# Absents à dessein : suppressions (todo.remove_item, remove_completed_items, scene.delete), commandes libres
+# (vacuum.send_command, remote.send_command, remote.learn_command), mises à jour (update.install), redémarrages et
+# rechargements (homeassistant.*, *.reload), conversation.process (contournerait la politique), notify (outil à part).
 SERVICES: dict[str, tuple[str, ...]] = {
     "light": ("turn_on", "turn_off", "toggle"),
-    "cover": ("open_cover", "close_cover", "stop_cover", "set_cover_position"),
-    "climate": ("set_temperature", "set_hvac_mode", "set_preset_mode", "set_fan_mode", "turn_on", "turn_off"),
-    "media_player": ("media_play", "media_pause", "media_stop", "media_next_track", "media_previous_track",
-                     "volume_set", "volume_mute", "turn_on", "turn_off", "select_source"),
+    "switch": ("turn_on", "turn_off", "toggle"),
+    "fan": ("turn_on", "turn_off", "toggle", "set_percentage", "increase_speed", "decrease_speed", "oscillate",
+            "set_direction", "set_preset_mode"),
+    "cover": ("open_cover", "close_cover", "stop_cover", "toggle", "set_cover_position", "open_cover_tilt",
+              "close_cover_tilt", "stop_cover_tilt", "set_cover_tilt_position", "toggle_cover_tilt"),
+    "climate": ("set_temperature", "set_hvac_mode", "set_preset_mode", "set_fan_mode", "set_humidity",
+                "set_swing_mode", "set_swing_horizontal_mode", "turn_on", "turn_off", "toggle"),
+    "humidifier": ("turn_on", "turn_off", "toggle", "set_humidity", "set_mode"),
+    "water_heater": ("turn_on", "turn_off", "set_temperature", "set_operation_mode", "set_away_mode"),
+    "media_player": ("media_play", "media_pause", "media_play_pause", "media_stop", "media_next_track",
+                     "media_previous_track", "media_seek", "volume_set", "volume_up", "volume_down", "volume_mute",
+                     "turn_on", "turn_off", "toggle", "select_source", "select_sound_mode", "shuffle_set",
+                     "repeat_set", "play_media", "clear_playlist", "join", "unjoin"),
+    # Music Assistant : services d'intégration qui visent une entité media_player (TARGET_DOMAIN)
+    "music_assistant": ("play_media", "play_announcement", "transfer_queue"),
+    "tts": ("speak",),
+    "assist_satellite": ("announce",),
+    "vacuum": ("start", "pause", "stop", "return_to_base", "locate", "clean_spot", "clean_area", "set_fan_speed"),
+    "lawn_mower": ("start_mowing", "pause", "dock", "stop"),
+    "remote": ("turn_on", "turn_off", "toggle"),
+    "todo": ("add_item", "update_item"),
+    "calendar": ("create_event",),
+    "input_boolean": ("turn_on", "turn_off", "toggle"),
+    "input_select": ("select_option", "select_next", "select_previous", "select_first", "select_last"),
+    "input_number": ("set_value", "increment", "decrement"),
+    "input_text": ("set_value",),
+    "input_datetime": ("set_datetime",),
+    "timer": ("start", "pause", "cancel", "finish", "change"),
     "lock": ("lock", "unlock", "open"),
-    "alarm_control_panel": ("alarm_arm_home", "alarm_arm_away", "alarm_arm_night", "alarm_disarm"),
-    "camera": ("turn_on", "turn_off", "snapshot", "play_stream", "record"),
+    "alarm_control_panel": ("alarm_arm_home", "alarm_arm_away", "alarm_arm_night", "alarm_arm_vacation",
+                            "alarm_arm_custom_bypass", "alarm_disarm", "alarm_trigger"),
+    "camera": ("turn_on", "turn_off", "enable_motion_detection", "disable_motion_detection"),
+    "valve": ("open_valve", "close_valve", "stop_valve", "set_valve_position", "toggle"),
+    "siren": ("turn_on", "turn_off", "toggle"),
+    "button": ("press",),
+    "input_button": ("press",),
+    "select": ("select_option", "select_next", "select_previous", "select_first", "select_last"),
+    "number": ("set_value",),
+    "text": ("set_value",),
+    "scene": ("turn_on",),
     "script": ("turn_on", "turn_off"),
     "automation": ("trigger", "turn_on", "turn_off"),
     "knx": ("send", "read"),  # bus physique : toujours une carte forte (ou refusé), voir PHYSICAL_BUS_DOMAINS
 }
 DEFAULT_SERVICES = ("turn_on", "turn_off", "toggle")
+# Services d'intégration dont la cible est une entité d'un AUTRE domaine (music_assistant.play_media → media_player.*) et
+# clés de `data` qui désignent d'autres entités : tables partagées avec la passerelle (même contrôle des deux côtés).
+from nokker.homebridge.ha import ENTITY_REF_KEYS, TARGET_DOMAIN  # noqa: E402
+
+# Contenu joué : URI d'un fournisseur ou d'une source média de HA, ou lien https d'un service de musique connu. Jamais
+# une URL http(s) quelconque (HA irait la chercher : requête vers le réseau local), jamais file:, rtsp:, smb:.
+MEDIA_URI_SCHEMES = ("spotify:", "media-source://", "library://", "apple_music://", "tidal://", "deezer://",
+                     "qobuz://", "ytmusic://", "soundcloud://", "tunein://", "radiobrowser://", "plex://",
+                     "jellyfin://", "subsonic://", "spotify://")
+MEDIA_HTTPS_HOSTS = frozenset({"open.spotify.com", "music.apple.com", "music.youtube.com", "www.youtube.com",
+                               "youtube.com", "tidal.com", "listen.tidal.com", "www.deezer.com", "deezer.com",
+                               "soundcloud.com"})
+# Clés jamais écrites au journal (code d'alarme ou de serrure).
+SECRET_DATA_KEYS = frozenset({"code"})
 
 
 def services_for(domain: str) -> tuple[str, ...]:
-    return SERVICES.get(domain, DEFAULT_SERVICES)  # écritures de configuration HA (outil `maison_config`) : toujours fortes
+    return SERVICES.get(domain, DEFAULT_SERVICES)
+
+
+def target_domain(service_domain: str) -> str:
+    """Domaine des entités visées par un service (`music_assistant` → `media_player`) ; sinon le domaine lui-même."""
+    return TARGET_DOMAIN.get(service_domain, service_domain)
+
+
+def media_ref(data: dict[str, Any] | None) -> tuple[str, str]:
+    """(media_content_id, media_content_type) d'un play_media, forme plate ou objet `media` (2026.x)."""
+    d = dict(data or {})
+    media = d.get("media") if isinstance(d.get("media"), dict) else {}
+    cid = d.get("media_content_id", media.get("media_content_id", d.get("media_id", "")))
+    ctype = d.get("media_content_type", media.get("media_content_type", d.get("media_type", "")))
+    return str(cid or "").strip(), str(ctype or "").strip()
+
+
+def is_media_uri(cid: str) -> bool:
+    low = cid.lower()
+    return low.startswith(MEDIA_URI_SCHEMES) or low.startswith(("http://", "https://", "file:", "rtsp:", "rtmp:",
+                                                                 "smb:", "ftp:", "data:"))
+
+
+def media_uri_ok(cid: str) -> bool:
+    low = cid.lower()
+    if low.startswith(MEDIA_URI_SCHEMES):
+        return True
+    if low.startswith("https://"):
+        host = low[8:].split("/", 1)[0].split("?", 1)[0]
+        return host in MEDIA_HTTPS_HOSTS
+    return False
+
+
 TEMPERATURE_KEYS = ("temperature", "target_temp_low", "target_temp_high")
 # Cibles d'un appel : une entité nommée, jamais une zone ou un appareil entier (la politique se juge par entité).
 TARGET_KEYS = frozenset({"entity_id", "area_id", "device_id", "floor_id", "label_id"})
@@ -57,9 +142,10 @@ MAX_TARGETS = 10
 
 DEFAULT_ROLES: dict[str, dict[str, list[str]]] = {
     "adult": {"read": ["*"], "direct": ["*"], "strong": ["*"]},
-    "teen": {"read": ["*"], "direct": ["light", "cover", "climate", "media_player"], "strong": []},
-    "child": {"read": ["light", "media_player", "climate", "sensor", "binary_sensor"],
-              "direct": ["light", "media_player"], "strong": []},
+    "teen": {"read": ["*"], "direct": ["light", "cover", "climate", "media_player", "switch", "fan", "tts",
+                                       "assist_satellite", "todo", "vacuum", "input_boolean", "timer"], "strong": []},
+    "child": {"read": ["light", "media_player", "climate", "sensor", "binary_sensor", "weather", "todo"],
+              "direct": ["light", "media_player", "todo"], "strong": []},
     "guest": {"read": ["light", "cover", "climate", "media_player", "sensor", "binary_sensor", "weather"],
               "direct": ["light", "media_player"], "strong": []},
 }
@@ -74,6 +160,7 @@ def domain_of(entity_id: str) -> str:
 class Classified:
     klass: str  # direct | strong | deny
     reason: str
+    refs: tuple[str, ...] = ()  # entités désignées dans data (ENTITY_REF_KEYS) : droits du membre vérifiés par l'appelant
 
 
 @dataclass(frozen=True)
@@ -196,37 +283,65 @@ class HomePolicy:
         if domain in PHYSICAL_BUS_DOMAINS and domain not in self.direct_domains \
                 and domain not in self.strong_domains:
             return Classified(DENY, f"écriture sur un bus physique ({domain}) exclue par défaut")
+        tdom = target_domain(domain)
         strong_why: list[str] = []
         if domain in PHYSICAL_BUS_DOMAINS:
             strong_why.append(f"écriture sur un bus physique : {domain}")
         for eid in ids:
-            if domain_of(eid) != domain:
-                return Classified(DENY, f"{eid} n'est pas une entité du domaine {domain}")
+            if domain_of(eid) != tdom:
+                return Classified(DENY, f"{eid} n'est pas une entité du domaine {tdom}")
             attrs = attributes(eid) if self.exposed(eid) else None
             if attrs is None:
                 return Classified(DENY, f"entité inconnue : {eid}")
             if eid in self.strong_entities:
                 strong_why.append(f"{eid} : entité sensible (config)")
             elif domain == "cover" and str(attrs.get("device_class") or "") in STRONG_COVER_CLASSES:
-                strong_why.append(f"{eid} : {'garage' if attrs.get('device_class') == 'garage' else 'portail'}")
+                cls = str(attrs.get("device_class"))
+                strong_why.append(f"{eid} : {'garage' if cls == 'garage' else 'portail' if cls == 'gate' else 'porte'}")
+        refs: list[str] = []
+        for key, ref_domain in ENTITY_REF_KEYS.items():
+            if key not in (data or {}):
+                continue
+            raw = (data or {})[key]
+            vals = raw if isinstance(raw, list) else [raw]
+            for ref in vals:
+                ref = str(ref)
+                if domain_of(ref) != ref_domain or not self.exposed(ref) or attributes(ref) is None:
+                    return Classified(DENY, f"{key} : entité inconnue ou d'un autre domaine ({ref[:60]})")
+                refs.append(ref)
+        if len(refs) > MAX_TARGETS:
+            return Classified(DENY, f"au plus {MAX_TARGETS} entités par appel")
+        if service in ("play_media", "play_announcement"):
+            raw_ids = (data or {}).get("media_id")
+            cids = [str(x) for x in raw_ids] if isinstance(raw_ids, list) else [media_ref(data)[0]]
+            for cid in cids:
+                if cid and is_media_uri(cid) and not media_uri_ok(cid):
+                    return Classified(DENY, "contenu refusé : URI d'un service de musique ou source média de Home "
+                                            "Assistant seulement (jamais une URL quelconque)")
         if domain in self.strong_domains:
             strong_why.append(f"domaine sensible : {domain}")
+        if domain == "water_heater" and service == "set_temperature":
+            strong_why.append("consigne d'eau chaude")
         if domain == "climate" and service == "set_temperature":
+            d = dict(data or {})
+            rng = d.get("temperature_range") if isinstance(d.get("temperature_range"), dict) else {}
             for key in TEMPERATURE_KEYS:
-                if key in (data or {}):
+                if key in d or key in rng:
                     try:
-                        value = float((data or {})[key])
+                        value = float(d[key] if key in d else rng[key])
                     except (TypeError, ValueError):
                         return Classified(DENY, f"{key} n'est pas un nombre")
                     if not self.climate_min <= value <= self.climate_max:
                         strong_why.append(f"chauffage hors bornes ({value:g} hors de "
                                           f"{self.climate_min:g}–{self.climate_max:g})")
         if strong_why:
-            return Classified(STRONG, " ; ".join(dict.fromkeys(strong_why)))
-        if domain in self.direct_domains:
-            return Classified(DIRECT, f"domaine direct : {domain}")
+            return Classified(STRONG, " ; ".join(dict.fromkeys(strong_why)), tuple(refs))
+        if tdom in self.direct_domains and (domain == tdom or domain in TARGET_DOMAIN):
+            return Classified(DIRECT, f"domaine direct : {tdom}", tuple(refs))
         return Classified(DENY, f"domaine non autorisé : {domain}")
 
 
 __all__ = ["CONFIG_KINDS", "DEFAULT_DIRECT_DOMAINS", "DEFAULT_ROLES", "DEFAULT_STRONG_DOMAINS", "DENY", "DIRECT",
-           "MAX_TARGETS", "PHYSICAL_BUS_DOMAINS", "READ", "SERVICES", "STRONG", "Classified", "HomePolicy", "RoleRights", "domain_of", "services_for"]
+           "ENTITY_REF_KEYS", "MAX_TARGETS", "PHYSICAL_BUS_DOMAINS", "READ", "SECRET_DATA_KEYS", "SERVICES", "STRONG",
+           "TARGET_DOMAIN", "Classified", "HomePolicy", "RoleRights", "domain_of", "is_media_uri", "media_ref",
+           "media_uri_ok", "services_for", "target_domain"]

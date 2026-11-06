@@ -95,6 +95,9 @@ class Household:
     # Locataire d'un membre dont le registre, le préfixe ou les règles changent (profil, attestation, liste blanche,
     # entrée, sortie) : le serveur y branche `TenantRegistry.forget`.
     on_change: Callable[[str], None] | None = None
+    # Un membre sort du foyer (départ, retrait, suppression du foyer) : (foyer, compte sorti, membres restants). Le
+    # serveur y branche `Connectors.member_gone` (partages de connecteurs, docs/CONNECTORS-MULTI.md). Après la sortie.
+    on_member_gone: Callable[[str, str, list[HouseholdMember]], None] | None = None
     # Facturation (train) : locataire du payeur → palier actif ; None = facturation éteinte, aucun contrôle de plus.
     payer_plan: Callable[[str], str | None] | None = None
     # Palier → ses plafonds (`turns_per_day`, `turns_per_week`, `household_members`) ; posé avec `payer_plan`.
@@ -198,10 +201,21 @@ class Household:
 
     def delete(self, actor: Any) -> dict[str, Any]:
         p, _ = self._payer(actor)
-        others = [r.account_id for r in self.store.hh_members(actor, p.id) if not r.payer]
+        rows = self.store.hh_members(actor, p.id)
+        others = [r.account_id for r in rows if not r.payer]
         self.store.delete_project(actor, p)
         self._changed(actor.account_id, *others)
+        for r in rows:
+            self._gone(p.id, r.account_id, rows)
         return {"deleted": True}
+
+    def _gone(self, household_id: str, account_id: str, members: list[HouseholdMember]) -> None:
+        if self.on_member_gone is None:
+            return
+        try:
+            self.on_member_gone(household_id, account_id, [m for m in members if m.account_id != account_id])
+        except Exception:  # noqa: BLE001 — la sortie est faite ; un nettoyage raté se refait (la RLS ferme déjà l'accès)
+            logger.warning("foyer : nettoyage après la sortie de %s en échec", account_id, exc_info=True)
 
     def _line(self, r: HouseholdMember, me: str, usage: dict[str, Any] | None,
               settings: Settings | None = None) -> dict[str, Any]:
@@ -370,10 +384,12 @@ class Household:
             target = self._target(actor, p, account_id)
             if target.payer:
                 raise TeamError(409, "payer_fixed", "le payeur ne se retire pas")
+        rows = self.store.hh_members(actor, p.id)
         self.store.remove_member(actor, p, account_id)
         if target.minor and mine.payer:
             self.store.revoke_consents(actor, p.id, target.email, actor.account_id, self.clock())
         self._changed(account_id)
+        self._gone(p.id, account_id, rows)
         return {"removed": True}
 
     def set_cap(self, actor: Any, account_id: str, body: Any) -> dict[str, Any]:

@@ -84,10 +84,11 @@ def _urllib(method: str, url: str, body: bytes, headers: dict[str, str], timeout
 
 class StripeClient:
     def __init__(self, secret_key: str, timeout_s: float = 20.0, transport: Transport | None = None,
-                 base_url: str = API):
+                 base_url: str = API, portal_configuration: str = ""):
         if not secret_key:
             raise ValueError("clé secrète Stripe requise")
         self._base, self._timeout, self._send = base_url.rstrip("/"), timeout_s, transport or _urllib
+        self._portal_configuration = portal_configuration
         self._headers = {"Authorization": f"Bearer {secret_key}", "User-Agent": "nokker-core/1 (billing)",
                          "Content-Type": "application/x-www-form-urlencoded"}
 
@@ -111,9 +112,11 @@ class StripeClient:
         return str(r["id"])
 
     def checkout_session(self, customer: str, price_id: str, tenant_id: str, plan: str, success_url: str,
-                         cancel_url: str, lang: str, coupon: str | None = None) -> str:
+                         cancel_url: str, lang: str, coupon: str | None = None, currency: str | None = None) -> str:
         """Session Checkout d'abonnement. `coupon` (id d'un coupon Stripe) : remise appliquée d'office par
-        `discounts` ; Stripe refuse `discounts` avec `allow_promotion_codes`, qui n'est donc jamais envoyé."""
+        `discounts` ; Stripe refuse `discounts` avec `allow_promotion_codes`, qui n'est donc jamais envoyé. `currency` :
+        monnaie imposée à la session (le prix doit l'avoir, en monnaie principale ou dans `currency_options`) ; sans
+        elle, Stripe choisit la monnaie d'après le client (vu le 05.11 : EUR pour un prix CHF+EUR)."""
         params: dict[str, Any] = {
             "mode": "subscription", "customer": customer, "client_reference_id": tenant_id,
             "line_items": [{"price": price_id, "quantity": 1}],
@@ -122,10 +125,40 @@ class StripeClient:
         }
         if coupon:
             params["discounts"] = [{"coupon": coupon}]
+        if currency:
+            params["currency"] = currency
         return str(self._call("POST", "checkout/sessions", params)["url"])
 
+    def checkout_trial(self, customer: str, price_id: str, tenant_id: str, plan: str, success_url: str, cancel_url: str,
+                       lang: str, *, trial_end: int, expires_at: int, voucher: str,
+                       currency: str | None = None) -> tuple[str, str]:
+        """Session Checkout d'ESSAI (voucher) : carte toujours demandée, premier débit à `trial_end`, aucune remise
+        (jamais de coupon avec un essai). Rend (id de session, url) : l'id rattache la réservation du code."""
+        params: dict[str, Any] = {
+            "mode": "subscription", "customer": customer, "client_reference_id": tenant_id,
+            "line_items": [{"price": price_id, "quantity": 1}], "payment_method_collection": "always",
+            "success_url": success_url, "cancel_url": cancel_url, "locale": "fr" if lang == "fr" else "en",
+            "expires_at": expires_at, "metadata": {"tenant_id": tenant_id, "plan": plan, "voucher": voucher},
+            "subscription_data": {"metadata": {"tenant_id": tenant_id, "plan": plan, "voucher": voucher},
+                                  "trial_end": trial_end,
+                                  "trial_settings": {"end_behavior": {"missing_payment_method": "cancel"}}},
+        }
+        if currency:
+            params["currency"] = currency
+        r = self._call("POST", "checkout/sessions", params)
+        return str(r["id"]), str(r["url"])
+
+    def get_price(self, price_id: str) -> dict[str, Any]:
+        """Un prix, avec ses `currency_options` (montant par monnaie)."""
+        return self._call("GET", f"prices/{urllib_parse.quote(price_id, safe='')}?expand[]=currency_options")
+
     def portal_session(self, customer: str, return_url: str) -> str:
-        return str(self._call("POST", "billing_portal/sessions", {"customer": customer, "return_url": return_url})["url"])
+        """Portail client. Avec `portal_configuration` (bpc_…), le portail de Nokker (titre, CGU, confidentialité) ;
+        sans, la configuration par défaut du compte Stripe, partagée avec les autres produits de Ninabot."""
+        params = {"customer": customer, "return_url": return_url}
+        if self._portal_configuration:
+            params["configuration"] = self._portal_configuration
+        return str(self._call("POST", "billing_portal/sessions", params)["url"])
 
     def list_subscriptions(self, customer: str) -> list[dict[str, Any]]:
         """Tous les abonnements du client, y compris résiliés (l'appelant filtre). 100 suffisent : un locataire en a 1."""

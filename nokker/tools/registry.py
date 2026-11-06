@@ -166,6 +166,8 @@ class Registry:
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         for src in self.sources:
             if any(s.name == name for s in src.specs()):
+                if name == SCREENSHOT_TOOL and any(s.name == EVALUATE_TOOL for s in src.specs()):
+                    return _masked_screenshot(src, arguments, ctx)
                 return src.call(name, arguments, ctx)
         return unknown_tool_result(name)
 
@@ -174,6 +176,33 @@ class Registry:
             close = getattr(src, "close", None)
             if callable(close):
                 close()
+
+
+SCREENSHOT_TOOL = "browser_take_screenshot"
+EVALUATE_TOOL = "browser_evaluate"
+
+
+def _masked_screenshot(src: Any, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Capture d'écran sans données de carte (PAYMENTS §2 bis) : champs de carte et iframes de prestataires de paiement
+    floutés le temps de la capture, sur l'onglet de la capture (même `lane`). Si le masque ne peut pas se poser, pas de
+    capture : le texte de l'instantané reste disponible."""
+    from nokker.payments.cardmask import MASK_SCRIPT, UNMASK_SCRIPT, screenshot_refused_text
+
+    lane = {"lane": arguments["lane"]} if "lane" in arguments else {}
+    try:
+        masked = src.call(EVALUATE_TOOL, {"function": MASK_SCRIPT, **lane}, ctx)
+    except Exception:  # noqa: BLE001 — navigateur injoignable : la capture échouera de même
+        masked = None
+    if masked is None or getattr(masked, "is_error", True):
+        return ToolResult(call_id="", name=SCREENSHOT_TOOL, is_error=True,
+                          content=screenshot_refused_text())
+    try:
+        return src.call(SCREENSHOT_TOOL, arguments, ctx)
+    finally:
+        try:
+            src.call(EVALUATE_TOOL, {"function": UNMASK_SCRIPT, **lane}, ctx)
+        except Exception:  # noqa: BLE001 — le masque reste posé : sans effet sur la page, seulement visuel
+            pass
 
 
 __all__ = ["Registry", "StaticToolSource", "builtin_core_source"]

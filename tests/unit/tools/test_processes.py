@@ -24,6 +24,7 @@ from nokker.tools.code import PROCESS_TOOLS, CodeToolSource
 from nokker.tools.processes import (
     PreviewSigner, ProcessError, ProcessTable, is_process_id, reap_processes,
 )
+from tests.unit.tools.fenced import parse
 
 CTX = ToolContext(thread_id="th_bg", turn_index=0, channel="api")
 PY = sys.executable
@@ -276,13 +277,13 @@ def test_tools_end_to_end_and_close_stops_everything(tmp_path, monkeypatch):
     try:
         r = src.call("process_start", {"command": f"{PY} -u -c \"print('écoute'); import time; time.sleep(30)\"",
                                        "name": "srv", "port": 5173}, CTX)
-        started = json.loads(r.content)
+        started = parse(r.content)
         assert not r.is_error and started["state"] == "running" and started["port"] == 5173
         assert "aperçu privé" in started["hint"]
         pid = started["id"]
         listing = json.loads(src.call("process_list", {}, CTX).content)["processes"]
         assert [p["id"] for p in listing] == [pid]
-        assert _wait(lambda: "écoute" in json.loads(src.call("process_logs", {"id": pid}, CTX).content)["output"])
+        assert _wait(lambda: "écoute" in parse(src.call("process_logs", {"id": pid}, CTX).content)["output"])
         other = ToolContext(thread_id="th_autre", turn_index=0, channel="api")
         assert src.call("process_stop", {"id": pid}, other).is_error  # un autre fil ne l'arrête pas
         assert json.loads(src.call("process_list", {}, other).content)["processes"] == []
@@ -371,7 +372,7 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         monkeypatch.setattr(src, "_open", lambda t: code.Workspace(env=ShellEnv(str(app)), ops=None, todos=None,
                                                                    cwd=str(app)))
         ctx = ToolContext(thread_id=tid, turn_index=0, channel="api")
-        started = json.loads(src.call("process_start", {"command": f"{PY} -u -m http.server {dev} --bind 127.0.0.1",
+        started = parse(src.call("process_start", {"command": f"{PY} -u -m http.server {dev} --bind 127.0.0.1",
                                                         "port": dev}, ctx).content)
         pid = started["id"]
         # Prêt quand le serveur le dit (il écoute), pas au bout d'un délai fixe ; le port réservé est alors rendu.
@@ -452,7 +453,7 @@ def test_docker_background_server_logs_preview_and_cleanup(monkeypatch):
                               capture_output=True, text=True, check=True).stdout.split()
 
     try:
-        r = json.loads(src.call("process_start", {"command": "python3 -u -m http.server 8000 --bind 127.0.0.1",
+        r = parse(src.call("process_start", {"command": "python3 -u -m http.server 8000 --bind 127.0.0.1",
                                                   "name": "web", "port": 8000}, ctx).content)
         pid = r["id"]
         assert r["state"] == "running", r
@@ -464,7 +465,7 @@ def test_docker_background_server_logs_preview_and_cleanup(monkeypatch):
         assert _wait(lambda: table.fetch(pid, "/index.html")[0] == 200, timeout=15)
         status, ctype, body, _ = table.fetch(pid, "/index.html")  # joint DANS le bac à sable
         assert "bac à sable" in body.decode() and ctype.startswith("text/html")
-        assert _wait(lambda: "GET /index.html" in json.loads(src.call("process_logs", {"id": pid}, ctx).content)
+        assert _wait(lambda: "GET /index.html" in parse(src.call("process_logs", {"id": pid}, ctx).content)
                      ["output"], timeout=10)
         log_in_box = subprocess.run(["docker", "exec", cid, "ls", "/tmp/.nokker-bg"], capture_output=True,
                                     text=True).stdout

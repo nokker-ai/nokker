@@ -104,3 +104,15 @@ def test_checkout_applies_the_beta_coupon_by_discounts_never_with_promotion_code
         body = _checkout_body(**none)
         assert not any(k.startswith(("discounts", "allow_promotion_codes")) for k in body)
         assert body["line_items[0][price]"] == ["price_f"] and body["mode"] == ["subscription"]
+
+
+def test_portal_session_passes_the_nokker_configuration_when_set():
+    seen = []
+
+    def tr(method, url, body, headers, timeout):
+        seen.append(body.decode())
+        return 200, {"url": "https://billing.stripe.com/p/x"}
+
+    StripeClient("sk", transport=tr, portal_configuration="bpc_nokker").portal_session("cus_1", "https://app/account")
+    StripeClient("sk", transport=tr).portal_session("cus_1", "https://app/account")
+    assert "configuration=bpc_nokker" in seen[0] and "configuration" not in seen[1]

@@ -123,10 +123,22 @@ class SokkanProvider:
     vision: bool = False
     # `vision: auto` (nokker/providers/vision_probe.py) : sonde unique au premier tour avec image ; None = pas de sonde.
     vision_probe: Any = None
+    # Échantillonnage fixe du palier (`tiers.<nom>.sampling`, ex. {"temperature": 0.3} pour le palier nina, entraîné et
+    # mesuré à T=0,3) : ajouté à chaque corps AVANT le corps de raisonnement. Vide (défaut) = défaut de l'amont, inchangé.
+    sampling_body: dict[str, Any] = field(default_factory=dict)
+    # Client HTTP construit par l'appelant (`timeout` → `httpx.Client`) : BYOK cloud, client gardé contre le SSRF et
+    # revérifié à chaque connexion (nokker/byok/guard.py). None = client httpx ordinaire (comportement historique).
+    client_factory: Callable[[httpx.Timeout], httpx.Client] | None = None
+    # En-tête `X-Session-Id` (affinité du Router) : coupé vers un amont tiers, qui n'a pas à voir nos identifiants de fil.
+    session_header: bool = True
 
     def __post_init__(self) -> None:
-        self._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
+        self._client = self._new_client()
         self._closed = False
+
+    def _new_client(self) -> httpx.Client:
+        timeout = self._httpx_timeout(self.timeout_s)
+        return self.client_factory(timeout) if self.client_factory is not None else httpx.Client(timeout=timeout)
 
     def _httpx_timeout(self, t: float) -> httpx.Timeout:
         """Lecture, écriture, pool : `t` ; connexion (TLS compris) : `connect_timeout_s`, jamais plus que `t`."""
@@ -138,7 +150,7 @@ class SokkanProvider:
         côté amont : un `recv` bloqué ne se réveille pas d'un autre thread, et le Router ne libère la place qu'à la
         fin de la réponse."""
         twin = copy.copy(self)
-        twin._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
+        twin._client = self._new_client()
         twin._closed = False
         return twin
 
@@ -208,9 +220,12 @@ class SokkanProvider:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        body.update(self.sampling_body)
         body.update(self.reasoning_on_body if reasoning else self.reasoning_off_body)
 
-        headers = {"Content-Type": "application/json", "X-Session-Id": session_key}
+        headers = {"Content-Type": "application/json"}
+        if self.session_header:
+            headers["X-Session-Id"] = session_key
         if self.api_key:  # un amont sans auth (ex. llama.cpp local) refuse un Bearer vide
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update(self.extra_headers)

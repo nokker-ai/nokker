@@ -13,6 +13,10 @@
 #   openbao, vault-unseal    profil `vault` (install.sh --vault, COMPOSE_PROFILES=vault dans .env) : coffre OpenBao
 #               des secrets du noyau, et son compagnon qui le descelle (mode auto) ; vault-init (profil vault-init,
 #               lancé une fois par l'installeur) l'initialise. La part et le root token n'entrent jamais dans `core`.
+#   payagent, paychrome, testshop   profil `pay` (éteint par défaut ; docs/PAY-AGENT.md §11) : l'agent de paiement
+#               « ta carte » (la carte de la personne dans le coffre, montage `payagent/` que le noyau ne lit pas), son
+#               navigateur de checkout DÉDIÉ (CDP sur `paynet`, jamais celui du modèle) et un marchand de TEST sans PSP ;
+#               vault-pay-init (profil pay-init, une fois) donne à l'agent son AppRole, coffre neuf ou existant.
 #   ollama, local-llm-pull   profil `local-llm` (install.sh --local-llm, COMPOSE_PROFILES=local-llm) : moteur
 #               d'inférence local (Ollama, CPU) et le job qui tire le modèle NOKKER_LOCAL_LLM_MODEL ; le noyau le
 #               détecte (NOKKER_OLLAMA_URLS) et /setup le propose comme modèle local. Aucun port publié.
@@ -26,6 +30,7 @@
 #   coreout     core ↔ egress seulement — interne : la sortie de core (modèles, canaux, forges) passe par egress, qui
 #               refuse les plages privées (box, NAS, métadonnées cloud) ; core n'a plus de route directe
 #   outbound    egress, embed et ollama (téléchargement des modèles)
+#   paynet      payagent ↔ paychrome ↔ testshop (profil pay) — interne : ni Internet, ni le noyau
 name: nokker
 
 x-hardening: &hardening
@@ -70,8 +75,8 @@ services:
       HTTPS_PROXY: http://egress:3128
       http_proxy: http://egress:3128
       https_proxy: http://egress:3128
-      NO_PROXY: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
-      no_proxy: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
+      NO_PROXY: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge,payagent
+      no_proxy: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge,payagent
       # Réseau des bacs à sable de CETTE installation (config : code.network_name_env), le seul que le proxy accepte.
       NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
@@ -91,6 +96,9 @@ services:
       # Coffre (LOKKAL §7 X4) : `file` (vault.bin, NOKKER_LOCAL_SECRET_KEY) sans le profil vault ; `openbao` avec. Le
       # noyau ne reçoit que role_id et secret_id de l'AppRole nokker-core, en fichiers (rien dans l'environnement).
       NOKKER_SECRETS_PROVIDER: ${NOKKER_SECRETS_PROVIDER:-file}
+      # Agent de paiement (profil pay) : jeton du noyau vers l'agent, secret des rappels signés ; vides sans le profil.
+      NOKKER_PAY_AGENT_TOKEN: ${NOKKER_PAY_AGENT_TOKEN:-}
+      NOKKER_PAY_AGENT_CALLBACK_SECRET: ${NOKKER_PAY_AGENT_CALLBACK_SECRET:-}
       NOKKER_OPENBAO_ADDR: http://openbao:8200
       NOKKER_OPENBAO_ROLE_ID_FILE: /run/nokker-vault/role_id
       NOKKER_OPENBAO_SECRET_ID_FILE: /run/nokker-vault/secret_id
@@ -121,6 +129,7 @@ services:
     depends_on: {core: {condition: service_healthy}}
     volumes:
       - ./web/lokkal.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./web/security-headers.conf:/etc/nginx/snippets/lokkal-security-headers.conf:ro
     networks: [internal, front]   # un port n'est publié que depuis un réseau non interne : `front`, rien d'autre dessus
     ports: ["127.0.0.1:${NOKKER_PORT:-7420}:8080", "127.0.0.1:${NOKKER_API_PORT:-8742}:8742"]   # web, et API du noyau relayée
     mem_limit: 128m
@@ -184,6 +193,7 @@ services:
       PGDATABASE: nokker
       NOKKER_OWNER_PASSWORD: ${NOKKER_OWNER_PASSWORD:?}
       NOKKER_APP_PASSWORD: ${NOKKER_APP_PASSWORD:?}
+      NOKKER_PAY_AGENT_PASSWORD: ${NOKKER_PAY_AGENT_PASSWORD:-}   # profil pay seulement (sql/roles.sh)
     volumes: &sql
       - ./sql:/sql:ro
     networks: [internal]
@@ -234,6 +244,11 @@ services:
     image: ${NOKKER_SANDBOXD_IMAGE:-ghcr.io/nokker-ai/sandboxd}:${NOKKER_VERSION}
     command: ["python3", "egress.py"]
     read_only: true
+    # Hôtes ssh déclarés (docs/en/ops.md) : liste écrite par le noyau (state/egress/ssh-hosts.json, 0640), lue par le
+    # groupe de l'utilisateur ; rien d'autre du dossier d'état (ni coffre, ni jeton local).
+    group_add: ["${NOKKER_GID:?}"]
+    volumes:
+      - ${NOKKER_STATE_DIR:?}/egress:/etc/nokker/egress:ro
     networks: [sandbox, coreout, outbound]
     mem_limit: 64m
 
@@ -310,6 +325,84 @@ services:
       - ./vault/unseal:/vault/unseal
       - ./vault/approle:/vault/approle
     networks: [internal]
+
+  # ---- profil pay (agent de paiement « ta carte », docs/PAY-AGENT.md §11) — éteint par défaut ------------------
+  # COMPOSE_PROFILES=…,pay dans .env (jamais `--profile pay up` : il remplacerait vault/local-llm le temps de l'appel).
+  # Images pas encore publiées : construites sur la machine (pull_policy: never ; `compose pull` les ignore). Variables en
+  # `:-` (compose interpole TOUT le fichier, profils éteints compris) : l'agent refuse de démarrer à moitié configuré.
+  vault-pay-init:
+    <<: *hardening
+    profiles: [pay-init]
+    restart: "no"
+    image: ${NOKKER_OPENBAO_IMAGE:-openbao/openbao:2.4.1}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    entrypoint: ["/bin/sh", "/vault/pay-init.sh"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      HOME: /tmp
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./vault/pay-init.sh:/vault/pay-init.sh:ro
+      - ./vault/unseal:/vault/unseal:ro
+      - ./vault/approle-pay:/vault/approle-pay      # À PART : jamais monté dans core
+    networks: [internal]
+
+  payagent:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_PAYAGENT_IMAGE:-ghcr.io/nokker-ai/pay-agent}:${NOKKER_VERSION}
+    pull_policy: never
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"   # lit ./vault/approle-pay (0600, à l'utilisateur)
+    depends_on:
+      grants: {condition: service_completed_successfully}
+      paychrome: {condition: service_started}
+    environment:
+      PAYAGENT_ISSUER: own_card
+      PAYAGENT_KERNEL_TOKEN: ${NOKKER_PAY_AGENT_TOKEN:-}
+      PAYAGENT_CALLBACK_URL: http://core:8742/v1/payments/agent/events
+      PAYAGENT_CALLBACK_HOST: 127.0.0.1:8742   # Host admis par le noyau (local.allowed_hosts)
+      PAYAGENT_CALLBACK_SECRET: ${NOKKER_PAY_AGENT_CALLBACK_SECRET:-}
+      PAYAGENT_WEBAUTHN_ORIGIN: http://localhost:${NOKKER_PORT:-7420}   # passkey locale (rpId localhost)
+      PAYAGENT_DSN: postgresql://nokker_pay_agent:${NOKKER_PAY_AGENT_PASSWORD:-}@postgres:5432/nokker
+      PAYAGENT_CURRENCIES: CHF,EUR
+      NOKKER_OPENBAO_ADDR: http://openbao:8200
+      NOKKER_OPENBAO_ROLE_ID_FILE: /run/payagent-vault/role_id
+      NOKKER_OPENBAO_SECRET_ID_FILE: /run/payagent-vault/secret_id
+      PAYAGENT_CHECKOUT_CDP_URL: http://paychrome:9223
+      PAYAGENT_TEST_HTTP_HOSTS: ${NOKKER_PAY_TEST_HTTP_HOSTS:-}   # marchand de test seulement (shop.nokker.test)
+    volumes:
+      - ./vault/approle-pay:/run/payagent-vault:ro
+    networks: [internal, paynet]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 384m
+
+  paychrome:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_PAYCHROME_IMAGE:-ghcr.io/nokker-ai/pay-chrome}:${NOKKER_VERSION}
+    pull_policy: never
+    environment:
+      HOME: /tmp
+    read_only: true
+    tmpfs: [/tmp]
+    shm_size: 256m
+    networks: [paynet]     # aucune sortie : le marchand de test seulement (un vrai marchand : par egress, à venir)
+    mem_limit: 768m
+
+  testshop:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_TESTSHOP_IMAGE:-python:3.12-alpine}
+    user: "65534:65534"
+    entrypoint: ["python3", "/shop/shop.py", "--port", "8099"]
+    read_only: true
+    volumes:
+      - ./testshop:/shop:ro
+    networks:
+      paynet: {aliases: [shop.nokker.test]}
+    mem_limit: 64m
 
   # ---- profil local-llm -----------------------------------------------------------------------------------
   ollama:
@@ -411,3 +504,4 @@ networks:
     internal: true
   outbound: {}
   front: {}
+  paynet: {internal: true}   # profil pay : payagent ↔ paychrome ↔ testshop

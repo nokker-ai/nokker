@@ -65,6 +65,13 @@ _GO_WORDS = re.compile(r"\b(oui|ouais|yes|go|vas[- ]?y|fais[- ]le|fais|lance\w*|
                        r"confirme\w*|d'accord|dac|ok pour|on y va|allons[- ]y|c'est parti|envo[iy]\w*|supprim\w*|"
                        r"efface\w*|install\w*|pousse\w*|push|merge|publie\w*|paye?\w*|vire\w*|transf[eè]re\w*)\b")
 
+# Acquittement seul (« OK », « d'accord », « parfait »…) : trivial SEULEMENT au premier tour d'un fil, où il n'y a encore
+# rien à approuver. Plus loin, il peut répondre à « je supprime ? » : la règle des mots de GO s'applique (jamais trivial).
+# Mesuré sur une machine de test le 05.11 : un « OK » en session neuve partait sur Ship, explorait le dossier (2 à 3 appels, outils).
+_ACK = {"ok", "okay", "oké", "d'accord", "dac", "parfait", "super", "top", "cool", "nickel", "génial", "excellent",
+        "bien", "noté", "compris", "entendu", "merci", "thanks", "👍", "🙂", "😊"}
+_ACK_CORE = {"ok", "okay", "oké", "d'accord", "dac", "parfait", "super", "top", "noté", "compris", "entendu"}
+
 _CODE_FENCE = re.compile(r"```")
 _TRACE = re.compile(r"traceback \(most recent call last\)|\b(error|exception|erreur)\b.*\bline \d+|"
                     r"\bat .+:\d+:\d+\)|\bsegmentation fault\b|\bpanicked at\b", re.IGNORECASE)
@@ -91,6 +98,25 @@ _CODE_ASK = re.compile(
     r"tests? (unitaires?|qui (échoue|casse|passe))|pytest|jest|vitest|npm|pip install|cargo|"
     r"pull request|\bpr\b|commit|diff|patch|merge conflict|conflit de fusion|migration sql|schéma sql|"
     r"function|endpoint|api rest|regex)\b", re.IGNORECASE)
+# Drapeau `route_relay_voice` : une demande de résumé ou de relais d'un document (« résume », « fasse … zusammen »,
+# « summarize », « riassumi », « que dit le rapport ») reste sur le palier de la voix même si elle ou le document
+# contient des mots techniques (« build », « commit », « migration ») qui la classeraient en code. Règle de PRIORITÉ :
+# elle ne retire aucun mot de `_CODE_ASK` et cède à une vraie demande de code (`_CODE_ACTION`, fichier source, bloc de
+# code, trace). Banc du palier 03.11 : « Der Build-Agent … Fass ihn mir … zusammen » partait en Deep sur « build ».
+_RELAY_ASK = re.compile(
+    r"\b(résume[rsz]?|résume-(le|la|les)|résumé|synthèse|synthétise[rz]?|redis-moi|relaie|que dit (le|la|l')|"
+    r"qu'est-ce que (dit|raconte) (le|la|l')|"
+    r"zusammenfass\w*|fass\w*\b.{0,80}\bzusammen|was (sagt|steht in|steht im)|"
+    r"summari[sz]e\w*|summary|recap|tl;?dr|what does\b.{0,80}\bsay|"
+    r"riassum\w*|riassunto|sintetizza\w*|(che )?cosa dice)\b", re.IGNORECASE)
+# Verbes d'une vraie demande de code (sous-ensemble de `_CODE_ASK` : les verbes, pas les noms « build », « commit »…).
+_CODE_ACTION = re.compile(
+    r"\b(corrige|corriger|fixe?r?|fix|debug(ue)?r?|implémente[rz]?|implement|refactor(ise)?r?|réécri[st]|"
+    r"ajoute[rz]? (un |une |des )?(test|fonction|méthode|classe|endpoint|route|option|champ|module)|"
+    r"écri[st] (un |une |le |la |des )?(test|fonction|script|classe|code|module|programme)|"
+    r"write (a |the )?(test|function|script|class|module|program)|"
+    r"(renomme|supprime|crée|déplace|extrai[st]) (la |le |une |un |cette |ce )?(variable|fonction|méthode|classe))\b",
+    re.IGNORECASE)
 # Objet de code nommé par un identifiant (`slugify`, `parse_date()`, `InvoiceRow`) : la fonction ou la classe d'un
 # programme, pas celle d'un bouton ou d'un élève.
 _CODE_IDENT = re.compile(r"\b(fonction|méthode|classe|class|variable)\s+`?([a-z]+_[\w]*|[a-z]+[A-Z]\w*|\w+\(\)|"
@@ -101,8 +127,12 @@ _OTHER_TOPIC = re.compile(r"\b(mail|courriel|agenda|planning|rendez-vous|rdv|ré
 _CONTINUATION_MAX_CHARS = 200
 
 
-def classify_rules(text: str, previous: TaskClass | None = None) -> Classified:
-    """Étage 1 : règles, sans appel. `previous` = classe du tour précédent du fil (None : premier tour connu)."""
+def classify_rules(text: str, previous: TaskClass | None = None, relay_voice: bool = False,
+                   first_turn: bool = False) -> Classified:
+    """Étage 1 : règles, sans appel. `previous` = classe du tour précédent du fil (None : premier tour connu).
+    `relay_voice` (drapeau `route_relay_voice`) : un résumé ou un relais reste une conversation (voir `_RELAY_ASK`).
+    `first_turn` : premier tour du fil (index 0, sûr même après un redémarrage, contrairement à `previous`) ; un
+    acquittement seul y est trivial (voir `_ACK`)."""
     raw = text or ""
     t = _norm(raw)
     if not t:
@@ -110,11 +140,16 @@ def classify_rules(text: str, previous: TaskClass | None = None) -> Classified:
     if _CODE_FENCE.search(raw) or _TRACE.search(raw):
         return Classified(TaskClass.CODE, "bloc de code ou trace d'erreur dans le message")
     words = [w for w in re.split(r"[\s,;:!.?…]+", t) if w]
+    if first_turn and len(t) <= 40 and words and all(w in _ACK for w in words) and any(w in _ACK_CORE for w in words):
+        return Classified(TaskClass.TRIVIAL, "acquittement seul au premier tour du fil (rien à approuver)")
     courteous = words and all(w in _COURTESY for w in words)
     if (len(t) <= 60 and not _GO_WORDS.search(t) and courteous
             and (any(w in _COURTESY_CORE for w in words) or _SMALLTALK.search(t))):
         return Classified(TaskClass.TRIVIAL, "politesse seule, sans GO")
     coded = _NOT_CODE.sub(" ", t)
+    if (relay_voice and _RELAY_ASK.search(t) and not _SOURCE_FILE.search(coded) and not _CODE_ACTION.search(coded)
+            and not _CODE_IDENT.search(_NOT_CODE.sub(" ", raw))):
+        return Classified(TaskClass.CONVERSATION, "résumé ou relais d'un document : palier de la voix")
     if _SOURCE_FILE.search(coded) or _CODE_ASK.search(coded) or _CODE_IDENT.search(_NOT_CODE.sub(" ", raw)):
         return Classified(TaskClass.CODE, "demande de code (verbe, fichier source ou outil de développement)")
     if previous is TaskClass.CODE and len(t) <= _CONTINUATION_MAX_CHARS and not _OTHER_TOPIC.search(t):
@@ -219,9 +254,10 @@ class ModelClassifier:
         return _LETTERS.get(m.group(1)) if m else None
 
 
-def classify(text: str, previous: TaskClass | None = None, model: ModelClassifier | None = None) -> Classified:
+def classify(text: str, previous: TaskClass | None = None, model: ModelClassifier | None = None,
+             relay_voice: bool = False, first_turn: bool = False) -> Classified:
     """Règles, puis le modèle pour un tour non sûr. Le modèle ne fait jamais d'un GO un trivial."""
-    ruled = classify_rules(text, previous)
+    ruled = classify_rules(text, previous, relay_voice=relay_voice, first_turn=first_turn)
     if ruled.sure or model is None:
         return ruled
     got = model.classify(text, previous)

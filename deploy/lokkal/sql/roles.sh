@@ -9,3 +9,10 @@ ALTER ROLE nokker_app PASSWORD :'app';
 ALTER DATABASE corthexis OWNER TO nokker_app;
 SQL
 psql -v ON_ERROR_STOP=1 -q -d corthexis -c "ALTER SCHEMA public OWNER TO nokker_app"
+# Agent de paiement (profil `pay`, docs/PAY-AGENT.md §11) : son rôle existe toujours (roles.sql) ; il ne se connecte que
+# si l'installation lui a donné un mot de passe.
+if [ -n "${NOKKER_PAY_AGENT_PASSWORD:-}" ]; then
+  psql -v ON_ERROR_STOP=1 -q -v pa="$NOKKER_PAY_AGENT_PASSWORD" <<'SQL'
+ALTER ROLE nokker_pay_agent PASSWORD :'pa';
+SQL
+fi

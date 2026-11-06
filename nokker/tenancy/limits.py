@@ -35,7 +35,8 @@ DAY_RESET_UTC_HOUR = 12
 WEEK_RESET_UTC_HOUR = 6  # le lundi
 DEFAULT_LIMITS: dict[str, Any] = {"mode": "soft", "turns_per_day": 40, "turns_per_week": 200,
                                   "hard_turns_per_day": 150, "deep_per_day": 20}
-KINDS = ("turns", "deep", "week_turns")
+KINDS = ("turns", "deep", "week_turns", "speech_chars", "byok_turns")  # speech_chars : caractères lus à voix haute (web)
+# byok_turns : tours servis par le point d'accès du client (BYOK cloud, migration 066), hors du quota du Router.
 UNBOUNDED = 2**31 - 1
 
 LIMIT_REPLY_DAY = (
@@ -119,6 +120,13 @@ class MemoryUsage:
         with self._lock:
             return self._counts.get((tenant_id, account, day, kind), 0)
 
+    def add(self, tenant_id: str, account: str, day: date, kind: str, n: int) -> int:
+        """Compteur sans plafond (ex. caractères lus à voix haute) : ajoute `n`, rend le total du jour."""
+        key = (tenant_id, account, day, kind)
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + max(0, int(n))
+            return self._counts[key]
+
 
 class PgUsage:
     """Table `tenant_usage` (migrations 007, 011). Une connexion par opération, `app.tenant_id` posé avant toute
@@ -157,6 +165,14 @@ class PgUsage:
         with self._conn(tenant_id) as conn:
             conn.execute(f"UPDATE tenant_usage SET {k} = GREATEST({k} - 1, 0) "
                          "WHERE tenant_id = %s AND account = %s AND day = %s", (tenant_id, account, day))
+
+    def add(self, tenant_id: str, account: str, day: date, kind: str, n: int) -> int:
+        k = self._kind(kind)
+        sql = (f"INSERT INTO tenant_usage AS u (tenant_id, account, day, {k}) VALUES (%s, %s, %s, %s) "
+               f"ON CONFLICT (tenant_id, account, day) DO UPDATE SET {k} = u.{k} + EXCLUDED.{k} RETURNING u.{k}")
+        with self._conn(tenant_id) as conn:
+            row = conn.execute(sql, (tenant_id, account, day, max(0, int(n)))).fetchone()
+        return int(row[0]) if row else 0
 
     def read(self, tenant_id: str, account: str, day: date, kind: str) -> int:
         k = self._kind(kind)
@@ -222,19 +238,30 @@ class TenantLimits:
         return self.turns_per_week if self.mode == "hard" else None
 
     # ── tour ──────────────────────────────────────────────────────────────────────────────────────────────────────
-    def check_turn(self, sender: str | None, *, shared: bool = False) -> Verdict | None:
+    def check_turn(self, sender: str | None, *, shared: bool = False, byok: bool = False) -> Verdict | None:
         """None : le tour passe (et il est compté). Sinon le verdict à journaliser ; le tour répond `reply(verdict)`.
 
         `shared` : le compte est membre d'un foyer (lot X23) ; son quota est celui du foyer (nokker/household/quota.py),
-        compté à part. Le tour reste compté ici, et seule la garde de coût `hard_turns_per_day` coupe."""
+        compté à part. Le tour reste compté ici, et seule la garde de coût `hard_turns_per_day` coupe.
+
+        `byok` : tour servi par le point d'accès du client (BYOK cloud, docs/CLOUD-BYOK.md §5). Rien n'est compté au
+        quota du Router (`turns`, `week_turns`) ; le tour est compté à part (`byok_turns`) sous la seule garde de débit
+        `hard_turns_per_day` (même plafond journalier que la garde de coût)."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.check_turn(sender, shared=shared)
+            return eff.check_turn(sender, shared=shared, byok=byok)
         tid = current_tenant()  # hors scope : NoTenant, jamais un tour sans quota par défaut
         if tid == INTERNAL_TENANT:
             return None
         who = sender or ""
         (day, _), (week, _) = self._keys()
+        if byok:
+            cap = self.hard_turns_per_day
+            if not self.counter.take(tid, who, day.date(), "byok_turns", UNBOUNDED if cap is None else cap):
+                return Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0, rule="limits:byok_turns_per_day",
+                               reason=f"{cap} tours BYOK par jour atteints pour {sender or '(compte inconnu)'}",
+                               subject="reply")
+            return None
         day_cap, week_cap = self._day_cap(), self._week_cap()
         if shared:
             day_cap, week_cap = self.hard_turns_per_day, None
@@ -258,7 +285,7 @@ class TenantLimits:
         (_, day_end), (_, week_end) = self._keys()
         if verdict is not None and verdict.rule == "limits:turns_per_week":
             return LIMIT_REPLY_WEEK.format(n=self.turns_per_week, at=_swiss_hour(week_end))
-        if verdict is not None and verdict.rule == "limits:hard_turns_per_day":
+        if verdict is not None and verdict.rule in ("limits:hard_turns_per_day", "limits:byok_turns_per_day"):
             return LIMIT_REPLY_DAY.format(n=self.hard_turns_per_day, at=_swiss_hour(day_end))
         return LIMIT_REPLY_DAY.format(n=self._day_cap(), at=_swiss_hour(day_end))
 
@@ -291,6 +318,17 @@ class TenantLimits:
             return True
         (day, _), _ = self._keys()
         return self.counter.take(tid, sender or "", day.date(), "deep", self.deep_per_day)
+
+    def deep_available(self, sender: str | None) -> bool:
+        """Le compte courant peut-il encore appeler Deep aujourd'hui ? Lecture seule : ne compte rien."""
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.deep_available(sender)
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT:
+            return True
+        (day, _), _ = self._keys()
+        return self.deep_per_day > 0 and self.counter.read(tid, sender or "", day.date(), "deep") < self.deep_per_day
 
     # ── lecture (GET /v1/account/usage, docs/CLIENT-API.md) ───────────────────────────────────────────────────────
     def usage(self, sender: str) -> dict[str, Any]:
@@ -325,6 +363,10 @@ class LimitedPolicy:
 
     def choose(self, state: RouteState) -> RouteDecision:
         route = self.inner.choose(state)
+        from nokker.byok.context import active as byok_active
+
+        if byok_active() is not None:  # tour BYOK : un seul point d'accès, celui du client ; aucun Deep décompté
+            return route
         if route.tier is not Tier.DEEP or self.limits.allow_deep(state.turn.sender):
             return route
         return RouteDecision(tier=Tier.SHIP, reasoning=False,

@@ -212,3 +212,201 @@ def test_every_tier_down_escalates_without_html_in_the_reason():
     assert turn.escalated
     assert "<" not in turn.reply and "page d'erreur HTML" in turn.reply
     assert _short_error(RuntimeError("a  b\n c")) == "a b c"
+
+
+# ── retenue par début de secret (`secret_tail`, 05.11) ──
+import base64 as _b64  # noqa: E402
+import random  # noqa: E402
+
+from nokker.core.stream import secret_tail  # noqa: E402
+
+SSH_LIKE = ("-----BEGIN OPENSSH " + "PRIVATE KEY-----\n" + "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB" * 7
+            + "\n-----END OPENSSH " + "PRIVATE KEY-----")  # forme d'une clé (≈ 430 car.), pas une vraie clé
+OTHER = "Zq9-faux-" + "SECRET-de-test-8Lm3xQv"          # partage son début (« Zq9-faux-SECRET-de-test- ») avec FAKE
+
+
+def _known(*pairs):
+    k = KnownSecrets()
+    for n, v in pairs:
+        k.add(n, v)
+    return k
+
+
+class CheckingSink(Sink):
+    """Vérifie à CHAQUE delta que le cumul émis est un début du texte final caviardé : jamais un caractère de secret."""
+
+    def __init__(self, final: str) -> None:
+        super().__init__()
+        self.final = final
+
+    def delta(self, text: str) -> None:
+        super().delta(text)
+        assert self.final.startswith(self.text), (self.text[-80:], self.final[:len(self.text)][-80:])
+
+
+def _run(text, known, pieces, min_step=1):
+    inv = DeterministicInvariants(known=known)
+    sink = CheckingSink(inv.scrub_output(text))
+    sd = ScrubbedDeltas(inv.scrub_output, sink, DEFAULT_HOLDBACK, known=known)
+    sd.min_step = min_step
+    for p in pieces:
+        sd.feed(p)
+    return sink, inv
+
+
+def _assert_no_secret_bits(out, *secrets):
+    bare = out
+    for n in ("TEST_FAUX_SECRET", "AUTRE", "CLE_SSH"):
+        bare = bare.replace(f"[secret:{n}]", "")
+    flat = bare.replace(" ", "").replace("\t", "")
+    for s in secrets:
+        s2 = s.replace(" ", "").replace("\t", "")
+        for i in range(len(s2) - 5):
+            assert s2[i:i + 6] not in flat, s2[i:i + 6]
+
+
+def test_secret_tail_measures_the_start_of_a_known_value_only():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET))
+    assert secret_tail("du texte ordinaire ", k) == 0
+    assert secret_tail("la clé est " + FAKE_SECRET[:5], k) == 5
+    assert secret_tail("la clé est " + " ".join(FAKE_SECRET[:7]), k) == len(" ".join(FAKE_SECRET[:7]))
+    b64 = _b64.b64encode(FAKE_SECRET.encode()).decode()
+    assert secret_tail("encodé : " + b64[:9], k) == 9
+    assert secret_tail("x", None) == 0 and secret_tail("", k) == 0
+
+
+INTRO = "Voici la configuration demandée pour le service, ligne par ligne, sans rien omettre du tout. "
+OUTRO = " et elle reste privée. Suite du texte, encore du texte, pour finir proprement la réponse. "
+
+
+def test_secret_cut_at_every_character_in_two_pieces():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET))
+    text = INTRO + "La clé est " + FAKE_SECRET + OUTRO
+    for i in range(1, len(text)):
+        sink, _ = _run(text, k, [text[:i], text[i:]])
+        _assert_no_secret_bits(sink.text, FAKE_SECRET)
+
+
+def test_secret_cut_at_every_pair_of_characters_around_it_in_three_pieces():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET))
+    text = INTRO + "La clé est " + FAKE_SECRET + OUTRO
+    a = text.index(FAKE_SECRET) - 4
+    b = a + len(FAKE_SECRET) + 8
+    for i in range(a, b):
+        for j in range(i + 1, b + 1):
+            sink, _ = _run(text, k, [text[:i], text[i:j], text[j:]])
+            _assert_no_secret_bits(sink.text, FAKE_SECRET)
+
+
+def test_two_secrets_sharing_a_start():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET), ("AUTRE", OTHER))
+    assert FAKE_SECRET[:24] == OTHER[:24]
+    text = INTRO + "Le second : " + OTHER + OUTRO
+    for step in (1, 2, 5, 11, 23):
+        sink, _ = _run(text, k, [text[i:i + step] for i in range(0, len(text), step)])
+        _assert_no_secret_bits(sink.text, FAKE_SECRET, OTHER)
+        assert "[secret:AUTRE]" in sink.text
+
+
+def test_secret_starting_in_one_delta_right_after_another_secret():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET), ("AUTRE", OTHER))
+    for sep in ("", " ", "\t"):
+        text = INTRO + "Les deux : " + FAKE_SECRET + sep + OTHER + OUTRO
+        start2 = text.index(OTHER)
+        for cut in range(start2 - 3, start2 + len(OTHER)):
+            sink, _ = _run(text, k, [text[:cut], text[cut:cut + 7], text[cut + 7:]])
+            _assert_no_secret_bits(sink.text, FAKE_SECRET, OTHER)
+
+
+def test_spaced_variant_with_any_number_of_blanks():
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET))
+    rnd = random.Random(7)
+    for _ in range(20):
+        spaced = "".join(ch + rnd.choice(["", " ", "  ", "\t", " \t "]) for ch in FAKE_SECRET).rstrip()
+        text = INTRO + "Épelée : " + spaced + OUTRO
+        for step in (1, 3, 8):
+            sink, _ = _run(text, k, [text[i:i + step] for i in range(0, len(text), step)])
+            _assert_no_secret_bits(sink.text, FAKE_SECRET)
+
+
+def test_open_pem_block_is_still_held_with_known_secrets():
+    k = _known(("CLE_SSH", SSH_LIKE))
+    text = INTRO + "Le fichier commence par -----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3NzaC1yc2EAAAADAQABAAAB et continue "
+    inv = DeterministicInvariants(known=k)
+    sink = Sink()
+    sd = ScrubbedDeltas(inv.scrub_output, sink, DEFAULT_HOLDBACK, known=k)
+    sd.min_step = 1
+    _feed_all(sd, text, 3)
+    assert "BEGIN" not in sink.text and "AAAAB3" not in sink.text
+
+
+def test_short_answers_stream_with_a_400_char_ssh_key_in_the_vault():
+    """Avant : retenue 2 × 430 + 8 ≈ 870 caractères, une réponse de 200 caractères ne sortait qu'à la fin."""
+    k = _known(("CLE_SSH", SSH_LIKE), ("TEST_FAUX_SECRET", FAKE_SECRET))
+    assert holdback_for(DeterministicInvariants(known=k)) > 800
+    reply = ("Il est vingt et une heures dix, jeudi, heure de Zurich. Le dossier de travail est vide pour le moment, "
+             "dis-moi ce que tu veux faire et je m'en occupe tout de suite. ")
+    assert len(reply) < 250
+    sink, _ = _run(reply, k, [reply[i:i + 4] for i in range(0, len(reply), 4)], min_step=24)
+    # tout sauf la retenue de base, au pas de caviardage (24) et au mot entier près
+    assert sink.text and len(sink.text) >= len(reply) - DEFAULT_HOLDBACK - 24 - 20
+    assert reply.startswith(sink.text)
+
+
+def test_ssh_key_itself_never_leaves_even_split_finely():
+    k = _known(("CLE_SSH", SSH_LIKE))
+    text = INTRO + "La clé : " + SSH_LIKE + OUTRO
+    for step in (1, 7, 64):
+        sink, _ = _run(text, k, [text[i:i + step] for i in range(0, len(text), step)])
+        assert "b3BlbnNzaC1r" not in sink.text and "BEGIN" not in sink.text
+
+
+WORDS = ("le chat dort sur la table pendant que la pluie tombe doucement dehors et nous parlons du projet de la "
+         "semaine avec calme puis nous rangeons les livres dans le salon avant le repas du soir").split()
+
+
+def _secret(rnd):
+    alpha = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz-_"
+    return "Zq" + "".join(rnd.choice(alpha) for _ in range(rnd.randint(12, 40)))
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_property_no_secret_character_is_ever_emitted_before_redaction(seed):
+    """Découpages aléatoires : à CHAQUE delta, le cumul émis est un début du texte final caviardé (CheckingSink), donc
+    aucun début de secret (exact, espacé, base64) ne part avant que le scrubber l'ait remplacé."""
+    rnd = random.Random(seed)
+    secrets = [_secret(rnd) for _ in range(rnd.randint(1, 3))]
+    if rnd.random() < 0.3:  # deux secrets au même début
+        secrets.append(secrets[0][:rnd.randint(4, len(secrets[0]) - 2)] + _secret(rnd)[2:])
+    if rnd.random() < 0.2:
+        secrets.append(SSH_LIKE)
+    k = _known(*[(f"S{i}", s) for i, s in enumerate(secrets)])
+    parts = []
+    for _ in range(rnd.randint(3, 12)):
+        parts.append(" ".join(rnd.choice(WORDS) for _ in range(rnd.randint(1, 12))))
+        if rnd.random() < 0.6:
+            s = rnd.choice(secrets)
+            form = rnd.choice(["exact", "exact", "spaced", "b64", "b64url"])
+            if form == "spaced":
+                s = "".join(ch + rnd.choice(["", " ", "\t", "  "]) for ch in s).rstrip()
+            elif form == "b64":
+                s = _b64.b64encode(s.encode()).decode().rstrip("=" if rnd.random() < 0.5 else "")
+            elif form == "b64url":
+                s = _b64.urlsafe_b64encode(s.encode()).decode()
+            parts.append(s)
+    text = " ".join(parts) + " fin."
+    cuts = sorted(rnd.sample(range(1, len(text)), min(len(text) - 1, rnd.randint(1, 40))))
+    pieces = [text[a:b] for a, b in zip([0, *cuts], [*cuts, len(text)])]
+    _run(text, k, pieces, min_step=rnd.choice([1, 1, 5, 24]))
+
+
+def test_variant_tables_forget_values_that_left_the_vault():
+    from nokker.core import stream as st
+
+    k = _known(("TEST_FAUX_SECRET", FAKE_SECRET), ("AUTRE", OTHER))
+    secret_tail("texte " + FAKE_SECRET[:5], k)
+    assert FAKE_SECRET in st._VARIANTS and OTHER in st._VARIANTS
+    rotated = _known(("TEST_FAUX_SECRET", FAKE_SECRET + "-v2"))
+    secret_tail("texte", rotated)
+    assert FAKE_SECRET not in st._VARIANTS and OTHER not in st._VARIANTS
+    assert set(st._VARIANTS) == {FAKE_SECRET + "-v2"}

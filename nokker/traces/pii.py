@@ -7,6 +7,7 @@ Ce qui est couvert (remplacé par une étiquette entre crochets) :
   - téléphones (`[téléphone]`) : suisses (international et national), et toute forme internationale `+CC …` d'au
     moins 8 chiffres ;
   - IBAN (`[iban]`, toute forme pays + 2 chiffres + blocs) et numéros AVS (`[avs]`) ;
+  - numéros de carte (Luhn, 12 à 19 chiffres) et valeurs des champs de carte : chiffres remplacés par « • » ;
   - adresses postales (`[adresse]`) : rue/avenue/chemin/route/place/boulevard/quai/impasse… suivi d'un nom propre et
     d'un numéro facultatif ; `…strasse|gasse|weg|platz 12` ; `12 Main Street` ; code postal + localité après une
     virgule, un saut de ligne ou `CH-` ;
@@ -25,6 +26,7 @@ import re
 from collections import Counter
 from typing import Any
 
+from nokker.payments.cardmask import mask_card_text
 from nokker.tools.web import _AVS_RE, _EMAIL_RE, _PHONE_CH_RE
 
 _UP = "A-ZÀ-ÖØ-Ý"
@@ -80,6 +82,12 @@ def scrub_pii(text: str, terms: list[str] | None = None, counts: Counter | None 
             c[label] += n
         return out
 
+    # Données de carte (PAYMENTS §2 bis) : chiffres masqués (« • »), avant l'IBAN dont la forme est voisine. Couvre
+    # aussi les arguments d'un appel refusé (un numéro tapé par le modèle reste dans le tour stocké).
+    masked = mask_card_text(text)
+    if masked != text:
+        c["carte"] += 1
+        text = masked
     text = sub(_EMAIL_RE, "email", text)
     text = sub(_IBAN_RE, "iban", text)
     text = sub(_AVS_RE, "avs", text)

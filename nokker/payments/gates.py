@@ -123,11 +123,24 @@ class PaymentGates:
             rule, reason = refused
             self.payments.note_refused(turn.thread_id, sender, rule, reason, cart)
             return [_deny(rule, reason, call)]
-        _, guardian = self.payments.approver_of(sender)
+        approver, guardian = self.payments.approver_of(sender)
+        reason = TO_PAY_REASON.format(amount=format_minor(cart.amount_minor, cart.currency),
+                                      merchant=inline(cart.merchant, 120))
+        if self.payments.agent is not None:  # drapeau `pay_agent` : sinon rien ne change
+            from nokker.payments.agent import (DUPLICATE_REASON, DUPLICATE_RULE, MERCHANT_MAX, TO_PAY_AGENT_REASON,
+                                               TO_PAY_CARD_REASON, TO_PAY_OWN_REASON)
+
+            dup = self.payments.active_duplicate(sender, cart)
+            if dup is not None:
+                return [_deny(DUPLICATE_RULE, DUPLICATE_REASON.format(mid=dup), call)]
+            block = self.payments._agent_pay_for(cart, approver)
+            if block is not None:
+                text = {"issuer_card": TO_PAY_CARD_REASON, "own_card": TO_PAY_OWN_REASON}.get(
+                    str(block.get("via")), TO_PAY_AGENT_REASON)
+                reason = text.format(amount=format_minor(cart.amount_minor, cart.currency),
+                                                    merchant=inline(cart.merchant, MERCHANT_MAX))
         return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=GUARDIAN_RULE if guardian else PAY_RULE,
-                        reason=TO_PAY_REASON.format(amount=format_minor(cart.amount_minor, cart.currency),
-                                                    merchant=inline(cart.merchant, 120)),
-                        subject=call.id, strength="strong")]
+                        reason=reason, subject=call.id, strength="strong")]
 
     def switch(self, reply: str, turn: Turn, tier: Any) -> list[Verdict]:
         return self.inner.switch(reply, turn, tier)

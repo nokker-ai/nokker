@@ -182,13 +182,18 @@ def check_create(body: dict, cfg: Config) -> dict:
         if net == cfg.network:
             given = {e.split("=", 1)[0]: e.split("=", 1)[1] for e in (body.get("Env") or []) if "=" in e}
             env = [e for e in (body.get("Env") or []) if e.split("=", 1)[0].lower() not in
-                   ("http_proxy", "https_proxy", "no_proxy", "all_proxy")]
+                   ("http_proxy", "https_proxy", "no_proxy", "all_proxy", "nokker_ssh_proxy")]
             for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
                 # Le noyau peut poser l'identité du bac à sable (`nokker:<jeton>@`, injection de secrets par egress,
                 # docs/EGRESS-SECRETS.md) : gardée SEULEMENT si l'URL vise exactement le même proxy ; sinon écrasée.
                 v = given.get(k, "")
                 env.append(f"{k}={v if v and same_proxy(v, cfg.egress_proxy) else cfg.egress_proxy}")
             env += ["NO_PROXY=localhost,127.0.0.1", "no_proxy=localhost,127.0.0.1"]
+            # Client ssh des outils `ssh_*` (nokker/tools/ssh.py) : ProxyCommand CONNECT vers egress (hôte:port), qui
+            # n'ouvre que les hôtes déclarés dans hosts.yaml. Toujours la valeur d'egress, jamais celle du noyau.
+            e = urlsplit(cfg.egress_proxy)
+            if e.hostname and e.port:
+                env.append(f"NOKKER_SSH_PROXY={e.hostname}:{e.port}")
             body["Env"] = env
     return body
 

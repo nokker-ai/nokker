@@ -134,6 +134,93 @@ class HttpJudgeTransport:
         self._client.close()
 
 
+class HedgedJudgeTransport:
+    """Transport du juge avec repli (décision produit 02.11) : si le modèle principal n'a rien rendu au bout de
+    `hedge_after_s`, OU s'il échoue (HTTP >= 400, délai dépassé), `fallback` répond à sa place (même logique que
+    `providers/hedged.py` : le primaire tourne dans un thread, abandonné à l'échéance, sans réessai ici). Si le repli
+    échoue aussi, son erreur remonte : les appelants gardent leur comportement d'échec actuel. Le champ `model` de la
+    réponse porte TOUJOURS le modèle qui a réellement répondu (les appelants lisent `data["model"]`), jamais le nom
+    configuré quand c'est le repli."""
+
+    def __init__(self, primary: Any, fallback: Any, hedge_after_s: float = 5.0) -> None:
+        self.primary, self.fallback, self.hedge_after_s = primary, fallback, float(hedge_after_s)
+        self.hedged_calls = 0  # compteur observable (santé du primaire)
+
+    # Les réglages d'amont posés à chaud (serve : lien du Router) valent pour les deux modèles (même amont).
+    @property
+    def base_url(self) -> str:
+        return self.primary.base_url
+
+    @base_url.setter
+    def base_url(self, v: str) -> None:
+        self.primary.base_url = self.fallback.base_url = v
+
+    @property
+    def api_key(self) -> str:
+        return self.primary.api_key
+
+    @api_key.setter
+    def api_key(self, v: str) -> None:
+        self.primary.api_key = self.fallback.api_key = v
+
+    @property
+    def model(self) -> str:
+        return self.primary.model
+
+    @model.setter
+    def model(self, v: str) -> None:
+        self.primary.model = v
+
+    @property
+    def known(self) -> Any:
+        return self.primary.known
+
+    @known.setter
+    def known(self, v: Any) -> None:
+        self.primary.known = self.fallback.known = v
+
+    @property
+    def _plain(self) -> bool:
+        return self.primary._plain
+
+    @_plain.setter
+    def _plain(self, v: bool) -> None:
+        self.primary._plain = self.fallback._plain = v
+
+    @staticmethod
+    def _stamp(data: dict[str, Any], transport: Any) -> dict[str, Any]:
+        if not data.get("model"):
+            data = {**data, "model": transport.model}
+        return data
+
+    def post(self, body: dict[str, Any]) -> dict[str, Any]:
+        import contextvars
+        import threading
+
+        box: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                box["data"] = self.primary.post(body)
+            except Exception as e:  # noqa: BLE001
+                box["error"] = e
+            finally:
+                finished.set()
+
+        threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True, name="hedged-judge").start()
+        if finished.wait(self.hedge_after_s) and "data" in box:
+            return self._stamp(box["data"], self.primary)
+        why = box["error"] if "error" in box else f"sans réponse après {self.hedge_after_s:g}s"
+        self.hedged_calls += 1
+        logger.warning("juge %s : %s, repli sur %s", self.primary.model, why, self.fallback.model)
+        return self._stamp(self.fallback.post(body), self.fallback)
+
+    def close(self) -> None:
+        for t in (self.primary, self.fallback):
+            getattr(t, "close", lambda: None)()
+
+
 def _cache_key(question_id: str, prompt: str, options: list[str], model: str) -> str:
     h = hashlib.sha256()
     h.update(question_id.encode())
@@ -269,5 +356,5 @@ class OpenAICompatJudge:
 
 
 __all__ = [
-    "HttpJudgeTransport", "JudgeTransport", "OpenAICompatJudge", "probability_from_top_logprobs",
+    "HedgedJudgeTransport", "HttpJudgeTransport", "JudgeTransport", "OpenAICompatJudge", "probability_from_top_logprobs",
 ]

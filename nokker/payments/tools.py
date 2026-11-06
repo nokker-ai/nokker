@@ -17,7 +17,7 @@ from typing import Any
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.payments.detect import checkout_page, refs_of
-from nokker.payments.mandate import format_minor
+from nokker.payments.mandate import agent_pay_of, format_minor
 from nokker.payments.service import PAY_TOOL, Payments
 from nokker.qa.untrusted import fence, inline
 
@@ -43,6 +43,13 @@ PAY_PARAMETERS: dict[str, Any] = {
     },
     "required": ["merchant", "amount", "currency", "items"],
 }
+# Drapeau `pay_tool_choice` (sans agent de paiement) : même outil, texte qui pousse à l'appeler plutôt qu'à demander.
+PAY_DESCRIPTION_TOOL_CHOICE = ("Arrêt au paiement : dès qu'une demande mène à payer (commande, achat, facture, "
+                               "abonnement), appelle cet outil au lieu de répondre en texte ou de demander une "
+                               "confirmation : la carte EST la confirmation. Prépare une carte « à payer » (marchand, "
+                               "montant, devise, articles, lien) ; la personne approuve avec sa passkey et paie "
+                               "elle-même. Ne saisis jamais de numéro de carte, et ne confie jamais un paiement à un "
+                               "sous-agent.")
 CHECKOUT_NOTICE = ("\n[Paiement] Page de paiement détectée : ne remplis aucun champ de carte et ne clique pas sur le "
                    "bouton de paiement. Appelle pay_request (marchand, montant, devise, articles, lien) ; la personne "
                    "paiera elle-même.")
@@ -62,9 +69,19 @@ HANDOFF_REASON = "Paiement à faire par toi : {amount} chez {merchant} (mandat {
 class PayTools:
     payments: Payments
     source_name: str = "builtin:payments"
+    tool_choice: bool = False  # drapeau `pay_tool_choice`
 
     def specs(self) -> list[ToolSpec]:
-        return [ToolSpec(name=PAY_TOOL, description=PAY_DESCRIPTION, parameters=PAY_PARAMETERS, effect=Effect.SPEND,
+        desc = PAY_DESCRIPTION_TOOL_CHOICE if self.tool_choice else PAY_DESCRIPTION
+        if self.payments.agent is not None:  # drapeau `pay_agent` : texte nouveau, sinon octet pour octet l'ancien
+            from nokker.payments.agent import (PAY_DESCRIPTION_AGENT, PAY_DESCRIPTION_CARD, PAY_DESCRIPTION_OWN,
+                                               PAY_DESCRIPTION_OWN_CHOICE)
+
+            issuer = getattr(self.payments.agent_settings, "issuer", "")
+            # own_card : `pay_tool_choice` choisit SA variante ; wise et stripe_spt gardent leur texte (gelé) tel quel.
+            own = PAY_DESCRIPTION_OWN_CHOICE if self.tool_choice else PAY_DESCRIPTION_OWN
+            desc = {"wise": PAY_DESCRIPTION_CARD, "own_card": own}.get(issuer, PAY_DESCRIPTION_AGENT)
+        return [ToolSpec(name=PAY_TOOL, description=desc, parameters=PAY_PARAMETERS, effect=Effect.SPEND,
                          source=self.source_name)]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -76,10 +93,41 @@ class PayTools:
         source = (rec.mandate.get("cart") or {}).get("source") or "browser"
         how = HOW.get(source, HOW["browser_nohandoff"])
         amount = format_minor(rec.amount_minor, rec.currency)
+        if self.payments.agent is not None and agent_pay_of(rec.mandate) is not None:
+            return self._agent_pays(name, rec, amount, ctx)
         if source == "browser" and not (self.payments.settings.handoff and self._handoff(ctx, amount, rec)):
             how = HOW["browser_nohandoff"]
         return ToolResult(call_id="", name=name, content=DONE_TEXT.format(
             mid=rec.id, amount=amount, merchant=rec.merchant, until=rec.mandate.get("valid_until"), how=how))
+
+    def _agent_pays(self, name: str, rec: Any, amount: str, ctx: ToolContext) -> ToolResult:
+        """Mandat qui confie le paiement à l'agent de paiement (drapeau `pay_agent`). Le résultat ne dit jamais
+        « payé » : l'agent émet un jeton borné, la remise au vendeur n'est pas faite par ce lot."""
+        from nokker.payments.agent import (AGENT_ACTION_TEXT, AGENT_CARD_TEXT, AGENT_FAILED_TEXT, AGENT_FAILED_WHY,
+                                           AGENT_ISSUED_TEXT, AGENT_OWN_TEXT)
+        from nokker.payments.mandate import AGENT_PAY_VIA_CARD, AGENT_PAY_VIA_OWN
+
+        state, err = self.payments.agent_execute(rec)
+        # Le marchand vient d'une carte que le modèle a préparée depuis une page : une ligne, neutralisé, 60 car. au plus.
+        # `{why}` ne vient jamais de Stripe : libellé fixe d'AGENT_FAILED_WHY, choisi par le code d'erreur.
+        from nokker.payments.agent import MERCHANT_MAX
+
+        merchant = inline(rec.merchant, MERCHANT_MAX)
+        fields = {"mid": rec.id, "amount": amount, "merchant": merchant, "until": rec.mandate.get("valid_until")}
+        if state is not None and state.get("status") in ("active", "requires_action"):
+            via = (agent_pay_of(rec.mandate) or {}).get("via")
+            if via == AGENT_PAY_VIA_CARD:
+                text = AGENT_CARD_TEXT  # carte émise : le 3-D Secure éventuel est dit dans le même texte
+            elif via == AGENT_PAY_VIA_OWN:
+                text = AGENT_OWN_TEXT  # carte de la personne : code ou confirmation de la banque hors conversation
+            else:
+                text = AGENT_ACTION_TEXT if state["status"] == "requires_action" else AGENT_ISSUED_TEXT
+            return ToolResult(call_id="", name=name, content=text.format(**fields))
+        how = HOW["browser_nohandoff"]
+        if self.payments.settings.handoff and self._handoff(ctx, amount, rec):
+            how = HOW["browser"]
+        why = AGENT_FAILED_WHY.get(err or "", AGENT_FAILED_WHY["unreachable"])
+        return ToolResult(call_id="", name=name, content=AGENT_FAILED_TEXT.format(mid=rec.id, why=why, how=how))
 
     @staticmethod
     def _handoff(ctx: ToolContext, amount: str, rec: Any) -> bool:

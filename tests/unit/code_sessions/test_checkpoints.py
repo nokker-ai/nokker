@@ -201,3 +201,30 @@ def test_real_upstream_never_reads_another_tenants_checkpoint(cluster, tmp_path,
         svc.close(ANA, a["id"], purge=True)
     assert not os.path.exists(os.path.join(svc.cfg.state_dir, TA, ANA, "checkpoints", a["id"]))
     svc.close_all()
+
+
+def test_card_snapshots_per_session_outside_the_sandbox_and_tenant_bound(svc, cluster):
+    """Point PAR CARTE du relecteur automatique (sessions multi-utilisateur) : sous le home des points de la session,
+    hors de toute racine montée, sans l'amont ; un autre locataire ne le lit pas."""
+    from nokker.tools.card_snapshots import CardSnapshots
+
+    mgr = SessionCheckpoints(svc)  # aucun amont : le point par carte n'en dépend pas
+    cards = CardSnapshots(svc.root_of, mgr.cards_dir)
+    wrapper = CheckpointingToolSource(svc.tools(), svc.root_of, manager=mgr, cards=cards)
+    wrapper.manager = None  # comme configure_code_sessions quand l'amont manque
+    with tenant_scope(TA):
+        a = svc.create(ANA, {})
+    ta = f"{TA}:{a['id']}"
+    with tenant_scope(TA):
+        ctx = ToolContext(thread_id=ta, turn_index=1, channel="api", sender=ANA, auto_approval_id="ap_c1")
+        assert not wrapper.call("write_file", {"path": "f.txt", "content": "1"}, ctx).is_error
+        offer = cards.offer("ap_c1", ta)
+    assert offer == {"available": True, "checkpoint_id": "ap_c1", "files": ["f.txt"], "applied": False}
+    d = os.path.join(svc.cfg.state_dir, TA, ANA, "checkpoints", a["id"], "cards", "ap_c1")
+    assert os.path.isfile(os.path.join(d, "manifest.json"))
+    assert not d.startswith(os.path.join(cluster.workspace_root, TA) + os.sep)  # hors de toute racine montée
+    with tenant_scope(TB):
+        assert cards.offer("ap_c1", ta) is None
+    with tenant_scope(TA):
+        assert cards.apply("ap_c1", ta)["restored"] == ["f.txt"]
+        assert not os.path.exists(os.path.join(svc.cfg.workspace_root, TA, ANA, a["id"], "f.txt"))

@@ -56,6 +56,13 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
   [/Approbation]
   ```
   Un refus produit le même tour de continuation, sans appel d'outil (`Résultat : refusé par <decided_by>.`).
+  **Tour du noyau, pas de la personne (03.11)** : l'exécuteur pose `TurnInput.control = "approval_continue"`
+  (`core/turn.py::APPROVAL_CONTINUE`, jamais accepté d'un client : `metadata.cli_control` n'admet que
+  `goals.service.CONTROLS`). Ce bloc redit une décision déjà prise sur la carte : il ne lève AUCUN drapeau de domaine
+  (sans quoi le montant du résultat de `pay_request` escaladait la suite, `domaine:montant`), et le tour porte
+  `InputCheck.origin = "approval"`, exposé en `origin` sur le message `user` de `GET /v1/threads/{id}` pour que les
+  clients ne l'affichent pas comme un message de la personne. Le même bloc TAPÉ par quelqu'un reste un message
+  ordinaire (drapeaux comme avant).
   **File par fil (25.10, docs/LOKKAL.md §7.4.9)** : l'outil et le tour de continuation passent par la file du fil,
   après le tour en cours (jamais en parallèle : même index, contexte perdu) ; la sortie de l'outil est publiée en
   `tool.result` (même `call_id` que l'appel en attente, `approval_id`) avant la continuation. La décision locale
@@ -349,6 +356,36 @@ au tour (« relecteur automatique : carte standard »). L'API rend `auto_review`
 locataire) → la carte. Refus révoqué : la carte revient `pending` (ou `expired`) et part aux humains, qui la décident
 par le chemin habituel (exécuteur, tour de continuation). Approbation révoquée : l'effet a eu lieu, la carte reste
 `executed` et le dit ; le relecteur n'approuve plus cet outil sur ce fil. `409` si rien à révoquer ou déjà révoquée.
+
+**Restauration après révocation** (`nokker/tools/card_snapshots.py`) : juste avant qu'une écriture de fichier approuvée
+automatiquement (`write_file`, `patch`) s'exécute, l'enveloppe des points de retour copie chaque fichier visé (ou note
+« fichier absent ») hors du bac à sable, puis note l'empreinte de chaque fichier après l'outil. Ce point PAR CARTE ne
+dépend pas des points git (pris une fois par tour, absents sans la bibliothèque amont) ; il est limité au dossier de
+travail (chemin résolu, lien symbolique refusé), à 5 Mo par fichier et 20 Mo par carte, gardé 30 jours. Lokkal :
+`<état>/checkpoints/cards/<carte>/` ; sessions de code multi-utilisateur : `<home des points de la session>/cards/`.
+
+**Pas de point de retour, pas d'approbation automatique d'écriture** : avant de relire une carte `write_file`/`patch`,
+le noyau vérifie que le point est possible (`card_snapshots.preflight` : fichier trop grand, hors du dossier de
+travail, lien symbolique, aucun magasin pour le fil). Sinon la carte reste `pending` pour l'humain, escaladée par
+règle sans appel au modèle ; la raison est rangée dans `auto_review.reason` de la carte, le modèle voit le texte
+d'attente habituel.
+
+- La réponse de révocation d'une approbation porte `rollback: {available, checkpoint_id, files, reason?}`
+  (`available: false` et la raison si le point manque, est incomplet ou a déjà servi). Rien n'est restauré à la
+  révocation.
+- `POST /v1/approvals/{id}/auto-review/rollback` (même identité, approbation DÉJÀ révoquée) applique le point :
+  `{approval_id, checkpoint_id, restored, conflicts}`. Un fichier modifié depuis l'écriture (empreinte différente de
+  celle d'après l'outil) n'est pas écrasé et figure dans `conflicts`. Une seule application ; `409` sinon (pas
+  révoquée, pas de point, point incomplet, déjà appliqué). Chaque restauration est inscrite au journal des
+  approbations (`record_rollback` : événement `auto_review_rollback` avec qui, quand, `checkpoint_id`, `restored`,
+  `conflicts` ; `approval.auto_review_rollback` sur le bus).
+- `GET /v1/approvals/{id}` (et la liste) porte le même `rollback` pour une approbation automatique révoquée, avec
+  `applied` : `false` tant que rien n'est restauré ; après la restauration `applied: true`, `applied_at`, `restored`,
+  `conflicts` (et `available: false`).
+- **Bulle du fil** : une approbation automatique ouvre dans le fil une bulle `approval` (docs/BUBBLES.md : état
+  approuvé, `decided_via: "auto-review"`, raison), mise à jour à la révocation et à la restauration. Pas de
+  notification push ; aucun texte ajouté au tour.
+- Les autres écritures (`write` hors fichiers : agenda, tâches…) n'ont pas de point de retour : `available: false`.
 
 Mesure : banc B-1 (`nokker-judge-bench/auto_review_eval.py`, hors du dépôt), 01.11.2026, 49 cartes (21 fautives). Sans
 le contrôle des dates : 3 faux « approuver » (qwen3.6-35b-a3b). Avec le contrôle des dates et adresses :

@@ -16,9 +16,9 @@ extra_go_senders: [local-owner]      # le propriétaire de la machine donne les 
 # vision (X7) : le 397B lit les images — mesuré le 25.10.2026 chez l'amont (Qwen3.5-397B-A17B, PNG 8×8 rouge en data
 # URL : « solid red square », 86 jetons d'entrée). Images jointes : <local.state_dir>/images.
 tiers:
-  ship:
-    base_url: https://router.sokkan.ch/v1
-    model: qwen/qwen3.5-397b-a17b
+  ship:                                        # Nina = Ship = 27B dense (décision produit, 04-05.11),
+    base_url: https://router.sokkan.ch/v1      # comme la bêta ; le 397B (Deep) seulement en escalade.
+    model: qwen/qwen3.8-27b
     api_key_env: ROUTER_KEY
     vision: true
   deep:
@@ -31,7 +31,8 @@ tiers:
     model: qwen/qwen3.6-35b-a3b-eu
     api_key_env: ROUTER_KEY
 # Multi-modèle et juge allumés (X8, docs/LOKKAL.md §7.12). Routage par tour : trivial → small, conversation → Ship,
-# code → Deep. D1 tranchée le 25.10 : petit palier 35B-eu, Ship et Deep 397B, juge 397B raisonnement coupé.
+# code → Deep. D1 tranchée le 25.10 : petit palier 35B-eu, juge 397B raisonnement coupé ; Ship 27B depuis le 05.11
+# (comme la bêta), Deep 397B.
 route:
   policy: v1                                   # v0 : Ship partout, Deep sur signaux (défaut du code)
   classifier: rules                            # rules : aucun appel ; model : petit palier, 1 jeton, tour ambigu
@@ -40,6 +41,9 @@ judge_enabled: false                 # portes action/bascule du juge (couche 2) 
 judge_review: true                   # le juge relit le diff du tour avant « terminé » (renvoi à l'auteur, 1 fois)
 show_me: true                       # outil point_at, bulle pointer (web Lokkal compilé avec VITE_NOKKER_SHOW_ME=1)
 guide: true                          # sur-agent Guide (docs/GUIDE.md), palier small par défaut, repli ship
+approval_bubbles: true               # carte d'approbation posée dans le fil (docs/BUBBLES.md) ; sans elle, « ta carte » et les autres cartes
+                                     # ne s'affichent que sur /approvals/<id> (démo own_card r37 du 05.11)
+judge_require_explicit: true         # démarrage refusé si juge/relecteur/correcteur allumé sans `judge:` (pas de repli silencieux sur Ship)
 judge_review_rounds: 1
 judge_advice: true                   # avis court + niveau de risque sur les cartes fortes (format de X10)
 judge:                               # D1 (25.10) : 397B, raisonnement coupé (reasoning_effort: none, défaut)
@@ -56,6 +60,7 @@ previews_cache_dir: /opt/data/previews
 host: 0.0.0.0                        # dans le container ; le compose ne publie le port que sur 127.0.0.1 de l'hôte
 port: 8742
 local:
+  reasoning: false                             # Ship sans raisonnement (comme la bêta) ; Deep raisonne (escalade)
   state_dir: /opt/data                         # NOKKER_HOME = HERMES_HOME, bind sur ~/.nokker/state de l'hôte
   token_path: /opt/data/local-token
   settings_path: /opt/data/settings.json

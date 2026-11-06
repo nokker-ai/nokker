@@ -32,12 +32,14 @@ from nokker.core.ports import (
 )
 from nokker.core.controls import STEER_MAX_CHARS, Steer, TurnControls
 from nokker.core.live_input import LiveToolInputs
-from nokker.core.stream import ScrubbedDeltas, holdback_for
+from nokker.core.stream import DEFAULT_HOLDBACK, ScrubbedDeltas, holdback_for
 from nokker.core.turn_lock import TurnLocks
 from nokker.images.render import has_images, materialize
 from nokker.core.turn import (
-    Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
+    APPROVAL_CONTINUE, Decision, Effect, Gate, ImageRef, InputCheck, LLMCall, Message, Tier, ToolCall, ToolResult, Turn, TurnInput, Verdict,
 )
+from nokker.byok.context import active as byok_active
+from nokker.byok.context import turn_scope as byok_turn_scope
 from nokker.ledger.attribution import merge_tags, spend_tag
 from nokker.tenancy.context import submit_in_context, tenant_of_thread
 
@@ -80,6 +82,17 @@ class TurnCancelled(Exception):
 
 
 CANCEL_REPLY = "Annulé à ta demande."
+# Formule sans inférence Nokker (`byok`) sans point d'accès utilisable (docs/CLOUD-BYOK.md §3) : tour refusé.
+BYOK_NOT_CONFIGURED_SHORT = "aucun modèle configuré pour ta formule BYOK"
+BYOK_NOT_CONFIGURED_REPLY = ("Ta formule n'inclut pas le modèle de Nokker : configure ton modèle (point d'accès, modèle "
+                             "et clé) dans Mon compte → Modèles, puis renvoie ton message.\n\n"
+                             "Your plan does not include Nokker's model: set up your model (endpoint, model and key) "
+                             "in My account → Models, then send your message again.")
+# Tour BYOK dont le point d'accès du client ne répond pas (docs/CLOUD-BYOK.md §5) : pas de repli vers le Router.
+BYOK_DOWN_REPLY = ("Ton modèle « {name} » ne répond pas ({why}). Vérifie le point d'accès et la clé dans Mon compte → "
+                   "Modèles, ou repasse sur le modèle de Nokker.\n\n"
+                   "Your model \"{name}\" is not responding ({why}). Check the endpoint and key in My account → Models, "
+                   "or switch back to Nokker's model.")
 
 # Motif d'une conclusion forcée, tel qu'il s'affiche avec les remarques de la relecture (`_final_review`).
 _FORCED_WHY = {"loop:max_calls": "le tour a atteint sa limite d'appels", "loop:stalled": "le tour tournait en rond"}
@@ -183,6 +196,10 @@ class Kernel:
     # MCP Apps (drapeau `mcp_apps`, docs/MCP-NEXT.md) : `nokker.tools.mcp_apps.AppRegistry`, posé par `build_kernel` ;
     # None = aucune app enregistrée, aucun `tool.app`, `app_tool_call` refuse.
     mcp_apps: Any = None
+    # BYOK cloud (docs/CLOUD-BYOK.md, `nokker/byok/service.py::CloudByok`) : `route_for_turn()` rend le point d'accès du
+    # locataire courant quand son défaut est `byok:<nom>` et qu'il y a droit. Le tour entier passe alors par lui (tous
+    # paliers), sans repli vers le Router ni vers un autre palier, hors du quota du Router. None : rien ne change.
+    byok: Any = None
     # Fils dont le tour en cours doit s'arrêter (POST /v1/threads/{id}/cancel, client terminal) : vérifié avant chaque
     # appel modèle et chaque outil ; le tour finit sur « annulé », sans erreur d'amont.
     _cancelled: set[str] = field(default_factory=set, init=False, repr=False)
@@ -269,6 +286,12 @@ class Kernel:
         """Un appel d'outil du propriétaire, sans tour modèle (docs/LOKKAL.md §7.4.4) : mêmes portes que la boucle
         (effet de CET appel, règles, invariants, caviardage). Rend le résultat, ou l'id de la carte si l'appel attend
         une approbation (le résultat arrive alors par l'exécuteur de cartes). Un refus est un résultat `is_error`."""
+        from nokker.tools.scope import thread_scope
+
+        with thread_scope(thread_id):
+            return self._direct_call(thread_id, name, arguments, sender)
+
+    def _direct_call(self, thread_id: str, name: str, arguments: dict, sender: str | None = None) -> ToolResult | str:
         spec = self.tools.spec(name)
         tc = ToolCall(id=f"direct-{time.monotonic_ns()}", name=name, arguments=arguments)
         turn = Turn(thread_id=thread_id, index=self.store.next_index(thread_id), input=InputCheck(text=""),
@@ -394,6 +417,20 @@ class Kernel:
                          rule=rule.rule)
         return excluded(probe, effect.value) is None
 
+    def _snapshot_rule(self, tc: ToolCall, ctx: ToolContext) -> Any:
+        """Écriture de fichier sans point de retour possible (`card_snapshots.preflight`) : escalade par règle, sans
+        appel au modèle (pas de point, pas d'approbation automatique). None sinon."""
+        from nokker.tools.card_snapshots import SNAPSHOT_TOOLS, preflight
+
+        if tc.name not in SNAPSHOT_TOOLS:
+            return None
+        why = preflight(self.card_snapshots, ctx.thread_id, tc.name, dict(tc.arguments or {}))
+        if why is None:
+            return None
+        from nokker.approvals.auto_review import ReviewDecision
+
+        return ReviewDecision("escalate", f"écriture de fichier : {why}", by_rule=True)
+
     def _auto_review(self, turn: Turn, tc: ToolCall, spec: Any, ctx: ToolContext, approval: Any,
                      effect: Effect) -> ToolResult | None:
         """Relit la carte qui vient d'être posée. Rend le résultat à donner au modèle (outil exécuté, ou refus motivé),
@@ -401,7 +438,8 @@ class Kernel:
         from nokker.approvals.auto_review import REFUSED_RESULT
 
         try:
-            res = self.auto_reviewer.review(turn, approval, call_id=tc.id, approvals=self.approvals)
+            res = self._snapshot_rule(tc, ctx) or self.auto_reviewer.review(turn, approval, call_id=tc.id,
+                                                                             approvals=self.approvals)
         except Exception:  # noqa: BLE001 — un relecteur qui tombe laisse la carte à l'humain
             logger.warning("relecteur automatique en échec", exc_info=True)
             res = None
@@ -432,9 +470,12 @@ class Kernel:
         if decision == "reject":
             return ToolResult(call_id=tc.id, name=tc.name, content=REFUSED_RESULT.format(
                 reason=reason, approval_id=approval.id), is_error=False, reason="auto_review_rejected")
-        # Approuvée : exécutée DANS le tour, comme une action permise (le modèle voit le résultat de l'outil).
+        # Approuvée : exécutée DANS le tour, comme une action permise (le modèle voit le résultat de l'outil). La carte
+        # est passée dans le contexte : une écriture de fichier y gagne un point de retour par carte (révocation).
+        import dataclasses as _dc
+
         try:
-            result = self.tools.call(tc.name, tc.arguments, ctx)
+            result = self.tools.call(tc.name, tc.arguments, _dc.replace(ctx, auto_approval_id=approval.id))
         except Exception as e:  # noqa: BLE001 — même contrat que l'exécuteur de cartes
             self.approvals.mark_failed(approval.id, f"{type(e).__name__}: {e}"[:500])
             raise
@@ -444,6 +485,11 @@ class Kernel:
             self.approvals.mark_failed(approval.id, (redacted.content or "")[:500])
         else:
             self.approvals.mark_executed(approval.id, (redacted.content or "")[:2000])
+        if self.observer is not None and hasattr(self.observer, "auto_review_decided"):  # bulle `approval` du fil
+            try:
+                self._observe("auto_review_decided", turn, self.approvals.get(approval.id))
+            except Exception:  # noqa: BLE001 — une bulle en panne ne casse jamais le tour
+                logger.warning("bulle de la décision automatique non posée", exc_info=True)
         suffix = self._observe("tool_executed", turn, tc, spec, redacted)
         admit_in = getattr(self.context, "admit_result_in", None)
         admitted = (admit_in(turn.thread_id, turn.index, redacted) if admit_in is not None
@@ -586,6 +632,9 @@ class Kernel:
     # drapeau `auto_review`) : approuve, refuse ou laisse à l'humain une carte de la liste permise. `None` = éteint
     # (défaut) : aucune carte relue, chemin et textes inchangés.
     auto_reviewer: Any = None
+    # Points de retour PAR CARTE des écritures approuvées automatiquement (`nokker/tools/card_snapshots.py`) : un
+    # magasin par enveloppe des points de retour ; lus par la révocation (`rollback`) et `…/auto-review/rollback`.
+    card_snapshots: list[Any] = field(default_factory=list)
     # Traces d'entraînement (docs/TRACES.md, `nokker/traces/recorder.py::TraceRecorder`) : chaque appel modèle (messages
     # exacts envoyés, schémas, suite) gardé à part, écrit à la fin du tour. `None` = rien n'est enregistré (défaut ;
     # `traces_record: false`). Jamais d'effet sur ce que voit le modèle : l'enregistreur copie, et une erreur est avalée.
@@ -800,7 +849,7 @@ class Kernel:
         assembled.messages.append({"role": "user", "content": WRAP_UP_NOTE})
         assembled.tools = []
         try:
-            comp, live = self._complete(self.providers[route.tier], assembled, route, thread_id, stream, turn)
+            comp, live = self._complete(self._provider_for(route.tier), assembled, route, thread_id, stream, turn)
         except TurnCancelled:
             raise
         except Exception as e:  # noqa: BLE001 — l'appelant escalade
@@ -833,7 +882,18 @@ class Kernel:
 
         Un tour à la fois par fil, dans l'ordre d'arrivée (`turn_locks`) : un tour demandé pendant qu'un autre tourne
         attend sa fin, prend l'index suivant et voit son contexte."""
-        with self.turn_locks.get(inp.thread_id):
+        from nokker.tools.scope import thread_scope
+
+        with self.turn_locks.get(inp.thread_id), thread_scope(inp.thread_id):  # outils offerts selon le fil
+            # 00. BYOK cloud : point d'accès du client pour ce tour. Formule sans inférence Nokker (`byok`) et aucun point
+            # d'accès utilisable : refusé ici, avant tout appel de modèle et tout décompte (foyer, budget, quota).
+            byok = self._byok_route()
+            if byok is not None and byok.provider is None:
+                verdict = Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0, rule="byok:not_configured",
+                                  reason=f"formule sans inférence Nokker : {byok.blocked}", subject="reply")
+                return self._limited_turn(inp, self.invariants.check_input(inp.user_text), verdict,
+                                          reply=BYOK_NOT_CONFIGURED_REPLY,
+                                          failure={"code": "byok_not_configured", "message": BYOK_NOT_CONFIGURED_SHORT})
             # 0. Projet d'équipe : le budget est relu avant le tour ; refusé, le tour s'arrête là (rien n'est compté
             # au plafond du compte). Attribué, chaque appel du tour porte le projet au ledger (`spend_tag`).
             # 0 bis. Foyer (X23) : quota commun et plafond du membre, comptés en tours dans le ledger ; un tour d'un
@@ -847,17 +907,40 @@ class Kernel:
                 return self._limited_turn(inp, self.invariants.check_input(inp.user_text), ticket.verdict,
                                           reply=ticket.reply)
             with spend_tag(merge_tags(ticket.tag if ticket is not None else None,
-                                      house.tag if house is not None else None)):
+                                      house.tag if house is not None else None)), \
+                    byok_turn_scope(byok):
                 return self._run_turn(inp, stream, ticket, house)
+
+    def _byok_route(self) -> Any:
+        """Point d'accès du client pour ce tour (BYOK cloud), ou None : le Router et les paliers de la config."""
+        if self.byok is None:
+            return None
+        try:
+            return self.byok.route_for_turn()
+        except Exception:  # noqa: BLE001 — réglages illisibles : le tour garde les paliers (jamais la clé au journal)
+            logger.warning("byok : point d'accès du tour illisible", exc_info=True)
+            return None
+
+    def _provider_for(self, tier: Tier) -> Provider:
+        """Fournisseur d'un appel : celui du client pour un tour BYOK (quel que soit le palier), sinon le palier."""
+        route = byok_active()
+        return route.provider if route is not None else self.providers[tier]
 
     def _run_turn(self, inp: TurnInput, stream: TurnStream | None = None, budget_ticket: Any = None,
                   household_ticket: Any = None) -> Turn:
         # 1. Entrée : caviardage + drapeaux de domaine AVANT tout enregistrement.
         checked = self.invariants.check_input(inp.user_text)
+        if inp.control == APPROVAL_CONTINUE:
+            # Suite d'une carte décidée : le bloc `[Approbation]` est écrit par le noyau (décision déjà prise par la
+            # personne sur la carte) ; aucun drapeau de domaine sur sa propre relance (montant d'un pay_request…).
+            checked.domain_flags = set()
+            checked.origin = "approval"
         # 1 bis. Plafond du compte (testeurs seulement) : au-delà, réponse claire, sans rappel ni appel modèle. Membre
         # d'un foyer : le quota est celui du foyer (0 bis), seule la garde de coût du compte reste (`shared`).
         shared = household_ticket is not None
-        over = self.limits.check_turn(inp.sender, shared=shared) if self.limits is not None else None
+        # Tour BYOK : hors du quota du Router, compté à part sous la garde de débit (`limits:byok_turns_per_day`).
+        byok_kw = {"byok": True} if byok_active() is not None else {}
+        over = self.limits.check_turn(inp.sender, shared=shared, **byok_kw) if self.limits is not None else None
         if over is not None:
             return self._limited_turn(inp, checked, over)
         # 2 (lancé tôt). Rappel du tour : part maintenant, en parallèle de la préparation du contexte ci-dessous,
@@ -1006,13 +1089,23 @@ class Kernel:
                         state.current_tier = route.tier
                         assembled = self.context.assemble(turn, history, recall, loaded, route.tier)
                     try:
-                        comp, live = self._complete(self.providers[route.tier], assembled, route, inp.thread_id,
+                        comp, live = self._complete(self._provider_for(route.tier), assembled, route, inp.thread_id,
                                                     stream, turn)
                         break
                     except TurnCancelled:
                         raise  # l'utilisateur a annulé : ni repli de palier ni escalade
                     except Exception as e:  # noqa: BLE001 — un amont indisponible n'est pas un bug du noyau
                         failure = e
+                if comp is None and byok_active() is not None:
+                    # BYOK : ni repli vers le Router ni escalade ; l'erreur du point d'accès du client, lisible.
+                    name = byok_active().name
+                    why = _short_error(failure)
+                    turn.failure = {"code": "byok_unavailable", "message": f"modèle « {name} » injoignable : {why}"}
+                    self._log_verdicts(turn, [Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0,
+                                                      rule="byok:unavailable", reason=turn.failure["message"])])
+                    reply = BYOK_DOWN_REPLY.format(name=name, why=why)
+                    turn.messages.append(Message(role="assistant", content=reply))
+                    break
                 if comp is None:
                     reason = f"palier {route.tier.value} indisponible : {_short_error(failure)}"
                     turn.failure = {"code": "tier_unavailable", "message": reason}
@@ -1176,7 +1269,8 @@ class Kernel:
         # 8 bis. Quota dépassé en mode soft : l'avertissement suit la réponse (une fois par fenêtre). Hors de
         # `messages` : le modèle ne le relit pas au tour suivant. Le chunk final du flux porte `turn.reply`.
         try:
-            notice = self.limits.notice(inp.sender, shared=shared) if self.limits is not None else None
+            notice = self.limits.notice(inp.sender, shared=shared) \
+                if self.limits is not None and not byok_kw else None
             if household_ticket is not None and notice is None:
                 notice = self.household.notice(household_ticket)  # foyer en mode soft : quota passé, une fois
         except Exception:  # noqa: BLE001 — un avertissement manqué ne casse jamais le tour
@@ -1229,11 +1323,14 @@ class Kernel:
                 self.add_owner_note(turn.thread_id, line)
         return turn
 
-    def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict, *, reply: str | None = None) -> Turn:
+    def _limited_turn(self, inp: TurnInput, checked, verdict: Verdict, *, reply: str | None = None,
+                      failure: dict[str, str] | None = None) -> Turn:
         """Tour refusé par un plafond (compte, ou budget du projet : `reply` donné) : gardé dans l'historique avec son
-        verdict, sans appel modèle."""
+        verdict, sans appel modèle. `failure` : l'échec à annoncer (`turn.done.error`), ex. BYOK non configuré."""
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender)
+        if failure is not None:
+            turn.failure = failure
         self._observe("turn_started", turn)
         self._log_verdicts(turn, [verdict])
         if reply is None:
@@ -1366,8 +1463,8 @@ class Kernel:
 
     def _routes_with_fallback(self, route: RouteDecision) -> list[RouteDecision]:
         """Le palier choisi, puis Ship en repli s'il est différent et configuré (jamais l'inverse : Ship est le
-        plancher, son indisponibilité escalade)."""
-        if route.tier is Tier.SHIP or Tier.SHIP not in self.providers:
+        plancher, son indisponibilité escalade). Tour BYOK : un seul point d'accès, aucun repli."""
+        if route.tier is Tier.SHIP or Tier.SHIP not in self.providers or byok_active() is not None:
             return [route]
         return [route, RouteDecision(tier=Tier.SHIP, reasoning=route.reasoning,
                                      reason=f"repli : {route.tier.value} indisponible")]
@@ -1409,7 +1506,7 @@ class Kernel:
         """Un palier qui déclare sa fenêtre (`max_context_tokens`, palier `nina` 32 k) ne reçoit jamais un appel qui n'y
         tient pas : bascule sur Ship (verdict `router:context`), le prompt est réassemblé pour Ship."""
         provider = self.providers.get(route.tier)
-        if provider is None or route.tier is Tier.SHIP or Tier.SHIP not in self.providers:
+        if provider is None or route.tier is Tier.SHIP or Tier.SHIP not in self.providers or byok_active() is not None:
             return route, assembled
         from nokker.route.nina import fits
 
@@ -1441,7 +1538,9 @@ class Kernel:
         tools_live: LiveToolInputs | None = None
         kwargs = {}
         if stream is not None and accepts_on_delta(provider):
-            live = ScrubbedDeltas(self.invariants.scrub_output, stream, holdback_for(self.invariants))
+            # Retenue : base + début de secret connu en fin de texte (`secret_tail`), au lieu de 2 × le plus long secret.
+            live = ScrubbedDeltas(self.invariants.scrub_output, stream, DEFAULT_HOLDBACK,
+                                  known=getattr(self.invariants, "known", None))
             kwargs["on_delta"] = self._cancellable(live.feed, thread_id)
             tools_live = self._live_tool_inputs(provider, assembled, turn)
             if tools_live is not None:

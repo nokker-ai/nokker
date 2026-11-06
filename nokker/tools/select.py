@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass
 
 from nokker.core.ports import ToolSpec
+from nokker.tools.essentials.texts import ESS_CALC, ESS_METEO, ESS_TRANSIT, ESS_WIKI
+from nokker.tools.essentials.texts_v2 import ESS2_METEO, ESS2_MOBILITY, ESS2_SCHOOL, ESS2_WATER
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,37 @@ FAMILIES: tuple[Family, ...] = (
         r"\bquel temps\b", r"\btemp[ée]rature", r"\bpleuv", r"\bpluie\b", r"\bneige", r"\bprix\b", r"\btarifs?\b", r"\bhoraires?\b", r"\bscores?\b", r"\bcours de\b", r"\bwikip", r"\bqui est\b",
         r"\bc'est quoi\b", r"\bqu'est-ce qu", r"\bliens?\b", r"\bsources?\b", r"\bsearch\b", r"\blook up\b",
         r"\bwhat is\b", r"\bwho is\b", r"\blatest\b", r"\baujourd'hui\b", r"\bderni[eè]re?s?\b")),
+    # Pack Essentiels (drapeau `essentials`, docs/ESSENTIALS.md), quatre familles : sans ces outils dans le registre
+    # (drapeau éteint), elles ne produisent aucune ligne et ne chargent rien.
+    Family("Météo", ESS_METEO + ESS2_METEO, ESS_METEO + ESS2_METEO, _rx(
+        r"\bm[ée]t[ée]o", r"\bweather\b", r"\bwetter\b", r"\bquel temps\b", r"\btemp[ée]rature", r"\bpleuv",
+        r"\bpluie\b", r"\bneige", r"\bsoleil\b", r"\borage", r"\bpollens?\b", r"\ballergi", r"\bavalanches?\b",
+        r"\blawinen?", r"\bski\b", r"\brandonn[ée]e", r"\bforecast\b", r"\bvigilance\b", r"\balertes? m[ée]t[ée]o", r"\bqualit[ée] de l'air\b",
+        r"\bpollution\b", r"\bindice atmo\b", r"\bair quality\b")),
+    # Vague 2 (`essentials_v2`) : sans ces outils dans le registre, ces familles ne produisent rien. « vacances » seul ne
+    # charge JAMAIS les vacances scolaires (contrainte relecture, 05.11.2026).
+    Family("Mobilité", ESS2_MOBILITY, ESS2_MOBILITY, _rx(
+        r"\bv[ée]los? (en )?(libre-service|partag)", r"\btrottinettes?\b", r"\bcar ?sharing\b", r"\bmobility\b",
+        r"\bpublibike\b", r"\bdonkey\b", r"\bvoitures? (en )?partag", r"\bv[ée]hicules? partag", r"\bbornes? de recharge",
+        r"\brecharger\b", r"\bvoiture [ée]lectrique", r"\bladestation", r"\bcharging stations?\b")),
+    Family("Eau", ESS2_WATER, ESS2_WATER, _rx(
+        r"\brivi[èe]res?\b", r"\bfleuves?\b", r"\blacs?\b", r"\bd[ée]bit\b", r"\bniveau (du|de la|de l'|des)\b",
+        r"\btemp[ée]rature de l'eau\b", r"\baar[e]?\b", r"\bl[ée]man\b", r"\bbaignade", r"\bcrues?\b")),
+    Family("Vacances scolaires", ESS2_SCHOOL, ESS2_SCHOOL, _rx(
+        r"\bvacances scolaires\b", r"\bcong[ée]s scolaires\b", r"\bschulferien\b", r"\brel[âa]ches\b")),
+    Family("Transports", ESS_TRANSIT, ESS_TRANSIT, _rx(
+        r"\btrains?\b", r"\btrams?\b", r"\bbus\b", r"\bcars? postal", r"\bbateaux?\b", r"\bcff\b", r"\bsbb\b",
+        r"\bgares?\b", r"\barr[êe]ts?\b", r"\btrajets?\b", r"\bitin[ée]raire", r"\bcorrespondances?\b",
+        r"\bretards? (du|des|de la|d'un|d'une) (trains?|bus|trams?|bateaux?|m[ée]tro)\b", r"\btransports? publics?\b",
+        r"\bfahrplan", r"\btimetable\b")),
+    Family("Encyclopédie", ESS_WIKI, ESS_WIKI, _rx(
+        r"\bwikip", r"\bqui est\b", r"\bqui [ée]tait\b", r"\bqu'est-ce que c'est\b", r"\bqu'est-ce qu'une?\b",
+        r"\bc'est quoi (un|une|le|la)\b", r"\bwho is\b", r"\bwhat is (a|an|the)\b", r"\bencyclop")),
+    Family("Calculs", ESS_CALC, ESS_CALC, _rx(
+        r"\btaux de change\b", r"\bexchange rates?\b", r"\bdevises?\b", r"\ben (euros?|dollars?|francs?|chf)\b",
+        r"\bconverti", r"\d+\s*(chf|eur|usd)\s*(en|in|to)\b", r"\bf[ée]ri[ée]", r"\bholidays?\b", r"\bfeiertag", r"\bconvert", r"\bcalcul",
+        r"\bcombien (font|fait)\b", r"\d\s*(km|mi|kg|lb|°[cf]|ft|oz)\b", r"\bmiles?\b", r"\bfahrenheit",
+        r"\bcelsius", r"\bjours? (entre|avant|apr[eè]s)\b", r"\bquel jour\b", r"\bdans \d+ jours\b")),
     Family("Mail", ("mail_*",), ("mail_*",), _rx(
         r"\be-?mails?\b", r"\bmails?\b", r"\bcourriels?\b", r"\bbo[iî]te\b", r"\binbox\b", r"\br[ée]pon[ds]",
         r"\bbrouillon", r"\bdraft", r"\bmessages? (re[çc]us?|non lus?)", r"\bunread\b", r"\bexp[ée]diteur",
@@ -56,6 +89,12 @@ FAMILIES: tuple[Family, ...] = (
         r"\bagenda\b", r"\bcalendri", r"\bcalendar\b", r"\bplannings?\b", r"\bprogrammes?\b", r"\bconvocations?\b",
         r"\bhoraires?\b", r"\bd[ée]ch[eè]terie", r"\bentra[îi]nements?\b", r"\b[ée]cole\b", r"\bclub\b",
         r"\b[ée]v[ée]nements?\b", r"\bbrouillon\b", r"\bschedule")),
+    # Paiement (drapeau `payments`, docs/PAYMENTS.md) : sans l'outil `pay_request` dans le registre (drapeau éteint), la
+    # famille ne produit aucune ligne et ne charge rien. Avant le navigateur : « commande » charge les deux.
+    Family("Paiement", ("pay_request",), ("pay_request",), _rx(
+        r"\bpaie", r"\bpaye", r"\bpayer\b", r"\bpaiements?\b", r"\bcommande", r"\bach[eè]te", r"\bcommander\b",
+        r"\bbestell", r"\bkauf", r"\bbezahl", r"\bordina", r"\bcompra", r"\bpaga",
+        r"\border\b", r"\bbuy\b", r"\bpurchase", r"\bpay\b", r"\bcheckout\b")),
     Family("Navigateur", ("browser_*",), (
         "browser_lane", "browser_navigate", "browser_snapshot", "browser_find", "browser_read_text", "browser_click",
         "browser_type", "browser_fill_form", "browser_press_key", "browser_select_option", "browser_wait_for",

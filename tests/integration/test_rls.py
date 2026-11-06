@@ -38,6 +38,10 @@ CONTENT_TABLES = [
     # équipe (023) : locataire du PROJET ; les politiques d'équipe (membres d'autres locataires) dans test_team_rls.py
     "team_projects", "team_access", "team_members", "team_invites", "team_skills", "team_notes",
     "team_note_quarantine",
+    # partages de connecteurs (068) : locataire du PROPRIÉTAIRE ; la lecture du bénéficiaire dans test_connector_grants_rls.py
+    "connector_grants", "connector_grant_events",
+    # connecteurs OAuth (069) : comptes reliés (jetons chiffrés) et flux en cours, dans le locataire du profil
+    "oauth_accounts", "oauth_flows",
     "lokkal_machine_resources", "lokkal_handoffs", "lokkal_mirror_notes",  # délégation par besoin (025, X21)
     "nokker_agent_runs",  # passages des agents Crew (024, X14) : écrits dans le locataire de l'agent
     # plan et incidents (029, X18) : sources signées, signatures reçues, incidents, cartes, propositions, brief
@@ -80,7 +84,7 @@ KEYED = {"accounts": ("id", "email"), "billing_customers": ("stripe_customer",),
          "household_minor_grants": ("account_id",), "lokkal_gateway_codes": ("code_sha256",),
          "lokkal_gateway_refresh": ("token_sha256", "family"),
          "lokkal_machines": ("id", "token_sha256", "host", "account_id"), "sso_domain_claims": ("domain",),
-         "sso_flows": ("state_sha256",), "sso_routes": ("connection_id",), "thread_share_tokens": ("token_sha256",),
+         "sso_flows": ("state_sha256",), "oauth_flows": ("state_sha256",), "sso_routes": ("connection_id",), "thread_share_tokens": ("token_sha256",),
          "ambient_displays": ("id", "token_sha256", "pair_sha256", "account_id")}
 OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
@@ -93,7 +97,12 @@ OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", 
               "account_minors",
               # canaux Slack/WhatsApp (048) : codes d'appairage (comme telegram_pairing), événements déjà vus,
               # fenêtre de 24 h WhatsApp sous empreinte — lus avant de connaître le locataire
-              "channel_pairing", "channel_events", "channel_windows"}
+              "channel_pairing", "channel_events", "channel_windows",
+              # agent de paiement (063) : sans locataire, rôle nokker_pay_agent seul (test_pay_agent_role_*)
+              "pay_agent_methods", "pay_agent_tokens", "pay_agent_events",
+              "pay_agent_cards", "pay_agent_3ds", "pay_agent_links",
+              # vouchers d'essai (067) : un code est global à une campagne ; locataire et adresse en empreintes seulement
+              "vouchers", "voucher_uses"}
 
 
 @pytest.fixture(scope="module")
@@ -159,7 +168,7 @@ def _dummy_row(conn, table: str) -> tuple[list[str], list]:
     vals = {"text": lambda: uuid.uuid4().hex, "integer": lambda: secrets.randbelow(10**6),
             "bigint": lambda: secrets.randbelow(10**9), "double precision": lambda: 1.0,
             "boolean": lambda: False, "jsonb": lambda: Jsonb({}), "bytea": lambda: b"<p>x</p>",
-            "timestamp with time zone": lambda: datetime.now(timezone.utc)}
+            "timestamp with time zone": lambda: datetime.now(timezone.utc), "ARRAY": lambda: ["x"]}
     return [c for c, _ in rows], [vals[t]() for _, t in rows]
 
 
@@ -181,6 +190,12 @@ def _insert(conn, table: str, tenant: str | None = None) -> None:
         vals[cols.index("action")] = "unpublish" if table == "lokkal_page_moderation" else "allow"
     if table == "ambient_displays":  # 054 : profondeur 1 ou 2
         vals[cols.index("depth")] = 1
+    if table == "connector_grants":  # 068 : nature et niveau contraints, propriétaire ≠ bénéficiaire
+        cols, vals = [*cols, "level"], [*vals, "read"]
+        vals[cols.index("kind")] = "mail"
+        vals[cols.index("grantee_account")] = "us_" + uuid.uuid4().hex[:12]
+    if table == "connector_grant_events":  # 068 : événement contraint
+        vals[cols.index("event")] = "granted"
     if tenant is not None:
         cols, vals = [*cols, "tenant_id"], [*vals, tenant]
     names = ", ".join(f'"{c}"' for c in cols)
@@ -960,3 +975,37 @@ def test_web_packs_and_agent_origin_roundtrip_under_rls(pg, pod_env):
             assert agents.get(a.id) is None
     finally:
         agents.close()
+
+
+@requires_pg
+def test_pay_agent_role_reads_four_device_columns_and_its_tables_only(pg):
+    """Agent de paiement (063, docs/PAY-AGENT.md §6) : `nokker_pay_agent` lit id, user, public_key_spki, status de
+    `devices` et rien d'autre (ni `code`, ni écriture, ni table du noyau) ; il écrit dans ses tables pay_agent_*, où
+    `nokker_app` n'a aucun droit."""
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    pw = secrets.token_hex(12)
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        su.execute(f"ALTER ROLE nokker_pay_agent PASSWORD '{pw}'")
+        su.execute("INSERT INTO devices (id, code, \"user\", name, public_key_spki, status, created_at) "
+                   "VALUES ('dev_alice', 'c-alice', 'us_alice', 'alice', 'spki', 'approved', 1.0)")
+    agent = make_conninfo(pg["su"], user="nokker_pay_agent", password=pw)
+    with psycopg.connect(agent, autocommit=True) as conn:
+        assert conn.execute('SELECT id, "user", public_key_spki, status FROM devices WHERE id = %s',
+                            ("dev_alice",)).fetchone() == ("dev_alice", "us_alice", "spki", "approved")
+        conn.execute("INSERT INTO pay_agent_events (id) VALUES ('evt_1')")
+        assert conn.execute("SELECT count(*) FROM pay_agent_events").fetchone()[0] == 1
+        for sql in ("SELECT code FROM devices", "SELECT * FROM devices",
+                    "UPDATE devices SET status = 'revoked' WHERE id = 'dev_alice'",
+                    "SELECT * FROM pay_mandates", "SELECT * FROM accounts", "SELECT * FROM sessions"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(sql)
+    with psycopg.connect(pg["app"], autocommit=True) as conn:
+        for t in ("pay_agent_methods", "pay_agent_tokens", "pay_agent_events", "pay_agent_cards", "pay_agent_3ds",
+                  "pay_agent_links"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(f"SELECT * FROM {t}")
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        attrs = su.execute("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'nokker_pay_agent'").fetchone()
+    assert attrs == (False, False)

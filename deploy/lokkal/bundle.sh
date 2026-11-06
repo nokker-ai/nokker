@@ -9,6 +9,7 @@ STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
 D="$STAGE/nokker"; mkdir -p "$D"
 cp -r "$HERE/docker-compose.yml" "$HERE/initdb" "$HERE/sql" "$HERE/web" "$HERE/install.sh" "$HERE/backup.sh" "$D/"
 mkdir -p "$D/vault"; cp "$HERE/vault/init.sh" "$HERE/vault/unseal.sh" "$D/vault/"   # profil vault (X4)
+cp "$HERE/vault/pay-init.sh" "$D/vault/"; cp -r "$HERE/testshop" "$D/"   # profil pay (docs/PAY-AGENT.md §11.5), éteint
 cp "$ROOT/deploy/postgres/roles.sql" "$D/sql/roles.sql"
 # Config du noyau : le modèle de Nokker dev (deploy/lokkal/core-config.yaml), statique (chemins et hôtes par l'env).
 [ -f "$HERE/core-config.yaml" ] || { echo "deploy/lokkal/core-config.yaml absent (branche p2/lokkal-dev pas intégrée ?)" >&2; exit 1; }

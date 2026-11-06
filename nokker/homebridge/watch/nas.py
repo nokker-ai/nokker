@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import ssl
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from nokker.homebridge.watch.net import LanHttp, UpstreamError, WatchEnv
 
@@ -174,15 +176,22 @@ def websocket_rpc(config: WatchEnv, url: str, key_ref: str, verify: Any) -> RpcF
     def call(method: str, params: list[Any]) -> Any:
         from websockets.sync.client import connect
 
-        config.check_url(url)
-        ctx = None
+        ip = config.check_url(url)
+        parts = urlsplit(url)
+        kw: dict[str, Any] = {}
         if url.startswith("wss://"):
             ctx = ssl.create_default_context(cafile=verify if isinstance(verify, str) else None)
             if verify is False:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
+            kw = {"ssl": ctx, "server_hostname": parts.hostname}
+        port = parts.port or (443 if url.startswith("wss://") else 80)
+        try:  # TCP sur l'IP vérifiée (pas de second tour DNS) ; certificat et SNI au nom de l'hôte
+            sock = socket.create_connection((ip, port), timeout=10)
+        except OSError as e:
+            raise UpstreamError(f"TrueNAS injoignable ({type(e).__name__})", "unreachable") from None
         try:
-            with connect(url, ssl=ctx, open_timeout=10, close_timeout=2, max_size=4 * 1024 * 1024) as ws:
+            with connect(url, sock=sock, open_timeout=10, close_timeout=2, max_size=4 * 1024 * 1024, **kw) as ws:
                 def rpc(i: int, m: str, p: list[Any]) -> Any:
                     ws.send(json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p}))
                     while True:
@@ -199,6 +208,8 @@ def websocket_rpc(config: WatchEnv, url: str, key_ref: str, verify: Any) -> RpcF
             raise
         except Exception as e:  # noqa: BLE001 — réseau, TLS, protocole : jamais le détail (pas de secret)
             raise UpstreamError(f"TrueNAS injoignable ({type(e).__name__})", "unreachable") from None
+        finally:
+            sock.close()
     return call
 
 

@@ -23,6 +23,10 @@ SCREENS = ("chat", "crew", "incidents", "plan", "team", "household", "packs", "c
            "learning", "house", "folder")
 UI_TARGETS = ("composer", "attach", "send", "new_session", "sessions", "account", "bubbles")
 
+# Qui fait la fonction (notes de fonctions, `nokker/guide/notes.py`, drapeau `feature_notes`).
+WHO_VOICE, WHO_TEAM, WHO_GUIDE, WHO_CARD = "voix", "équipe via delegate", "Guide", "carte de la personne"
+WHO = (WHO_VOICE, WHO_TEAM, WHO_GUIDE, WHO_CARD)
+
 # Profils du tour d'accueil.
 SOLO, HOUSEHOLD = "solo", "household"
 PROFILES = (SOLO, HOUSEHOLD, LOKKAL)
@@ -49,6 +53,13 @@ class Feature:
     intro_rank: int = 100  # ordre dans le tour d'accueil (petit = d'abord)
     signals: tuple[str, ...] = ()  # outils ou événements qui comptent comme un usage
     extra: dict[str, Any] = field(default_factory=dict)
+    # Notes de fonctions (drapeau `feature_notes`, `nokker/guide/notes.py`) : textes vus par le modèle, relus avant allumage.
+    # Vides : la ligne n'est pas rendue (fonction pas encore décrite, jamais inventée).
+    when_fr: str = ""  # quand s'en servir, une phrase
+    who: tuple[str, ...] = ()  # qui la fait (WHO)
+    tools_how: str = ""  # outils, arguments clés, ordre
+    never: str = ""  # interdits
+    sees_fr: str = ""  # ce que la personne voit à l'écran
 
 
 F = Feature
@@ -70,8 +81,8 @@ CATALOG: tuple[Feature, ...] = (
     F("steer", "Corriger en cours de route", "Steer a running turn",
       "Ajouter une consigne pendant que l'agent travaille, sans l'arrêter.", "Ah, et seulement les offres en Suisse.",
       "Écris dans le fil pendant que l'agent travaille.", flags=("steer_enabled",), ui="composer", intro_rank=60),
-    F("bubbles", "Bulles", "Bubbles", "Garder à l'écran des objets vivants : liste, tableau, suivi.",
-      "Garde la liste de courses dans une bulle.", "Demande-le dans le fil ; les bulles se déplacent d'un fil à l'autre.",
+    F("bubbles", "Bulles", "Bubbles", "Montrer une page (profil, article, site) dans une carte d'aperçu qui reste dans le fil.",
+      "Montre-moi le profil Instagram de l'artiste.", "Demande-le dans le fil ; les bulles se déplacent d'un fil à l'autre.",
       flags=("bubbles_enabled",), ui="bubbles", intro_rank=30, signals=("bubble_show", "bubble_update")),
     F("show_me", "Montre-moi", "Show me", "L'agent montre où cliquer au lieu de le faire à ta place.",
       "Montre-moi où joindre un fichier.", "Demande « montre-moi » dans le fil.", flags=("show_me",), intro_rank=50,
@@ -97,8 +108,8 @@ CATALOG: tuple[Feature, ...] = (
       "Écran Apprentissage → règles suggérées.", flags=("approval_suggestions.enabled",), screen="learning",
       intro_rank=80),
     # ── agents ──
-    F("subagents", "Sous-agents", "Sub-agents", "Confier une partie du travail à un sous-agent en parallèle.",
-      "Pendant que tu écris, fais vérifier les chiffres par un sous-agent.", "Demande-le dans le fil.",
+    F("subagents", "Sous-agents", "Sub-agents", "Confier un travail technique ou une analyse à l'équipe, qui rend un compte rendu.",
+      "Compare les offres des trois opérateurs internet pour la maison.", "Demande-le dans le fil.",
       intro_rank=75, signals=("delegate",)),
     F("delegate_fork", "Sous-agent qui reprend le fil", "Forked sub-agent",
       "Un sous-agent qui part avec tout le contexte du fil.", "Explore l'autre piste avec tout ce qu'on a dit.",
@@ -179,6 +190,10 @@ CATALOG: tuple[Feature, ...] = (
     F("billing", "Abonnement", "Subscription", "Voir ton offre, ta consommation et changer de formule.",
       "Combien de tours me reste-t-il cette semaine ?", "Mon compte → abonnement.", flags=("billing_enabled",),
       targets=(CLOUD,), screen="account", ui="account", adult_only=True, intro_rank=97),
+    F("cloud_byok", "Mon propre modèle", "Bring your own model",
+      "Brancher ta propre inférence compatible OpenAI au lieu du modèle de Nokker (formules qui l'incluent).",
+      "Comment j'utilise ma clé OpenAI avec Nokker ?", "Mon compte → Modèles.", flags=("cloud_byok.enabled",),
+      targets=(CLOUD,), screen="account", ui="account", adult_only=True, intro_rank=98),
     # ── canaux ──
     F("slack", "Slack", "Slack", "Parler à l'agent depuis Slack.", "Réponds-moi dans Slack.",
       "Mon compte → relier Slack.", flags=("slack.enabled",), screen="account", intro_rank=78),
@@ -236,6 +251,76 @@ CATALOG: tuple[Feature, ...] = (
 
 # Drapeaux de la config qui ne sont PAS des fonctions à présenter (réglages techniques, garde-fous, exploitation).
 # Toute exclusion porte sa raison : un nouveau drapeau doit être ajouté ici ou au catalogue (test anti-dérive).
+# Notes de fonctions (drapeau `feature_notes`) : `when_fr`, `who`, `tools_how`, `never` des fonctions déjà décrites,
+# d'après leurs outils réels (schémas du registre) et leurs règles existantes. Une fonction absente d'ici n'a pas ces
+# lignes (jamais inventées) : `tests/unit/guide/test_feature_notes.py` liste celles qui restent à décrire.
+_NOTES: dict[str, dict[str, Any]] = {
+    "web_search": dict(
+        when_fr="La réponse demande un fait récent ou une source vérifiable.", who=(WHO_VOICE,),
+        tools_how="web_search(query) pour trouver, puis web_fetch(urls) pour lire les pages retenues ; citer les sources.",
+        never="Jamais présenter comme vérifié ce qui n'a pas été lu dans une source."),
+    "bubbles": dict(
+        sees_fr="une carte d'aperçu cliquable (image, titre, description) dans le fil.",
+        when_fr="La personne demande d'afficher ou de montrer une page (profil, article, site).", who=(WHO_VOICE,),
+        tools_how="bubble_show(url) ouvre la bulle, le noyau remplit la carte ; bubble_update(bubble_id) ne met à jour "
+                  "qu'une bulle existante du fil courant.",
+        never="Jamais de bubble_update ni de navigation juste après bubble_show."),
+    "show_me": dict(
+        sees_fr="un repère sur l'élément de l'interface, avec la légende.",
+        when_fr="La personne demande où cliquer ou comment faire dans l'interface.", who=(WHO_VOICE,),
+        tools_how="point_at(caption, ui) montre l'élément de l'interface ; caption dit le geste à faire.",
+        never="Jamais faire le geste à la place de la personne : on montre, elle fait."),
+    "subagents": dict(
+        when_fr="Un travail technique ou une analyse doit être confié et suivi jusqu'au compte rendu.", who=(WHO_TEAM,),
+        tools_how="delegate(tasks=[{goal, context}]) ; avant l'appel, dire en une phrase ce qui est confié et qu'on "
+                  "attend la réponse ; ensuite transmettre le compte rendu fidèlement en disant qui a répondu.",
+        never="Jamais conclure avant le compte rendu ; jamais déléguer un paiement ni une question simple à laquelle "
+              "la voix sait répondre."),
+    "approvals": dict(
+        sees_fr="une carte dans le fil, à approuver ou refuser.",
+        when_fr="Une action forte ou sensible attend l'accord de la personne.", who=(WHO_CARD,),
+        tools_how="Le noyau pose la carte quand l'outil l'exige ; l'outil répond EN ATTENTE : dire ce qu'on attend et "
+                  "terminer le tour.",
+        never="Jamais rappeler l'outil ni escalader pendant qu'une carte attend."),
+    "payments": dict(
+        sees_fr="une carte « à payer » (marchand, montant, articles), approuvée avec sa passkey.",
+        when_fr="Une demande mène à payer : achat, facture, abonnement.", who=(WHO_VOICE, WHO_CARD),
+        tools_how="pay_request(merchant, amount, currency, items, url) prépare la carte « à payer » ; la carte EST la "
+                  "confirmation : appeler l'outil plutôt que demander en texte. La personne approuve avec sa passkey.",
+        never="Jamais saisir un numéro de carte ; jamais confier un paiement à un sous-agent."),
+    "crew": dict(
+        sees_fr="une carte de création d'agent, qu'elle active.",
+        when_fr="La personne veut un agent qui revient régulièrement (veille, rapport).", who=(WHO_VOICE, WHO_CARD),
+        tools_how="agent_draft(name, role, instructions) propose la carte de l'agent ; la personne l'active.",
+        never=""),
+    "rubric": dict(
+        when_fr="Un objectif mérite des critères de réussite vérifiables.", who=(WHO_VOICE,),
+        tools_how="rubric_propose(criteria, objective) propose les critères à la personne.", never=""),
+    "code": dict(
+        when_fr="Un travail porte sur un dépôt de code, dans une session de code.", who=(WHO_VOICE, WHO_TEAM),
+        tools_how="Dans le fil de la session : lire avec read_file et search_files ; faire construire avec delegate "
+                  "(un worktree par sous-agent).",
+        never="Jamais modifier un fichier soi-même : la voix lit, l'équipe construit ; aucun outil de code hors d'un "
+              "fil de session de code."),
+    "connectors": dict(
+        sees_fr="pour un envoi, une carte d'approbation avant que le mail parte.",
+        when_fr="La demande porte sur le mail ou l'agenda de la personne.", who=(WHO_VOICE, WHO_CARD),
+        tools_how="Lire avec mail_search et mail_read, l'agenda avec calendar_events ; préparer avec mail_draft ; "
+                  "créer ou modifier un événement avec calendar_create et calendar_update quand ces outils sont "
+                  "dans ta liste (sinon l'agenda est en lecture seule : dis-le) ; mail_send et calendar_delete "
+                  "posent une carte.",
+        never="Jamais d'envoi externe ni de suppression sans la carte de la personne."),
+}
+
+
+def _with_notes(f: Feature) -> Feature:
+    from dataclasses import replace
+
+    return replace(f, **_NOTES[f.id]) if f.id in _NOTES else f
+
+
+CATALOG = tuple(_with_notes(f) for f in CATALOG)
+
 EXCLUDED: dict[str, str] = {
     "judge_enabled": "porte du juge (couche 2), réglage interne",
     "judge_explicit": "posé par le chargement de la config",
@@ -247,7 +332,25 @@ EXCLUDED: dict[str, str] = {
     "require_rls": "garde-fou de la base",
     "admin_enabled": "console d'administration (exploitation)",
     "admin_candidatures": "module candidatures de la console (exploitation)",
+    "judge_require_explicit": "garde de démarrage du juge (exploitation)",
+    "delegate_tier": "palier et lecture seule des sous-agents (réglage interne, canari)",
+    "pay_agent": "agent de paiement : entrée au catalogue à son ouverture (allumage sur décision produit)",
+    "essentials_v2": "pack Essentiels vague 2 (docs/ESSENTIALS.md) : entrée au catalogue à son allumage",
+    "essentials": "pack Essentiels (docs/ESSENTIALS.md) : entrée au catalogue à son allumage, textes en relecture",
+    "pay_tool_choice": "texte de l'outil pay_request (réglage interne, mesuré au banc du palier)",
+    "card_mask_notice": "textes du masquage des cartes pour le modèle (réglage interne ; le masquage est toujours actif)",
+    "approval_bubbles": "bulle de la carte dans le fil (affichage des cartes existantes, réglage interne)",
+    "code_tools_session_only": "outils des sessions de code offerts dans leurs fils seulement (réglage interne)",
+    "voice_read_only": "la voix lit, ses sous-agents écrivent (réglage interne)",
+    "delegate_router": "routeur des sous-agents du harnais (réglage interne)",
+    "feature_notes": "notes des fonctions pour le modèle (réglage interne)",
+    "reply_language": "consigne de langue du préfixe (réglage interne, mesuré au banc du palier)",
+    "reply_language_tail": "ligne de langue avant le message (réglage interne, mesuré au banc du palier)",
+    "route_relay_voice": "routage des résumés et relais sur le palier de la voix (réglage interne, banc du palier)",
     "billing_live": "mode réel de la facturation (exploitation)",
+    "oauth_providers": "connecteurs OAuth (exploitation : clients Microsoft et Google ; se voit dans Connecteurs, entrée connecteurs)",
+    "vouchers_enabled": "vouchers d'essai (exploitation ; l'essai se voit dans Mon compte, entrée billing_enabled)",
+    "voucher_grants_invite": "un code de campagne sert d'invitation (exploitation, parcours d'inscription)",
     "mcp_modern": "transport MCP, technique",
     "mcp_apps": "apps MCP des serveurs du locataire interne seulement",
     "mcp_tool_servers": "serveurs MCP du locataire interne (un testeur passe par ses connecteurs)",
