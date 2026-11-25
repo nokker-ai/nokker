@@ -157,7 +157,10 @@ class PgEpisodeStore(_PgBase):
 class PgReservoirStore(_PgBase):
     def put(self, item: ReservoirItem) -> None:
         cols = _RS_COLS.split(", ")
-        sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols[1:])
+        # `created_at` est GARDÉ à la réécriture d'un élément (une relecture, un remplacement) : l'ordre « du plus récent au
+        # plus ancien » de `recall_context` et la date des extraits viennent de l'arrivée du résultat, jamais d'une écriture
+        # ultérieure.
+        sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols[1:] if c != "created_at")
         self._one(f"INSERT INTO nokker_reservoir ({_RS_COLS}) VALUES ({', '.join(['%s'] * 11)}) "
                   f"ON CONFLICT (id) DO UPDATE SET {sets} RETURNING id",
                   (item.id, item.thread_id, item.kind, item.name, item.content, item.preview, item.tokens,

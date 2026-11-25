@@ -212,6 +212,86 @@ def test_send_external_without_identifiable_recipient_is_hitl():
     assert v.decision is Decision.HITL
 
 
+def _send_decision(allow: Allowlist, **args) -> Decision:
+    return inv(allowlist=allow).check_action(
+        tc("send_email_reply", **args), spec("send_email_reply", Effect.SEND_EXTERNAL),
+        turn_with_text("envoie")).decision
+
+
+_OK = Allowlist.load(domains=["ninabot.ch"], addresses=["alice@example.ch"])
+
+
+def test_g1_liste_mixte_une_adresse_hors_liste_carte():
+    # avant le correctif : seul le dernier domaine (après le dernier « @ ») était regardé
+    assert _send_decision(_OK, to="evil@x.com, ok@ninabot.ch") is Decision.HITL
+    assert _send_decision(_OK, to="ok@ninabot.ch; evil@x.com") is Decision.HITL
+    assert _send_decision(_OK, to="evil@x.com,ok@ninabot.ch,") is Decision.HITL
+
+
+def test_g1_cc_bcc_reply_to_sont_controles():
+    for key in ("cc", "bcc", "reply_to"):
+        assert _send_decision(_OK, to="ok@ninabot.ch", **{key: "evil@x.com"}) is Decision.HITL, key
+        assert _send_decision(_OK, to="ok@ninabot.ch", **{key: ["evil@x.com"]}) is Decision.HITL, key
+        assert _send_decision(_OK, to="ok@ninabot.ch", **{key: "alice@example.ch"}) is Decision.ALLOW, key
+
+
+def test_g1_formes_valides_autorisees():
+    assert _send_decision(_OK, to="  OK@NinaBot.CH ") is Decision.ALLOW
+    assert _send_decision(_OK, to="Alice Martin <alice@example.ch>") is Decision.ALLOW
+    assert _send_decision(_OK, to='"Alice, M." <alice@example.ch>; bob@ninabot.ch') is Decision.ALLOW
+    assert _send_decision(_OK, to=["a@ninabot.ch", "Bob <b@ninabot.ch>"], cc="c@ninabot.ch;d@ninabot.ch") is Decision.ALLOW
+
+
+def test_g1_nom_affiche_ne_blanchit_pas():
+    assert _send_decision(_OK, to="ok@ninabot.ch <evil@x.com>") is Decision.HITL
+    assert _send_decision(_OK, to='"evil@x.com" <ok@ninabot.ch>, evil@x.com') is Decision.HITL
+
+
+def test_g1_illisible_vide_ou_forme_inconnue_carte():
+    assert _send_decision(_OK, to="n'importe quoi") is Decision.HITL
+    assert _send_decision(_OK, to="ok@ninabot.ch", cc="???") is Decision.HITL
+    assert _send_decision(_OK, to="ok@ninabot.ch", bcc="") is Decision.HITL
+    assert _send_decision(_OK, to="ok@ninabot.ch", cc=[]) is Decision.HITL
+    assert _send_decision(_OK, to="ok@ninabot.ch", cc={"a": 1}) is Decision.HITL
+    assert _send_decision(_OK, to="") is Decision.HITL
+    assert _send_decision(_OK, body="x") is Decision.HITL
+
+
+def test_g1_champ_absent_ou_nul_ignore():
+    assert _send_decision(_OK, to="ok@ninabot.ch", cc=None) is Decision.ALLOW
+
+
+def test_g4_outil_inconnu_carte_tant_qu_aucune_carte_n_est_approuvee():
+    i = inv()
+    sp = ToolSpec(name="mon_outil_x", description="d", parameters={}, effect=Effect.WRITE, effect_inferred="unknown")
+
+    def turn(tid):
+        return Turn(thread_id=tid, index=0, input=InputCheck(text="fais-le"))
+
+    v1 = i.check_action(tc("mon_outil_x"), sp, turn("t1"))
+    assert v1.decision is Decision.HITL and v1.rule == "effect:write:unknown_tool"
+    # carte refusée ou ignorée : le rappel du même outil reste une carte, jamais un WRITE exécuté
+    for _ in range(3):
+        assert i.check_action(tc("mon_outil_x"), sp, turn("t1")).decision is Decision.HITL
+    i.note_approved("t1", "mon_outil_x")  # une carte APPROUVÉE puis exécutée
+    assert i.check_action(tc("mon_outil_x"), sp, turn("t1")).decision is Decision.ALLOW
+    assert i.check_action(tc("mon_outil_x"), sp, turn("t2")).decision is Decision.HITL  # autre fil
+    declared = ToolSpec(name="kanban_create_task", description="d", parameters={}, effect=Effect.WRITE)
+    assert i.check_action(tc("kanban_create_task"), declared, turn("t3")).decision is Decision.ALLOW
+
+
+def test_g4_note_approved_ne_declasse_jamais_un_outil_inconnu_d_envoi():
+    i = inv(allowlist=Allowlist.load(domains=["ninabot.ch"]))
+    sp = ToolSpec(name="slack_post_message", description="d", parameters={}, effect=Effect.SEND_EXTERNAL,
+                  effect_inferred="send")
+    t = Turn(thread_id="t1", index=0, input=InputCheck(text="envoie"))
+    i.note_approved("t1", "slack_post_message")  # carte approuvée une fois dans le fil
+    assert i.check_action(tc("slack_post_message", to="evil@x.com"), sp, t).decision is Decision.HITL
+    assert i.check_action(tc("slack_post_message", to="a@ninabot.ch, evil@x.com"), sp, t).decision is Decision.HITL
+    assert i.check_action(tc("slack_post_message", text="salut"), sp, t).decision is Decision.HITL
+    assert i.check_action(tc("slack_post_message", to="a@ninabot.ch"), sp, t).decision is Decision.ALLOW
+
+
 # ───────────────────────── SEND_BULK : toujours refusé ─────────────────────────
 
 

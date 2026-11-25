@@ -203,7 +203,7 @@ _IBAN_SPACED_RE = re.compile(r"\b[A-Z]{2}\d{2}(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{
 # d'espace), ce qui évite de caviarder toute la phrase qui suit. Le mot-clé peut porter le même complément que la forme
 # en phrase (« le mot de passe du wifi : VALEUR », banc bench/keys S5, 01.11.2026 : resté en clair partout).
 _PASSWORD_KEYWORD_RE = re.compile(
-    r"(?i)\b(mot de passe|mdp|password|pw|passwort)((?:\s+(?:du|de la|de l'|de|des|pour|of|for|for the)\s+[^\s,;:=]+)"
+    r"(?i)\b(mot de passe|mdp|password|passwd|pw|passwort)((?:\s+(?:du|de la|de l'|de|des|pour|of|for|for the)\s+[^\s,;:=]+)"
     r"{0,2})\s*[:=]\s*(\S+)")
 
 # Même chose en phrase (carnet d'incidents D2, 24.10) : « le mot de passe du portail c'est VALEUR ». Sans « : », la
@@ -217,6 +217,26 @@ _PASSWORD_PHRASE_RE = re.compile(
 # Réservé au résultat d'un outil SECRET (`secret_tool=True`) : dans du texte humain, « mot de passe oublié » ou
 # « mot de passe trop court » ne doivent pas bouger — et la valeur doit de toute façon AVOIR l'air d'un mot de passe.
 _PASSWORD_BARE_RE = re.compile(r"(?i)\b(mot de passe|mdp|password|passwort|pw)\s+(?!c'est|c’est|est\b|is\b|ist\b)(\S+)")
+
+
+# Code PIN suivi de 4 à 8 chiffres (« PIN : 483920 », « code pin = 1234 ») : lu dans un RÉSULTAT d'outil (`tool_keywords`),
+# où le nombre à lui seul n'est jamais une preuve ; le mot-clé l'est.
+_PIN_RE = re.compile(r"(?i)\b((?:code\s+)?pin(?:\s+code)?\s*[:=]\s*['\"]?)(\d{4,8})(?![\w.])")
+_CODE_LIKE_RE = re.compile(r"[(\[{<$%\\]|^\*|\.[A-Za-z_]\w*\(|^[~/.]|^\w+\.\w+")
+_PW_PLACEHOLDERS = frozenset({"changeme", "change_me", "password", "motdepasse", "required", "optional", "string",
+                              "secret", "null", "none", "true", "false", "empty", "hidden", "masked", "redacted"})
+
+
+def _tool_password_ok(value: str) -> bool:
+    """Valeur d'un « mot de passe : VALEUR » lue dans un résultat d'OUTIL (code, config, sortie de commande) : plus
+    stricte que `_looks_like_password` — pas un appel ou un accès de code (`os.environ["X"]`, `${DB_PASSWORD}`,
+    `self.password`), pas un chemin, pas un identifiant, pas un mot de remplissage."""
+    v = value.strip("'\"`,;)")
+    if not _looks_like_password(v) or v.lower() in _PW_PLACEHOLDERS or _CODE_LIKE_RE.search(v):
+        return False
+    # Un mot de passe sans séparateur (`hunter2Zz`) n'est pas un identifiant de code : le test d'identifiant ne vaut que
+    # pour snake_case et kebab-case (`db_password_v2`), où il sait lire des mots.
+    return not (("_" in v or "-" in v) and (_identifier_like(v) or _code_identifier(v)))
 
 
 def _looks_like_password(value: str) -> bool:
@@ -723,7 +743,7 @@ class RedactResult:
 
 
 def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, wire: bool = False,
-           secret_tool: bool = False) -> RedactResult:
+           secret_tool: bool = False, tool_keywords: bool = False) -> RedactResult:
     """Caviarde `text` : valeurs connues d'abord, puis motifs précis, puis (si `weak`) le repli
     « mot de passe : … » et le repli par entropie.
 
@@ -732,6 +752,10 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     Router refuse le tour sur ces formes. Ailleurs (`wire=False`), elles restent en clair.
 
     `secret_tool=True` (résultat d'un outil d'effet `SECRET` seulement) ajoute « mot de passe VALEUR » sans connecteur.
+
+    `tool_keywords=True` (G2 : résultat d'un outil NON `SECRET`, filet du fil) avec `weak=False` : ajoute les seuls motifs
+    à MOT-CLÉ (« mot de passe : X », `password=X`, `passwd`, `PIN : 483920`), la valeur devant passer `_tool_password_ok`
+    (pas un accès de code, un chemin, un identifiant) ; ni hexadécimal ni entropie.
 
     `weak=False` désactive les deux motifs les moins sûrs (mot de passe sans coffre, entropie) —
     réservé aux résultats d'outils non déclarés `SECRET` (`qa/invariants.py::redact_result`),
@@ -743,7 +767,8 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     if not text:
         return RedactResult(text=text, names=[])
     if "⟦" in text and MARKER_RE.search(text):
-        return _redact_around_markers(text, known, weak=weak, wire=wire, secret_tool=secret_tool)
+        return _redact_around_markers(text, known, weak=weak, wire=wire, secret_tool=secret_tool,
+                                      tool_keywords=tool_keywords)
 
     names: list[str] = []
     values: dict[str, str] = {}
@@ -927,6 +952,8 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
                 rebuilt.append(handles[i])
         out = "".join(rebuilt)
     else:
+        if tool_keywords:
+            out = _tool_keyword_pass(out, _mark)
         # 6 bis. `weak=False` (résultats d'outils non SECRET, filet du fil vers le modèle) saute le repli hexadécimal et
         #        l'entropie. Seule exception, étroite et déterministe : une suite de 32 chiffres décimaux ou plus sans
         #        point ni exposant (clé hexadécimale qui ne contient que des chiffres, cas ambigu : on masque).
@@ -974,6 +1001,50 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
         out = _KW_COOKIE_RE.sub(_kw_cookie_sub, out)
 
     return RedactResult(text=_restore(out, saved), names=names, values=values)
+
+
+def _tool_keyword_pass(out: str, mark: Callable[..., None]) -> str:
+    """Motifs à mot-clé seuls, pour un résultat d'outil non SECRET (voir `redact(tool_keywords=True)`)."""
+    if not _KW_ANY_RE.search(out):
+        return out
+
+    def _pw(m: re.Match[str]) -> str:
+        value = m.group(3).rstrip(",.;)")
+        if HANDLE_RE.search(value) or not _tool_password_ok(value):
+            return m.group(0)
+        name = _type_name("password", value)
+        mark(name, value)
+        return m.group(0)[:m.start(3) - m.start()] + _handle(name) + m.group(3)[len(value):]
+
+    def _phrase(m: re.Match[str]) -> str:
+        value = m.group(4).rstrip(",.;)")
+        if HANDLE_RE.search(value) or not _tool_password_ok(value):
+            return m.group(0)
+        name = _type_name("password", value)
+        mark(name, value)
+        return f"{m.group(1)}{m.group(2)} {m.group(3)} {_handle(name)}{m.group(4)[len(value):]}"
+
+    def _pin(m: re.Match[str]) -> str:
+        name = _type_name("pin", m.group(2))
+        mark(name, m.group(2))
+        return f"{m.group(1)}{_handle(name)}"
+
+    def _json(m: re.Match[str]) -> str:  # `"password": "VALEUR"` (JSON, YAML entre guillemets)
+        value = m.group(2)
+        if HANDLE_RE.search(value) or not _tool_password_ok(value):
+            return m.group(0)
+        name = _type_name("password", value)
+        mark(name, value)
+        return f"{m.group(1)}{_handle(name)}{m.group(3)}"
+
+    out = _PASSWORD_JSON_RE.sub(_json, out)
+    out = _PASSWORD_KEYWORD_RE.sub(_pw, out)
+    out = _PASSWORD_PHRASE_RE.sub(_phrase, out)
+    return _PIN_RE.sub(_pin, out)
+
+
+_PASSWORD_JSON_RE = re.compile(r"(?i)(['\"](?:mot de passe|mdp|password|passwd|pw|passwort)['\"]\s*[:=]\s*['\"])([^'\"\s]{6,})(['\"])")
+_KW_ANY_RE = re.compile(r"(?i)mot de passe|mdp|passw|\bpw\b|\bpin\b")
 
 
 def _redact_around_markers(text: str, known: KnownSecrets | None, **kw: bool) -> RedactResult:
@@ -1028,11 +1099,11 @@ def redact_messages(messages: list[dict[str, Any]], known: KnownSecrets | None =
     C'est le filet du fil : chaque entrée du contexte est déjà caviardée à sa porte (entrée, résultat d'outil, rappel,
     contexte reçu, nom d'image), mais certaines n'en ont pas (bloc du plan, mémoire de projet, diff relu par le juge
     reconstruit depuis les arguments du modèle). Un texte sans secret ressort à l'identique : le cache de préfixe ne
-    bouge pas. `scrub` : la fonction de caviardage d'une chaîne (par défaut `redact(…, known, weak=False, wire=True)`).
+    bouge pas. `scrub` : la fonction de caviardage d'une chaîne (par défaut `redact(…, known, weak=False, wire=True, tool_keywords=True)`).
     Les messages d'origine ne sont pas modifiés."""
     if scrub is None:
         def scrub(text: str) -> str:
-            return redact(text, known, weak=False, wire=True).text
+            return redact(text, known, weak=False, wire=True, tool_keywords=True).text
     out: list[dict[str, Any]] = []
     for m in messages:
         if not isinstance(m, dict):

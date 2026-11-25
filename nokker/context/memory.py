@@ -77,7 +77,11 @@ class MemoryReservoirStore:
 
     def put(self, item: ReservoirItem) -> None:
         with self._lock:
-            self._items[item.id] = copy.deepcopy(item)
+            old = self._items.get(item.id)
+            new = copy.deepcopy(item)
+            if old is not None and old.created_at:  # la date d'arrivée du résultat survit à une réécriture
+                new.created_at = old.created_at
+            self._items[item.id] = new
 
     def get(self, item_id: str) -> ReservoirItem | None:
         with self._lock:

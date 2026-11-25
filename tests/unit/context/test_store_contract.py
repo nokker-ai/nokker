@@ -246,3 +246,13 @@ def test_reservoir_find(reservoir, tid):
     assert reservoir.find(tid, 4, "call_a").id == it.id
     assert reservoir.find(tid, 5, "call_a") is None
     assert reservoir.find(tid, 4, "absent") is None
+
+
+def test_reservoir_rewrite_keeps_the_arrival_date(reservoir):
+    """`created_at` (arrivée du résultat) survit à la réécriture d'un élément : l'ordre de `recall_context` en dépend."""
+    it = _item("th_dates", 10, created_at=1_000.0)
+    reservoir.put(it)
+    it.created_at, it.preview = 9_999.0, "relu"
+    reservoir.put(it)
+    got = reservoir.get(it.id)
+    assert got.created_at == 1_000.0 and got.preview == "relu"

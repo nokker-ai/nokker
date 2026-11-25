@@ -11,6 +11,7 @@ Le journal (`turns`) n'est JAMAIS modifié ; tout ce qui bouge (épisodes, état
 from __future__ import annotations
 
 import hashlib
+import re
 import logging
 import math
 import threading
@@ -24,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from nokker.approvals.rule_labels import current_lang
 from nokker.attachments import fence_head
+from nokker.context.engine import strip_recall_block
 from nokker.context import index as episode_index
 from nokker.context.memory import MemoryEpisodeStore, MemoryReservoirStore
 from nokker.context.summarize import ExtractiveSummarizer, message_tokens, turn_tokens
@@ -132,6 +134,15 @@ class ContextManager:
     clock: Callable[[], float] = time.time
     # Appelé à la clôture d'un épisode ; renvoie l'id de la bulle `episode` créée (ou None).
     on_episode_closed: Callable[[Episode], str | None] | None = None
+    # Capture des valeurs durables (nokker/memory/values.py) : (fil, tours de l'épisode, raison) à la clôture d'un épisode
+    # et, UNE fois, pour chaque segment d'un historique importé (tous par défaut, du plus ancien au plus récent). Ne lève jamais vers le tour ; None = rien.
+    on_capture: Callable[[str, list[Turn], str], None] | None = None
+    # Valeurs remplacées du compte du fil (`thread_id -> [{old, new, key, at}]`, nokker/memory/tenant_long.py) : marque une
+    # ancienne valeur retrouvée par `recall_context` ou `[Épisodes pertinents]`. None = rien.
+    superseded: Callable[[str], list[dict[str, Any]]] | None = None
+    # Relecture d'UNE valeur de la mémoire longue par son nom (`recall_context("<nom>")`) : (fil, nom) -> ligne ou None.
+    value_lookup: Callable[[str, str], str | None] | None = None
+    capture_bootstrap_max: int = 0  # 0 = TOUS les segments importés, par lots (un appel borné par segment) ; > 0 : les N plus récents
     # Recherche sémantique (moteur CortHeXis, `corthexis_index.py`) ; None = lexical seulement.
     semantic: Any = None
     # Qui a le GO (`DeterministicInvariants.go_authorized`, posé par `build_kernel`) : dans un fil de GROUPE (plusieurs
@@ -177,7 +188,7 @@ class ContextManager:
             st = self.state(turn.thread_id)
         n = estimate_tokens(turn.input.text or "")
         if turn.head and turn.index >= st.heads_shed_before:
-            n += estimate_tokens(fence_head(turn.head))  # contient déjà le contexte reçu ; porté comme au rejeu (r46)
+            n += estimate_tokens(fence_head(strip_recall_block(turn.head)))  # contient déjà le contexte reçu ; porté comme au rejeu (r46)
         else:
             n += sum(estimate_tokens(b) for b in turn.injected)
         for m in turn.messages:
@@ -212,6 +223,7 @@ class ContextManager:
         st.last_turn_index = history[-1].index
         seq = self.episodes.next_seq(thread_id)
         start, acc, seg = history[0].index, 0, []
+        segments: list[list[Turn]] = []
         for i, t in enumerate(history):
             seg.append(t)
             acc += turn_tokens(t)
@@ -222,6 +234,7 @@ class ContextManager:
                 self._finish_episode(ep, seg, "watermark", now)
                 self.episodes.save(ep)
                 self._index_semantic(ep, seg)
+                segments.append(seg)
                 seq += 1
                 start, acc, seg = t.index + 1, 0, []
         opened = Episode(id=new_episode_id(), thread_id=thread_id, seq=seq, first_turn=start,
@@ -229,12 +242,31 @@ class ContextManager:
         self.episodes.save(opened)
         st.episode_id, st.base_turn = opened.id, start
         self.episodes.save_state(st)
+        segments.append(seg)  # l'épisode ouvert aussi : ses décisions comptent dès l'import
+        self._capture_imported(thread_id, segments)
         if self.budgets.bootstrap_compact:
             # Historique importé / fil d'avant ce chantier : l'épisode courant garde ses résultats d'outils EN CLAIR
             # (`compact` ne tourne qu'en fin de tour). Même règle de délestage, UNE FOIS, avant le tout premier appel :
             # événement discret et persisté comme les autres (aucun cache à casser : rien n'a encore été envoyé).
             self._shed(thread_id, st)
         return st
+
+    def _capture(self, thread_id: str, turns: list[Turn], reason: str) -> None:
+        if self.on_capture is None or not turns:
+            return
+        try:
+            self.on_capture(thread_id, turns, reason)
+        except Exception:  # noqa: BLE001 — la capture ne casse jamais un tour
+            logger.exception("capture des valeurs en échec (fil %s)", thread_id)
+
+    def _capture_imported(self, thread_id: str, segments: list[list[Turn]]) -> None:
+        """Historique importé : une capture par segment (tous, par lots), dans l'ordre chronologique (un
+        remplacement « passe de X à Y » suppose que X soit lu avant Y)."""
+        if self.on_capture is None:
+            return
+        cap = int(self.capture_bootstrap_max)
+        for seg in segments[-cap:] if cap > 0 else segments:
+            self._capture(thread_id, seg, "import")
 
     # ───────────────────────────── frontières ─────────────────────────────
 
@@ -311,6 +343,7 @@ class ContextManager:
                 ep.bubble_id = bubble_id
                 self.episodes.save(ep)
         self._index_semantic(ep, turns)
+        self._capture(thread_id, turns, reason)
         st.episode_id = None
         st.base_turn = self._carry_from(thread_id, st, ep, turns)
         st.shed = {k: v for k, v in st.shed.items() if int(k.split(":", 1)[0]) >= st.base_turn}
@@ -629,7 +662,9 @@ class ContextManager:
             hit = self._mem_snap.get(thread_id)
             if hit is not None and hit[0] == key:
                 return hit[1]
-            text = self.memory_block(thread_id, recall_available)
+            # Une ancienne valeur citée par un résumé y est marquée « remplacée par … » AU FIGEMENT (le bloc reste figé ensuite :
+            # préfixe de cache intact ; une valeur remplacée plus tard n'y entre qu'à l'événement suivant).
+            text = self._mark_superseded(thread_id, self.memory_block(thread_id, recall_available))
             self._mem_snap[thread_id] = (key, text)
             return text
 
@@ -748,6 +783,36 @@ class ContextManager:
                 "recall_context(query) pour les retrouver, recall_context(id) pour les relire")
 
     def relevant_block(self, thread_id: str, query: str, exclude: set[str] | None = None) -> str:
+        return self._mark_superseded(thread_id, self._relevant_raw(thread_id, query, exclude))
+
+    def _mark_superseded(self, thread_id: str, text: str) -> str:
+        """Une ancienne valeur retrouvée dans un résumé d'épisode ou un message est suivie de « remplacée par X le … » quand la
+        mémoire longue du compte l'a remplacée (valeurs archivées, `nokker/memory/values.py`). Sans source
+        (`superseded` absent), sans valeur remplacée ou sans occurrence : le texte est rendu tel quel, octet pour octet.
+        Rendu par tour (en-tête du tour, résultat d'outil) : jamais dans le préfixe stable."""
+        if self.superseded is None or not text:
+            return text
+        try:
+            vals = self.superseded(thread_id) or []
+        except Exception:  # noqa: BLE001
+            logger.warning("valeurs remplacées illisibles", exc_info=True)
+            return text
+        if not vals:
+            return text
+        out = []
+        for line in text.split("\n"):
+            marks = []
+            for v in vals:
+                old, new = str(v.get("old") or ""), str(v.get("new") or "")
+                if len(old) < 2 or not new or new.lower() in line.lower():
+                    continue
+                if re.search(rf"(?<!\w){re.escape(old)}(?!\w)", line, re.IGNORECASE):
+                    marks.append(mt.pick(mt.VALUE_REPLACED, current_lang()).format(
+                        old=old, new=new, date=day_of(float(v.get("at") or 0.0))))
+            out.append(line + (" " + " ".join(marks[:2]) if marks else ""))
+        return "\n".join(out)
+
+    def _relevant_raw(self, thread_id: str, query: str, exclude: set[str] | None = None) -> str:
         """Bloc du tour : les épisodes clos les plus pertinents au message courant (lexical), hors ceux déjà en
         couche 3. Vide si aucun ne passe le seuil de score."""
         b = self.budgets
@@ -869,6 +934,11 @@ class ContextManager:
 
     def recall(self, thread_id: str, *, ref: str | None = None, query: str | None = None, part: str = "auto",
                max_chars: int = 3000, offset: int = 0) -> str:
+        return self._mark_superseded(thread_id, self._recall_raw(thread_id, ref=ref, query=query, part=part,
+                                                                 max_chars=max_chars, offset=offset))
+
+    def _recall_raw(self, thread_id: str, *, ref: str | None = None, query: str | None = None, part: str = "auto",
+                    max_chars: int = 3000, offset: int = 0) -> str:
         """Relecture à la demande (`recall_context`) — LIMITÉE au fil appelant."""
         max_chars = max(200, min(int(max_chars or 3000), 8000))
         offset = max(0, int(offset or 0))

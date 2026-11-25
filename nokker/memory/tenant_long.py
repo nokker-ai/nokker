@@ -23,10 +23,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import re
 import threading
 import time
 import unicodedata
 from collections.abc import Callable
+from datetime import UTC, datetime
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -57,7 +59,14 @@ LESSON_LINE = "{title} (apprise par l'assistant) — {text}"
 def user_line(n: LongNote) -> str:
     """Ligne de rappel d'une note du compte : `USER_LINE`, ou `LESSON_LINE` pour une leçon de la consolidation."""
     line = LESSON_LINE if str(n.origin or "").startswith(LESSON_ORIGIN_PREFIX) else USER_LINE
-    return line.format(title=n.title, text=n.text)
+    out = line.format(title=n.title, text=n.text)
+    if n.key:  # valeur FINALE : sa date accompagne la ligne (une note sans clé garde EXACTEMENT sa forme d'avant)
+        out += " " + mt.pick(mt.MEMORY_VALUE_SINCE).format(date=day_of(n.created_at))
+    return out
+
+
+def day_of(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts), UTC).strftime("%Y-%m-%d")
 
 
 class LongMemoryError(Exception):
@@ -76,6 +85,15 @@ class Settings:
     vector_weight: float = 0.7
     max_candidates: int = 500  # notes lues par portée et par tour (recherche exacte)
     tools: bool = False  # memory_search / memory_get pour les testeurs (textes existants) — à valider avant d'allumer
+    # Valeurs FINALES toujours rappelées : si le compte en a au plus `always_values_max`, toutes celles que le score n'a pas
+    # retenues suivent le rappel du tour (une paraphrase sans mot commun ne doit jamais laisser la valeur en vigueur hors du
+    # contexte). 0 = seulement ce que le score retient.
+    always_values_max: int = 8
+    # Rendu des valeurs hors score : « marked » (défaut, décision du 23.11 d'après le banc v7 : valeur + date + mention « peut ne
+    # pas concerner la question »), « names » (leurs NOMS seulement, une ligne), « off ».
+    always_values_mode: str = "marked"
+    # Consigne de non-invention du bloc de rappel (`memory.values_guard`) : « on » (défaut) | « off » (variante sans consigne).
+    values_guard_mode: str = "on"
     note_tool: bool = False  # `memory_note` (quarantaine, nokker/memory/long_note.py) : demande `memory_pending` ; éteint : aucun texte
 
     @classmethod
@@ -129,6 +147,14 @@ class LongNote:
     updated_at: float = 0.0
     embed_model: str | None = None
     embedding: list[float] | None = field(default=None, repr=False)
+    # Valeur datée (migration 096, nokker/memory/values.py) : clé, valeur, fil et tour d'où elle vient. Une valeur
+    # remplacée est ARCHIVÉE (`superseded_by` = la note qui la remplace) : jamais rappelée, jamais deux vivantes.
+    key: str | None = None
+    value: str | None = None
+    source_thread: str | None = None
+    source_turn: int | None = None
+    superseded_by: str | None = None
+    superseded_at: float | None = None
 
     @property
     def seq(self) -> float:  # `household.memory.rank` départage par récence
@@ -141,7 +167,64 @@ class LongNote:
              "mine": self.author_account == viewer}
         if self.scope == "household":
             d["household_id"] = self.household_id
+        if self.key:
+            d.update({"key": self.key, "value": self.value, "source_thread": self.source_thread,
+                      "source_turn": self.source_turn})
+        if self.superseded_by:
+            d.update({"superseded_by": self.superseded_by, "superseded_at": self.superseded_at})
         return d
+
+
+def normalize_key(key: str) -> str:
+    """Clé normalisée : casse, accents, ponctuation et espaces neutralisés (`dedup.normalize`)."""
+    from nokker.memory.dedup import normalize
+
+    return normalize(str(key or ""))
+
+
+def subject_words(key: str) -> frozenset[str]:
+    """Mots porteurs de sens d'une clé (sans mots-outils, singulier grossier) : le « sujet » de la valeur."""
+    from nokker.memory.dedup import tokens
+
+    return tokens(key)
+
+
+def head_word(key: str) -> str:
+    """Premier mot significatif de la clé normalisée (la « tête » du sujet)."""
+    from nokker.memory.dedup import STOP
+
+    return next((w for w in normalize_key(key).split() if w not in STOP), "")
+
+
+_DATE = re.compile(r"^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$")
+_NUMBER = re.compile(r"^[-+]?\d+(?:[ .,']\d+)*\s*(?:[%a-zA-Zéèàùµ°/]{0,12})$")
+_IDENT = re.compile(r"^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9_./:-]{2,40}$")
+
+
+def value_type(value: str) -> str:
+    """Type simple d'une valeur : `date`, `number` (nombre, éventuellement avec une unité : « 5000 francs », « 12 h »),
+    `identifier` (un seul mot mêlant lettres et chiffres : « D415 », « v2.1 »), sinon `text`."""
+    v = " ".join(str(value or "").split())
+    if _DATE.match(v):
+        return "date"
+    first, _, rest = v.partition(" ")
+    if first and first.replace(".", "", 1).replace(",", "", 1).lstrip("+-").isdigit() and len(rest.split()) <= 3:
+        return "number"
+    if _NUMBER.match(v) and any(c.isdigit() for c in v) and len(v.split()) <= 3:
+        return "number"
+    if _IDENT.match(v):
+        return "identifier"
+    return "text"
+
+
+def same_subject(a: str, b: str, va: str = "", vb: str = "") -> bool:
+    """Filet de proximité : mêmes mots porteurs de sens (« port de l'API » / « port api »), même mot de tête, et — quand
+    les valeurs sont données — même type de valeur. L'INCLUSION de mots seule ne suffit jamais (« délai livraison » et
+    « délai livraison express » sont deux grandeurs) ; la reprise d'une clé plus longue doit être DÉCLARÉE (`replaces_key`)."""
+    wa, wb = subject_words(a), subject_words(b)
+    if not wa or wa != wb or head_word(a) != head_word(b):
+        return False
+    return not (va and vb) or value_type(va) == value_type(vb)
 
 
 def _norm(text: str) -> str:
@@ -231,6 +314,7 @@ class MemoryLongStore:
         self.membership = membership
         self.notes: dict[tuple[str, str, str], LongNote] = {}
         self.pending: dict[str, dict[str, Any]] = {}
+        self.recall_log: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.vector = True
 
@@ -254,6 +338,7 @@ class MemoryLongStore:
                    limit: int) -> list[tuple[LongNote, float | None]]:
         with self._lock:
             rows = [n for n in self.notes.values() if n.scope == scope and self._visible(actor, n)
+                    and n.superseded_by is None
                     and (scope == "user" or (m is not None and n.household_id == m.household_id
                                              and n.tenant_id == m.tenant_id))]
         rows.sort(key=lambda n: -n.updated_at)
@@ -262,6 +347,34 @@ class MemoryLongStore:
             cos = cosine(qvec, n.embedding) if qvec is not None and n.embed_model == model else None
             out.append((n, cos))
         return out
+
+    def log_recall(self, actor: Actor, row: dict[str, Any]) -> None:
+        with self._lock:
+            self.recall_log.append({**row, "tenant_id": actor.tenant_id, "account_id": actor.account_id})
+            del self.recall_log[:-5000]
+
+    def live_by_key(self, actor: Actor, key: str) -> LongNote | None:
+        """La valeur VIVANTE de la clé, dans la mémoire de profil du compte (jamais deux)."""
+        with self._lock:
+            for n in self.notes.values():
+                if (n.scope == "user" and n.key == key and n.superseded_by is None
+                        and n.tenant_id == actor.tenant_id and n.account_id == actor.account_id):
+                    return n
+        return None
+
+    def archive(self, actor: Actor, n: LongNote, by: str | None, at: float | None) -> bool:
+        """Archive (`by` = nom de la note qui remplace) ou, avec `by=None`, rétablit la valeur."""
+        with self._lock:
+            if n.tenant_id != actor.tenant_id or n.account_id != actor.account_id:
+                return False
+            n.superseded_by, n.superseded_at = by, at
+            return True
+
+    def archived(self, actor: Actor) -> list[LongNote]:
+        with self._lock:
+            return sorted((n for n in self.notes.values() if n.superseded_by is not None and n.scope == "user"
+                           and n.tenant_id == actor.tenant_id and n.account_id == actor.account_id),
+                          key=lambda n: n.created_at)
 
     def find(self, actor: Actor, name: str, m: Membership | None) -> LongNote | None:
         with self._lock:
@@ -314,6 +427,7 @@ class MemoryLongStore:
             for pid in [p for p, r in self.pending.items()
                         if r["tenant_id"] == tenant_id or r["author_account"] == account_id]:
                 del self.pending[pid]
+            self.recall_log = [r for r in self.recall_log if r["tenant_id"] != tenant_id]
         return len(gone)
 
     def drop_household(self, household_id: str, tenant_id: str) -> None:
@@ -323,13 +437,17 @@ class MemoryLongStore:
 
 
 _COLS = ("tenant_id, account_id, name, scope, household_id, audience, kind, title, body, author_account, origin, "
-         "embed_model, created_at, updated_at, provenance")
+         "embed_model, created_at, updated_at, provenance, value_key, value_text, source_thread, source_turn, "
+         "superseded_by, superseded_at")
+_NCOLS = 21
 
 
 def _row(r: tuple) -> LongNote:
     (tenant_id, account_id, name, scope, household_id, audience, kind, title, body, author, origin, model, created,
-     updated, provenance) = r[:15]
-    return LongNote(name=name, scope=scope, kind=kind, title=title, text=body, account_id=account_id,
+     updated, provenance, vkey, vvalue, sthread, sturn, sup_by, sup_at) = r[:_NCOLS]
+    return LongNote(key=vkey, value=vvalue, source_thread=sthread, source_turn=sturn, superseded_by=sup_by,
+                    superseded_at=float(sup_at) if sup_at is not None else None,
+                    name=name, scope=scope, kind=kind, title=title, text=body, account_id=account_id,
                     tenant_id=tenant_id, author_account=author, household_id=household_id, audience=audience,
                     origin=origin, created_at=float(created), updated_at=float(updated), embed_model=model,
                     provenance=provenance or "unknown_legacy")
@@ -356,7 +474,8 @@ class PgLongMemoryStore:
 
             migs = Path(__file__).parent.parent / "store" / "migrations"
             migrate(dsn, (migs / "049_tenant_long_memory.sql").read_text(encoding="utf-8"),
-                    (migs / "080_memory_provenance.sql").read_text(encoding="utf-8"))  # colonne `provenance`
+                    (migs / "080_memory_provenance.sql").read_text(encoding="utf-8"),  # colonne `provenance`
+                    (migs / "096_long_memory_values.sql").read_text(encoding="utf-8"))  # valeurs datées, archivage
 
     def _conn(self, actor: Actor):
         from nokker.store.conn import connect
@@ -394,13 +513,17 @@ class PgLongMemoryStore:
         vector = self.vector and vec is not None
         cols = _COLS + (", embedding" if vector else "")
         vals = [n.tenant_id, n.account_id, n.name, n.scope, n.household_id, n.audience, n.kind, n.title, n.text,
-                n.author_account, n.origin, model if vector else None, n.created_at, n.updated_at, n.provenance]
+                n.author_account, n.origin, model if vector else None, n.created_at, n.updated_at, n.provenance,
+                n.key, n.value, n.source_thread, n.source_turn, n.superseded_by, n.superseded_at]
         marks = ", ".join(["%s"] * len(vals)) + (", %s::vector" if vector else "")
         if vector:
             vals.append(_vec_literal(vec))
         upd = ("title = EXCLUDED.title, body = EXCLUDED.body, kind = EXCLUDED.kind, audience = EXCLUDED.audience, "
                "origin = EXCLUDED.origin, embed_model = EXCLUDED.embed_model, updated_at = EXCLUDED.updated_at, "
-               "provenance = EXCLUDED.provenance"
+               "provenance = EXCLUDED.provenance, value_key = EXCLUDED.value_key, "
+               "value_text = EXCLUDED.value_text, source_thread = EXCLUDED.source_thread, "
+               "source_turn = EXCLUDED.source_turn, superseded_by = EXCLUDED.superseded_by, "
+               "superseded_at = EXCLUDED.superseded_at"
                + (", embedding = EXCLUDED.embedding" if vector else ""))
         with self._conn(actor) as c:
             c.execute(f"INSERT INTO nokker_long_memory ({cols}) VALUES ({marks}) "
@@ -416,6 +539,7 @@ class PgLongMemoryStore:
     def candidates(self, actor: Actor, scope: str, m: Membership | None, qvec: list[float] | None, model: str | None,
                    limit: int) -> list[tuple[LongNote, float | None]]:
         where, params = self._where(actor, scope, m)
+        where += " AND superseded_by IS NULL"  # une valeur remplacée est archivée : jamais candidate au rappel
         if qvec is not None and self.vector:
             sel = (f"SELECT {_COLS}, CASE WHEN embedding IS NOT NULL AND embed_model = %s "
                    f"THEN 1 - (embedding <=> %s::vector) END AS cos FROM nokker_long_memory WHERE {where} "
@@ -426,7 +550,40 @@ class PgLongMemoryStore:
             args = [*params, int(limit)]
         with self._conn(actor) as c:
             rows = c.execute(sel, args).fetchall()
-        return [(_row(r), float(r[15]) if r[15] is not None else None) for r in rows]
+        return [(_row(r), float(r[_NCOLS]) if r[_NCOLS] is not None else None) for r in rows]
+
+    def log_recall(self, actor: Actor, row: dict[str, Any]) -> None:
+        from psycopg.types.json import Jsonb
+
+        with self._conn(actor) as c:
+            c.execute("INSERT INTO nokker_long_recall_log (account_id, at, thread_id, query, candidates, injected, "
+                      "notes, top_score) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                      (actor.account_id, row["at"], row.get("thread_id", ""), row.get("query", ""),
+                       row.get("candidates", 0), row.get("injected", 0), Jsonb(row.get("notes", [])),
+                       row.get("top_score")))
+
+    def live_by_key(self, actor: Actor, key: str) -> LongNote | None:
+        with self._conn(actor) as c:
+            r = c.execute(f"SELECT {_COLS} FROM nokker_long_memory WHERE scope = 'user' AND tenant_id = %s AND "
+                          "account_id = %s AND value_key = %s AND superseded_by IS NULL LIMIT 1",
+                          (actor.tenant_id, actor.account_id, key)).fetchone()
+        return _row(r) if r else None
+
+    def archive(self, actor: Actor, n: LongNote, by: str | None, at: float | None) -> bool:
+        with self._conn(actor) as c:
+            ok = c.execute("UPDATE nokker_long_memory SET superseded_by = %s, superseded_at = %s WHERE tenant_id = %s "
+                           "AND account_id = %s AND name = %s AND scope = 'user'",
+                           (by, at, n.tenant_id, n.account_id, n.name)).rowcount > 0
+        if ok:
+            n.superseded_by, n.superseded_at = by, at
+        return ok
+
+    def archived(self, actor: Actor) -> list[LongNote]:
+        with self._conn(actor) as c:
+            rows = c.execute(f"SELECT {_COLS} FROM nokker_long_memory WHERE scope = 'user' AND tenant_id = %s AND "
+                             "account_id = %s AND superseded_by IS NOT NULL ORDER BY created_at",
+                             (actor.tenant_id, actor.account_id)).fetchall()
+        return [_row(r) for r in rows]
 
     def find(self, actor: Actor, name: str, m: Membership | None) -> LongNote | None:
         with self._conn(actor) as c:
@@ -600,6 +757,105 @@ class LongMemory:
         return {"note": self._put(actor, scope, m, kind, title, text, audience, account_id, origin,
                                   provenance).public(account_id)}
 
+    def write_value(self, account_id: str, *, key: str, value: str, kind: str = "fact", title: str, text: str,
+                    origin: str = "capture", provenance: str | None = None, source_thread: str | None = None,
+                    source_turn: int | None = None, at: float | None = None,
+                    replaces_key: str | None = None) -> dict[str, Any]:
+        """Valeur DATÉE de la mémoire de profil (capture automatique, nokker/memory/values.py). Une seule valeur vivante
+        par clé : même valeur = doublon (rien d'écrit) ; valeur différente = la nouvelle est écrite et l'ancienne ARCHIVÉE
+        avec son lien (`superseded_by`), jamais supprimée. `at` : date de la valeur (le tour source), sinon maintenant.
+        Rend `{note, duplicate?, superseded?}`. Une valeur plus ANCIENNE que la vivante (rejeu d'un vieil épisode) n'écrase
+        rien : elle entre déjà archivée, derrière la vivante."""
+        from nokker.memory.provenance import for_new_fact
+
+        provenance = for_new_fact(provenance)
+        actor = self.actor(account_id)
+        key = normalize_key(key)[:MAX_TITLE]
+        value = " ".join(str(value or "").split())
+        title, text = self._clean(kind, title, text, "all", "user")
+        if not key or not value:
+            raise LongMemoryError(400, "bad_note", "clé et valeur requises")
+        if self.scrub is not None:
+            value = self.scrub(value)
+        when = float(at if at is not None else self.now_fn())
+        rep = normalize_key(replaces_key or "")[:MAX_TITLE]
+        # Ordre : la même clé ; la clé que le modèle DÉCLARE reprendre (`replaces_key`, déjà validée par la capture) ; le filet
+        # de proximité (mêmes mots, même tête, même type de valeur). Jamais l'inclusion de mots seule.
+        live = (self.store.live_by_key(actor, key)
+                or (self.store.live_by_key(actor, rep) if rep and rep != key else None)
+                or self._same_subject(actor, key, value))
+        if live is not None and live.key == key and _norm(live.value or "") == _norm(value):
+            return {"note": live.public(account_id), "duplicate": True}
+        now = float(self.now_fn())
+        n = LongNote(name=note_name(kind, title, text, when), scope="user", kind=kind, title=title, text=text,
+                     account_id=actor.account_id, tenant_id=actor.tenant_id, author_account=actor.account_id,
+                     origin=origin, created_at=when, updated_at=now, provenance=provenance, key=key, value=value,
+                     source_thread=source_thread, source_turn=source_turn)
+        if live is not None and live.created_at > when:  # rejeu d'une valeur déjà dépassée : entre archivée
+            n.superseded_by, n.superseded_at = live.name, now
+            vec, model = self._embed_doc(title, text)
+            self.store.put(actor, n, vec, model)
+            return {"note": n.public(account_id), "archived": True}
+        vec, model = self._embed_doc(title, text)
+        if live is not None:  # l'ancienne d'abord (l'index unique refuse deux vivantes), rétablie si l'écriture échoue
+            self.store.archive(actor, live, n.name, now)
+            try:
+                self.store.put(actor, n, vec, model)
+            except BaseException:
+                self.store.archive(actor, live, None, None)
+                raise
+            return {"note": n.public(account_id), "superseded": live.public(account_id)}
+        self.store.put(actor, n, vec, model)
+        return {"note": n.public(account_id)}
+
+    def reconcile_values(self, account_id: str) -> int:
+        """Réconciliation (fin d'une capture, import compris) : deux valeurs VIVANTES dont les clés NORMALISÉES sont égales ne
+        coexistent pas (clés écrites avant la normalisation) ; la plus récente gagne, l'autre est archivée avec son lien.
+        Aucune fusion par inclusion de mots ni par proximité : deux grandeurs distinctes restent toutes deux vivantes, une
+        reprise de clé ne vient que de la déclaration du modèle (`replaces_key`, à l'écriture). Rend le nombre archivé."""
+        actor = self.actor(account_id)
+        live = [n for n, _ in self.store.candidates(actor, "user", None, None, None, self.settings.max_candidates)
+                if n.key]
+        live.sort(key=lambda n: (n.created_at, n.updated_at))
+        archived, now = 0, float(self.now_fn())
+        for i, old in enumerate(live):
+            if old.superseded_by is not None:
+                continue
+            for newer in live[i + 1:]:
+                if newer.superseded_by is None and normalize_key(old.key or "") == normalize_key(newer.key or ""):
+                    if self.store.archive(actor, old, newer.name, now):
+                        archived += 1
+                    break
+        return archived
+
+    def superseded_values(self, account_id: str) -> list[dict[str, Any]]:
+        """Valeurs REMPLACÉES du compte avec ce qui les remplace : `{old, new, key, at}` (`at` = date de la valeur qui
+        remplace). Sert à marquer une ancienne valeur retrouvée dans un résumé d'épisode (`ContextManager`)."""
+        actor = self.actor(account_id)
+        arch = self.store.archived(actor) if hasattr(self.store, "archived") else []
+        out: list[dict[str, Any]] = []
+        for n in arch:
+            cur, hops = n, 0
+            while cur.superseded_by and hops < 8:  # jusqu'à la valeur vivante de la chaîne
+                nxt = self.store.find(actor, cur.superseded_by, None)
+                if nxt is None:
+                    break
+                cur, hops = nxt, hops + 1
+            if cur is not n and cur.superseded_by is None and (n.value or "") and _norm(n.value or "") != _norm(cur.value or ""):
+                out.append({"old": n.value, "new": cur.value, "key": n.key, "at": cur.created_at})
+        return out
+
+    def _same_subject(self, actor: Actor, key: str, value: str = "") -> LongNote | None:
+        """Valeur vivante du MÊME SUJET sous une autre clé (« port de l'API » / « port api rest ») : mots de la clé égaux, ou
+        ceux de la plus courte (≥ 2 mots) inclus dans l'autre. Une valeur différente la remplace (archivée), jamais deux
+        valeurs vivantes pour un même sujet."""
+        for n, _ in self.store.candidates(actor, "user", None, None, None, self.settings.max_candidates):
+            if not n.key:
+                continue
+            if same_subject(key, n.key, value, n.value or ""):
+                return n
+        return None
+
     def equivalent_note(self, account_id: str, text: str) -> LongNote | None:
         """Note de portée user du compte, active, équivalente à `text` (`dedup.equivalent`) ; None sinon (T6)."""
         actor = self.actor(account_id)
@@ -692,7 +948,8 @@ class LongMemory:
         m = self._member(account_id)
         user = [n.public(account_id) for n, _ in self.store.candidates(actor, "user", None, None, None, 100000)]
         mine = [n.public(account_id) for n in self.store.authored(actor, m)]
-        return {"user": user, "household_authored": mine}
+        archived = [n.public(account_id) for n in self.store.archived(actor)] if hasattr(self.store, "archived") else []
+        return {"user": user, "household_authored": mine, **({"archived": archived} if archived else {})}
 
     def get_note(self, account_id: str, name: str) -> LongNote | None:
         actor = self.actor(account_id)
@@ -733,8 +990,63 @@ class LongMemory:
         hh = self._scored(self.store.candidates(actor, "household", m, qvec, model, n_cand), query) if m else []
         return user[:limit], hh[:limit], m
 
-    def recall(self, account_id: str, query: str, k: int = 5) -> list[Recall]:
-        """`[Rappel mémoire]` du tour : profil + foyer, quotas par portée, places libres à l'autre portée."""
+    def _remaining_values(self, account_id: str, have: set[str]) -> list[Recall]:
+        """Valeurs vivantes du compte que le score n'a pas retenues, si elles sont peu nombreuses (`always_values_max`) :
+        leur valeur MARQUÉE « peut ne pas concerner la question » (`always_values_mode = marked`, défaut), ou leurs NOMS dans
+        une ligne (`names`), ou rien (`off`)."""
+        cap = int(self.settings.always_values_max)
+        mode = str(self.settings.always_values_mode)
+        if cap <= 0 or mode == "off":
+            return []
+        try:
+            actor = self.actor(account_id)
+            live = [n for n, _ in self.store.candidates(actor, "user", None, None, None, self.settings.max_candidates)
+                    if n.key]
+        except Exception:  # noqa: BLE001
+            return []
+        if not live or len(live) > cap:
+            return []
+        live.sort(key=lambda n: -n.created_at)
+        rest = [n for n in live if n.name not in have]
+        if not rest:
+            return []
+        if mode == "marked":
+            mark = mt.pick(mt.VALUE_UNSCORED)
+            return [Recall(note=n.name, text=f"{user_line(n)} {mark}", score=0.0, provenance=n.provenance) for n in rest]
+        names = ", ".join(n.key[:80] for n in rest)
+        return [Recall(note="values:others", text=mt.pick(mt.VALUES_OTHERS).format(names=names), score=0.0,
+                       provenance=PERSON)]
+
+    def value_line(self, account_id: str, name: str) -> str | None:
+        """Relecture d'UNE valeur vivante par son nom (`recall_context("<nom>")`) : ligne `titre — texte (date)`, ou None."""
+        key = normalize_key(name)
+        if not key:
+            return None
+        actor = self.actor(account_id)
+        live = [n for n, _ in self.store.candidates(actor, "user", None, None, None, self.settings.max_candidates)
+                if n.key]
+        hit = next((n for n in live if n.key == key), None) or next(
+            (n for n in live if same_subject(n.key or "", key)), None)
+        return user_line(hit) if hit is not None else None
+
+    def _journal(self, account_id: str, thread_id: str, query: str, candidates: int, found: list[Recall]) -> None:
+        """Une ligne par recherche (aucune recherche hors du journal), même sans résultat. Jamais d'exception."""
+        log_fn = getattr(self.store, "log_recall", None)
+        if log_fn is None:
+            return
+        try:
+            log_fn(self.actor(account_id), {
+                "at": float(self.now_fn()), "thread_id": thread_id or "", "query": " ".join(query.split())[:300],
+                "candidates": candidates, "injected": len(found),
+                "notes": [{"note": r.note, "score": r.score} for r in found],
+                "top_score": max((r.score for r in found), default=None)})
+        except Exception:  # noqa: BLE001
+            self._warn("journal du rappel en échec")
+
+    def recall(self, account_id: str, query: str, k: int = 5, thread_id: str = "") -> list[Recall]:
+        """`[Rappel mémoire]` du tour : profil + foyer, quotas par portée, places libres à l'autre portée. Valeurs
+        FINALES seulement (une valeur remplacée est archivée, jamais candidate), avec leur date. Chaque recherche est
+        journalisée (`nokker_long_recall_log`)."""
         if not query.strip():
             return []
         try:
@@ -752,8 +1064,16 @@ class LongMemory:
                 h += self.household_recall.recall_for_account(account_id, query, k)
             except Exception:
                 log.warning("notes du foyer illisibles", exc_info=True)
-        return merge_quotas({"user": u, "household": h},
-                            {"user": self.settings.user_k, "household": self.settings.household_k}, k)
+        out = merge_quotas({"user": u, "household": h},
+                           {"user": self.settings.user_k, "household": self.settings.household_k}, k)
+        rest = self._remaining_values(account_id, {r.note for r in out})
+        out += rest
+        self._journal(account_id, thread_id, query, len(user) + len(hh), out)
+        # Consigne de non-invention, SEULEMENT quand le bloc de rappel porte des valeurs (aucun texte de plus sinon). Dans le
+        # bloc du tour : retiré de l'historique rejoué, jamais dans le préfixe stable.
+        if str(self.settings.values_guard_mode) != "off" and (any(n.key for n, _ in user) or rest):
+            out.append(Recall(note="values:guard", text=mt.pick(mt.VALUES_GUARD), score=0.0, provenance=PERSON))
+        return out
 
     def search(self, account_id: str, query: str, top_k: int = 8) -> list[dict[str, Any]]:
         """`memory_search` d'un testeur : sans seuil de rappel, mais seulement ce que le compte voit."""
@@ -808,7 +1128,7 @@ class LongMemoryPort:
         return self.service.recall(self.account_id, query, k)
 
     def recall_for(self, thread_id: str, query: str, k: int = 5) -> list[Recall]:
-        return self.recall(query, k)
+        return self.service.recall(self.account_id, query, k, thread_id=thread_id)
 
     def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         """Faits de la consolidation (approuvés si la quarantaine est allumée) : rangés AVEC leur provenance ;

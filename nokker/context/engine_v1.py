@@ -83,7 +83,7 @@ class ContextEngineV1(ContextEngineV0):
         # par un stub (état de vue persisté).
         kept = self.images_kept(history, turn)
         for past in history:
-            messages.append(self.user_message(past, self.past_user(past, mgr.replay_head(past, st)), kept))
+            messages.append(self.user_message(past, self.past_user(past, mgr.replay_head(past, st), strip_recall=self.strip_past_recall), kept))
             for m in past.messages:
                 d = m.to_openai(thinking=True)
                 if m.role == "tool":

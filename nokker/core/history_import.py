@@ -39,6 +39,23 @@ class Entry:
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    at: float = 0.0  # instant d'origine de l'entrée (epoch ou ISO-8601 fourni par l'hôte), 0 = inconnu
+
+
+def _entry_instant(raw: Any) -> float:
+    """Instant d'origine facultatif d'une entrée (`at` : secondes epoch ou ISO-8601) ; illisible ou absent : 0 (inconnu)."""
+    from datetime import datetime
+
+    if isinstance(raw, bool):
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw) if raw > 0 else 0.0
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _bad(message: str) -> HistoryImportError:
@@ -108,7 +125,7 @@ def parse(body: Any, max_turns: int = MAX_TURNS, max_bytes: int = MAX_BYTES) -> 
             raise HistoryImportError(400, CODE_TOO_LARGE, f"turns : {max_bytes // 1024} Ko au plus "
                                                           "(réglable : local.import_max_bytes)")
         out.append(Entry(role=role, content=content, name=name, tool_call_id=call_id,
-                         tool_calls=[dict(c) for c in calls] if calls else None))
+                         tool_calls=[dict(c) for c in calls] if calls else None, at=_entry_instant(raw.get("at"))))
     if out[0].role != "user":
         raise _bad("turns[0] : l'historique commence par un tour user")
     seen_assistant = False
@@ -144,7 +161,8 @@ def build_turns(kernel: Any, thread_id: str, entries: list[Entry], first_index: 
         if e.role == "user":
             check = inv.check_input(e.content)
             cur = Turn(thread_id=thread_id, index=first_index + len(turns),
-                       input=InputCheck(text=check.text, redacted=list(check.redacted), domain_flags=set(), origin=ORIGIN))
+                       input=InputCheck(text=check.text, redacted=list(check.redacted), domain_flags=set(), origin=ORIGIN),
+                       at=e.at)
             turns.append(cur)
             continue
         assert cur is not None  # `parse` : le premier est un user
@@ -185,7 +203,9 @@ def build_turns(kernel: Any, thread_id: str, entries: list[Entry], first_index: 
 def import_history(kernel: Any, thread_id: str, body: Any, max_turns: int = MAX_TURNS,
                    max_bytes: int = MAX_BYTES) -> dict[str, Any]:
     """Valide, puis range l'historique dans le fil s'il est VIDE (`HistoryImportError` 400 / 409). Jamais d'appel d'outil, de modèle,
-    de ledger ni de mémoire : seulement des tours rangés au store."""
+    de ledger ni de mémoire : seulement des tours rangés au store. Puis, si le never clear est allumé, l'état de vue du fil est
+    amorcé UNE fois (`ContextManager.state` : épisodes, délestage des gros résultats d'outils, capture des valeurs durables
+    en tâche de fond) : le premier appel du modèle ne part plus avec tout l'historique en clair."""
     from nokker.tenancy.context import tenant_of_thread, tenant_scope
 
     entries = parse(body, max_turns, max_bytes)
@@ -198,6 +218,14 @@ def import_history(kernel: Any, thread_id: str, body: Any, max_turns: int = MAX_
         turns = build_turns(kernel, thread_id, entries)
         for t in turns:
             kernel.store.append(t)
+        mgr = getattr(getattr(kernel, "context", None), "manager", None)
+        if mgr is not None and turns:
+            try:
+                mgr.state(thread_id)  # amorce : épisodes, compact (`bootstrap_compact`), capture des valeurs
+            except Exception:  # noqa: BLE001 — l'import a réussi ; l'amorçage se refera au premier tour
+                import logging
+
+                logging.getLogger("nokker.history_import").warning("amorçage du fil importé en échec", exc_info=True)
     return {"thread_id": thread_id, "imported": len(entries), "turns": len(turns), "origin": ORIGIN}
 
 

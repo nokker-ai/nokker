@@ -108,7 +108,7 @@ from nokker.qa.escalate import EscalatorV0
 from nokker.qa.gates import GatesV0, GatesV1
 from nokker.qa.invariants import Allowlist, DeterministicInvariants, GoAuthorizedSenders
 from nokker.qa.judge import HedgedJudgeTransport, HttpJudgeTransport, OpenAICompatJudge
-from nokker.qa.provenance import build_provenance
+from nokker.qa.provenance import build_provenance, settings_for
 from nokker.qa.review import CardAdvisor, DiffReviewer, parse_advice
 from nokker.qa.secrets import KnownSecrets
 from nokker.route.classify import ModelClassifier
@@ -2124,7 +2124,56 @@ def configure_long_memory(config: NokkerConfig, kernel: Any, tenancy: Any) -> No
     exports = getattr(account_http, "_exports", None)
     if exports is not None and hasattr(exports, "long_memory"):
         exports.long_memory = svc.export
+    configure_memory_capture(config, kernel, svc)
     long_http.configure(svc)
+
+
+def configure_memory_capture(config: NokkerConfig, kernel: Any, svc: Any) -> None:
+    """Capture automatique des valeurs durables (nokker/memory/values.py) : branchée sur la clôture d'épisode du never
+    clear et sur le chargement d'un historique importé. Sans palier utilisable, sans never clear ou drapeau éteint : rien."""
+    if not getattr(config, "memory_capture", True):
+        return
+    mgr = getattr(getattr(kernel, "context", None), "manager", None)
+    if mgr is None:
+        logger.info("capture des valeurs : sans never clear (context_enabled) — rien")
+        return
+    from nokker.memory.consolidation.wiring import provider_for
+    from nokker.memory.values import ValueCapture
+
+    raw = dict(getattr(config, "memory_capture_settings", None) or {})
+    complete, model = provider_for(config, str(raw.get("tier") or "ship"))
+    if complete is None:
+        return
+    if hasattr(complete, "sampling_body"):  # instance dédiée à la capture (provider_for en construit une) : extraction déterministe
+        complete.sampling_body = {**dict(complete.sampling_body or {}), "temperature": 0,
+                                  "seed": int(raw.get("seed", 7))}
+    cap = ValueCapture(long=svc, complete=complete, model_name=model, ledger=getattr(kernel, "ledger", None),
+                       max_chars=int(raw.get("max_chars", 24000)), max_tokens=int(raw.get("max_tokens", 900)),
+                       background=bool(raw.get("background", True)))
+    mgr.capture_bootstrap_max = int(raw.get("bootstrap_max", 0))
+    # Valeurs remplacées du compte du fil : marquées quand un résumé d'épisode ou un message les cite encore.
+    from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
+
+    def superseded(_thread_id: str) -> list[dict[str, Any]]:
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT or getattr(svc, "account_for_tenant", None) is None:
+            return []
+        acc = svc.account_for_tenant(tid)
+        account_id = getattr(acc, "account_id", None) if acc is not None else None
+        return svc.superseded_values(account_id) if account_id else []
+
+    mgr.superseded = superseded
+
+    def value_lookup(_thread_id: str, name: str) -> str | None:
+        tid = current_tenant()
+        if tid == INTERNAL_TENANT or getattr(svc, "account_for_tenant", None) is None:
+            return None
+        acc = svc.account_for_tenant(tid)
+        account_id = getattr(acc, "account_id", None) if acc is not None else None
+        return svc.value_line(account_id, name) if account_id else None
+
+    mgr.value_lookup = value_lookup
+    mgr.on_capture = lambda thread_id, turns, reason: cap(thread_id, turns, reason)
 
 
 def configure_consolidation(config: NokkerConfig, kernel: Any, tenancy: Any, hub: Any = None) -> None:
@@ -3222,7 +3271,7 @@ def build_kernel(config: NokkerConfig, invariants: Invariants | None = None,
         goals.kernel = kernel
         kernel.goals = goals
     kernel.mcp_apps = app_registry
-    kernel.provenance = build_provenance(getattr(config, "provenance", None), inv)  # None si éteint (défaut)
+    kernel.provenance = build_provenance(settings_for(config), inv)  # None si éteint ; Lokkal : allumée par défaut (G5)
     if isinstance(policy.inner, PolicyV1):
         policy.inner.available = lambda: tuple(kernel.providers)  # les paliers servis à cet instant (X8)
     if config.self_improve:  # variantes APPROUVÉES sur carte (docs/SELF-IMPROVE.md) ; éteint : rien n'est lu
@@ -7965,6 +8014,11 @@ def default_model_applier(config: NokkerConfig, kernel: Kernel, link_endpoint_fn
     return use_default_model
 
 
+def local_action_claims_guard(config: NokkerConfig) -> bool:
+    """Garde « c'est fait » sans action faite sur Lokkal : ALLUMÉE par défaut (G3), `local.action_claims_guard: false` l'éteint."""
+    return bool((config.local or {}).get("action_claims_guard", True))
+
+
 def reap_local_sandboxes(local_api: Any) -> int:
     """Ménage des bacs à sable au démarrage du noyau local (backend docker) : supprime ceux de CETTE instance (étiquette
     exacte) et jamais les autres. Les bacs de l'ancienne étiquette (hash du chemin de l'état, identique pour tous les Lokkal) ne
@@ -8369,7 +8423,7 @@ def serve(config: NokkerConfig | None = None, kernel: Kernel | None = None,
             logger.info("lokkal : %d processus en arrière-plan orphelin(s) arrêté(s) au démarrage", n)
         kernel.max_calls = int(config.local.get("max_calls", 60))  # une tâche de code fait des dizaines d'appels
         kernel.max_tokens = int(config.local.get("max_tokens", 16384))
-        kernel.action_claims_guard = bool(config.local.get("action_claims_guard", False))  # « c'est fait » sans action faite
+        kernel.action_claims_guard = local_action_claims_guard(config)  # « c'est fait » sans action faite
         # Carte posée : le tour attend sa décision jusqu'à ce nombre de secondes et exécute l'outil lui-même si elle arrive
         # (la personne approuve dans le client pendant le tour) ; 0 = éteint (le tour finit « en attente », la suite tourne après).
         kernel.approval_wait_s = max(0.0, float(config.local.get("approval_wait_s", 0) or 0))

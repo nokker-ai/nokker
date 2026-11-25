@@ -1,7 +1,7 @@
 """Provider OpenAI-compatible pour le Router SOKKAN (`providers.Provider`, PLAN-P1 §2.6/§2.8).
 
 Un palier = une instance de `SokkanProvider` (base_url + modèle + clé propres à ce palier). La clé de
-session (`session_key`) part en en-tête `X-Session-Id` pour l'affinité Router (F5, cache + slot sticky).
+session (`session_key`) part, HACHÉE, en en-tête `X-Session-Id` pour l'affinité Router (F5, cache + slot sticky), vers le Router seulement.
 
 Raisonnement : désactivé par défaut via `reasoning_effort: "none"` — **vérifié en réel le 17.10.2026 sur
 le Router** (`qwen/qwen3.8-27b` et `qwen/qwen3.5-397b-a17b`, amont OVH) : c'est la SEULE variante testée qui
@@ -70,6 +70,7 @@ précède par nature tout octet de réponse : rien n'a pu être généré ni fac
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -340,8 +341,8 @@ class SokkanProvider:
         body.update(self.reasoning_on_body if reasoning else self.reasoning_off_body)
 
         headers = {"Content-Type": "application/json"}
-        if self.session_header:
-            headers["X-Session-Id"] = session_key
+        if self.session_header and self.behind_router:  # affinité : le Router seulement, jamais BYOK ni un autre amont
+            headers["X-Session-Id"] = session_affinity_id(session_key)
         if self.api_key:  # un amont sans auth (ex. llama.cpp local) refuse un Bearer vide
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update(self.extra_headers)
@@ -370,6 +371,7 @@ class SokkanProvider:
         msg = choice.get("message") or {}
         usage_raw = data.get("usage") or {}
         usage = _parse_usage(usage_raw)
+        _observe_estimate(self.model, body, usage.prompt)
         tool_calls = [_parse_tool_call(tc) for tc in (msg.get("tool_calls") or [])]
         # Un amont qui retire le bloc de raisonnement laisse ses « \n\n » en tête de réponse (Lokkal, 28.10).
         message = Message(role="assistant", content=(msg.get("content") or "").lstrip("\r\n"), tool_calls=tool_calls)
@@ -670,6 +672,34 @@ def _delta_reasoning(chunk: dict[str, Any]) -> str:
         if isinstance(choice, dict) and choice.get("index", 0) == 0:
             out += _message_reasoning(choice.get("delta"))
     return out
+
+
+def _observe_estimate(tier: str, body: dict[str, Any], prompt_tokens: int) -> None:
+    """Mesure l'estimateur (`context/tokens.py`) contre le `prompt_tokens` que l'amont vient de compter pour CETTE requête
+    (messages + schémas d'outils) : nourrit le calibrateur par palier (facteur réel/estimé, sans effet tant que
+    `context_budgets.calibrate_tokens` est faux). `len // 4` sous-estimait d'environ 10 k jetons sur 30 k ; sans cette
+    mesure, rien ne comparait jamais l'estimation à la valeur de l'amont. Jamais d'exception vers l'appel."""
+    if prompt_tokens < 2000:  # une petite requête : le surcoût fixe du gabarit fausserait le ratio
+        return
+    try:
+        from nokker.context.tokens import CALIBRATOR, estimate_tokens
+
+        est = 0
+        for m in body.get("messages") or []:
+            est += estimate_tokens(str(m.get("content") or ""))
+            for tc in m.get("tool_calls") or []:
+                est += estimate_tokens(json.dumps(tc, ensure_ascii=False), "json")
+        if body.get("tools"):
+            est += estimate_tokens(json.dumps(body["tools"], ensure_ascii=False), "json")
+        CALIBRATOR.observe(tier, est, prompt_tokens)
+    except Exception:  # noqa: BLE001
+        logger.debug("estimation non comparée à prompt_tokens", exc_info=True)
+
+
+def session_affinity_id(session_key: str) -> str:
+    """Valeur de `X-Session-Id` : empreinte courte de la clé de session (jamais l'identifiant du fil en clair), stable pour
+    un même fil, différente d'un fil à l'autre."""
+    return hashlib.sha256((session_key or "").encode("utf-8")).hexdigest()[:24]
 
 
 def _parse_usage(raw: dict[str, Any]) -> Usage:

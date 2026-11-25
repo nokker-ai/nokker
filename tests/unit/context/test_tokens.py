@@ -102,7 +102,7 @@ def test_calibrated_window_follows_the_observed_ratio_only_when_the_flag_is_on(t
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
     try:
-        plain = make_session(ContextBudgets(current_budget=10 ** 6), tmp_path=tmp_path / "a")
+        plain = make_session(ContextBudgets(current_budget=10 ** 6, calibrate_tokens=False), tmp_path=tmp_path / "a")
         calibrated = make_session(ContextBudgets(current_budget=10 ** 6, calibrate_tokens=True), tmp_path=tmp_path / "b")
         for s in (plain, calibrated):
             s.say("bonjour, une question sur le calcul du maillage ?")

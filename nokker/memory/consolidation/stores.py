@@ -24,6 +24,7 @@ SNAP = ("name", "scope", "household_id", "audience", "kind", "title", "body", "a
         "embed_model", "embedding", "created_at", "updated_at", "provenance")
 LEGACY = "unknown_legacy"  # = nokker.memory.provenance.UNKNOWN_LEGACY : instantané d'avant la migration 080
 PROVENANCE_MIGRATION = Path(__file__).resolve().parents[2] / "store" / "migrations" / "080_memory_provenance.sql"
+VALUES_MIGRATION = Path(__file__).resolve().parents[2] / "store" / "migrations" / "096_long_memory_values.sql"
 MIGRATION = Path(__file__).resolve().parents[2] / "store" / "migrations" / "053_memory_consolidation.sql"
 
 
@@ -94,7 +95,10 @@ class _MemTx:
 
     # ── notes détenues ──
     def notes(self) -> list[dict[str, Any]]:
-        return [_snap_of(n) for (t, a, _), n in list(self.s.long.notes.items()) if (t, a) == self.key]
+        # Les valeurs datées (clé, migration 096) ne passent pas par la consolidation : elles se remplacent par archivage
+        # (nokker/memory/values.py), jamais par fusion ni par correction.
+        return [_snap_of(n) for (t, a, _), n in list(self.s.long.notes.items())
+                if (t, a) == self.key and not n.key and n.superseded_by is None]
 
     def note(self, name: str) -> dict[str, Any] | None:
         n = self.s.long.notes.get((*self.key, name))
@@ -250,7 +254,8 @@ class PgConsolidationStore:
         if migrate_now:
             from nokker.store.conn import migrate
 
-            migrate(dsn, MIGRATION.read_text(encoding="utf-8"), PROVENANCE_MIGRATION.read_text(encoding="utf-8"))
+            migrate(dsn, MIGRATION.read_text(encoding="utf-8"), PROVENANCE_MIGRATION.read_text(encoding="utf-8"),
+                    VALUES_MIGRATION.read_text(encoding="utf-8"))  # `value_key` (valeurs datées) lue par `notes()`
 
     @property
     def vector(self) -> bool:
@@ -324,8 +329,8 @@ class _PgTx:
         return f"SELECT {_NOTE_COLS}, " + ("embedding::text" if self.vector else "NULL") + " FROM nokker_long_memory"
 
     def notes(self) -> list[dict[str, Any]]:
-        rows = self.c.execute(self._sel() + " WHERE tenant_id = %s AND account_id = %s ORDER BY created_at",
-                              self.k).fetchall()
+        rows = self.c.execute(self._sel() + " WHERE tenant_id = %s AND account_id = %s AND value_key IS NULL "
+                              "AND superseded_by IS NULL ORDER BY created_at", self.k).fetchall()
         return [self._snap(r) for r in rows]
 
     def note(self, name: str) -> dict[str, Any] | None:

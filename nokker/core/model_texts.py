@@ -481,6 +481,12 @@ INV_RECIPIENT_UNKNOWN = _t("gate.inv_recipient_unknown", "destinataire non ident
                            "Empfänger nicht identifizierbar", "destinatario non identificabile")
 INV_SPEND = _t("gate.inv_spend", "dépense sans GO explicite", "spending without an explicit GO",
                "Ausgabe ohne ausdrückliches GO", "spesa senza GO esplicito")
+INV_UNKNOWN_TOOL = _t(
+    "gate.inv_unknown_tool",
+    "outil sans effet déclaré, premier usage dans ce fil : à confirmer avant d'agir",
+    "tool with no declared effect, first use in this thread: to confirm before acting",
+    "Werkzeug ohne deklarierte Wirkung, erste Verwendung in diesem Verlauf: vor der Ausführung zu bestätigen",
+    "strumento senza effetto dichiarato, primo utilizzo in questo filo: da confermare prima di agire")
 INV_SECRET = _t(
     "gate.inv_secret",
     "résultat transformé en poignée [secret:NOM] par redact_result avant stockage/contexte",
@@ -1586,6 +1592,58 @@ SESSION_MEMORY_HINT = _t(
     "(La finestra mostra solo l'episodio corrente. Per ritrovare un dettaglio (nome di file, valore, risultato) di "
     "questa sessione, chiama recall_context con quel dettaglio: non indovinare e non rispondere che non lo sai prima di "
     "aver cercato; se la ricerca non trova nulla, dillo semplicemente.)")
+# Marque d'une ancienne valeur retrouvée dans un résumé d'épisode ou un message, quand la mémoire l'a remplacée.
+VALUE_REPLACED = _t(
+    "context.value_replaced",
+    "[ancienne valeur : « {old} » a été remplacée par « {new} » le {date}]",
+    "[former value: \"{old}\" was replaced by \"{new}\" on {date}]",
+    "[frühere Angabe: „{old}“ wurde am {date} durch „{new}“ ersetzt]",
+    "[valore precedente: « {old} » è stato sostituito da « {new} » il {date}]")
+
+# Valeurs de la mémoire que le score n'a pas retenues pour la question : leurs NOMS seulement (jamais leurs valeurs : sur une
+# question voisine le modèle recopierait la valeur d'une grandeur voisine).
+VALUES_OTHERS = _t(
+    "memory.values_others",
+    "Autres valeurs enregistrées (elles peuvent ne pas concerner la question) : {names}. Si l'une répond à la question, "
+    "relis-la avec recall_context(\"<nom>\") ; sinon ne l'utilise pas.",
+    "Other recorded values (they may not concern the question): {names}. If one answers the question, read it again with "
+    "recall_context(\"<name>\"); otherwise do not use it.",
+    "Weitere gespeicherte Werte (sie betreffen die Frage womöglich nicht): {names}. Beantwortet einer die Frage, lies ihn "
+    "mit recall_context(\"<Name>\") erneut; sonst verwende ihn nicht.",
+    "Altri valori registrati (potrebbero non riguardare la domanda): {names}. Se uno risponde alla domanda, rileggilo con "
+    "recall_context(\"<nome>\"); altrimenti non usarlo.")
+# Consigne ajoutée au bloc de rappel QUAND il contient des valeurs (figée par la relecture HPC, 25.11) : jamais de valeur inventée.
+VALUES_GUARD = _t(
+    "memory.values_guard",
+    "Si une valeur listée ci-dessus correspond à la question, même formulée autrement ou par un synonyme, utilise-la et cite "
+    "son nom. Sinon, dis que tu ne la trouves pas, sans proposer de valeur.",
+    "If a value listed above matches the question, even when worded differently or with a synonym, use it and cite its name. "
+    "Otherwise, say that you cannot find it, without suggesting a value.",
+    "Entspricht ein oben aufgeführter Wert der Frage, auch bei anderer Formulierung oder mit einem Synonym, verwende ihn und "
+    "nenne seinen Namen. Andernfalls sag, dass du ihn nicht findest, ohne einen Wert vorzuschlagen.",
+    "Se un valore elencato sopra corrisponde alla domanda, anche formulata diversamente o con un sinonimo, usalo e cita il suo "
+    "nome. Altrimenti di' che non lo trovi, senza proporre alcun valore.")
+
+# Variante « valeurs injectées mais marquées » (réglage always_values_mode = marked) : suffixe d'une valeur hors score.
+VALUE_UNSCORED = _t(
+    "memory.value_unscored",
+    "[valeur enregistrée : peut ne pas concerner la question]",
+    "[recorded value: may not concern the question]",
+    "[gespeicherter Wert: betrifft die Frage womöglich nicht]",
+    "[valore registrato: potrebbe non riguardare la domanda]")
+
+# Réponse du noyau à la 2e recherche VIDE d'un même tour (`recall_context(query)` sur un sujet absent de la mémoire).
+RECALL_NOTHING_FOUND = _t(
+    "context.recall_nothing_found",
+    "Rien trouvé dans la mémoire de ce fil après deux recherches : ne cherche plus, dis simplement à la personne que tu "
+    "n'as pas cette information et demande-la-lui.",
+    "Nothing found in this thread's memory after two searches: stop searching, simply tell the person you do not have "
+    "this information and ask them for it.",
+    "Nach zwei Suchen nichts im Gedächtnis dieses Verlaufs gefunden: such nicht weiter, sag der Person einfach, dass du "
+    "diese Information nicht hast, und frag sie danach.",
+    "Niente trovato nella memoria di questo filo dopo due ricerche: non cercare oltre, di' semplicemente alla persona che "
+    "non hai questa informazione e chiedila a lei.")
+
 # Mention d'une révision de valeur dans les résultats de recall_context et le bloc `[Épisodes pertinents]`.
 RECALL_REVISION = _t(
     "context.recall_revision",

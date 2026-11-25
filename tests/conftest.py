@@ -39,6 +39,17 @@ def _stop_kernel_background_threads():
     corthexis.stop_all_warm_ups()
 
 
+@pytest.fixture(autouse=True)
+def _reset_token_calibrator():
+    """Le calibrateur de jetons est un état de processus (ratio réel/estimé par palier, alimenté par chaque appel
+    du fournisseur) : un test ne doit pas hériter du ratio d'un autre, la fenêtre calibrée en dépend."""
+    from nokker.context.tokens import CALIBRATOR
+
+    CALIBRATOR.reset()
+    yield
+    CALIBRATOR.reset()
+
+
 def _stop_server_and_loop_threads() -> None:
     """Serveurs HTTP (`serve_forever`) et boucles asyncio (`run_forever`) démarrés dans un fil par un test : arrêt par
     leur propre API (`shutdown` + `server_close`, `loop.stop`), jamais en remplaçant un constructeur. Le propriétaire est

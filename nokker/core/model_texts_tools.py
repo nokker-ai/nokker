@@ -432,6 +432,9 @@ MEMORY_NO_HOUSEHOLD = _t(
 MEMORY_PAYER_WRITES = _t(
     "memory.payer_writes", "seul le payeur écrit dans la mémoire du foyer", "only the payer writes to the household memory",
     "nur der Zahler schreibt in das Haushaltsgedächtnis", "solo il pagante scrive nella memoria della famiglia")
+MEMORY_VALUE_SINCE = _t(
+    "memory.value_since", "(valeur en vigueur depuis le {date})", "(current value since {date})",
+    "(gültiger Wert seit dem {date})", "(valore in vigore dal {date})")
 MEMORY_REVIEW_OFF = _t(
     "memory.review_off", "proposer au foyer demande la relecture du payeur (memory_pending éteint)",
     "proposing to the household requires the payer's review (memory_pending off)",

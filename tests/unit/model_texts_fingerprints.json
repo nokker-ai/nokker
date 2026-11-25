@@ -413,6 +413,12 @@
 "fr": "5184149ed8c555bf",
 "it": "743c8b0efcf58683"
 },
+"context.recall_nothing_found": {
+"de": "9f0c994f41103ec2",
+"en": "3d4e0f0491a74e79",
+"fr": "0247fe0ac519ee15",
+"it": "d1c018f6a1535ba1"
+},
 "context.recall_revision": {
 "de": "a83f60f3e2941f5b",
 "en": "59df1c3a41689e75",
@@ -436,6 +442,12 @@
 "en": "b8600f114a087cb0",
 "fr": "d09e6360307030d1",
 "it": "94a2346422f76ea5"
+},
+"context.value_replaced": {
+"de": "34302c6bf3ef953b",
+"en": "cbcd262d10103115",
+"fr": "13e9399f295bbb58",
+"it": "3f6303a6c6fc28b0"
 },
 "delegate.cancelled": {
 "de": "6ead11d3c56fc04e",
@@ -712,6 +724,12 @@
 "en": "7757954e4df38004",
 "fr": "6cdb1111360eb977",
 "it": "4b334e1d405ca44a"
+},
+"gate.inv_unknown_tool": {
+"de": "6585cb1983f87329",
+"en": "32e068b577760ea8",
+"fr": "05713b64830fdf61",
+"it": "9199df28418eea8f"
 },
 "gate.judge_advice": {
 "de": "84e1a8d85531f0c3",
@@ -1570,6 +1588,30 @@
 "en": "cb5970fef7ff3659",
 "fr": "d2b84ee677f5ba0a",
 "it": "f77f18d1dae566ef"
+},
+"memory.value_since": {
+"de": "7389cb118e18665f",
+"en": "a420b74fe7372310",
+"fr": "7ed07668511612ee",
+"it": "5ef744dce2d06a7d"
+},
+"memory.value_unscored": {
+"de": "75956d2504b60888",
+"en": "f361faab01e3bd77",
+"fr": "f212e6b27f58edb2",
+"it": "4d19beef8301effa"
+},
+"memory.values_guard": {
+"de": "d9dd25abe6267f44",
+"en": "12ddce018dfceda1",
+"fr": "b5f511cdef3ab8bc",
+"it": "59458472c23c7985"
+},
+"memory.values_others": {
+"de": "1dc07447a99d0606",
+"en": "ed6522493fcf6d26",
+"fr": "8cb42e627f35142c",
+"it": "f21a852c133eef36"
 },
 "note.announce": {
 "de": "da32cb7b5245cf99",

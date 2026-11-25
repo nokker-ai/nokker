@@ -432,3 +432,23 @@ def test_provider_declares_the_optional_keywords_of_the_port(up):
         _ask(twin)
     up.reply(message([{"type": "text", "text": "ok"}]))
     assert _ask(p).message.content == "ok"  # le jumeau fermé ne coupe pas l'original
+
+
+def test_a_tool_loaded_after_the_base_keeps_a_cache_point_on_the_previous_last_tool(up):
+    """`tools` précède `system` côté Anthropic : quand le jeu grandit d'un outil chargé à la suite, le dernier outil de
+    l'appel précédent garde son point de cache (le bloc d'avant reste lu) ; sans ajout, un seul point, comme avant."""
+    p = _provider(up, cache="prefix")
+    body1 = {}
+    p._mark_base_tools(body1, "s")  # sans outils : rien
+    assert body1 == {}
+    specs1 = [{"name": "a"}, {"name": "b", "cache_control": {"type": "ephemeral"}}]
+    p._mark_base_tools({"tools": specs1}, "s")
+    specs2 = [{"name": "a"}, {"name": "b"}, {"name": "c", "cache_control": {"type": "ephemeral"}}]
+    p._mark_base_tools({"tools": specs2}, "s")
+    assert "cache_control" in specs2[1] and "cache_control" in specs2[2] and "cache_control" not in specs2[0]
+    specs3 = [{"name": "a"}, {"name": "b"}, {"name": "c", "cache_control": {"type": "ephemeral"}}]
+    p._mark_base_tools({"tools": specs3}, "s")  # même jeu : un seul point
+    assert "cache_control" not in specs3[1]
+    other = [{"name": "z"}, {"name": "y"}]  # un autre fil n'est pas touché par l'historique du premier
+    p._mark_base_tools({"tools": other}, "autre")
+    assert all("cache_control" not in s for s in other)

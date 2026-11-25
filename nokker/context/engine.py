@@ -12,6 +12,8 @@ du modèle, cf. notes internes §F4).
 """
 from __future__ import annotations
 
+import re
+
 import hashlib
 import json
 import logging
@@ -93,8 +95,20 @@ def date_block(now: datetime, turn: Turn | None = None) -> str:
     return f"{mt.pick(mt.DATE_LABEL, lang)}\n{format_now(now, lang)}\n[/Date]"
 
 
+_RECALL_BLOCK = re.compile(r"\[Rappel mémoire\]\n.*?\n\[/Rappel\](?:\n\n|\Z)", re.DOTALL)
+
+
+def strip_recall_block(head: str) -> str:
+    """En-tête d'un tour PASSÉ sans son bloc `[Rappel mémoire]…[/Rappel]` : le rappel est injecté pour le tour qui le
+    demande, il ne s'accumule pas dans l'historique (~3,5 k jetons par tour mesurés en natif). Le tour courant garde le sien
+    (format = contrat, rappel AVANT le message) ; seul le DERNIER message du tour précédent change d'un appel au suivant,
+    le préfixe commun d'avant ce message est intact."""
+    return _RECALL_BLOCK.sub("", head, count=1) if "[Rappel mémoire]" in head else head
+
+
 @dataclass
 class ContextEngineV0:
+    # Les tours passés sont rejoués SANS leur bloc `[Rappel mémoire]` (voir `strip_recall_block`) ; faux = rejoué tel quel.
     tools: ToolRegistry  # pour l'index court des outils non cœur (couche 5) — pas dans le Protocol
     prefix_path: str = DEFAULT_PREFIX_PATH
     profile_path: str | None = None
@@ -153,6 +167,8 @@ class ContextEngineV0:
     # bloc `[Approbation]` (`replayed_messages`). Vrai par défaut (le texte disait d'attendre une validation déjà donnée) ;
     # Faux : historique complet, identique à l'octet d'avant.
     drop_card_end_text: bool = True
+    # Les tours passés sont rejoués SANS leur bloc `[Rappel mémoire]` (`strip_recall_block`) ; faux = rejoué tel quel (option A).
+    strip_past_recall: bool = True
 
     def __post_init__(self) -> None:
         self._layers = {"internal": (self._load_prefix(self.prefix_path),
@@ -490,13 +506,14 @@ class ContextEngineV0:
         return {"role": "user", "content": parts}
 
     @staticmethod
-    def past_user(past: Turn, with_head: bool = True) -> str:
+    def past_user(past: Turn, with_head: bool = True, strip_recall: bool = False) -> str:
         """Message `user` d'un tour tel qu'il a été envoyé : en-tête figé + texte. Sans en-tête (tour d'avant
         `Turn.head`, ou en-tête délesté par le never clear) : contexte reçu + texte, comme avant. Un en-tête d'avant
         r46 voit ses [Fichier]/[Dossier] joints portés dans la clôture commune ICI, au rejeu seulement
         (`attachments.fence_head`, idempotent) : `Turn.head` persisté n'est jamais réécrit."""
-        if past.head and with_head:
-            return "\n\n".join([fence_head(past.head), past.input.text])
+        head = strip_recall_block(past.head) if strip_recall else past.head
+        if head and with_head:
+            return "\n\n".join([fence_head(head), past.input.text])
         if past.injected:
             return "\n\n".join([render_injected(past.injected), past.input.text])
         return past.input.text
@@ -534,7 +551,7 @@ class ContextEngineV0:
         # Couche 4 — tours bruts de l'épisode courant, append-only, chacun avec SON en-tête d'origine (`past_user`).
         kept = self.images_kept(history, turn)
         for i, past in enumerate(history):
-            messages.append(self.user_message(past, self.past_user(past), kept))
+            messages.append(self.user_message(past, self.past_user(past, strip_recall=self.strip_past_recall), kept))
             following = history[i + 1] if i + 1 < len(history) else turn
             messages.extend(m.to_openai(thinking=True) for m in (replayed_messages(past, following) if self.drop_card_end_text
                                                     else past.messages))

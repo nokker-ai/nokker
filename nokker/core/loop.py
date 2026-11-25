@@ -615,6 +615,8 @@ class Kernel:
     account_lang: Any = None
     # Fils dont le tour en cours doit s'arrêter (POST /v1/threads/{id}/cancel, client terminal) : vérifié avant chaque
     # appel modèle et chaque outil ; le tour finit sur « annulé », sans erreur d'amont.
+    _sticky: dict[str, list[str]] = field(default_factory=dict, init=False, repr=False)  # fil -> outils chargés, dans l'ordre
+    _sticky_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _cancelled: set[str] = field(default_factory=set, init=False, repr=False)
     _keep_partial: set[str] = field(default_factory=set, init=False, repr=False)  # fils dont l'annulation garde le partiel
     _unavailable_seen: dict[tuple[str, int], set[str]] = field(default_factory=dict, init=False, repr=False)
@@ -777,7 +779,8 @@ class Kernel:
         names = [n for n, _w in missing]
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender, lang=inp.lang or "", lang_signal=inp.lang_signal,
-                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface)
+                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface,
+                    at=float(self.turn_clock()))
         servers = [{"server": n, "reason": w} for n, w in missing]
         message = f"serveur(s) MCP requis injoignable(s) : {', '.join(names)}"
         turn.error = "mcp_required_unavailable"
@@ -1169,6 +1172,11 @@ class Kernel:
     tool_loading: str = "relevance"
     # Outils utilisés dans les N derniers tours de la fenêtre : rechargés pour une relance (« et Lausanne ? »).
     tool_reuse_turns: int = 5
+    # Outils chargés d'un fil conservés d'un tour à l'autre (bloc d'outils append-only, préfixe d'amont stable) ; 0 = comme
+    # avant (le jeu est recalculé à chaque message). Au-delà de ce nombre, le jeu repart du message (une rupture).
+    tool_sticky_max: int = 16
+    # Horloge des tours (`Turn.at`) : secondes epoch ; un banc qui scripte le temps la remplace.
+    turn_clock: Callable[[], float] = time.time
     recall_k: int = 5
     # Attente maximale du rappel, comptée depuis son lancement (début du tour) : au-delà, le tour part sans
     # rappel (verdict `memory:recall_late`) — le modèle garde memory_search s'il en a besoin. Un pic du serveur
@@ -1773,7 +1781,8 @@ class Kernel:
                                                                  self.recall_k)
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender, lang=inp.lang or "", lang_signal=inp.lang_signal,
-                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface)
+                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface,
+                    at=float(self.turn_clock()))
         if self.questions is not None and not inp.control and checked.text.strip():
             self._close_question(inp.thread_id, checked.text)
         # Images jointes (X7) : références seules, déjà validées et rangées au magasin par la frontière (API) ; le nom
@@ -1836,7 +1845,7 @@ class Kernel:
 
         # 2. Rappel du tour (bloc 5) : calculé une fois, par le noyau, sans attendre que le modèle y pense (A2).
         recall = self._await_recall(turn, recall_future, recall_started)
-        loaded = self._initial_tools(checked.text, history)
+        loaded = self._initial_tools(checked.text, history, inp.thread_id)
         state = RouteState(turn=turn, call_index=0)
         last_errors: list[str] = []
         reply = ""
@@ -2328,7 +2337,8 @@ class Kernel:
         verdict, sans appel modèle. `failure` : l'échec à annoncer (`turn.done.error`), ex. BYOK non configuré."""
         turn = Turn(thread_id=inp.thread_id, index=self.store.next_index(inp.thread_id), input=checked,
                     channel=inp.channel, sender=inp.sender, lang=inp.lang or "", lang_signal=inp.lang_signal,
-                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface)
+                    lang_seen=(inp.lang or "") if inp.lang_recognized else "", surface=inp.surface,
+                    at=float(self.turn_clock()))
         if failure is not None:
             turn.failure = failure
         self._observe("turn_started", turn)
@@ -2383,13 +2393,36 @@ class Kernel:
         except Exception:
             logger.exception("context.after_turn a levé")
 
-    def _initial_tools(self, text: str, history: list) -> list[ToolSpec]:
+    def _initial_tools(self, text: str, history: list, thread_id: str = "") -> list[ToolSpec]:
         """Schémas non cœur chargés au premier appel du tour (`tool_loading`, voir tools/select.py)."""
         non_core = self.tools.find("", limit=10_000)
         if self.tool_loading == "all":
             return list(non_core)
         used = {c.name for past in history[-self.tool_reuse_turns:] for m in past.messages for c in m.tool_calls}
-        return relevant_tools(text, used, non_core)
+        return self._sticky_tools(thread_id, relevant_tools(text, used, non_core), non_core)
+
+    def _sticky_tools(self, thread_id: str, wanted: list[ToolSpec], non_core: list[ToolSpec]) -> list[ToolSpec]:
+        """Schémas chargés d'un fil : jeu qui ne fait que GRANDIR, dans l'ordre de chargement (les outils de base d'abord,
+        puis chaque outil chargé À LA SUITE). Sans cela le jeu `relevance` changeait à chaque message et le bloc d'outils
+        réécrivait tout le préfixe en cache de l'amont. Plafond `tool_sticky_max` : au-delà, le jeu repart de ce que le
+        message demande (une seule rupture)."""
+        if not thread_id or self.tool_sticky_max <= 0:
+            return wanted
+        with self._sticky_lock:
+            prev = self._sticky.get(thread_id, [])
+            by_name = {s.name: s for s in non_core}
+            keep = [by_name[n] for n in prev if n in by_name]
+            have = {s.name for s in keep}
+            out = keep + [s for s in wanted if s.name not in have]
+            if len(out) > self.tool_sticky_max:
+                out = list(wanted)
+            self._remember_tools(thread_id, [s.name for s in out])
+            return out
+
+    def _remember_tools(self, thread_id: str, names: list[str]) -> None:
+        self._sticky[thread_id] = names
+        while len(self._sticky) > 5000:  # borne mémoire : on oublie les plus anciens fils
+            self._sticky.pop(next(iter(self._sticky)), None)
 
     # 5-6. Porte action, exécution, réservoir.
     def _attach_tool_images(self, turn: Turn, result: ToolResult) -> None:
@@ -2503,6 +2536,10 @@ class Kernel:
         spec = self.tools.spec(tc.name)
         if spec is not None and not spec.core and all(s.name != spec.name for s in loaded):
             loaded.append(spec)  # appelé sans schéma : exécuté (portes comprises) ET chargé pour la suite du tour
+            with self._sticky_lock:  # et pour les tours suivants du fil (à la suite, jamais au milieu)
+                names = self._sticky.get(turn.thread_id, [])
+                if spec.name not in names and self.tool_sticky_max > 0:
+                    self._remember_tools(turn.thread_id, [*names, spec.name])
             # Sauf si un champ `required` manque ou est vide : le modèle a inventé les arguments sans voir le schéma. Erreur qui cite
             # les champs attendus, aucune exécution, aucune porte, aucun verdict ; le schéma est chargé (ligne ci-dessus), donc un
             # 2e appel invalide rend l'erreur de la source, pas celle-ci (`core/deferred_args.py`).

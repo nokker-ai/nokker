@@ -23,7 +23,7 @@ docker pull -q alpine:3.20 >/dev/null; docker pull -q hello-world >/dev/null; do
 docker run -d --name $P-egress --network $SB --cap-drop ALL --security-opt no-new-privileges $P-img >/dev/null
 docker network connect bridge $P-egress
 docker run -d --name $P-proxy --network $P-api --user 0 --cap-drop ALL --security-opt no-new-privileges --read-only \
-  -v /var/run/docker.sock:/var/run/docker.sock -e NOKKER_HOST_WORKSPACE="$WS" -e NOKKER_SANDBOX_IMAGES=alpine \
+  -v /var/run/docker.sock:/var/run/docker.sock -e NOKKER_INSTANCE=$P -e NOKKER_HOST_WORKSPACE="$WS" -e NOKKER_SANDBOX_IMAGES=alpine \
   -e NOKKER_SANDBOX_EGRESS=http://$P-egress:3128 $P-img python3 dockerproxy.py >/dev/null
 sleep 2
 D() { docker run --rm --network $P-api -e DOCKER_HOST=tcp://$P-proxy:2375 docker:27-cli "$@"; }
@@ -36,7 +36,7 @@ id=$(D create --storage-opt size=1m hello-world 2>&1); case "$id" in *Forbidden*
   pass "sonde disque create (ou refus du pilote de stockage, hors proxy)"; D rm "$id" >/dev/null 2>&1;; esac
 
 echo "— bac à sable façon bibliothèque amont"
-cid=$(D run -d --init --name $P-sb --label nokker.sandbox=fil-1 -w /workspace --cap-drop ALL \
+cid=$(D run -d --init --name $P-sb --label nokker.instance=$P --label nokker.sandbox=fil-1 -w /workspace --cap-drop ALL \
   --cap-add DAC_OVERRIDE --cap-add CHOWN --cap-add FOWNER --security-opt no-new-privileges --pids-limit 256 \
   --cpus 1 --memory 512m --tmpfs /tmp --tmpfs /run -v "$WS:/workspace" --network $SB alpine:3.20 sleep infinity 2>&1)
 [ ${#cid} -ge 12 ] && pass "run -d étiqueté" || fail "run -d : $cid"
@@ -54,14 +54,14 @@ D exec $P-sb sh -c 'ls /var/run/docker.sock' >/dev/null 2>&1 && fail "socket vis
 
 echo "— refus"
 r() { local what=$1; shift; out=$(D "$@" 2>&1); echo "$out" | grep -q "nokker dockerproxy" && pass "$what refusé" || fail "$what : $out"; }
-r "privileged" run -d --label nokker.sandbox=x --security-opt no-new-privileges --privileged --network $SB alpine:3.20 true
-r "montage /" run -d --label nokker.sandbox=x --security-opt no-new-privileges -v /:/host --network $SB alpine:3.20 true
-r "montage socket" run -d --label nokker.sandbox=x --security-opt no-new-privileges -v /var/run/docker.sock:/s --network $SB alpine:3.20 true
-r "réseau host" run -d --label nokker.sandbox=x --security-opt no-new-privileges --network host alpine:3.20 true
-r "réseau bridge" run -d --label nokker.sandbox=x --security-opt no-new-privileges alpine:3.20 true
-r "pid host" run -d --label nokker.sandbox=x --security-opt no-new-privileges --pid host --network $SB alpine:3.20 true
-r "SYS_ADMIN" run -d --label nokker.sandbox=x --security-opt no-new-privileges --cap-add SYS_ADMIN --network $SB alpine:3.20 true
-r "sans no-new-privileges" run -d --label nokker.sandbox=x --network $SB alpine:3.20 true
+r "privileged" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges --privileged --network $SB alpine:3.20 true
+r "montage /" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges -v /:/host --network $SB alpine:3.20 true
+r "montage socket" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges -v /var/run/docker.sock:/s --network $SB alpine:3.20 true
+r "réseau host" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges --network host alpine:3.20 true
+r "réseau bridge" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges alpine:3.20 true
+r "pid host" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges --pid host --network $SB alpine:3.20 true
+r "SYS_ADMIN" run -d --label nokker.instance=$P --label nokker.sandbox=x --security-opt no-new-privileges --cap-add SYS_ADMIN --network $SB alpine:3.20 true
+r "sans no-new-privileges" run -d --label nokker.instance=$P --label nokker.sandbox=x --network $SB alpine:3.20 true
 r "sans étiquette" run -d --network $SB alpine:3.20 sleep 9
 r "exec privilégié" exec --privileged $P-sb id
 r "exec hors bac à sable" exec $P-proxy id
@@ -70,6 +70,8 @@ r "rm hors bac à sable" rm -f $P-egress
 r "build" build -q - <<<"FROM alpine"
 r "network create" network create x
 r "volume create" volume create x
+# NOKKER_INSTANCE (e439957b) : le proxy ne sert que les bacs de SON instance.
+r "autre instance" run -d --label nokker.instance=autre-instance --label nokker.sandbox=x --security-opt no-new-privileges --network $SB alpine:3.20 true
 D cp /etc/hostname $P-sb:/tmp/nokker-cp >/dev/null 2>&1; D exec $P-sb test -e /tmp/nokker-cp && fail "cp vers le container passé" || pass "cp vers le container refusé"
 D ps -a --format '{{.Names}}' | grep -q $P-proxy && fail "ps montre le proxy" || pass "ps ne montre que les bacs à sable"
 

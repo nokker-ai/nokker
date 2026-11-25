@@ -617,10 +617,17 @@ class NokkerConfig:
     # profil par compte et mémoire commune du foyer, sous RLS, plongements CortHeXis (pgvector de la base du noyau,
     # service d'embed `CORTHEXIS_EMBED_URLS`), rappelées dans le `[Rappel mémoire]` des testeurs. Éteint par défaut :
     # aucune route /v1/memory/long*, rien de rappelé de plus. `tenant_long_memory_settings` : {user_k: 3,
-    # household_k: 2, min_score: 0.35, relative_floor: 0.6, lexical_min_score: 0.3, vector_weight: 0.7,
+    # household_k: 2, always_values_max: 8, always_values_mode: marked|names|off, values_guard_mode: on|off, min_score: 0.35, relative_floor: 0.6, lexical_min_score: 0.3, vector_weight: 0.7,
     # max_candidates: 500, tools: false}.
     tenant_long_memory: bool = False
     tenant_long_memory_settings: dict[str, Any] | None = None
+    # Capture AUTOMATIQUE des valeurs durables (nokker/memory/values.py) : à la clôture d'un épisode et au chargement d'un
+    # historique importé, une extraction (palier `tier`, défaut ship) range décisions, préférences et valeurs (clé, valeur,
+    # date, tour source) dans la mémoire longue du compte ; une valeur remplacée est archivée, jamais effacée. Demande
+    # `tenant_long_memory` et le never clear (`context_enabled`). `memory_capture_settings` : {tier: ship, max_chars:
+    # 24000, max_tokens: 900, seed: 7 (température 0 + graine fixe), bootstrap_max: 0 (tous les épisodes importés, par lots), background: true}.
+    memory_capture: bool = True
+    memory_capture_settings: dict[str, Any] | None = None
     # Auto-amélioration hors ligne sous contrôle humain (docs/SELF-IMPROVE.md, nokker/improve/). Éteint par défaut :
     # `nokker improve` refuse de tourner, aucune variante n'est lue au démarrage, aucun geste de carte n'est branché ;
     # ce que voit le modèle est identique octet pour octet. Allumé, seule une variante APPROUVÉE sur carte (versionnée,

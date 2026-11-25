@@ -10,7 +10,8 @@ def test_defaults_of_the_compact_cache_lot():
     assert all(getattr(b, k) is True for k in ("memory_as_message", "bootstrap_compact", "summary_key_items",
                                                "direct_recall_hint", "revision_markers", "recall_recent_first",
                                                "never_clear_fixes_enabled"))
-    assert all(getattr(b, k) is False for k in ("shed_heads", "retroactive_shed", "calibrate_tokens"))
+    assert all(getattr(b, k) is False for k in ("shed_heads", "retroactive_shed"))
+    assert b.calibrate_tokens is True  # allumé le 22.11 (banc décisions : l'estimation brute sous-estime de ~15 %)
 
 
 def test_from_config_clamps_and_ignores_unknown_keys():

@@ -331,6 +331,9 @@ class ApprovalExecutor:
             result = (kernel.mcp_apps.call(app_server, approval.tool_name, approval.arguments, ctx)
                       if app_server is not None else kernel.tools.call(approval.tool_name, approval.arguments, ctx))
             result = kernel.invariants.redact_result(result, spec)
+            noted = getattr(kernel.invariants, "note_approved", None)  # outil sans effet déclaré : carte approuvée (G4)
+            if callable(noted):
+                noted(approval.thread_id, approval.tool_name)
         except Exception as e:  # noqa: BLE001 — un outil qui plante n'est pas un bug de l'exécuteur
             error = f"{type(e).__name__}: {e}"
             approval = self.approvals.mark_failed(approval.id, error)

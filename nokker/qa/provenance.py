@@ -90,7 +90,7 @@ SEARCH_TOOLS = frozenset({"web_search"})
 # Sources dont une valeur ne doit pas sortir dans la requête d'une recherche web : tout ce qui est lu, sauf ce que
 # l'utilisateur a écrit, la liste autorisée, la consigne d'un parent et le web lui-même (déjà public).
 _PUBLIC_SOURCES = frozenset({"utilisateur", "liste-autorisée", "délégation", "web"})
-RECIPIENT_KEYS = ("to", "cc", "bcc", "recipient", "recipients", "email", "address", "destinataire", "destinataires",
+RECIPIENT_KEYS = ("to", "cc", "bcc", "reply_to", "recipient", "recipients", "email", "address", "destinataire", "destinataires",
                   "attendees")
 
 # Une décision par famille : « carte » (HITL, carte forte) ou « refus » (DENY). Défauts du prototype.
@@ -215,6 +215,11 @@ class ProvenanceGuard:
     la règle nommée sur la carte est la sienne), `record(turn, call, spec, result)` après chaque résultat exécuté."""
 
     strict: bool = False  # origine inconnue d'un destinataire / hôte = traitée comme non fiable
+    # Une adresse de la liste autorisée est-elle « blanchie » (jamais teintée) ? Vrai (défaut, comportement d'avant) : oui.
+    # Faux (G5, bêta et Lokkal) : elle se lit comme les autres adresses — donnée par l'utilisateur : normale ; vue
+    # seulement dans une source non fiable (contenu de mail, web, retour d'outil) : carte forte MÊME autorisée ; vue
+    # nulle part (avec `strict`) : carte.
+    allowlist_launders: bool = True
     workspace_trusted: bool = True  # False : espace de travail et mémoire comptent comme non fiables
     decisions: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_DECISIONS))
     allow_addresses: frozenset[str] = frozenset()
@@ -403,7 +408,8 @@ class ProvenanceGuard:
 
     # Où une valeur apparaît : (blanchie ?, segments non fiables, vue ailleurs ?)
     def _locate(self, kind: str, value: str, segments: list[Segment]) -> tuple[bool, list[Segment], bool]:
-        if kind == "email" and (value in self.allow_addresses or value.rsplit("@", 1)[-1] in self.allow_domains):
+        if self.allowlist_launders and kind == "email" and (
+                value in self.allow_addresses or value.rsplit("@", 1)[-1] in self.allow_domains):
             return True, [], True
         if kind == "host" and any(value == d or value.endswith("." + d) for d in self.allow_domains):
             return True, [], True
@@ -661,9 +667,24 @@ def explain(family: str, findings: list[Finding], mode: str) -> str:
     return f"provenance : {body}. {subject}{tail}"
 
 
+# Défaut de Lokkal quand `provenance:` n'est pas posé dans sa config (G5) : allumée, origine inconnue = carte, la liste
+# autorisée ne blanchit plus. `provenance: {enabled: false}` l'éteint.
+LOKKAL_DEFAULT: dict[str, Any] = {"enabled": True, "strict": True, "allowlist_launders": False}
+
+
+def settings_for(config: Any) -> dict[str, Any] | None:
+    """Réglages de provenance d'une config : ceux qu'elle pose ; sur Lokkal (bloc `local`) sans réglage, `LOKKAL_DEFAULT`."""
+    settings = getattr(config, "provenance", None)
+    if not settings and getattr(config, "local", None) is not None:
+        return dict(LOKKAL_DEFAULT)
+    return settings
+
+
 def build_provenance(settings: dict[str, Any] | None, invariants: Any = None) -> ProvenanceGuard | None:
-    """Le garde depuis la config (`provenance: {enabled, strict, workspace_trusted, decisions}`). Éteint (défaut) :
-    None, le noyau ne fait rien de plus. La liste autorisée des invariants (`Allowlist`) blanchit ses adresses."""
+    """Le garde depuis la config (`provenance: {enabled, strict, workspace_trusted, allowlist_launders, decisions}`).
+    Éteint (défaut) : None, le noyau ne fait rien de plus. La liste autorisée des invariants (`Allowlist`) blanchit ses
+    adresses, sauf `allowlist_launders: false` (G5, bêta et Lokkal : une adresse autorisée mais lue seulement dans une
+    source non fiable, ou vue nulle part en `strict`, reste une carte forte)."""
     s = dict(settings or {})
     if not s.get("enabled"):
         return None
@@ -673,6 +694,7 @@ def build_provenance(settings: dict[str, Any] | None, invariants: Any = None) ->
             decisions[k] = v
     allow = getattr(invariants, "allowlist", None)
     return ProvenanceGuard(strict=bool(s.get("strict", False)),
+                           allowlist_launders=bool(s.get("allowlist_launders", True)),
                            workspace_trusted=bool(s.get("workspace_trusted", True)), decisions=decisions,
                            allow_addresses=frozenset(getattr(allow, "addresses", ()) or ()),
                            allow_domains=frozenset(getattr(allow, "domains", ()) or ()))
@@ -680,6 +702,7 @@ def build_provenance(settings: dict[str, Any] | None, invariants: Any = None) ->
 
 __all__ = [
     "DEFAULT_DECISIONS",
+    "LOKKAL_DEFAULT",
     "SOURCES",
     "Finding",
     "ProvenanceGuard",
@@ -689,4 +712,5 @@ __all__ = [
     "build_provenance",
     "explain",
     "root_of",
+    "settings_for",
 ]

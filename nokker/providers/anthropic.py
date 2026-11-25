@@ -118,6 +118,7 @@ class AnthropicProvider(SokkanProvider):
     # Fils (clé de session) qui ont déjà reçu un 400 de liaison : `drop_block` part d'emblée sur leurs appels suivants
     # (l'API ne garde pas le réglage d'une requête à l'autre).
     _drop_sessions: set = field(default_factory=set, init=False, repr=False)
+    _tool_names: dict = field(default_factory=dict, init=False, repr=False)  # session -> noms d'outils du dernier appel
 
     @property
     def replays_thinking(self) -> bool:
@@ -143,6 +144,21 @@ class AnthropicProvider(SokkanProvider):
             headers[CALL_ID_HEADER] = call_id
         return headers
 
+    def _mark_base_tools(self, body: dict[str, Any], session_key: str) -> None:
+        """Quand le jeu d'outils du fil a GRANDI (un outil chargé à la suite), un point de cache est aussi posé sur le dernier
+        outil de l'appel précédent : le bloc d'outils d'avant reste lu au cache (sur l'API Anthropic `tools` précède
+        `system` : sans lui, ajouter un schéma réécrit tout). 4 points au plus (outils ×2, préfixe, dernier message)."""
+        specs = body.get("tools")
+        if not specs or self.cache != "prefix":
+            return
+        names = [s.get("name") for s in specs]
+        prev = self._tool_names.get(session_key)
+        self._tool_names[session_key] = names
+        while len(self._tool_names) > 2000:
+            self._tool_names.pop(next(iter(self._tool_names)), None)
+        if prev and len(prev) < len(names) and names[:len(prev)] == prev:
+            specs[len(prev) - 1]["cache_control"] = _cache_control(self.cache_ttl)
+
     def _sampling(self) -> dict[str, Any]:
         if not self.sampling_body or self.anthropic_version >= NO_SAMPLING_SINCE:
             return {}
@@ -162,6 +178,7 @@ class AnthropicProvider(SokkanProvider):
         body = to_messages_body(messages, tools, model=self.model, max_tokens=max_tokens or self.max_tokens_default,
                                 cache=self.cache == "prefix", stable_prefix=stable_prefix,
                                 cache_ttl=self.cache_ttl, thinking_model=self.model if replay else None)
+        self._mark_base_tools(body, session_key)
         body.update(self._sampling())
         if self.effort:
             body["output_config"] = {"effort": self.effort}

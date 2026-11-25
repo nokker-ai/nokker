@@ -171,13 +171,14 @@ def test_non_core_index_rendered_but_not_in_tools_payload(tmp_path):
 
 def test_history_replays_each_turn_exactly_as_sent_so_the_next_prompt_extends_the_previous(tmp_path):
     """Option A (cache entre tours) : le prompt du tour N+1 commence par le prompt complet du tour N — en-tête
-    (date, rappel) figé et rejoué tel quel par l'historique, index d'outils dans le système."""
+    (date, rappel) figé et rejoué tel quel par l'historique, index d'outils dans le système. Valable avec
+    `strip_past_recall=False` : par défaut le rappel d'un tour passé n'est plus rejoué (il ne s'accumule pas)."""
     from nokker.core.loop import prompt_text
     prefix = tmp_path / "prefix.md"
     prefix.write_text("P")
     clock = iter([datetime(2026, 10, 20, 14, m, tzinfo=ZURICH) for m in range(10)])
     reg = FakeRegistry(index_entries=[("send_bulk_email", "mailing de masse")])
-    engine = ContextEngineV0(tools=reg, prefix_path=str(prefix), now_fn=lambda: next(clock))
+    engine = ContextEngineV0(tools=reg, prefix_path=str(prefix), now_fn=lambda: next(clock), strip_past_recall=False)
     t0 = make_turn("première ?", index=0)
     a0 = engine.assemble(t0, [], [Recall(note="n", text="fait rappelé", score=0.9)], [], Tier.SHIP)
     t0.messages.append(Message("assistant", "réponse"))

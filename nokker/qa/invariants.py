@@ -12,6 +12,7 @@ Ordre du tour concerné (PLAN §2.3) :
 from __future__ import annotations
 
 import dataclasses
+import email.utils
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -289,17 +290,51 @@ class GoAuthorizedSenders:
 
 # ─────────────────────────────── allowlist SEND_EXTERNAL ───────────────────────────────
 
-_RECIPIENT_KEYS = ("to", "recipient", "recipients", "email", "address", "destinataire", "destinataires", "attendees")
+_RECIPIENT_KEYS = ("to", "cc", "bcc", "reply_to", "recipient", "recipients", "email", "address", "destinataire",
+                   "destinataires", "attendees")
+_ADDR_FORM = re.compile(r"[^@\s<>,;\"()\[\]]+@[^@\s<>,;\"()\[\]]+\.[^@\s<>,;\"()\[\]]+")
+
+
+def _flatten_recipient(v: Any) -> list[Any] | None:
+    """Les éléments d'un champ destinataire (chaîne, liste, élément `{email|address: …}`) ; `None` = forme inconnue."""
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple)):
+        out: list[Any] = []
+        for x in v:
+            if isinstance(x, dict):
+                x = x.get("email") or x.get("address")
+            sub = _flatten_recipient(x) if x is not None else None
+            if sub is None:
+                return None
+            out.extend(sub)
+        return out
+    return None
 
 
 def _extract_recipients(arguments: dict[str, Any]) -> list[str]:
+    """TOUTES les adresses visées (to, cc, bcc, reply_to…), une par élément, extraites avec `getaddresses` (virgules,
+    points-virgules, noms affichés, chevrons). Ce qui ne se lit pas (champ vide, forme inconnue, adresse illisible)
+    est rendu tel quel, hors liste : l'appelant en fait une carte. Un champ absent ou `None` est ignoré."""
     out: list[str] = []
     for key in _RECIPIENT_KEYS:
-        v = arguments.get(key)
-        if isinstance(v, str) and v.strip():
-            out.append(v.strip())
-        elif isinstance(v, list):
-            out.extend(str(x).strip() for x in v if str(x).strip())
+        if key not in arguments or arguments[key] is None:
+            continue
+        items = _flatten_recipient(arguments[key])
+        if not items:  # champ vide ou de forme inconnue
+            out.append(f"{key}: ?")
+            continue
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                out.append(f"{key}: ?")
+                continue
+            parsed = email.utils.getaddresses([text.replace(";", ",")])
+            addrs = [a.strip() for _, a in parsed]
+            if not parsed or any(not _ADDR_FORM.fullmatch(a) for a in addrs):
+                out.append(text)
+                continue
+            out.extend(addrs)
     return out
 
 
@@ -319,6 +354,8 @@ class Allowlist:
 
     def allows(self, recipient: str) -> bool:
         r = recipient.strip().lower()
+        if not _ADDR_FORM.fullmatch(r):  # une chaîne à plusieurs adresses ou illisible n'est jamais « autorisée »
+            return False
         if r in self.addresses:
             return True
         domain = r.rsplit("@", 1)[-1] if "@" in r else r
@@ -348,6 +385,22 @@ class DeterministicInvariants:
     go_senders: GoAuthorizedSenders = field(default_factory=GoAuthorizedSenders)
     account_tenant: Callable[[str | None], str | None] | None = None
     _context_cache: dict = field(default_factory=dict, init=False, repr=False)
+    # (fil, outil) d'un outil sans effet déclaré dont une carte a été APPROUVÉE (`note_approved`, posé par l'exécuteur de
+    # cartes). Borné.
+    _unknown_approved: dict = field(default_factory=dict, init=False, repr=False)
+
+    def note_approved(self, thread_id: str | None, tool_name: str) -> None:
+        """Une carte de premier usage d'un outil sans effet déclaré vient d'être approuvée et exécutée : dans ce fil, il
+        suit ensuite la règle WRITE. Une carte refusée ou ignorée ne passe jamais ici : l'outil reste fermé par défaut."""
+        self._unknown_approved[(str(thread_id), tool_name)] = True
+        while len(self._unknown_approved) > 2048:
+            self._unknown_approved.pop(next(iter(self._unknown_approved)))
+
+    def _unknown_tool_needs_card(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> bool:
+        """Vrai pour un outil sans effet déclaré (WRITE par défaut, `effect_inferred == "unknown"`) tant qu'aucune carte
+        n'a été APPROUVÉE pour lui dans ce fil : une carte refusée ne le déclasse pas, nouvelle carte à chaque appel."""
+        return getattr(spec, "effect_inferred", None) == "unknown" \
+            and (str(turn.thread_id), call.name) not in self._unknown_approved
 
     def go_authorized(self, sender: str | None) -> bool:
         tid = current_tenant_or_none()
@@ -425,6 +478,10 @@ class DeterministicInvariants:
                            reason=mt.pick(mt.INV_OUTSIDE_ALLOWLIST).format(bad=", ".join(bad)), subject=subject,
                            strength="standard")
 
+        if effect is Effect.WRITE and self._unknown_tool_needs_card(call, spec, turn):
+            return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule="effect:write:unknown_tool",
+                           reason=mt.pick(mt.INV_UNKNOWN_TOOL), subject=subject, strength="standard")
+
         if effect is Effect.SPEND:
             return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule="effect:spend",
                            reason=mt.pick(mt.INV_SPEND), subject=subject, strength="standard")
@@ -456,9 +513,11 @@ class DeterministicInvariants:
         - effet `SECRET` : traitement complet (coffre + motifs forts + repli « mot de passe : »
           et entropie) — c'est un canal déclaré comme renvoyant des secrets, le traitement le
           plus large est justifié ;
-        - tout autre résultat (y compris sans spec) : coffre de valeurs connues + motifs FORTS
-          seulement (`weak=False` : pas de repli entropie/mot-de-passe, trop bruyant pour un
-          JSON d'outil quelconque) — un filet de sécurité qui ne dépend pas de l'étiquette
+        - tout autre résultat (y compris sans spec) : coffre de valeurs connues + motifs FORTS + motifs à
+          MOT-CLÉ (`tool_keywords=True`, G2 : « mot de passe : X », `password=X`, `passwd`, `PIN : 483920`,
+          avec une valeur qui a l'air d'un mot de passe) ; ni entropie ni hexadécimal (`weak=False` : mesuré sur
+          un corpus de retours d'outils, ils masquaient 26 % de sorties légitimes, hashes git, sha256, UUID…)
+          — un filet de sécurité qui ne dépend pas de l'étiquette
           déclarée par qui a écrit le `ToolSpec` (une erreur d'étiquetage ne doit pas suffire à
           faire fuiter une valeur du coffre).
         """
@@ -469,7 +528,7 @@ class DeterministicInvariants:
             result = dataclasses.replace(result, content=neutralize_env(result.content))
         result = self._mask_cards(result)
         result = self._mask_avs(result)  # numéro AVS/AHV (`redact/avs.py`) : poignée `[secret:avs-…]`, comme un IBAN
-        red = redact(result.content, self.known, weak=False)
+        red = redact(result.content, self.known, weak=False, tool_keywords=True)
         if not red.names:
             return result
         handles = list(dict.fromkeys([*result.secret_handles, *red.names]))
@@ -485,7 +544,8 @@ class DeterministicInvariants:
         import json as _json
 
         try:
-            return _json.loads(redact(_json.dumps(data, ensure_ascii=False), self.known, weak=False).text)
+            return _json.loads(redact(_json.dumps(data, ensure_ascii=False), self.known, weak=False,
+                                      tool_keywords=True).text)
         except ValueError:
             return None
 
@@ -569,7 +629,7 @@ class DeterministicInvariants:
         def scrub(text: str) -> str:
             got = cache.get(text)
             if got is None:
-                got = mask_card_text(redact(text, known, weak=False, wire=True).text)  # le fil : rien de ce que refuse le Router ; aucune carte
+                got = mask_card_text(redact(text, known, weak=False, wire=True, tool_keywords=True).text)  # le fil : rien de ce que refuse le Router ; aucune carte
                 cache[text] = got
             return got
 

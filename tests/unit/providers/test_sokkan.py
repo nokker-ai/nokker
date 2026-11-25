@@ -91,7 +91,7 @@ def test_reasoning_off_body_is_overridable_for_llamacpp_hote21():
     assert seen["body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_session_key_sent_as_header():
+def test_session_key_sent_as_hashed_header():
     seen = {}
 
     def handler(request):
@@ -99,7 +99,7 @@ def test_session_key_sent_as_header():
         return httpx.Response(200, json={"model": "m", "choices": [{"message": {"content": "x"}}],
                                           "usage": {}})
     _provider(handler).complete([], [], reasoning=False, session_key="fil-42")
-    assert seen["header"] == "fil-42"
+    assert seen["header"] and seen["header"] != "fil-42" and "fil-42" not in seen["header"]
 
 
 def test_empty_api_key_sends_no_authorization_header():

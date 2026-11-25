@@ -61,8 +61,9 @@ def test_not_claims(text):
     assert not ac.claims_done(text)
 
 
-def test_only_the_first_sentences_count():
-    assert not ac.claims_done("Voici le contexte. Autre chose encore. Plus tard, j'ai envoyé le message.")
+def test_the_whole_reply_counts_not_only_the_first_sentences():
+    assert ac.claims_done("Voici le contexte. Autre chose encore. Plus tard, j'ai envoyé le message.")
+    assert ac.claims_done("Voici le contexte. Un autre point. Encore un. Un quatrième. Et voilà, c'est envoyé.")
 
 
 @pytest.mark.parametrize("lang", ["fr", "en", "de", "it"])
@@ -116,11 +117,15 @@ def test_medium_reply_is_completed_not_replaced():
     assert t.reply.startswith(text.rstrip()) and t.reply.endswith(fixed("fr", "none"))
 
 
-def test_drafted_text_is_never_touched():
+def test_long_text_lists_and_code_are_now_judged():
     long = "J'ai ajouté une section sur les risques. " + "Voici le détail de ce que contient le document. " * 12
-    assert run(long).reply == long
-    listed = "J'ai créé le plan :\n- étape un\n- étape deux"
-    assert run(listed).reply == listed
+    assert len(long) > ac.MAX_REPLY
+    assert run(long).reply == f"{long.rstrip()}\n\n{fixed('fr', 'none')}"
+    listed = "Voici où j'en suis :\n- étape un\n- J'ai créé le plan\n- étape trois"
+    assert run(listed).reply.endswith(fixed("fr", "none"))
+    code = "Voici le script :\n```\nprint('j'ai envoyé')\n```\nEt le mail a été envoyé."
+    assert run(code).reply.endswith(fixed("fr", "none"))
+    assert run("Voici le script :\n```\nprint('j'ai envoyé')\n```\nÀ lancer chez toi.").reply.startswith("Voici le script")
 
 
 def test_a_turn_with_only_a_question_to_the_person_is_untouched():
@@ -191,3 +196,79 @@ def test_tier_config_parses_tristate(tmp_path):
     p.write_text("tiers:\n  ship: {base_url: http://x, model: m, action_claims_guard: 'false'}\n")
     with pytest.raises(ValueError):
         load_config(str(p))
+
+
+# ───────────────────────── G3 : passif, 3e personne, listes, plusieurs effets ─────────────────────────
+
+PASSIVE = ["Le mail a été envoyé.", "Le message a bien été envoyé à Bob.", "L'email vient d'être envoyé.",
+           "Les fichiers ont été supprimés.", "The email was sent.", "The files were deleted.",
+           "The message has now been sent.", "Die Nachricht wurde gesendet.", "Die E-Mail wurde an Bob gesendet.",
+           "Die Dateien sind gelöscht worden.", "Il messaggio è stato inviato.", "La mail è stata inviata.",
+           "I file sono stati eliminati.", "✅ Mail envoyée à Bob", "✔ Fichier supprimé"]
+
+
+@pytest.mark.parametrize("text", PASSIVE)
+def test_passive_and_third_person_claims_recognised(text):
+    assert ac.claims_done(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "Le mail n'a pas été envoyé.", "Le message n'a pas encore été envoyé, une carte attend.", "The email was not sent.",
+    "The email has not been sent yet.", "Die Nachricht wurde nicht gesendet.", "Il messaggio non è stato inviato.",
+    "Je n'ai pas envoyé le mail, il attend ta confirmation.", "I have not sent anything.",
+    "Le mail a été envoyé hier par Bob.", "Last week the files were deleted by the cleanup job.",
+    "Le mail sera envoyé après ta confirmation.", "Should the mail be sent now?", "Le mail a-t-il été envoyé ?",
+    "Pour info, la commande `git push` envoie les commits.", "Rien n'a été envoyé.",
+    "Voici la fonction :\n```python\ndef f():\n    # le mail a été envoyé\n    pass\n```"])
+def test_negative_cases_do_not_trigger(text):
+    assert not ac.claims_done(text), text
+
+
+def test_reply_saying_not_sent_is_not_rewritten():
+    for text in ("Je n'ai pas envoyé le mail : il attend ta confirmation.", "Le mail n'a pas été envoyé.",
+                 "I have not sent it yet. " + "Tu peux relire le texte avant. " * 15):
+        assert run(text).reply == text
+
+
+def test_passive_claim_without_tool_is_replaced_and_long_one_completed():
+    assert run("Le mail a été envoyé.").reply == fixed("fr", "none")
+    long = "Le mail a été envoyé. " + "Voici le récapitulatif détaillé de tout ce qui a été prévu. " * 10
+    t = run(long).reply
+    assert t.startswith(long.rstrip()) and t.endswith(fixed("fr", "none"))
+
+
+def test_one_success_does_not_cover_another_pending_action():
+    specs = dict(SPECS, calendar_create=Effect.WRITE, mail_trash=Effect.DESTRUCTIVE)
+    pending = ("EN ATTENTE D'APPROBATION HUMAINE (envoi) [approval:x]. ", False)
+
+    n = [0]
+
+    def go(reply, calls, results, lang=None):
+        n[0] += 1
+        k = guard_world(reply, calls, specs, results)
+        k.action_claims_guard = True
+        return k.run_turn(TurnInput(thread_id=f"th_multi{n[0]}", user_text="fais tout", lang=lang)).reply
+
+    # envoi réussi + suppression en attente : « j'ai supprimé » est complété, « j'ai envoyé » seul reste intact
+    calls = [("mail_send", {}), ("mail_trash", {})]
+    res = {"mail_trash": pending}
+    both = go("J'ai envoyé le mail et supprimé l'ancien message.", calls, res)
+    assert both == f"J'ai envoyé le mail et supprimé l'ancien message.\n\n{fixed('fr', 'pending')}"
+    assert go("J'ai envoyé le mail.", calls, res) == "J'ai envoyé le mail."
+    assert go("C'est fait !", calls, res).endswith(fixed("fr", "pending"))
+    assert go("Done.", [("mail_send", {}), ("calendar_create", {})], {"calendar_create": ("Refusé : non.", False)},
+              "en").endswith(fixed("en", "refused"))
+    # un nouvel essai réussi solde le premier
+    assert go("C'est fait !", [("calendar_create", {}), ("calendar_create", {})], {}) == "C'est fait !"
+    # tout abouti : rien à dire
+    both_done = [("mail_send", {}), ("calendar_create", {})]
+    assert go("J'ai envoyé le mail et créé l'événement.", both_done, {}) == "J'ai envoyé le mail et créé l'événement."
+    assert go("J'ai créé l'événement.", [("mail_send", {}), ("mail_trash", {})], res) == "J'ai créé l'événement."
+
+
+def test_lokkal_default_turns_the_guard_on_and_the_flag_can_turn_it_off():
+    from nokker.api.server import local_action_claims_guard
+    from nokker.config import NokkerConfig
+
+    assert local_action_claims_guard(NokkerConfig()) is True
+    assert local_action_claims_guard(NokkerConfig(local={"action_claims_guard": False})) is False

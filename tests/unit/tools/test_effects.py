@@ -133,3 +133,47 @@ def test_failclosed_names_have_no_card_target():
 
     for name in _FAILCLOSED_NAMES:
         assert card_target(name, {"to": "bob@example.org", "subject": "Devis", "target": "telegram:1"}) is None
+
+
+# ───────────────────────── outil sans effet déclaré (G4) ─────────────────────────
+
+
+def _spec(name: str, description: str = "d", props: dict | None = None) -> ToolSpec:
+    return ToolSpec(name=name, description=description, source="mcp:x",
+                    parameters={"type": "object", "properties": props or {}})
+
+
+def test_g4_outil_inconnu_ressemblant_a_un_envoi_est_send_external():
+    table = EffectsTable.load()
+    for name in ("send_sms", "sendEmail", "slack_post_message", "notify_team", "publish_article", "reply_to_thread",
+                 "forward_mail", "gmail_send", "outlook_mail_create", "tweet_post"):
+        assert table.annotate(_spec(name)).effect is Effect.SEND_EXTERNAL, name
+
+
+def test_g4_schema_de_destinataire_vaut_envoi():
+    table = EffectsTable.load()
+    s = _spec("deliver", props={"recipients": {"type": "array"}, "body": {"type": "string"}})
+    assert table.annotate(s).effect is Effect.SEND_EXTERNAL
+    s = _spec("deliver", props={"to": {"type": "string"}, "subject": {"type": "string"}})
+    assert table.annotate(s).effect is Effect.SEND_EXTERNAL
+    s = _spec("deliver", props={"chat_id": {"type": "string"}, "text": {"type": "string"}})
+    assert table.annotate(s).effect is Effect.SEND_EXTERNAL
+
+
+def test_g4_lectures_et_outils_neutres_restent_write_marques_inconnus():
+    table = EffectsTable.load()
+    for name in ("get_message", "list_messages", "search_mail", "read_email", "convert_units", "resize_image"):
+        spec = table.annotate(_spec(name, props={"from": {"type": "string"}, "to": {"type": "string"}}))
+        assert spec.effect is Effect.WRITE, name
+        assert spec.effect_inferred == "unknown", name
+
+
+def test_g4_outils_connus_et_surcharges_inchanges():
+    table = EffectsTable.load({"slack_post_message": "read", "notify_team": "write"})
+    assert table.annotate(_spec("slack_post_message")).effect is Effect.READ
+    assert table.annotate(_spec("notify_team")).effect is Effect.WRITE
+    assert table.annotate(_spec("notify_team")).effect_inferred is None
+    assert table.annotate(_spec("mail_search")).effect is Effect.READ
+    assert table.annotate(_spec("mail_draft")).effect is Effect.WRITE
+    assert table.annotate(_spec("mail_draft")).effect_inferred is None
+    assert table.annotate(_spec("mail_send")).effect is Effect.SEND_EXTERNAL

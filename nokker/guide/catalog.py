@@ -328,6 +328,7 @@ EXCLUDED: dict[str, str] = {
     "nina_live": "Nina en direct : démo du titulaire seulement (vidéo Runway), pas une fonction proposée par le Guide",
     "persona": "« Ton Nokker » : choisi à l'onboarding (étape de l'app), pas une fonction proposée par le Guide",
     "approvals": "réglages des cartes (`executing_stale_s`, délai avant `interrupted`), pas une fonction à découvrir",
+    "memory_capture": "capture automatique des valeurs durables à la clôture d'un épisode (nokker/memory/values.py), sans geste de la personne",
     "judge_enabled": "porte du juge (couche 2), réglage interne",
     "judge_explicit": "posé par le chargement de la config",
     "kiosk": "écran HDMI du Lokkal (docs/KIOSK.md), réglage de la machine, aucune fonction à proposer dans le fil",

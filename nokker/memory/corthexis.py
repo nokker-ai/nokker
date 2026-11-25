@@ -340,7 +340,36 @@ class DirectCorthexisMemory:
             self._last_error = ""
         out = self._keep([r for r in rows if "info" not in r], query, k)
         self._last_recall_s = time.monotonic() - started
+        self._journal(query, [r for r in rows if "info" not in r], out, degraded=bool(degraded))
         return out
+
+    def _journal(self, query: str, rows: list[dict], kept_rows: list[Recall], *, degraded: bool) -> None:
+        """Journal du rappel dans la base CortHeXis : `recall_log` (notes rappelées) et `recall_turns` (chaque essai, même
+        sans résultat). CAUSE du `recall_log` vide en prod : `corthexis.service.search` ne journalise JAMAIS — seul le
+        moteur de rappel du paquet (`corthexis.recall.Recaller`, hook de session) écrit ces deux tables ; Nokker appelle
+        `service.search` directement, donc rien n'était écrit. Jamais d'exception vers le tour."""
+        try:
+            from corthexis.search import Hit
+
+            from nokker.context.corthexis_tenancy import guarded_store
+
+            store = guarded_store()
+            names = {r.note for r in kept_rows}
+            hits = [Hit(note_name=str(r.get("note_name") or "?"), score=float(r.get("score") or 0.0),
+                        cosine=r.get("cosine"), lexical=float(r.get("lexical") or 0.0),
+                        rerank=(float(r["rerank"]) if r.get("rerank") is not None else None),
+                        snippet=str(r.get("snippet") or ""), age_days=r.get("age_days"),
+                        date_source=str(r.get("date_source") or ""), generation=r.get("generation"))
+                    for r in rows if str(r.get("note_name") or "?") in names]
+            latency_ms = int((self._last_recall_s or 0.0) * 1000)
+            if hits and hasattr(store, "log_recall"):
+                store.log_recall("nokker", hits, query=query[:2000])
+            if hasattr(store, "log_recall_turn"):
+                store.log_recall_turn("nokker", query=query, candidates=len(rows), injected=len(hits),
+                                      degraded=degraded, latency_ms=latency_ms, threshold=self.score_threshold,
+                                      profile=self.memory_profile)
+        except Exception:  # noqa: BLE001 — le journal ne casse jamais un tour
+            logger.warning("corthexis(direct): journal du rappel en échec", exc_info=True)
 
     def _keep(self, rows: list[dict], query: str, k: int) -> list[Recall]:
         best = max((float(r.get("score") or 0.0) for r in rows), default=0.0)

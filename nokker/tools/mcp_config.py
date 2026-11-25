@@ -588,7 +588,7 @@ class ReadDeclaredSource:
     def _liftable(self, spec: ToolSpec) -> bool:
         from nokker.tools.effects import ARGUMENT_EFFECTS, DEFAULT_EFFECTS
 
-        if spec.name not in self.read_tools or spec.effect is not Effect.WRITE:
+        if spec.name not in self.read_tools or (spec.effect is not Effect.WRITE and spec.effect_inferred != "send"):
             return False
         if spec.name in self.effects.overrides or spec.name in DEFAULT_EFFECTS or spec.name in ARGUMENT_EFFECTS:
             return False

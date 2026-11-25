@@ -1575,9 +1575,20 @@ def ledger_usage_recorder(ledger: Any, default_model: str) -> Callable[..., None
     def record(tenant: str, machine: str, usage: dict[str, Any], seconds: float, model: str = "",
                turn_index: int = 0) -> None:
         # Appelé dans tenant_scope(tenant) : le ledger Postgres est sous RLS.
+        # `cached_tokens` : le Router le renvoie quand l'amont le donne ; absent = « non mesuré » (`cached_reported`
+        # faux), jamais 0. Sans cette lecture, tout appel relayé (palier Lokkal) restait « non mesuré » au ledger.
+        details = usage.get("prompt_tokens_details")
+        measured = isinstance(details, dict) and "cached_tokens" in details
+        cdetails = usage.get("completion_tokens_details")
         call = LLMCall(tier=Tier.DEEP, model=model or default_model, reasoning=False, prefix_sha256="",
                        layer_tokens={}, usage=Usage(prompt=int(usage.get("prompt_tokens") or 0),
-                                                    completion=int(usage.get("completion_tokens") or 0)),
+                                                    completion=int(usage.get("completion_tokens") or 0),
+                                                    cached=int(details.get("cached_tokens") or 0) if measured else 0,
+                                                    cached_reported=measured,
+                                                    reasoning=int(cdetails.get("reasoning_tokens") or 0)
+                                                    if isinstance(cdetails, dict) else 0,
+                                                    reasoning_reported=isinstance(cdetails, dict)
+                                                    and "reasoning_tokens" in cdetails),
                        latency_s=seconds, route_reason=f"lokkal:{machine}")
         ledger.record(scoped_thread_id(tenant, f"lokkal-{machine}"), turn_index, call)
 

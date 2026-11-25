@@ -223,8 +223,10 @@ class ContextBudgets:
     bootstrap_compact: bool = True
     # Ratio auto-calibré par palier (`tokens.TokenCalibrator`) : multiplie la taille estimée de la fenêtre par le rapport
     # jetons réels (`prompt_tokens` de l'amont) / estimés, borné [1,0 ; 2,5], moyenne mobile en mémoire du processus.
-    # ÉTEINT par défaut : la fenêtre cesse d'être une fonction pure du journal (un redémarrage change les seuils).
-    calibrate_tokens: bool = False
+    # ALLUMÉ par défaut (banc décisions du 22.11 : l'estimateur sous-estime encore de ~15 % — `len // 4` de 36 % — sur le 27B ;
+    # un délestage décidé sur l'estimation brute part trop tard). Coût assumé : la fenêtre cesse d'être une fonction pure du
+    # journal (un redémarrage repart de 1,0 jusqu'à la première observation). Retour arrière : `calibrate_tokens: false`.
+    calibrate_tokens: bool = True
     # Lot compact-cache, points 4-5 (tous rétablissables) :
     #  - `summary_key_items` / `summary_key_chars` : ligne « Éléments clés » (noms de fichiers, identifiants, valeurs avec unité,
     #    « (remplace …) » après une révision) dans le résumé extractif d'un épisode, ≤ summary_key_chars (max 600) ;
@@ -237,6 +239,9 @@ class ContextBudgets:
     direct_recall_hint: bool = True
     revision_markers: bool = True
     recall_recent_first: bool = True
+    # Plafond de jetons cumulés des RECHERCHES `recall_context(query)` d'un même tour (leurres : au-delà, plus de relance, le noyau
+    # répond `context.recall_nothing_found`). 0 = pas de plafond.
+    recall_budget_tokens: int = 12_000
     durable_instructions_k: int = 5  # consignes durables gardées en couche 3 (les plus récentes encore en vigueur)
 
     # Maxima des réglages numériques du lot compact-cache (`from_config` ramène une valeur trop grande au maximum, une valeur

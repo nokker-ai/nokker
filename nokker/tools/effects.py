@@ -191,6 +191,50 @@ def persists_beyond_thread(name: str, effect: Effect, declared: Effect | None = 
     return (Effect.WRITE in (effect, declared) and name not in THREAD_SCOPED) or name in LEAVES_THREAD
 
 
+# ─────────────────────────────── outil sans effet déclaré : ressemble-t-il à un envoi ? ───────────────────────────────
+#
+# Un outil MCP ou de skill absent de la table et des surcharges n'a aucun effet déclaré. Avant, tout tombait sur WRITE ;
+# un « slack_post_message » ou un « send_sms » inconnu partait donc sans allowlist ni carte d'envoi. Le nom (découpé en
+# mots, camelCase compris) et les noms de paramètres du schéma sont lus (la description, texte du serveur, ne l'est pas) : s'ils annoncent un envoi, l'effet est
+# SEND_EXTERNAL (fermé par défaut : sans destinataire lisible dans la liste, une carte). Liste large : un faux positif
+# coûte une carte, un faux négatif un envoi sans carte. Une surcharge `effect_overrides` ou une entrée de la table gagne.
+
+_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+_SEND_STRONG = frozenset({"send", "reply", "forward", "publish", "notify", "sms", "tweet", "broadcast", "dispatch",
+                          "transmit"})
+_SEND_WEAK = frozenset({"mail", "email", "message", "msg", "post", "dm", "outbox"})
+_READ_FIRST = frozenset({"get", "list", "read", "search", "find", "fetch", "query", "count", "describe", "show",
+                         "view", "check", "status", "lookup", "browse", "inspect", "peek", "preview"})
+_RECIPIENT_PROPS = frozenset({"recipient", "recipients", "cc", "bcc", "reply_to", "to_email", "to_emails", "to_address",
+                              "destinataire", "destinataires", "chat_id", "phone", "phone_number", "channel_id"})
+_BODY_PROPS = frozenset({"body", "text", "message", "content", "subject", "html"})
+
+
+def _words(text: str) -> list[str]:
+    out: list[str] = []
+    for w in _WORDS.findall(str(text or "")):
+        w = w.lower()
+        out.append(w[:-1] if w.endswith("s") and len(w) > 3 else w)
+    return out
+
+
+def looks_like_send(name: str, description: str = "", parameters: dict[str, Any] | None = None) -> bool:
+    """Vrai si le nom ou les paramètres d'un outil sans effet déclaré annoncent un envoi vers l'extérieur."""
+    words = _words(name)
+    read_first = bool(words) and words[0] in _READ_FIRST
+    if _SEND_STRONG & set(words):
+        return True
+    if read_first:
+        return False
+    if _SEND_WEAK & set(words):
+        return True
+    props = (parameters or {}).get("properties") if isinstance(parameters, dict) else None
+    keys = {str(k).lower() for k in props} if isinstance(props, dict) else set()
+    if keys & _RECIPIENT_PROPS or ("to" in keys and keys & _BODY_PROPS):
+        return True
+    return False
+
+
 @dataclass
 class EffectsTable:
     """Table par défaut + surcharge (config). Un outil absent des deux → WRITE."""
@@ -218,8 +262,13 @@ class EffectsTable:
         effect = self.effect_for(spec.name)
         classify = ARGUMENT_EFFECTS.get(spec.name) if spec.name not in self.overrides else None
         if classify is None:
-            return dataclasses.replace(spec, effect=effect)
-        return dataclasses.replace(spec, effect=effect, effect_of=classify)
+            if spec.name in self.overrides or spec.name in DEFAULT_EFFECTS:
+                return dataclasses.replace(spec, effect=effect, effect_inferred=None)
+            # Aucun effet déclaré : un envoi probable est fermé par défaut, le reste reste WRITE (carte au 1er usage).
+            if looks_like_send(spec.name, spec.description, spec.parameters):
+                return dataclasses.replace(spec, effect=Effect.SEND_EXTERNAL, effect_inferred="send")
+            return dataclasses.replace(spec, effect=effect, effect_inferred="unknown")
+        return dataclasses.replace(spec, effect=effect, effect_of=classify, effect_inferred=None)
 
 
 # ─────────────────────────────── transformation SECRET → poignée ───────────────────────────────
@@ -276,5 +325,5 @@ class SecretScrubbingToolSource:
 
 
 __all__ = ["ARGUMENT_EFFECTS", "DEFAULT_EFFECTS", "LEAVES_THREAD", "THIRD_PARTY_SITE_INPUT", "THREAD_SCOPED",
-           "EffectsTable", "SecretScrubbingToolSource", "persists_beyond_thread", "redact_tool_result",
+           "EffectsTable", "SecretScrubbingToolSource", "looks_like_send", "persists_beyond_thread", "redact_tool_result",
            "third_party_input"]

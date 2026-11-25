@@ -150,6 +150,8 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     }
     if turn.texts:  # pièces texte de l'appareil (P9), absentes des tours d'avant
         out["texts"] = [dict(t) for t in turn.texts]
+    if turn.at:  # instant du tour (absent des tours d'avant)
+        out["at"] = float(turn.at)
     if turn.lang_seen:  # dernière langue reconnue sur le fil (absente des tours d'avant et des tours sans message humain)
         out["lang"] = turn.lang_seen
     return out
@@ -167,6 +169,7 @@ def turn_from_dict(d: dict[str, Any]) -> Turn:
         error=d.get("error"), injected=list(d.get("injected", [])), head=d.get("head", ""),
         images=[ImageRef.from_dict(i) for i in d.get("images", [])],
         texts=[dict(t) for t in d.get("texts", [])], lang_seen=str(d.get("lang") or ""),
+        at=float(d.get("at") or 0.0),
     )
 
 

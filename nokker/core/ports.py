@@ -21,6 +21,10 @@ class ToolSpec:
     description: str  # une ligne : c'est elle qui va dans l'index du bloc du tour
     parameters: dict[str, Any]  # JSON schema
     effect: Effect = Effect.WRITE  # défaut prudent (PLAN §2.3 étape 5)
+    # Posé par `EffectsTable.annotate` quand AUCUN effet n'est déclaré pour cet outil (ni surcharge, ni table) :
+    # « send » = le nom ou le schéma ressemble à un envoi (effet SEND_EXTERNAL, fermé par défaut) ; « unknown » = WRITE
+    # par défaut, carte au premier usage dans un fil (`qa/invariants.py`). None = effet déclaré.
+    effect_inferred: str | None = None
     core: bool = False  # True = schéma dans le préfixe stable (≤ 8 outils)
     source: str = "builtin"  # builtin | mcp:<serveur>
     # Effet qui dépend des arguments (ex. `terminal` : `ls` ne détruit rien, `rm -rf` si). None = `effect` pour

@@ -42,6 +42,42 @@ class Outcomes:
         return "pending" if self.pending else "refused" if self.refused else "failed" if self.failed else "none"
 
 
+@dataclass
+class CallOutcome:
+    """Issue d'UN appel d'outil du tour (`call_outcomes`) : `state` = done | pending | refused | failed | read."""
+
+    name: str
+    effect: Effect
+    state: str
+    arguments: dict[str, Any]
+
+
+def _classify(m: Message, calls: dict[str, Any], spec_of: Callable[[str], Any] | None, failed_ids: set[str]) -> CallOutcome:
+    name, content = m.name or "", m.content or ""
+    tc = calls.get(m.tool_call_id or "")
+    args = tc.arguments if tc is not None else {}
+    effect = Effect.WRITE
+    if spec_of is not None:
+        effect = call_effect(spec_of(name), args)
+    if is_refusal(content):
+        return CallOutcome(name, effect, "refused", args)
+    if content.startswith(_PENDING):
+        return CallOutcome(name, effect, "pending", args)
+    if m.tool_call_id in failed_ids or (name == "memory_note" and any(k in content for k in _NOTE_FAILED_MARKS)):
+        return CallOutcome(name, effect, "failed", args)
+    if effect is not Effect.READ or name in EFFECT_DESPITE_READ or spec_of is None:
+        return CallOutcome(name, effect, "done", args)
+    return CallOutcome(name, effect, "read", args)
+
+
+def call_outcomes(messages: list[Message], spec_of: Callable[[str], Any] | None = None,
+                  failed_ids: Iterable[str] = ()) -> list[CallOutcome]:
+    """Une issue PAR appel d'outil du tour, dans l'ordre (la garde « c'est fait » juge action par action)."""
+    failed_ids = set(failed_ids)
+    calls = {tc.id: tc for m in messages if m.role == "assistant" for tc in m.tool_calls}
+    return [_classify(m, calls, spec_of, failed_ids) for m in messages if m.role == "tool"]
+
+
 def read_outcomes(messages: list[Message], spec_of: Callable[[str], Any] | None = None,
                   failed_ids: Iterable[str] = ()) -> Outcomes:
     """`spec_of(nom)` rend la spec d'un outil (effet) ; sans elle, tout outil abouti compte comme à effet (prudent pour

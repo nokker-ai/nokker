@@ -28,6 +28,7 @@ TEXTES = {"fr": "Résume le document.", "en": "Summarise the document.", "de": "
 
 
 def _engine(tmp_path, **flags) -> ContextEngineV1:
+    flags.setdefault("strip_past_recall", False)  # ces tests portent sur la ligne de langue figée, pas sur le rappel
     prefix = tmp_path / "prefix.md"
     if not prefix.exists():
         prefix.write_text("Tu es Atlas.\n\n## Style\n\n- Réponds dans la langue de l'utilisateur ; s'il change de langue, suis-le.\n- Sois bref.\n")

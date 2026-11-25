@@ -374,6 +374,9 @@ class Turn:
     # Dernière langue reconnue sur le fil : celle du message humain de ce tour (fr/en/de/it), vide pour un tour qui n'en
     # dit rien (suite de carte, tâche de fond). PERSISTÉE avec le tour (aucune colonne : le tour est un JSON).
     lang_seen: str = ""
+    # Instant du tour (secondes epoch) : posé à sa création par le noyau (`Kernel.turn_clock`) ou fourni par l'import
+    # d'un historique (`at`), PERSISTÉ avec le tour ; 0 = inconnu (tour d'avant ce champ). Sert à dater une valeur retenue.
+    at: float = 0.0
     # Repli de palier du tour (Deep indisponible -> Ship) : `{"from": "deep", "to": "ship"}`, pour `turn.done.fallback` seulement.
     # `notice` : ligne d'état pour la PERSONNE (`turn.done.notice`), posée seulement si le tour devait être profond ; jamais
     # dans `reply`, `messages`, l'historique ni le cache, jamais vue du modèle. Ni l'un ni l'autre n'est persisté.
