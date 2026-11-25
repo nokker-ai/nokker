@@ -218,7 +218,10 @@ def test_navitia_token_never_in_url_or_text():
 
 
 def _doc() -> str:
-    return (ROOT / "docs" / "ESSENTIALS.md").read_text(encoding="utf-8")
+    doc = ROOT / "docs" / "ESSENTIALS.md"
+    if not doc.exists():
+        pytest.skip("doc ou script privé, absent de l'export public")
+    return doc.read_text(encoding="utf-8")
 
 
 def test_doc_carries_wave2_texts_hash_and_examples():

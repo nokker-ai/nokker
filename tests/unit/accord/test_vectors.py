@@ -9,6 +9,8 @@ from nokker.accord import protocol as P
 from nokker.accord.vectors import build
 
 VECTORS = Path(__file__).resolve().parents[3] / "docs" / "accord-vectors.json"
+if not VECTORS.exists():
+    pytest.skip("doc ou script privé, absent de l'export public", allow_module_level=True)
 
 
 def _load() -> dict:

@@ -386,7 +386,10 @@ def test_names_and_specs():
 
 
 def _doc() -> str:
-    return (ROOT / "docs" / "ESSENTIALS.md").read_text(encoding="utf-8")
+    doc = ROOT / "docs" / "ESSENTIALS.md"
+    if not doc.exists():
+        pytest.skip("doc ou script privé, absent de l'export public")
+    return doc.read_text(encoding="utf-8")
 
 
 def test_doc_carries_the_exact_texts_seen_by_the_model_and_their_hash():
@@ -476,7 +479,9 @@ def _without_pack(text: str) -> str:
 def test_flag_off_is_byte_identical_and_on_adds_the_pack_only(monkeypatch):
     from nokker.config import load_config
 
-    assert load_config(str(ROOT / "deploy/beta/core-config.yaml")).essentials is True  # valeur explicite, allumé rév. 37
+    beta = ROOT / "deploy/beta/core-config.yaml"   # config privée : absente de l'export public, le reste du test y tourne
+    if beta.exists():
+        assert load_config(str(beta)).essentials is True  # valeur explicite, allumé rév. 37
     off = _kernel_surfaces(monkeypatch, False)
     assert _kernel_surfaces(monkeypatch, False) == off  # stable d'une construction à l'autre
     core_on, extra_on, index_on, tester_on, cidx_on, tidx_on = _kernel_surfaces(monkeypatch, True)

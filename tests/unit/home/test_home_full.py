@@ -381,7 +381,10 @@ def test_model_texts_hash():
     from pathlib import Path
 
     digest = model_texts_sha256()
-    doc = (Path(__file__).resolve().parents[3] / "docs" / "HOME-ASSISTANT.md").read_text(encoding="utf-8")
+    doc_path = Path(__file__).resolve().parents[3] / "docs" / "HOME-ASSISTANT.md"
+    if not doc_path.exists():
+        pytest.skip("doc ou script privé, absent de l'export public")
+    doc = doc_path.read_text(encoding="utf-8")
     assert digest in doc, digest
 
 

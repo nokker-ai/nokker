@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "voice" / "design-nina.py"
+if not SCRIPT.exists():
+    pytest.skip("doc ou script privé, absent de l'export public", allow_module_level=True)
 
 
 @pytest.fixture
