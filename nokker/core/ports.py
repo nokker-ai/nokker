@@ -34,6 +34,20 @@ class ToolSpec:
     # sur la machine (connecteur posé dans Lokkal) ; « both » = des deux côtés ; None = non déclaré, là où tourne le
     # noyau (outils intégrés). Valeurs et filtre à l'envoi : `nokker/core/locality.py` (lot X21).
     locality: str | None = None
+    # Normalisation des arguments AVANT les portes et la carte : `(fil, arguments) -> arguments`. La carte (donc son
+    # empreinte `args_sha256`) et l'exécution portent alors les mêmes arguments. None = aucune. Un échec = inchangé.
+    normalize_args: Callable[[str, dict[str, Any]], dict[str, Any]] | None = field(default=None, compare=False,
+                                                                                   repr=False)
+
+    def normalized(self, thread_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Arguments de CET appel après `normalize_args` (une copie) ; les arguments d'origine si rien à faire ou en cas d'échec."""
+        if self.normalize_args is None or not isinstance(arguments, dict):
+            return arguments
+        try:
+            out = self.normalize_args(thread_id, dict(arguments))
+        except Exception:  # noqa: BLE001 — une normalisation cassée = l'appel tel que donné
+            return arguments
+        return out if isinstance(out, dict) else arguments
 
     def effect_for(self, arguments: dict[str, Any]) -> Effect:
         """Effet de CET appel : `effect_of(arguments)` si l'outil classe ses appels, sinon `effect`."""
@@ -76,6 +90,9 @@ class ToolContext:
     # Carte approuvée qui a déclenché CET appel (posée par `approvals/executor.py`), None sinon : un connecteur relayé
     # (lot X20) en envoie la preuve à nokker.ai.
     approval_id: str | None = None
+    # Carte approuvée par le relecteur automatique qui a déclenché CET appel (posée par `core/loop.py::_auto_review`),
+    # None sinon : l'enveloppe des points de retour prend alors un point PAR CARTE (`nokker/tools/card_snapshots.py`).
+    auto_approval_id: str | None = None
     # Noyau et tour qui font CET appel (posés par `core/loop.py` ; le noyau seul par `approvals/executor.py`), None
     # ailleurs (appel direct, banc, relais). Seul `execute_code` s'en sert (nokker/tools/execute_code.py) : les appels
     # d'outils de son script repassent par les portes de CE noyau, jamais par un registre de côté.
@@ -111,6 +128,9 @@ class Recall:
     # Provenance : "" (mémoire de Nokker) ou `import:codex` (données importées d'un autre agent, rendues à part, jamais
     # comme consignes ; nokker/context/imported.py).
     source: str = ""
+    # Provenance du fait (nokker/memory/provenance.py) : "" (mémoire qui n'en porte pas), `person`, `assistant`,
+    # `unknown_legacy` → ligne de rappel inchangée ; `third_party:<sous-type>` → marqueur de source + `inline()`.
+    provenance: str = ""
 
 
 class MemoryPort(Protocol):
@@ -118,8 +138,9 @@ class MemoryPort(Protocol):
 
     def recall(self, query: str, k: int = 5) -> list[Recall]: ...
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
-        """Écriture en QUARANTAINE uniquement (D6) — jamais dans la mémoire de prod."""
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
+        """Écriture en QUARANTAINE uniquement (D6) — jamais dans la mémoire de prod. `provenance` : celle des faits
+        (nokker/memory/provenance.py) ; absente = doute = tiers."""
         ...
 
 
@@ -236,6 +257,20 @@ class Completion:
     # (1 = du premier coup). `core/loop.py` journalise un fait (ledger) quand > 1 — visibilité sur un amont
     # lent/saturé sans jamais bloquer le tour (voir providers/sokkan.py::SokkanProvider._post_with_retry).
     attempts: int = 1
+    # Réflexion renvoyée par l'amont pour CET appel (`reasoning` d'un vLLM récent, `reasoning_content` d'un amont
+    # OpenAI-compatible plus ancien), texte BRUT. Hors de `message` : jamais dans le contexte du modèle, jamais dans le
+    # store ni la mémoire. Lue par le noyau seulement avec `Kernel.reasoning_stream` (drapeau `host_reasoning_stream`),
+    # pour l'afficher au client dans un champ séparé (docs/NOKKAN-HOST-API.md §3). Vide = l'amont n'en a pas renvoyé.
+    reasoning: str = ""
+    # Identifiant de l'appel (`core/turn.py::new_call_id`), généré par le provider à chaque `complete` : repris tel quel
+    # par `LLMCall.call_id`. Vide = provider qui n'en génère pas (le noyau en pose un à l'inscription).
+    call_id: str = ""
+    # Champ `model` de la RÉPONSE de l'amont (non-flux : `model` du corps ; flux : premier chunk / `message_start`), borné
+    # par `core/model_served.py::clean_served`. None = l'amont n'en a pas déclaré : jamais le modèle du palier recopié.
+    model_served: str | None = None
+    # Id de l'amont qui a servi (en-tête de réponse `X-Sokkan-Upstream` du Router : `aws-ship`, `fallback-397b`…), borné ;
+    # None = pas d'en-tête. Traces et événement `route.model_mismatch` seulement : pas de colonne du ledger.
+    upstream: str | None = None
 
 
 class Provider(Protocol):
@@ -247,7 +282,9 @@ class Provider(Protocol):
     noyau ne le passe qu'aux providers dont la signature de `complete` le déclare (`core/loop.py::
     accepts_on_delta`) — un provider qui l'ignore (faux providers des tests, amont sans SSE) reste valide.
     Même règle pour `on_tool_delta: Callable[[int, str, str, str], None] | None = None` (X22 : index de l'appel
-    d'outil dans le flux, son id, son nom, morceau BRUT de ses `arguments`)."""
+    d'outil dans le flux, son id, son nom, morceau BRUT de ses `arguments`), et pour
+    `on_reasoning_delta: Callable[[str], None] | None = None` (morceaux BRUTS de la réflexion de l'amont, drapeau
+    `host_reasoning_stream`)."""
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
                  session_key: str, max_tokens: int = 2048) -> Completion: ...
@@ -265,6 +302,11 @@ class TurnStream(Protocol):
 
     def reset(self) -> None: ...
 
+    # OPTIONNELLE (hors Protocol, lue par `getattr`) : `reasoning(text: str, final: bool, call_index: int)` —
+    # réflexion de l'amont, déjà caviardée, pour un affichage replié (drapeau `host_reasoning_stream`). `final=True` :
+    # le texte complet de la réflexion de l'appel `call_index`, qui REMPLACE les morceaux reçus pour cet appel. Jamais
+    # mêlée à `delta`.
+
 
 # ─────────────────────── pilier (d) : approbations fortes ───────────────────────
 #
@@ -277,6 +319,11 @@ class TurnStream(Protocol):
 # port `approvals`, le comportement actuel — carte seulement dans `turn.pending_approvals` — ne change
 # pas). Le reste du cycle de vie (défi, décision, enrôlement d'appareil, session) est consommé par
 # `nokker/api/server.py` et `nokker/approvals/executor.py`, pas par la boucle elle-même.
+
+
+# Statuts d'une carte approuvée dont l'outil n'a pas fini : `approved` (décidée) puis `executing` (l'exécuteur a lancé l'outil, migration 091).
+# Un outil qui revérifie « ma carte est approuvée » PENDANT son exécution (`ctx.approval_id`) lit `executing` : il compare à cet ensemble.
+APPROVED_LIVE = ("approved", "executing")
 
 
 @dataclass
@@ -294,7 +341,7 @@ class Approval:
     rule: str  # Verdict.rule qui a produit le HITL
     reason: str = ""  # Verdict.reason
     advice: str | None = None  # avis de Nina (risques/sauvegarde/retour arrière) — n'accompagne, ne bloque rien
-    status: str = "pending"  # pending | approved | rejected | expired | executed | failed
+    status: str = "pending"  # pending | approved | executing | rejected | expired | executed | failed | interrupted
     created_at: float = 0.0  # epoch seconds (time.time())
     expires_at: float = 0.0
     decided_by: str | None = None  # identité VÉRIFIÉE (device.user ou utilisateur du TOTP)
@@ -308,6 +355,14 @@ class Approval:
     # Relecteur automatique des cartes `standard` (docs/APPROVALS.md §8, drapeau `auto_review`) : `{decision, reason,
     # model, at, by_rule[, revoked_by, revoked_at]}`, None si aucune relecture (drapeau éteint, carte hors périmètre).
     auto_review: dict[str, Any] | None = None
+    # Code stable du motif (`Verdict.code` du HITL : `accept_edits_write`, `ask_rule`…), à côté du texte `reason` que les
+    # clients ne doivent pas reconnaître. None quand le motif n'en a pas (juge, invariants : `rule` les distingue déjà).
+    reason_code: str | None = None
+    # Instant où l'exécuteur a démarré l'outil (statut `executing`, migration 091) ; None avant, ou pour une carte d'avant.
+    executing_at: float | None = None
+    # Cible lisible figée à la création (`approvals/target.py` : commande, chemin, URL, destinataire et sujet, entité et
+    # service ; caviardée, 200 caractères au plus) ; None pour un outil sans cible connue ou une carte d'avant (095).
+    target: str | None = None
 
 
 @dataclass

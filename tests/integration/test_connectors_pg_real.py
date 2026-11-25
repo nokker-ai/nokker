@@ -11,9 +11,10 @@ from nokker.connectors.store import PgConnectorStore
 from nokker.store.pg import apply_migrations
 
 DSN = os.environ.get("NOKKER_TEST_PG_DSN")
+requires_pg = pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN non posé — pas de Postgres jetable")
 
 pytestmark = [pytest.mark.integration,
-              pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN non posé — pas de Postgres jetable")]
+              requires_pg]
 
 MAIL = {"preset": "gmail", "address": "t@gmail.com", "imap_host": "imap.gmail.com"}
 

@@ -96,3 +96,40 @@ def test_secret_scrubbing_tool_source_annotates_specs():
     wrapped = SecretScrubbingToolSource(inner=inner)
     specs = wrapped.specs()
     assert specs[0].effect is Effect.SECRET
+
+
+# ── filet fail-closed : trois noms sans outil local, mais qu'un outil MCP ou de skill homonyme peut porter ──
+_FAILCLOSED_NAMES = ("send_email_reply", "send_email_forward", "send_telegram_message")
+
+
+class _McpHomonym:
+    """Source MCP minimale qui expose les trois noms (comme `McpToolSource` après `list_tools`) : tout en WRITE au départ."""
+
+    def specs(self):
+        from nokker.core.ports import ToolSpec
+
+        return [ToolSpec(name=n, description="Lit le dossier", parameters={}, source="mcp:tiers") for n in _FAILCLOSED_NAMES]
+
+    def call(self, name, arguments, ctx):
+        return "ok"
+
+    def turn_done(self, thread_id):
+        pass
+
+
+def test_mcp_homonyms_stay_send_external_and_are_not_liftable_to_read():
+    from nokker.tools.mcp_config import ReadDeclaredSource
+
+    table = EffectsTable()
+    # l'opérateur déclare ces outils « en lecture » (read_tools) : la déclaration ne baisse jamais un effet connu
+    wrapped = ReadDeclaredSource(inner=_McpHomonym(), read_tools=list(_FAILCLOSED_NAMES), effects=table)
+    assert {s.name: s.effect for s in wrapped.specs()} == {n: Effect.SEND_EXTERNAL for n in _FAILCLOSED_NAMES}
+    for spec in _McpHomonym().specs():
+        assert wrapped._liftable(table.annotate(spec)) is False
+
+
+def test_failclosed_names_have_no_card_target():
+    from nokker.approvals.target import card_target
+
+    for name in _FAILCLOSED_NAMES:
+        assert card_target(name, {"to": "bob@example.org", "subject": "Devis", "target": "telegram:1"}) is None

@@ -116,6 +116,10 @@ class AccountExports:
     # Mémoire longue du compte (docs/MEMORY-TENANCY.md, drapeau `tenant_long_memory`) : sa mémoire de profil et ses
     # contributions au foyer ; None (drapeau éteint) : la clé n'apparaît pas.
     long_memory: Callable[[str], dict[str, Any]] | None = None
+    # Nœud téléphone (P7, nokker/cloud/phone.py) et ses hôtes autorisés (P11) ; None (éteint) : la clé n'apparaît pas.
+    phone: Callable[[str], dict[str, Any]] | None = None
+    # « Ton Nokker » (V6, nokker/persona.py) : nom, voix et avatar choisis ; None (drapeau éteint) : pas de clé.
+    persona: Callable[[str], dict[str, Any] | None] | None = None
     clock: Callable[[], float] = time.time
 
     def request(self, account: Any, tenant_id: str) -> ExportMeta:
@@ -142,14 +146,18 @@ class AccountExports:
                                   for m in d.get("messages") or [] if m.get("role") == "tool"]})
         return {
             "format": FORMAT, "exported_at": _iso(now),
-            "account": {"id": account.account_id, "email": account.email, "lang": account.lang,
+            "account": {"id": account.account_id, "email": account.email, "first_name": getattr(account, "first_name", ""), "lang": account.lang or "fr",
                         "created_at": _iso(account.created_at), "status": account.status},
             "terms_acceptances": _plain(self.acceptances(account.account_id)) if self.acceptances else [],
             "consents": _plain(self.consents(account.account_id)) if self.consents else [],
             "usage": self.usage(account.account_id) if self.usage else None,
             "conversations": [{"thread": t, "turns": turns} for t, turns in sorted(threads.items())],
             **({"long_memory": self.long_memory(account.account_id)} if self.long_memory else {}),
-            "not_included": ["connector credentials (secrets, never exported)", "internal decision logs"],
+            **({"phone": self.phone(account.account_id)} if self.phone else {}),
+            **({"persona": self.persona(account.account_id)} if self.persona else {}),
+            "not_included": ["connector credentials (secrets, never exported)", "internal decision logs",
+                             *(["phone keys and tokens (secrets, never exported)",
+                                "content returned by phone tasks (pages, transcripts)"] if self.phone else [])],
         }
 
     def get(self, export_id: str, account_id: str) -> tuple[ExportMeta, bytes] | None:

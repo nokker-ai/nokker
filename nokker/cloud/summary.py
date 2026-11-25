@@ -41,15 +41,15 @@ LABELS = {
     "to": "À", "cc": "Cc", "bcc": "Cci", "subject": "Objet", "body": "Message", "in_reply_to": "En réponse au message",
     "message_id": "Message", "destination": "Vers", "reason": "Motif donné par l'assistant",
     "event_id": "Événement", "summary": "Titre", "start": "Début", "end": "Fin", "location": "Lieu",
-    "attendees": "Invités", "description": "Description", "calendar": "Agenda",
+    "attendees": "Invités", "description": "Description", "calendar": "Agenda", "mailbox": "Boîte d'envoi",
 }
 HUMAN = frozenset({"subject", "body", "summary", "description", "location", "reason"})  # caviardage complet
 EXCERPT = frozenset({"body", "description"})
 ADDRESSES = frozenset({"to", "cc", "bcc", "attendees"})
 # Ordre des champs par outil ; un outil absent est rendu champ par champ, sous les noms bruts.
 FIELDS: dict[str, tuple[str, ...]] = {
-    "mail_send": ("to", "cc", "bcc", "subject", "body", "in_reply_to"),
-    "mail_draft": ("to", "cc", "bcc", "subject", "body", "in_reply_to"),
+    "mail_send": ("mailbox", "to", "cc", "bcc", "subject", "body", "in_reply_to"),
+    "mail_draft": ("mailbox", "to", "cc", "bcc", "subject", "body", "in_reply_to"),
     "mail_trash": ("message_id", "reason"),
     "mail_move": ("message_id", "destination", "reason"),
     "calendar_create": ("summary", "start", "end", "location", "attendees", "description", "calendar"),

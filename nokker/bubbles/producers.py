@@ -55,14 +55,17 @@ def is_monitor_tool(name: str, spec: ToolSpec | None) -> bool:
     return False
 
 
-def search_state(arguments: dict[str, Any], content: str, took_ms: int | None = None) -> dict[str, Any] | None:
-    m = _WEB_DATA.search(content or "")
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
+def search_state(arguments: dict[str, Any], content: str, took_ms: int | None = None,
+                 data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """`data` : le bloc data porté par `ToolResult.data` (r44) ; sinon lu dans le texte (résultats d'avant r44)."""
+    if data is None:
+        m = _WEB_DATA.search(content or "")
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            return None
     results = []
     for r in (data.get("results") or [])[:SEARCH_RESULTS_MAX]:
         if not isinstance(r, dict) or not r.get("url"):
@@ -109,13 +112,15 @@ class Producers:
     # Écrans du foyer (docs/SCREEN-CAST.md §7) : cast_id → état de la bulle `cast` (CastService.bubble_state) ; None =
     # écrans éteints, aucune bulle `cast`.
     cast_state: Callable[[str], dict[str, Any] | None] | None = None
+    # Écrans du mur (docs/SCREENS.md, lot V7) : screen_id → état de la bulle `screen` ; None = écrans éteints.
+    screen_state: Callable[[str], dict[str, Any] | None] | None = None
 
     def produce(self, call: ToolCall, spec: ToolSpec | None, result: ToolResult,
                 took_ms: int | None = None) -> ProducedBubble | None:
         if result.is_error:
             return None
         if call.name == "web_search":
-            st = search_state(call.arguments, result.content, took_ms)
+            st = search_state(call.arguments, result.content, took_ms, getattr(result, "data", None))
             if st is None:
                 return None
             return ProducedBubble(kind="search", title=st["query"][:200], state=st)
@@ -138,6 +143,15 @@ class Producers:
                 return None
             title = str((st.get("view") or {}).get("title") or (st.get("screen") or {}).get("name") or "")
             return ProducedBubble(kind="cast", title=title[:200], state=st, status=st.get("bubble_status") or "idle")
+        if call.name == "screen_draft" and self.screen_state is not None:
+            from nokker.screens.service import screen_ids
+
+            ids = screen_ids(result.content)
+            st = self.screen_state(str(ids[0].get("screen_id") or "")) if ids else None
+            if st is None:
+                return None
+            return ProducedBubble(kind="screen", title=str(st.get("title") or "")[:200], state=st,
+                                  status=st.get("bubble_status") or "idle")
         if call.name == "lokkal_handoff":
             from nokker.cloud.handoff import bubble_state, handoff_state
 

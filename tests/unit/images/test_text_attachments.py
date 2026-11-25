@@ -52,8 +52,15 @@ def test_split_kinds_keeps_untyped_items_as_images():
 
 
 def test_text_content_is_rendered_verbatim_in_a_fixed_block():
+    """r46 : le texte du fichier, tel quel, dans la clôture commune précédée de la consigne des fichiers joints."""
+    import hashlib
+
     [a] = _svc().parse([{"type": "text", "content": "def f():\n    return 1", "name": "f.py"}])
-    assert render_block([a]) == ("[Pièces jointes]\n[Fichier : f.py (21 caractères)]\ndef f():\n    return 1\n"
+    fid = hashlib.sha256(b"def f():\n    return 1").hexdigest()[:16]
+    assert render_block([a]) == ("[Pièces jointes]\n[Fichier : f.py (21 caractères)]\n"
+                                 f"{att.FILE_TEXTS['notice']}\n"
+                                 f'<untrusted-data kind="attachment:file" id="{fid}">\ndef f():\n    return 1\n'
+                                 f'</untrusted-data id="{fid}">\n'
                                  "[/Fichier]\n[/Pièces jointes]")
 
 
@@ -259,7 +266,7 @@ def test_route_mixes_typed_images_with_text_pieces(tmp_path):
             {"type": "image", "data": data}, {"data": data}, {"type": "text", "content": "t"}]}, "s-mix")
         assert st == 200
         [turn] = hub.kernel.store.history("s-mix")
-        assert len(turn.images) == 2 and "[Fichier : texte (1 caractères)]\nt\n[/Fichier]" in turn.head
+        assert len(turn.images) == 2 and "[Fichier : texte (1 caractère)]\n" in turn.head and "\nt\n</untrusted-data" in turn.head
     finally:
         srv.stop()
 
@@ -294,11 +301,14 @@ def test_config_flag_defaults_off():
 
 def test_web_notice_precedes_only_a_web_page_never_a_file_or_a_folder():
     """UNTRUSTED_NOTICE (« Contenu récupéré sur le web… ») ne précède que [Page web] ; un [Fichier] ou un [Dossier]
-    joint n'en porte aucune (ni celle-ci : elle serait fausse pour un fichier local)."""
+    joint porte la consigne des fichiers joints (r46), jamais celle du web (elle serait fausse pour un fichier)."""
     f = att.TextAttachment(kind="text", name="f.py", body="def f():\n    return 1", note="21 caractères")
     d = att.TextAttachment(kind="dir", name="a", body="├── x.py", note="profondeur 1")
     u = att.TextAttachment(kind="url", name="https://exemple.ch/p", body="texte de la page", note="16 caractères")
-    assert "Contenu récupéré" not in render_block([f]) and "untrusted-data" not in render_block([f])
-    assert "Contenu récupéré" not in render_block([d]) and "untrusted-data" not in render_block([d])
-    assert render_block([u]).count(UNTRUSTED_NOTICE) == 1
+    notice = att.FILE_TEXTS["notice"]
+    assert "Contenu récupéré" not in render_block([f]) and render_block([f]).count(notice) == 1
+    assert 'kind="attachment:file"' in render_block([f])
+    assert "Contenu récupéré" not in render_block([d]) and render_block([d]).count(notice) == 1
+    assert 'kind="attachment:folder"' in render_block([d])
+    assert render_block([u]).count(UNTRUSTED_NOTICE) == 1 and notice not in render_block([u])
     assert render_block([f, d, u]).count(UNTRUSTED_NOTICE) == 1  # une seule fois, pour la page web

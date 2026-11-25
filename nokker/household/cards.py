@@ -16,6 +16,7 @@ from typing import Any
 
 from nokker.household.model import GUARDIAN_RULE
 from nokker.team.model import TeamError
+from nokker.tenancy.names import member_name
 
 
 def _status(exc: Exception) -> tuple[int, str]:
@@ -72,6 +73,7 @@ class GuardianCards:
                 for card in self.approvals.pending():
                     if card.rule == GUARDIAN_RULE:
                         out.append({"member": {"account_id": row.account_id, "email": row.email,
+                                               "name": member_name(getattr(acc, "first_name", ""), row.email),
                                                "profile": row.profile}, "approval": self.to_json(card)})
         return {"approvals": out}
 

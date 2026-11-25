@@ -28,8 +28,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
+
 FAIL_SIGNALS = ("no", "correction", "relance")
-UNKNOWN_PREFIX = "outil inconnu"
+UNKNOWN_PREFIX = tuple(m.lower() for m in mt.marks(mt.UNKNOWN_TOOL, head=" {name}"))  # une marque par langue du tour
 
 
 @dataclass
@@ -158,7 +160,7 @@ def turns_from_lines(lines: Iterable[dict[str, Any]], corpus: Any = None,
                 low = body.lower()
                 if low.startswith(UNKNOWN_PREFIX):
                     rec.unknown.append(name)
-                elif low.startswith(("erreur", "error", "refusé", "échec")):
+                elif low.startswith(("erreur", "error", "refusé", "échec", *(m.lower() for m in mt.marks(mt.REFUSED_PREFIX)))):
                     rec.errors.append((name, body[:200]))
     turns = [t for t in by_turn.values() if t.signal != "__skip__"]
     turns.sort(key=lambda t: (t.thread, t.turn))

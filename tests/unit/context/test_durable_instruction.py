@@ -21,7 +21,7 @@ from nokker.context.types import ContextBudgets
 from nokker.core.ports import Completion
 from nokker.core.turn import Message, TurnInput, Usage
 
-from .harness import make_session
+from .harness import make_session, context_text
 from .test_revocation import CannedProvider
 
 RULE = ("Consigne pour toute la suite de notre conversation : termine chacune de tes réponses par le mot ORCHIDÉE en "
@@ -64,7 +64,7 @@ def test_durable_clause_is_the_instruction_sentence_only():
 
 
 def _system(s) -> str:
-    return s.provider.seen[-1][0]["content"]
+    return context_text(s.provider.seen[-1])
 
 
 def _rules(s) -> str:
@@ -168,9 +168,9 @@ def test_cap_keeps_the_most_recent_rules(tmp_path, k):
     assert re.findall(r"par ([A-Z]+)\.", _rules(s)) == words[-k:]  # les k plus récentes, ordre chronologique
 
 
-def test_cap_default_is_five_and_flag_off_by_default():
+def test_cap_default_is_five_and_flag_on_by_default():
     assert ContextBudgets().durable_instructions_k == 5
-    assert ContextBudgets().never_clear_fixes_enabled is False
+    assert ContextBudgets().never_clear_fixes_enabled is True  # allumé depuis le lot compact-cache (gel levé)
 
 
 def test_cap_zero_disables(tmp_path):

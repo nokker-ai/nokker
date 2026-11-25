@@ -8,7 +8,7 @@
   semaine du lundi 06:00 UTC ; un tour compte dans la fenêtre de son premier appel.
 - **Plafonds**, vérifiés AVANT le tour (`Kernel.run_turn`), dans cet ordre : profil mineur suspendu, plafond du
   membre (tours par jour : défaut de la configuration, ou celui posé par le payeur), quota du foyer par jour, par
-  semaine. Refus : réponse claire FR/EN avec l'heure de remise à zéro, aucun appel modèle, tour gardé avec son verdict
+  semaine. Refus : réponse claire fr/en/de/it (langue du tour) avec l'heure de remise à zéro, aucun appel modèle, tour gardé avec son verdict
   `household:<plafond>` dont le motif porte `resets_at=<ISO>`. Mode `soft` : on compte, le tour qui dépasse reçoit un
   avertissement une fois, rien n'est coupé.
 - **Palier du payeur** : le quota est celui du palier actif du payeur (`Household.tier`). Foyer `suspended` (le payeur
@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.approvals.rule_labels import _l
+from nokker.core.person_texts import pick
 from nokker.core.turn import Decision, Gate, Verdict
 from nokker.household.model import Settings
 from nokker.ledger.attribution import SpendTag
@@ -78,6 +80,67 @@ NOTICE = {
 }
 
 
+# Les mêmes textes en fr/en/de/it, vus de la PERSONNE : fr = le texte d'origine ci-dessus, mot pour mot (français puis
+# anglais, empreintes testées) ; en/de/it = la seule langue de la personne, mêmes trous ({n}, {at}). La langue est celle du
+# tour (`rule_labels.current_lang`, posée par `Kernel.run_turn`) ; hors tour (inférence relayée) : `fr`, comme avant.
+def _en_of(fr_en: str, sep: str) -> str:
+    return fr_en.split(sep, 1)[1]
+
+
+REPLY_TEXTS: dict[str, dict[str, str]] = {
+    "member_turns_per_day": _l(
+        REPLY["member_turns_per_day"], _en_of(REPLY["member_turns_per_day"], "\n\n"),
+        "Tageslimit für dein Profil erreicht: {n} Nachrichten pro Tag, festgelegt von der zahlenden Person des "
+        "Haushalts. Der Zähler startet um {at} (Schweizer Zeit) neu; dein Gespräch bleibt erhalten.",
+        "Limite giornaliero raggiunto per il tuo profilo: {n} messaggi al giorno, stabilito da chi paga il piano della "
+        "famiglia. Il contatore riparte alle {at} (ora svizzera); la tua conversazione è conservata."),
+    "turns_per_day": _l(
+        REPLY["turns_per_day"], _en_of(REPLY["turns_per_day"], "\n\n"),
+        "Tageslimit für den Haushalt erreicht: {n} Nachrichten pro Tag für alle Mitglieder. Der Zähler startet um "
+        "{at} (Schweizer Zeit) neu; dein Gespräch bleibt erhalten.",
+        "Limite giornaliero raggiunto per la famiglia: {n} messaggi al giorno per tutti i suoi membri. Il contatore "
+        "riparte alle {at} (ora svizzera); la tua conversazione è conservata."),
+    "turns_per_week": _l(
+        REPLY["turns_per_week"], _en_of(REPLY["turns_per_week"], "\n\n"),
+        "Wochenlimit für den Haushalt erreicht: {n} Nachrichten pro Woche für alle Mitglieder. Der Zähler startet am "
+        "Montag um {at} (Schweizer Zeit) neu; dein Gespräch bleibt erhalten.",
+        "Limite settimanale raggiunto per la famiglia: {n} messaggi a settimana per tutti i suoi membri. Il contatore "
+        "riparte lunedì alle {at} (ora svizzera); la tua conversazione è conservata."),
+    "suspended": _l(
+        REPLY["suspended"], _en_of(REPLY["suspended"], "\n\n"),
+        "Dieses Profil wurde von der gesetzlichen Vertretung des Haushalts deaktiviert: Es wird keine Nachricht "
+        "verarbeitet, bis sie es wieder aktiviert.",
+        "Questo profilo è sospeso dal rappresentante legale della famiglia: nessun messaggio viene elaborato finché "
+        "non lo riattiva."),
+    "unavailable": _l(
+        REPLY["unavailable"], _en_of(REPLY["unavailable"], "\n\n"),
+        "Das Kontingent des Haushalts kann gerade nicht abgerufen werden: Aus Vorsicht wurde nichts an das Modell gesendet. "
+        "Versuche es gleich noch einmal.",
+        "Al momento non è possibile leggere la quota della famiglia: per prudenza, non è stato inviato nulla al "
+        "modello. Riprova tra un momento."),
+}
+NOTICE_TEXTS: dict[str, dict[str, str]] = {
+    "turns_per_day": _l(
+        NOTICE["turns_per_day"], _en_of(NOTICE["turns_per_day"], "\n"),
+        "— Der Haushalt hat soeben seine {n} Nachrichten pro Tag überschritten. Vorerst wird nichts gesperrt; der "
+        "Zähler startet um {at} (Schweizer Zeit) neu.",
+        "— La famiglia ha appena superato i suoi {n} messaggi al giorno. Per ora non viene interrotto nulla; il "
+        "contatore riparte alle {at} (ora svizzera)."),
+    "turns_per_week": _l(
+        NOTICE["turns_per_week"], _en_of(NOTICE["turns_per_week"], "\n"),
+        "— Der Haushalt hat soeben seine {n} Nachrichten pro Woche überschritten. Vorerst wird nichts gesperrt; der "
+        "Zähler startet am Montag um {at} (Schweizer Zeit) neu.",
+        "— La famiglia ha appena superato i suoi {n} messaggi a settimana. Per ora non viene interrotto nulla; il "
+        "contatore riparte lunedì alle {at} (ora svizzera)."),
+    "member_turns_per_day": _l(
+        NOTICE["member_turns_per_day"], _en_of(NOTICE["member_turns_per_day"], "\n"),
+        "— Du hast soeben die {n} Nachrichten pro Tag deines Profils überschritten. Vorerst wird nichts gesperrt; der "
+        "Zähler startet um {at} (Schweizer Zeit) neu.",
+        "— Hai appena superato i {n} messaggi al giorno del tuo profilo. Per ora non viene interrotto nulla; il "
+        "contatore riparte alle {at} (ora svizzera)."),
+}
+
+
 def _hour(at: datetime) -> str:
     return at.astimezone(ZURICH).strftime("%H:%M")
 
@@ -91,6 +154,7 @@ class HouseholdTicket:
     verdict: Verdict | None = None
     reply: str = ""
     soft_notice: str | None = None
+    resets_at: datetime | None = None  # fin de la fenêtre dont le plafond est atteint (None : refus sans fenêtre)
 
 
 @dataclass
@@ -144,7 +208,7 @@ class HouseholdQuota:
         if row.minor:
             st = self.household.minor_state(acc.account_id)
             if st is None or not st.active:
-                return self._refuse(t, "suspended", REPLY["suspended"], None)
+                return self._refuse(t, "suspended", pick(REPLY_TEXTS["suspended"]), None)
         tier = self.household.tier(p.tenant_id)
         if not tier.active:
             return None  # foyer suspendu : plus de quota commun, les plafonds du compte s'appliquent
@@ -153,7 +217,7 @@ class HouseholdQuota:
             n = self._turns(p, acc.account_id, now)
         except Exception:
             logger.exception("quota du foyer %s illisible", p.id)
-            return self._refuse(t, "unavailable", REPLY["unavailable"], None)
+            return self._refuse(t, "unavailable", pick(REPLY_TEXTS["unavailable"]), None)
         s = tier.settings
         mine = n["by_account"].get(acc.account_id, {"today": 0})["today"]
         member_cap, _ = row.cap(s)
@@ -165,9 +229,9 @@ class HouseholdQuota:
                 continue
             if s.mode == "soft":
                 if used == cap and t.soft_notice is None:  # ce tour sera le n° cap + 1 : il dépasse, une fois
-                    t.soft_notice = NOTICE[rule].format(n=cap, at=_hour(resets))
+                    t.soft_notice = pick(NOTICE_TEXTS[rule]).format(n=cap, at=_hour(resets))
                 continue
-            return self._refuse(t, rule, REPLY[rule].format(n=cap, at=_hour(resets)), resets)
+            return self._refuse(t, rule, pick(REPLY_TEXTS[rule]).format(n=cap, at=_hour(resets)), resets)
         return t
 
     def tag(self, sender: str | None) -> SpendTag | None:
@@ -192,6 +256,7 @@ class HouseholdQuota:
                             reason=f"foyer {t.tag.household_id} ({rule}) : tour refusé avant l'appel modèle{when}",
                             subject="reply")
         t.reply = reply
+        t.resets_at = resets
         return t
 
     def notice(self, ticket: HouseholdTicket | None) -> str | None:
@@ -230,4 +295,4 @@ def counted_turns(records: Iterable[Any]) -> int:
     return len({(r.thread_id, int(r.turn_index)) for r in records if "/sa-" not in (r.thread_id or "")})
 
 
-__all__ = ["HouseholdQuota", "HouseholdTicket", "counted_turns"]
+__all__ = ["NOTICE_TEXTS", "REPLY_TEXTS", "HouseholdQuota", "HouseholdTicket", "counted_turns"]

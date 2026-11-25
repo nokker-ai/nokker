@@ -26,10 +26,14 @@ import json
 import math
 import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from nokker.redact.markers import MARKER_RE
+from nokker.redact.numbers import exempt_spans, inside
 
 # ─────────────────────────────── poignées ───────────────────────────────
 
@@ -247,7 +251,7 @@ _BEARER_RE = re.compile(r"\b([Bb]earer[ \t]+)([A-Za-z0-9._~+/-]{20,}=*)")
 # chiffres, qui n'est ni un nom de constante ni un identifiant de code (`compute_token_v2`) — même règle que le Router.
 _KEY_VALUE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9\[])((?:[a-z0-9]+[_-])*(?:api[_-]?key|apikey|secret|token|passwd|password|access[_-]?key)"
-    r"['\"]?\s*[:=]\s*['\"]?)([A-Za-z0-9_\-]{16,})(?![A-Za-z0-9_\-(.\[])")
+    r"['\"]?\s*[:=]\s*['\"]?)([A-Za-z0-9_\-]{16,}={0,2})(?![A-Za-z0-9_\-(.\[])")
 
 # Paramètre de requête qui porte une clé ou une signature (`?key=…`, `&sig=…`, `&signature=…`) : un identifiant, souvent
 # un lien magique ou signé. Les `…token=` passent par `_KEY_VALUE_RE`. Même règle de valeur (16 car. ou plus, lettres
@@ -379,7 +383,147 @@ _SAFE_HEX_LENGTHS = {7, 8, 10, 12, 32, 40, 64}
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _ENTROPY_CANDIDATE_RE = re.compile(r"\b[A-Za-z0-9+/_]{20,100}={0,2}\b")
+_SSH_FP_RE = re.compile(r"[A-Za-z0-9+/]{43}=?")
 _ENTROPY_THRESHOLD = 3.5  # bits/caractère (Shannon) — repli, pas une preuve
+
+
+# ─────────────────────────────── hexadécimal pur (07.11) ───────────────────────────────
+#
+# Trou mesuré le 07.11 : 56 % des jetons hexadécimaux de 24 caractères tirés au hasard passaient sous le seuil
+# d'entropie (3,5 bits/car., maximum 4 en hexadécimal). Décision : sur-caviarder. Toute suite hexadécimale pure de 16
+# caractères ou plus, bornée par des non-alphanumériques, avec au moins un chiffre ET une lettre a-f, est caviardée
+# (chemin `weak`), SAUF :
+#   - 40 ou 64 caractères annoncés juste avant par sha / sha1 / sha256 / commit / digest (empreintes publiques utiles :
+#     commit git, digest d'image `sha256:`) ;
+#   - le nonce d'une clôture `<untrusted-data id="…">` (16 hexa), l'appId public d'une configuration Firebase, un sha
+#     de 40 ou 64 caractères juste après une commande git (`git show <sha>`) ;
+#   - un identifiant fabriqué par le noyau, `<préfixe>_<hexa>` avec un préfixe de KERNEL_ID_PREFIXES (pages `pg_`,
+#     tâches du bureau `dt_`… : le modèle les lit et les réécrit ; les caviarder casse l'outil qui les attend, comme
+#     les alias de fenêtres du Bureau le 06.11). La liste est tenue à jour par un test qui parcourt le code.
+# Un ObjectId MongoDB (24 hexa) public est caviardé : faux positif accepté. Les longueurs 7-12 (sha courts) restent en
+# clair (sous les 16 caractères).
+KERNEL_ID_PREFIXES = frozenset({
+    "acc", "ag", "ar", "as", "bg", "bs", "bu", "call", "cast", "cr", "dk", "dp", "dr", "ds", "dt", "dy", "ep", "ex", "fc",
+    "fd", "ho", "in", "iv", "lj", "mc", "md", "mp", "pc", "pd", "pfg", "pg", "pj", "pp", "pt", "px", "qn", "rc", "rs", "sc",
+    "scr", "sh", "st", "th"})
+_HEX_RUN_RE = re.compile(r"(?<![A-Za-z0-9])[0-9a-fA-F]{16,}(?![A-Za-z0-9])")
+_PUBLIC_DIGEST_CTX_RE = re.compile(r"(?i)(?:\bsha(?:1|256)?|\bcommit|\bdigest|\bgit\s+[a-z-]+(?:\s+[^\s<>\"'`]+){0,3}?)"
+                                   r"\s*[:=@]?\s*[\"'`(]?$")
+# Nonce d'une clôture `<untrusted-data … id="…">` (nokker/qa/untrusted.py, 16 hexa) : il apparie l'ouverture et la
+# fermeture d'une DONNÉE non fiable ; le caviarder casserait la clôture (test de provenance).
+_FENCE_ID_CTX_RE = re.compile(r'<\s*/?\s*untrusted-data\b[^<>]*\bid="$')
+# appId public d'une configuration web Firebase (`1:1234567890:web:<hexa>`) : publique par construction.
+_FIREBASE_APP_CTX_RE = re.compile(r"\d:\d{6,}:(?:web|android|ios):$")
+_KERNEL_ID_CTX_RE = re.compile(r"(?<![A-Za-z0-9])([a-z]{2,4})_$")
+
+
+_DIGITS_ONLY_MIN = 32
+_KERNEL_ID_VALUE_RE = re.compile(r"^([a-z]{2,4})_[0-9A-Za-z]+$")
+
+# ─────────────── valeur longue derrière un mot-clé de secret (`p2/integ-redact-kw`) ───────────────
+#
+# Règle étroite, sur TOUS les chemins (y compris `weak=False`, ce qui part au modèle, où le repli d'entropie et le repli
+# hexadécimal restent coupés : pas de liste blanche ni d'entropie aveugle) : une VALEUR de 24 caractères ou plus, d'un
+# seul tenant (`[A-Za-z0-9+/_=-]`), est masquée QUAND elle suit un mot-clé de secret. C'est le mot-clé qui décide, pas la
+# forme : un UUID derrière `session_id:` ou `token:` est masqué ; un sha256, un UUID ou un commit derrière `id`, `sha`,
+# `hash`, `commit`, `digest` reste lisible (ces mots ne sont pas des mots-clés de secret).
+#
+# Mots-clés : token, secret (donc client_secret), password, passwd, pwd, api[_-]?key, access[_-]?key,
+# private[_-]?key, auth, authorization, session[_-]?id, et cookie (traité à part, voir `_KW_COOKIE_RE`).
+# Le mot-clé est un SUFFIXE de segment : il commence après le début du texte ou un caractère qui n'est ni lettre ni
+# chiffre (`_`, `-`, `.`, `?`, `&`, espace, guillemet : `access_token`, `x-api-key`, `?token=`) OU à une frontière
+# camelCase (minuscule ou chiffre, puis majuscule : `refreshToken`, `clientApiKey`), et il doit se terminer là, juste
+# avant le séparateur. `max_tokens`, `tokenizer`, `token_count`, `author`, `authority`, `secretary`, `passwordless`,
+# `cookies_enabled` ne l'arment donc pas. Séparateur : `:` ou `=` (espaces autour permis), ou espaces seuls ; guillemets
+# simples/doubles (éventuellement échappés `\"`) de part et d'autre ; un schéma `Basic`/`Digest` entre le séparateur et
+# la valeur reste visible (`Authorization: Basic <base64>`). La valeur est masquée par la poignée habituelle
+# `[secret:key-value-…]` ; le mot-clé et le séparateur restent lisibles.
+# Valeur écartée (jamais un secret) : début par `/` ou `~` (chemin), suivie de `.` + alphanumérique (nom de fichier,
+# `auth: config.yaml`) ou de `(` (appel), moins de 4 caractères distincts (`xxxxxxxx…`), identifiant du noyau
+# (`pg_…`, `ep_…`), identifiant de code (`generate_secure_token_value`, `getAuthTokenForUser`), mot ou camelCase fait de
+# lettres seules, et valeur à `/` sans aucun chiffre ou faite de mots joints par `/` (chemin). Une URL entière
+# (`auth: https://…`) n'est pas un jeton : `:` n'est pas dans la valeur, donc elle s'arrête à `https`.
+# `/` et `+` (base64 standard) sont acceptés quand la valeur n'a ni `.` ni mot lisible ; en cas de doute, masqué.
+# Un UUID est toujours masqué quand le mot-clé l'arme.
+_KW_PATTERNS = (r"token", r"secret", r"password", r"passwd", r"pwd", r"api[_-]?key", r"access[_-]?key",
+                r"private[_-]?key", r"auth", r"authorization", r"session[_-]?id")
+_KW_ALT = "|".join(
+    f"(?<![A-Za-z0-9\\[])(?i:{p})|(?<=[a-z0-9]){p[0].upper()}(?i:{p[1:]})" for p in _KW_PATTERNS)
+_KW_SECRET_RE = re.compile(
+    r"(?:" + _KW_ALT + r")(?:\\?['\"])?(?:[ \t]*[:=][ \t]*|[ \t]+)(?:\\?['\"])?(?:(?:Basic|Digest)[ \t]+)?"
+    r"([A-Za-z0-9+/_=-]{24,})(?![A-Za-z0-9+/_=(-]|\.[A-Za-z0-9])")
+_KW_COOKIE_RE = re.compile(r"""(?i)(?<![A-Za-z0-9\[])(?:set-)?cookie(?:\\?['\"])?[ \t]*[:=][ \t]*(?:\\?['\"])?"""
+                           r"""([^\s;'\"]+(?:;[ \t]*[^\s;'\"]+)*)""")
+_KW_COOKIE_PAIR_RE = re.compile(r"(\s*(?:[A-Za-z_][A-Za-z0-9_.-]{0,40}=)?)([A-Za-z0-9+/_=-]{24,})(\s*)")
+_GIT_DIGEST_VALUE_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_KW_PRESCAN_RE = re.compile(r"(?i)token|secret|pass|pwd|key|auth|cookie|session")
+
+
+def _kw_value_ok(value: str) -> bool:
+    """La valeur derrière un mot-clé de secret est-elle un jeton à masquer (et non un chemin, un nom de fichier, un
+    identifiant de code, un mot) ? Voir le bloc ci-dessus ; dans le doute, oui."""
+    if HANDLE_RE.search(value) or value.startswith(("/", "~")) or len(set(value)) < 4:
+        return False
+    if _UUID_RE.match(value):
+        return True
+    k = _KERNEL_ID_VALUE_RE.match(value)
+    if k and k.group(1) in KERNEL_ID_PREFIXES:
+        return False
+    if "/" in value and (not re.search(r"\d", value) or _looks_like_safe_token(value)):
+        return False
+    if ("_" in value or "-" in value) and _identifier_like(value):
+        return False
+    if _code_identifier(value) or (value.isalpha() and _letters_word(value)):
+        return False
+    return True
+
+
+def _hex_runs(text: str) -> list[str]:
+    """Suites hexadécimales pures à caviarder (voir plus haut) : la valeur exacte de chacune."""
+    out = []
+    text = _mask_known_paths(text)
+    numbers = exempt_spans(text, _DIGITS_ONLY_MIN)
+    for m in _HEX_RUN_RE.finditer(text):
+        tok = m.group(0)
+        if numbers and inside(numbers, m.start(), m.end()):
+            continue  # morceau d'un nombre pur (`3.141592653589793e-05` : « 141592653589793e ») : jamais un secret
+        if not (re.search(r"[0-9]", tok) and re.search(r"[a-fA-F]", tok)):
+            # Suite de 32 chiffres décimaux ou plus : clé hexadécimale qui ne contient par hasard que des chiffres
+            # (ambigu : nombre ou secret ? on masque). Un décimal ou un nombre scientifique est écarté plus haut.
+            if not (len(tok) >= _DIGITS_ONLY_MIN and tok.isdigit()):
+                continue
+        before = text[max(0, m.start() - 160):m.start()]
+        if len(tok) == 16 and _FENCE_ID_CTX_RE.search(before):
+            continue
+        if _FIREBASE_APP_CTX_RE.search(before):
+            continue
+        k = _KERNEL_ID_CTX_RE.search(before)
+        if k and k.group(1) in KERNEL_ID_PREFIXES:
+            continue
+        if len(tok) in (40, 64) and _PUBLIC_DIGEST_CTX_RE.search(before):
+            continue
+        out.append(tok)
+    return out
+
+
+def _run_kind(token: str) -> str:
+    """Type de la poignée d'une suite pure : `num` pour des chiffres décimaux seuls (≥ 32, voir `_hex_runs`), `hex` sinon.
+    Le type est un mot de la poignée vue du modèle : une référence décimale n'est pas de l'hexadécimal."""
+    return "num" if token.isdigit() else "hex"
+
+
+def _long_digit_runs(text: str) -> list[str]:
+    """Suites de `_DIGITS_ONLY_MIN` chiffres décimaux ou plus, hors partie d'un décimal ou d'un scientifique épargné."""
+    out: list[str] = []
+    if not any(c.isdigit() for c in text):
+        return out
+    text = _mask_known_paths(text)
+    numbers = exempt_spans(text, _DIGITS_ONLY_MIN)
+    for m in _HEX_RUN_RE.finditer(text):
+        tok = m.group(0)
+        if len(tok) >= _DIGITS_ONLY_MIN and tok.isdigit() and not (numbers and inside(numbers, m.start(), m.end())):
+            out.append(tok)
+    return out
 
 
 def _shannon_entropy(s: str) -> float:
@@ -500,13 +644,64 @@ def _looks_like_safe_token(token: str, in_url: bool = False) -> bool:
     return False
 
 
+# Chemins de travail CONNUS (dossier d'une session, point de montage) : posés par le système (`add_known_path`, jamais par
+# le modèle ni par un texte), ils n'entrent pas dans les replis par entropie et par hexadécimal : le nom d'un dossier de
+# session tiré au hasard n'est pas un secret (vu en réel : `read_file "."` rendait « /[secret:entropy-…]-074012 »). Seule
+# la racine exacte est exemptée, pas ce qui la suit : un nom de fichier ou une valeur collée après la racine passe par la
+# détection comme avant, et les motifs précis (clés d'API, jetons, mot de passe) tournent AVANT ces replis, inchangés.
+_KNOWN_PATHS: dict[str, None] = {}
+_KNOWN_PATHS_LOCK = threading.Lock()
+_KNOWN_PATHS_MAX = 512
+_KNOWN_PATH_MIN = 8  # une racine plus courte ne peut pas contenir un jeton de 20 caractères
+
+
+def add_known_path(path: Any) -> None:
+    """Déclare une racine de travail connue (chemin absolu). Sans effet pour une valeur vide, relative ou trop courte."""
+    p = str(path or "").strip().rstrip("/")
+    if len(p) < _KNOWN_PATH_MIN or not p.startswith("/"):
+        return
+    with _KNOWN_PATHS_LOCK:
+        _KNOWN_PATHS.pop(p, None)
+        _KNOWN_PATHS[p] = None
+        while len(_KNOWN_PATHS) > _KNOWN_PATHS_MAX:
+            _KNOWN_PATHS.pop(next(iter(_KNOWN_PATHS)))
+
+
+def _mask_known_paths(text: str) -> str:
+    """`text` avec chaque racine connue remplacée par des « . » de même longueur (les positions ne bougent pas, et un jeton
+    ne traverse pas la frontière de la racine). Une racine n'est reconnue que bornée : après elle, ni lettre, ni chiffre."""
+    if "/" not in text or not _KNOWN_PATHS:
+        return text
+    with _KNOWN_PATHS_LOCK:
+        roots = sorted(_KNOWN_PATHS, key=len, reverse=True)
+    for root in roots:
+        start = text.find(root)
+        while start != -1:
+            end = start + len(root)
+            if end == len(text) or not text[end].isalnum() and text[end] != "_":
+                text = text[:start] + "." * len(root) + text[end:]
+                start = text.find(root, end)
+            else:
+                start = text.find(root, start + 1)
+    return text
+
+
 def _entropy_candidates(text: str) -> list[str]:
     out = []
+    text = _mask_known_paths(text)
     urls = [u.span() for u in _PUBLIC_URL_RE.finditer(text)] if "://" in text else []
+    numbers = exempt_spans(text, _DIGITS_ONLY_MIN)
     for m in _ENTROPY_CANDIDATE_RE.finditer(text):
         token = m.group(0)
+        if numbers and inside(numbers, m.start(), m.end()):
+            continue  # un nombre pur (`1.2345678901234567e+300`) n'est jamais candidat entropie
         in_url = any(start <= m.start() < end for start, end in urls)
         if _looks_like_safe_token(token, in_url):
+            continue
+        # Empreinte de clé d'hôte ssh (`SHA256:` + 43 caractères base64) : publique, et c'est ce qu'on doit COMPARER
+        # avant d'approuver un premier contact (ssh_trust) ; caviardée, la carte affichait « SHA256:[secret:entropy-…] »
+        # (test réel du 05.11). Une valeur connue du coffre reste caviardée par la passe exacte, avant celle-ci.
+        if text[max(0, m.start() - 7):m.start()] == "SHA256:" and _SSH_FP_RE.fullmatch(token):
             continue
         classes = sum(bool(re.search(p, token)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
         if classes < 2:
@@ -547,6 +742,8 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     """
     if not text:
         return RedactResult(text=text, names=[])
+    if "⟦" in text and MARKER_RE.search(text):
+        return _redact_around_markers(text, known, weak=weak, wire=wire, secret_tool=secret_tool)
 
     names: list[str] = []
     values: dict[str, str] = {}
@@ -671,7 +868,9 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
     out = _BEARER_RE.sub(_kv("bearer-token", _mixed), out)
     out = _ENV_LINE_RE.sub(_kv("env-secret", lambda v: _mixed(v) and not v.startswith(("$", "~", ".", "/", "<"))
                                 and not HANDLE_RE.search(v)), out)
-    out = _KEY_VALUE_RE.sub(_kv("key-value", lambda v: _mixed(v) and not _identifier_like(v)), out)
+    # Le `=`/`==` de remplissage base64 fait partie de la valeur masquée ; les gardes jugent le corps sans remplissage.
+    out = _KEY_VALUE_RE.sub(
+        _kv("key-value", lambda v: _mixed(v.rstrip("=")) and not _identifier_like(v.rstrip("="))), out)
     out = _QUERY_TOKEN_RE.sub(_kv("url-token", lambda v: _mixed(v) and not _identifier_like(v)), out)
 
     if weak:
@@ -709,12 +908,16 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
 
             out = _PASSWORD_BARE_RE.sub(_pw_bare_sub, out)
 
-        # 6. repli par entropie, uniquement HORS des poignées déjà posées (sinon on re-scanne le
-        #    hash court d'une poignée et on la double-caviarde).
+        # 6. hexadécimal pur (07.11), puis repli par entropie, uniquement HORS des poignées déjà posées (sinon on
+        #    re-scanne le hash court d'une poignée et on la double-caviarde).
         segments = HANDLE_RE.split(out)
         handles = HANDLE_RE.findall(out)
         rebuilt: list[str] = []
         for i, segment in enumerate(segments):
+            for token in sorted(set(_hex_runs(segment)), key=len, reverse=True):
+                name = _type_name(_run_kind(token), token)
+                segment = re.sub(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", _handle(name), segment)
+                _mark(name, token)
             for token in _entropy_candidates(segment):
                 name = _type_name("entropy", token)
                 segment = segment.replace(token, _handle(name))
@@ -723,8 +926,73 @@ def redact(text: str, known: KnownSecrets | None = None, *, weak: bool = True, w
             if i < len(handles):
                 rebuilt.append(handles[i])
         out = "".join(rebuilt)
+    else:
+        # 6 bis. `weak=False` (résultats d'outils non SECRET, filet du fil vers le modèle) saute le repli hexadécimal et
+        #        l'entropie. Seule exception, étroite et déterministe : une suite de 32 chiffres décimaux ou plus sans
+        #        point ni exposant (clé hexadécimale qui ne contient que des chiffres, cas ambigu : on masque).
+        if len(out) >= _DIGITS_ONLY_MIN:
+            segments = HANDLE_RE.split(out)
+            handles = HANDLE_RE.findall(out)
+            rebuilt = []
+            for i, segment in enumerate(segments):
+                for token in sorted(set(_long_digit_runs(segment)), key=len, reverse=True):
+                    name = _type_name(_run_kind(token), token)
+                    segment = re.sub(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", _handle(name), segment)
+                    _mark(name, token)
+                rebuilt.append(segment)
+                if i < len(handles):
+                    rebuilt.append(handles[i])
+            out = "".join(rebuilt)
+
+    # 7. valeur de 24 caractères ou plus derrière un mot-clé de secret (`_KW_SECRET_RE`), sur tous les chemins ; APRÈS les
+    #    replis ci-dessus pour qu'ils gardent leurs poignées (`hex-…`, `num-…`, `entropy-…`) quand ils ont déjà masqué la valeur.
+    if len(out) >= 24 and _KW_PRESCAN_RE.search(out):
+        def _kw_sub(m: re.Match[str]) -> str:
+            value = m.group(1)
+            if not _kw_value_ok(value):
+                return m.group(0)
+            if _GIT_DIGEST_VALUE_RE.fullmatch(value) and not re.search(r"[:=]", m.group(0)[:m.start(1) - m.start()]) \
+                    and _GIT_WORD_RE.search(m.string[max(0, m.start() - 80):m.start()]):
+                return m.group(0)  # « commit secret <sha> » : empreinte git en phrase, pas un secret (test existant)
+            name = _type_name("key-value", value)
+            _mark(name, value)
+            return m.group(0)[:m.start(1) - m.start()] + _handle(name) + m.group(0)[m.end(1) - m.start():]
+
+        def _kw_cookie_sub(m: re.Match[str]) -> str:
+            def pair(p: re.Match[str]) -> str:
+                if not _kw_value_ok(p.group(2)):
+                    return p.group(0)
+                name = _type_name("key-value", p.group(2))
+                _mark(name, p.group(2))
+                return p.group(1) + _handle(name) + p.group(3)
+
+            parts = [_KW_COOKIE_PAIR_RE.fullmatch(x) for x in m.group(1).split(";")]
+            body = ";".join(pair(p) if p else x for p, x in zip(parts, m.group(1).split(";"), strict=True))
+            return m.group(0)[:m.start(1) - m.start()] + body
+
+        out = _KW_SECRET_RE.sub(_kw_sub, out)
+        out = _KW_COOKIE_RE.sub(_kw_cookie_sub, out)
 
     return RedactResult(text=_restore(out, saved), names=names, values=values)
+
+
+def _redact_around_markers(text: str, known: KnownSecrets | None, **kw: bool) -> RedactResult:
+    """Un marqueur de valeur masquée sur l'appareil (`⟦PHONE-1⟧`, `nokker/redact/markers.py`) n'est JAMAIS caviardé :
+    le texte est caviardé morceau par morceau ENTRE les marqueurs, qui restent tels quels (« mot de passe : ⟦SECRET-1⟧ »
+    ou `API_KEY=⟦SECRET-2⟧` gardent leur marqueur : la valeur n'a jamais quitté l'appareil)."""
+    parts = MARKER_RE.split(text)
+    marks = [m.group(0) for m in MARKER_RE.finditer(text)]
+    names: list[str] = []
+    values: dict[str, str] = {}
+    out: list[str] = []
+    for i, part in enumerate(parts[::2]):  # split rend aussi le groupe capturé (la famille) : un morceau sur deux
+        red = redact(part, known, **kw)
+        out.append(red.text)
+        names += [n for n in red.names if n not in names]
+        values.update(red.values)
+        if i < len(marks):
+            out.append(marks[i])
+    return RedactResult(text="".join(out), names=names, values=values)
 
 
 # ─────────────────────────────── filet du fil ───────────────────────────────

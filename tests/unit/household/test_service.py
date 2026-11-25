@@ -123,7 +123,7 @@ def test_view_shows_counts_never_content_and_members_see_only_their_line():
         v = hh.view(pay)
     assert {m["account_id"] for m in v["members"]} == {pay.account_id, mem.account_id, kid.account_id}
     line = next(m for m in v["members"] if m["account_id"] == mem.account_id)
-    assert set(line) == {"account_id", "email", "payer", "profile", "status", "joined_at", "turns", "cap", "you"}
+    assert set(line) == {"account_id", "email", "first_name", "name", "payer", "profile", "status", "joined_at", "turns", "cap", "you"}
     assert line["cap"] == {"turns_per_day": 40, "source": "default"}
     assert next(m for m in v["members"] if m["payer"])["cap"] == {"turns_per_day": None, "source": "none"}
     assert "invitations" in v and "policy" in v

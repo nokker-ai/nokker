@@ -24,7 +24,9 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
 
 ## 2. Cycle de vie
 
-`pending` → `approved` | `rejected` | `expired` → (`approved`) `executed` | `failed`
+`pending` → `approved` | `rejected` | `expired` ; `approved` → `executing` → `executed` | `failed` | `interrupted` (`executing` : l'outil tourne, docs/HOST-EMBED.md §19)
+
+**`interrupted`** : le processus est mort pendant l'outil, la carte est restée `executing`. Au démarrage du serveur et à chaque balayage de fond (le fil du balayeur des bulles, 30 s, arrêtable), une carte `executing` depuis plus de `approvals.executing_stale_s` (défaut 900 s, plancher 60 s) passe `interrupted` : UPDATE conditionnel atomique, idempotent, un passage par locataire (RLS). Statut FINAL comme `executed`/`failed`, **jamais relancé** (au plus une exécution : l'exécuteur ne la reprend pas, `APPROVED_LIVE` ne la compte pas) ; le résultat est inconnu, la personne vérifie. Journal : un événement `interrupted {from: "executing", age_s}` (aucune donnée de la carte) ; flux : `approval.interrupted {approval_id, tool_name, age_s}` ; bulle `approval` : `failed`, état `status: "interrupted"` et `note` (texte de la personne, `person_texts.APPROVAL_INTERRUPTED`). `interrupted` est FINAL : `mark_executed`/`mark_failed` ne l'écrasent jamais (no-op journalisé). Le balayage ignore les cartes dont l'outil tourne EN CE PROCESSUS (ensemble des exécutions en vol : posé à `mark_executing`, vidé dans un `finally` de l'exécuteur), donc un outil légitime de plus de 15 min n'est jamais marqué ; au démarrage l'ensemble est vide et toute carte `executing` plus vieille que le seuil passe `interrupted` (une récente reste). Limite : l'ensemble est en mémoire du processus ; si plusieurs processus noyau partagent la base, l'un peut voir comme périmée une exécution vivante dans un autre (au-delà du délai) ; un battement de cœur partagé (colonne rafraîchie par l'exécuteur) lèverait la limite, hors périmètre ici. Une nouvelle demande du modèle crée une NOUVELLE carte, jamais la reprise de l'ancienne.
 
 - **Demande** (porte action, `Decision.HITL`, `Kernel._tool_step`) : si un port `Approvals` est branché (par défaut,
   `NokkerConfig.approvals_enabled=True`), le noyau appelle `approvals.request(turn, call, verdict, advice)` — enregistre
@@ -56,10 +58,23 @@ donc jamais de `strength` associée. Le niveau vient du `Verdict` (champ `streng
   [/Approbation]
   ```
   Un refus produit le même tour de continuation, sans appel d'outil (`Résultat : refusé par <decided_by>.`).
+  **Tour du noyau, pas de la personne (03.11)** : l'exécuteur pose `TurnInput.control = "approval_continue"`
+  (`core/turn.py::APPROVAL_CONTINUE`, jamais accepté d'un client : `metadata.cli_control` n'admet que
+  `goals.service.CONTROLS`). Ce bloc redit une décision déjà prise sur la carte : il ne lève AUCUN drapeau de domaine
+  (sans quoi le montant du résultat de `pay_request` escaladait la suite, `domaine:montant`), et le tour porte
+  `InputCheck.origin = "approval"`, exposé en `origin` sur le message `user` de `GET /v1/threads/{id}` pour que les
+  clients ne l'affichent pas comme un message de la personne. Le même bloc TAPÉ par quelqu'un reste un message
+  ordinaire (drapeaux comme avant).
   **File par fil (25.10, docs/LOKKAL.md §7.4.9)** : l'outil et le tour de continuation passent par la file du fil,
   après le tour en cours (jamais en parallèle : même index, contexte perdu) ; la sortie de l'outil est publiée en
   `tool.result` (même `call_id` que l'appel en attente, `approval_id`) avant la continuation. La décision locale
   répond tout de suite (`202`, `continuation`) ; cette route-ci attend encore la fin de l'exécution.
+- **Une écriture, une exécution (17.11)** : (1) le noyau ne pose pas une 2e carte pour une action déjà en attente (même fil,
+  même outil, même `args_sha256`, `BaseApprovals.pending_duplicate`) : il rend au modèle le texte « EN ATTENTE… » de la carte
+  existante (même id), sans texte nouveau ; (2) l'exécuteur ne lance jamais une carte déjà `executed`/`failed`, ni deux fois
+  la même (clé = id + empreinte des arguments + décision), même ordonnancée deux fois ; (3) une 2e décision sur la même carte
+  reste refusée (`ApprovalNotPending`, 409). Une action identique redemandée APRÈS exécution reste une nouvelle carte (tests
+  relancés après une correction).
 - **Journal** : chaque transition est append-only (table `approval_events`, `_append_event`). Rien n'est effacé.
 
 ## 3. Preuve
@@ -202,6 +217,11 @@ Les tests de l'hostile model restent vrais : sans preuve valide, `tools.called =
   "result_summary": null, "error": null
 }
 ```
+
+`command_kind` (carte `terminal` seulement, absent sinon) : `"run"` (lancer des tests, un linter, un build, un formatage
+en vérification : liste fermée, sans option qui écrit ni opérateur de shell, jamais pour une commande destructive) ou
+`"other"`. Champ d'AFFICHAGE : `effect` et la décision restent ceux de `classify_command` (`pytest` reste « écriture » côté
+noyau) ; un client peut afficher « exécution » quand `command_kind == "run"`. Source : `nokker/tools/code.py::command_kind`.
 
 `effect` est DÉRIVÉ de `rule` (`"effect:xxx[:...]"` → `"xxx"`) pour l'affichage — ce n'est pas un champ propre
 d'`Approval`. Dates toujours en ISO 8601 UTC (jamais un epoch nu). Forme canonique ; un client qui lisait déjà
@@ -349,6 +369,36 @@ au tour (« relecteur automatique : carte standard »). L'API rend `auto_review`
 locataire) → la carte. Refus révoqué : la carte revient `pending` (ou `expired`) et part aux humains, qui la décident
 par le chemin habituel (exécuteur, tour de continuation). Approbation révoquée : l'effet a eu lieu, la carte reste
 `executed` et le dit ; le relecteur n'approuve plus cet outil sur ce fil. `409` si rien à révoquer ou déjà révoquée.
+
+**Restauration après révocation** (`nokker/tools/card_snapshots.py`) : juste avant qu'une écriture de fichier approuvée
+automatiquement (`write_file`, `patch`) s'exécute, l'enveloppe des points de retour copie chaque fichier visé (ou note
+« fichier absent ») hors du bac à sable, puis note l'empreinte de chaque fichier après l'outil. Ce point PAR CARTE ne
+dépend pas des points git (pris une fois par tour, absents sans la bibliothèque amont) ; il est limité au dossier de
+travail (chemin résolu, lien symbolique refusé), à 5 Mo par fichier et 20 Mo par carte, gardé 30 jours. Lokkal :
+`<état>/checkpoints/cards/<carte>/` ; sessions de code multi-utilisateur : `<home des points de la session>/cards/`.
+
+**Pas de point de retour, pas d'approbation automatique d'écriture** : avant de relire une carte `write_file`/`patch`,
+le noyau vérifie que le point est possible (`card_snapshots.preflight` : fichier trop grand, hors du dossier de
+travail, lien symbolique, aucun magasin pour le fil). Sinon la carte reste `pending` pour l'humain, escaladée par
+règle sans appel au modèle ; la raison est rangée dans `auto_review.reason` de la carte, le modèle voit le texte
+d'attente habituel.
+
+- La réponse de révocation d'une approbation porte `rollback: {available, checkpoint_id, files, reason?}`
+  (`available: false` et la raison si le point manque, est incomplet ou a déjà servi). Rien n'est restauré à la
+  révocation.
+- `POST /v1/approvals/{id}/auto-review/rollback` (même identité, approbation DÉJÀ révoquée) applique le point :
+  `{approval_id, checkpoint_id, restored, conflicts}`. Un fichier modifié depuis l'écriture (empreinte différente de
+  celle d'après l'outil) n'est pas écrasé et figure dans `conflicts`. Une seule application ; `409` sinon (pas
+  révoquée, pas de point, point incomplet, déjà appliqué). Chaque restauration est inscrite au journal des
+  approbations (`record_rollback` : événement `auto_review_rollback` avec qui, quand, `checkpoint_id`, `restored`,
+  `conflicts` ; `approval.auto_review_rollback` sur le bus).
+- `GET /v1/approvals/{id}` (et la liste) porte le même `rollback` pour une approbation automatique révoquée, avec
+  `applied` : `false` tant que rien n'est restauré ; après la restauration `applied: true`, `applied_at`, `restored`,
+  `conflicts` (et `available: false`).
+- **Bulle du fil** : une approbation automatique ouvre dans le fil une bulle `approval` (docs/BUBBLES.md : état
+  approuvé, `decided_via: "auto-review"`, raison), mise à jour à la révocation et à la restauration. Pas de
+  notification push ; aucun texte ajouté au tour.
+- Les autres écritures (`write` hors fichiers : agenda, tâches…) n'ont pas de point de retour : `available: false`.
 
 Mesure : banc B-1 (`nokker-judge-bench/auto_review_eval.py`, hors du dépôt), 01.11.2026, 49 cartes (21 fautives). Sans
 le contrôle des dates : 3 faux « approuver » (qwen3.6-35b-a3b). Avec le contrôle des dates et adresses :

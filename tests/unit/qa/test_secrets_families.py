@@ -128,7 +128,10 @@ def test_handle_never_reads_as_secret_key_value_to_the_router(kind, text, value)
 
 def test_no_false_positive_on_paths_hashes_and_code():
     sha = j("3f9a1c2b4d5e6f70", "8192a3b4c5d6e7f8", "091a2b3c")
-    plain = (f"git show {sha}", f"le commit {sha[:12]} corrige le token de session", f"token {sha}",
+    # « token <40 hexa> » sans contexte git n'est plus « en clair » (décision du 07.11, test_secrets_hex.py) : c'est
+    # aussi la forme d'un jeton GitHub classique ; on sur-caviarde.
+    assert sha not in redact(f"token {sha}").text
+    plain = (f"git show {sha}", f"le commit {sha[:12]} corrige le token de session",
              "source /opt/miniconda3/bin/activate testbed", "/usr/lib/python3/dist-packages/apport",
              "max_tokens: 4096", "TOKEN_ENDPOINT=https://auth.example/token", "KEYCLOAK_URL=http://kc:8080",
              "Bearer token required", "MAX_TOKENS=4096", "export AWS_PROFILE=prod2")

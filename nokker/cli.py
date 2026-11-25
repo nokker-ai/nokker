@@ -52,6 +52,15 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     return 1 if turn.error else 0
 
 
+UNSAFE_LOCAL_WARNING = ("Attention : ce mode lance les commandes sur ta machine, avec les accès de Nokker : le modèle peut "
+                        "lire le jeton d'accès de Nokker stocké sur ta machine et approuver ses propres cartes. Utilise le bac à sable "
+                        "docker (par défaut).")
+UNSAFE_LOCAL_REFUSED = ("Refusé : --backend local lance les commandes sur ta machine, avec les accès de Nokker (le modèle "
+                        "pourrait lire le jeton d'accès de Nokker stocké sur ta machine et approuver ses propres cartes). Retire "
+                        "--backend local pour utiliser le bac à sable docker, ou ajoute --unsafe-local si tu sais ce que "
+                        "tu fais.")
+
+
 def _cmd_code(args: argparse.Namespace) -> int:
     """Une tâche de code dans un dossier (Nokker Lokkal L0, docs/LOKKAL.md), sans serveur : le noyau avec les outils
     de code (`nokker/tools/code.py`) et le préfixe de code, un tour jusqu'à la réponse. Sortie : la réponse sur
@@ -64,6 +73,19 @@ def _cmd_code(args: argparse.Namespace) -> int:
     from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates
     from nokker.tools.code import DEFAULT_SANDBOX_IMAGE, CodeToolSource
 
+    if args.backend == "local":
+        if not args.unsafe_local:
+            print(UNSAFE_LOCAL_REFUSED, file=sys.stderr)
+            return 2
+        print(UNSAFE_LOCAL_WARNING, file=sys.stderr)
+    if args.backend == "docker":  # bac injoignable : refus net, jamais de repli sur la machine
+        from nokker.tools.code import SandboxUnavailable, check_sandbox
+
+        try:
+            check_sandbox()
+        except SandboxUnavailable as e:
+            print(f"{e}", file=sys.stderr)
+            return 3
     config = load_config(args.config)
     local = config.local or {}
     # Mémoire de projet (X1) : `local.project_memory` de la config, comme le serveur local.
@@ -161,7 +183,8 @@ def _cmd_code(args: argparse.Namespace) -> int:
                        "latency_s": v.latency_s} for v in turn.verdicts if v.rule.startswith("judge:")],
             "llm_calls": [{"tier": c.tier.value, "model": c.model, "prompt": c.usage.prompt,
                            "completion": c.usage.completion, "reasoning": c.usage.reasoning,
-                           "cached": c.usage.cached, "latency_s": c.latency_s, "reason": c.route_reason}
+                           "cached": c.usage.cached, "latency_s": c.latency_s, "reason": c.route_reason,
+                           "model_served": c.model_served}
                           for c in turn.calls],
             "cost": _code_turn_cost(kernel, thread_id, turn, started),
         }, ensure_ascii=False, default=str))
@@ -291,8 +314,14 @@ def _cmd_import(args) -> int:
     from nokker.importers.cli import run
     from nokker.tools.packs import user_home
 
+    mcp_stdio = False
     try:
-        local = load_config(args.config).local or {}
+        cfg = load_config(args.config)
+        local = cfg.local or {}
+        if isinstance(cfg.mcp_stdio, dict) and cfg.mcp_stdio.get("enabled") is True:
+            from nokker.tools.mcp_stdio import stdio_refusal
+
+            mcp_stdio = stdio_refusal(cfg) is None  # Lokkal seulement (docs/NOKKAN-MCP-STDIO.md)
     except (OSError, ValueError):
         local = {}
     memory = None
@@ -302,7 +331,8 @@ def _cmd_import(args) -> int:
         state = Path(args.state_dir).expanduser() if getattr(args, "state_dir", None) else user_home(None)
         memory = ProjectMemory(root=Path(local.get("project_memory_dir") or state / "project-memory").expanduser(),
                                import_data=bool(local.get("import_codex_memory", False)))
-    return run(args, nokker_home=user_home(None), user_settings=_user_settings_path(local), memory=memory)
+    return run(args, nokker_home=user_home(None), user_settings=_user_settings_path(local), memory=memory,
+               **({"mcp_stdio": True} if mcp_stdio else {}))
 
 
 def _user_settings_path(local: dict | None = None):
@@ -724,7 +754,10 @@ def build_parser() -> argparse.ArgumentParser:
     code_p.add_argument("task", help="la consigne, ou - pour la lire sur stdin")
     code_p.add_argument("--workspace", default=".", help="dossier de travail (défaut : dossier courant)")
     code_p.add_argument("--backend", choices=["docker", "local"], default="docker",
-                        help="docker (défaut) : bac à sable jetable ; local : sur l'hôte")
+                        help="docker (défaut) : bac à sable jetable ; local : sur l'hôte, exige --unsafe-local")
+    code_p.add_argument("--unsafe-local", action="store_true",
+                        help="avec --backend local : accepte que les commandes tournent sur ta machine, avec les accès "
+                             "du noyau (jeton local lisible par le modèle)")
     code_p.add_argument("--image", default=None, help="image du bac à sable")
     code_p.add_argument("--host-root", default=None, help="chemin du dossier vu par le démon docker, s'il diffère")
     code_p.add_argument("--mount", default="/workspace",

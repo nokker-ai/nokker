@@ -11,7 +11,9 @@ brûlé : l'opérateur renvoie une invitation, qui remplace la précédente.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from nokker.approvals.base import BaseApprovals
@@ -48,6 +50,9 @@ class Onboarding:
     approvals: BaseApprovals
     acceptances: Acceptances
     consents: Consents | None = None
+    # Coupon bêta par compte (C16) : attributions du service billing, lues au moment de la création du compte (le
+    # service billing peut être monté après l'onboarding). None ou rend None : l'éligibilité n'est pas posée.
+    beta_grants: Callable[[], Any] | None = None
 
     def invitation(self, token: str) -> dict[str, Any]:
         """Lecture seule pour l'écran d'accueil : `{valid, lang, prenom}` — ne consomme rien."""
@@ -112,4 +117,20 @@ class Onboarding:
             except Exception:
                 self.approvals.delete_device(device.id)
                 raise
-        return {"account_id": account.account_id, "device_id": device.id, "lang": account.lang}
+        if inv.get("beta_coupon") is True:
+            self._grant_beta(invitation_id)
+        return {"account_id": account.account_id, "device_id": device.id, "lang": account.lang or "fr"}
+
+    def _grant_beta(self, invitation_id: str) -> None:
+        """Éligibilité « Solo offert 6 mois » posée par l'opérateur à l'invitation, portée par front1 : une ligne par
+        invitation, que seul le compte né de cette invitation peut utiliser. Un échec n'empêche pas la création du
+        compte (journal ; l'opérateur peut renvoyer une invitation éligible)."""
+        grants = self.beta_grants() if self.beta_grants else None
+        if grants is None:
+            logger.error("invitation %s éligible au coupon bêta, mais la facturation n'est pas montée : non posé",
+                         invitation_id)
+            return
+        try:
+            grants.grant(invitation_id, "invitation", datetime.now(timezone.utc))
+        except Exception:  # noqa: BLE001 — le compte existe déjà : on ne le défait pas pour une remise
+            logger.exception("coupon bêta non posé pour l'invitation %s", invitation_id)

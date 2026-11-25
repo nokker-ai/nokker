@@ -30,7 +30,8 @@ from typing import Any
 
 import httpx
 
-from nokker.core.ports import ToolContext, ToolSpec
+from nokker.core import model_texts as mt
+from nokker.core.ports import APPROVED_LIVE, ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 
 logger = logging.getLogger("nokker.local.relayed")
@@ -224,7 +225,7 @@ class RelayedConnectors:
             spec = next((s for s in self._specs if s.name == name), None)
             cid = self._route.get(name)
         if spec is None or cid is None:
-            return _err(name, f"outil inconnu : {name}")
+            return _err(name, mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name))
         token = self._token()
         if not token:
             return _err(name, "machine non liée à un compte nokker.ai : le connecteur relayé n'est pas disponible "
@@ -285,7 +286,7 @@ class RelayedConnectors:
             return "outil à effet d'un compte nokker.ai : il faut une carte approuvée (rien n'a été envoyé)"
         card = self.approvals.get(ctx.approval_id)
         digest = args_sha256(arguments)
-        if card is None or card.status != "approved" or card.tool_name != name \
+        if card is None or card.status not in APPROVED_LIVE or card.tool_name != name \
                 or card.args_sha256 != digest:
             return "la carte ne correspond pas à cet appel (outil, arguments ou statut) : rien n'a été envoyé"
         proof: dict[str, Any] = {"id": card.id, "args_sha256": digest, "decided_via": card.decided_via,

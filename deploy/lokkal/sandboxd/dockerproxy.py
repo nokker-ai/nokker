@@ -6,9 +6,20 @@ vers le démon (DOCKER_HOST=tcp://dockerproxy:2375, sur un réseau interne que s
 que ce dont le bac à sable a besoin :
 
 - sondes : _ping, version, info ; image inspect et pull ;
-- containers ÉTIQUETÉS `nokker.sandbox` seulement : create (vérifié, voir `check_create`), start, attach, wait,
-  inspect, exec, stop, kill, rm, liste (filtrée sur l'étiquette) ;
+- containers ÉTIQUETÉS `nokker.sandbox` ET `nokker.instance=<NOKKER_INSTANCE>` seulement : create (vérifié, voir
+  `check_create`), start, attach, wait, inspect, exec, stop, kill, rm, logs, resize, liste (filtrée sur les deux
+  étiquettes) ;
 - exec : seulement ceux créés par ce proxy, jamais privilégiés.
+
+Volumes nommés : refusés, sauf sous une forme unique et seulement si le service a `NOKKER_HOST_VOLUMES=1` (hôte qui
+embarque le noyau dans un conteneur, `local.code.host_volumes`) : `Mounts` de type volume, source `nokker-<instance>-<nom>`
+(le préfixe de CETTE instance), `VolumeOptions` réduit à un `Subpath` relatif non vide sans `..`, cible absolue ; ni
+`Binds` (« nom:/cible » n'a pas de sous-dossier), ni pilote, ni étiquette de volume, ni volume entier.
+
+Instance : le proxy ne sert QU'UNE instance de noyau, celle de `NOKKER_INSTANCE` (posée par l'installeur dans `.env`,
+la même valeur que `<état>/instance-id` que lit le noyau). Un create sans l'étiquette `nokker.instance` de SON instance
+est refusé ; un container d'une autre instance, ou sans l'étiquette, est refusé (403, même message qu'il existe ou
+non) pour toutes les actions. Deux noyaux sur un même démon ont chacun leur proxy et ne se voient pas.
 
 Tout le reste répond 403. Un create est refusé s'il demande : privileged, une capacité hors {DAC_OVERRIDE, CHOWN,
 FOWNER}, un espace de noms de l'hôte, un périphérique, un montage hors du dossier de travail (rw) et des dossiers de
@@ -16,8 +27,11 @@ skills (ro), un port publié, un autre réseau que `nokker-sandbox` ou `none`, o
 Le proxy ajoute lui-même HTTP(S)_PROXY vers le proxy de sortie (`egress`) : le réseau `nokker-sandbox` est interne,
 c'est la seule sortie, et elle refuse les plages privées.
 
-Les deux sondes de la bibliothèque amont (limites cgroup, quota disque) créent un container sans étiquette : acceptées si elles n'ont
-ni montage ni commande autre que `true`, sur une image connue ; le proxy leur pose l'étiquette et le réseau `none`.
+Les deux sondes de la bibliothèque amont (limites cgroup, quota disque) créent un container sans étiquette. Acceptées
+seulement sous leur forme EXACTE, sur une image connue, sans montage ni port ni entrypoint ni variable : la sonde cgroup
+est `docker run --rm --cpus 0.5 --memory 64m --pids-limit 32 <image> sleep 0` (commande `["sleep","0"]`, AutoRemove,
+plafonds au plus ceux de la sonde ; `sleep 5`, `sleep` quelconque, `true` : refusés), la sonde disque `docker create
+--storage-opt size=1m <image>` (aucune commande). Le proxy leur pose l'étiquette et le réseau `none`.
 
 Bibliothèque standard seulement. Configuration par l'environnement (voir `Config.from_env`).
 """
@@ -36,6 +50,10 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 log = logging.getLogger("dockerproxy")
 
 LABEL = "nokker.sandbox"
+INSTANCE_LABEL = "nokker.instance"
+_INSTANCE_FORM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{5,127}")   # au moins 6 caractères, comme `MIN_INSTANCE_LEN` du noyau
+CGROUP_PROBE_CMD = ["sleep", "0"]                      # tools/environments/docker.py::_cgroup_limits_available (amont)
+CGROUP_PROBE_MAX = {"NanoCpus": 500_000_000, "Memory": 64 << 20, "PidsLimit": 32}  # --cpus 0.5 --memory 64m --pids-limit 32
 ALLOWED_CAPS = {"DAC_OVERRIDE", "CHOWN", "FOWNER"}
 NNP = {"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"}
 MAX_BODY = 1 << 20  # un create fait quelques Ko ; au-delà, refus
@@ -53,6 +71,8 @@ class Config:
     network: str = "nokker-sandbox"
     egress_proxy: str = "http://egress:3128"
     probe_images: set[str] = field(default_factory=lambda: {"hello-world"})
+    host_volumes: bool = False         # NOKKER_HOST_VOLUMES=1 : le noyau monte un volume nommé de son instance (sous-dossier)
+    instance: str = ""                 # NOKKER_INSTANCE : étiquette `nokker.instance` des seuls bacs que ce proxy sert
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Config":
@@ -63,11 +83,15 @@ class Config:
             workspaces=[_norm(p) for p in env.get("NOKKER_HOST_WORKSPACE", "").split(":") if p.strip()],
             skills=[_norm(p) for p in env.get("NOKKER_HOST_SKILLS", "").split(":") if p.strip()],
             network=env.get("NOKKER_SANDBOX_NETWORK", cls.network),
+            instance=env.get("NOKKER_INSTANCE", "").strip(),
+            host_volumes=env.get("NOKKER_HOST_VOLUMES", "").strip().lower() in ("1", "true", "yes"),
             egress_proxy=env.get("NOKKER_SANDBOX_EGRESS", cls.egress_proxy),
         )
         c.probe_images |= {i.strip() for i in env.get("NOKKER_SANDBOX_IMAGES", "").split(",") if i.strip()}
         if not c.workspaces or "/" in c.workspaces:
             raise SystemExit("NOKKER_HOST_WORKSPACE absent ou « / » : refus de démarrer")
+        if not _INSTANCE_FORM.fullmatch(c.instance):
+            raise SystemExit("NOKKER_INSTANCE absent ou invalide (6 à 128 caractères [A-Za-z0-9_.-]) : refus de démarrer")
         return c
 
 
@@ -112,25 +136,74 @@ def _check_bind(src: str, dst: str, ro: bool, cfg: Config) -> None:
     raise Refused(f"montage hors du dossier de travail : {src} → {dst}")
 
 
+def _check_cgroup_probe(body: dict, hc: dict) -> None:
+    """La sonde cgroup de l'amont, et rien de plus large : `sleep 0` éphémère (AutoRemove), plafonds posés (sinon elle ne
+    sonde rien) et au plus ceux de la sonde, ni variable, ni utilisateur, ni dossier de travail, ni port."""
+    if hc.get("AutoRemove") is not True:
+        raise Refused("sonde cgroup : AutoRemove attendu")
+    for k, top in CGROUP_PROBE_MAX.items():
+        v = hc.get(k)
+        if not isinstance(v, int) or isinstance(v, bool) or not 0 < v <= top:
+            raise Refused(f"sonde cgroup : {k} hors de la sonde de l'amont")
+    if body.get("Env") or body.get("User") or body.get("WorkingDir") or body.get("ExposedPorts") or body.get("Tty"):
+        raise Refused("sonde cgroup : paramètres hors de la sonde de l'amont")
+
+
+_VOLUME_REST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
+_SUBPATH = re.compile(r"[A-Za-z0-9_./@+=-]{1,512}")           # même alphabet que `volume-subpath` côté noyau
+_VOLUME_MOUNT_KEYS = {"Type", "Source", "Target", "ReadOnly", "VolumeOptions"}
+
+
+def _check_volume(m: dict, cfg: Config) -> None:
+    """Le seul volume nommé admis : celui de l'instance, restreint à un sous-dossier (`--mount type=volume,source=
+    nokker-<instance>-<nom>,target=<cible>,volume-subpath=<dossier>`), et seulement si l'hôte l'a demandé."""
+    if not cfg.host_volumes:
+        raise Refused("volume nommé refusé (NOKKER_HOST_VOLUMES absent)")
+    if set(m) - _VOLUME_MOUNT_KEYS:
+        raise Refused(f"montage de volume : champs refusés {sorted(set(m) - _VOLUME_MOUNT_KEYS)}")
+    src, dst = m.get("Source", ""), m.get("Target", "")
+    prefix = f"nokker-{cfg.instance}-"
+    if not (isinstance(src, str) and src.startswith(prefix) and _VOLUME_REST.fullmatch(src[len(prefix):])):
+        raise Refused(f"volume {src!r} refusé : seul un volume {prefix}<nom> de cette instance")
+    if not (isinstance(dst, str) and dst.startswith("/") and dst != "/" and "\x00" not in dst and
+            ".." not in dst.split("/")):
+        raise Refused(f"cible de volume refusée : {dst!r}")
+    vo = m.get("VolumeOptions")
+    sub = vo.get("Subpath") if isinstance(vo, dict) and set(vo) == {"Subpath"} else None
+    if not (isinstance(sub, str) and _SUBPATH.fullmatch(sub) and not sub.startswith("/")
+            and not any(p in ("", "..", ".") for p in sub.split("/"))):
+        raise Refused("volume sans sous-dossier valide (Subpath relatif, sans « .. ») : le volume entier est refusé")
+
+
 def check_create(body: dict, cfg: Config) -> dict:
     """Valide (et complète) le corps d'un POST /containers/create. Renvoie le corps à transmettre."""
     hc = body.setdefault("HostConfig", {}) or {}
     body["HostConfig"] = hc
     labels = body.get("Labels") or {}
+    if not isinstance(labels, dict):
+        raise Refused("Labels illisibles")
     cmd = body.get("Cmd")
     probe = LABEL not in labels
     if probe:
         # Sondes de la bibliothèque amont : aucun montage, `true` ou la commande par défaut de l'image, image connue.
         if hc.get("Binds") or hc.get("Mounts") or body.get("Volumes"):
             raise Refused("container sans étiquette nokker.sandbox avec montage")
-        if cmd not in (None, [], ["true"]) or body.get("Entrypoint") not in (None, [], ""):
+        if body.get("Entrypoint") not in (None, [], ""):
+            raise Refused("container sans étiquette nokker.sandbox : entrypoint non autorisé")
+        if cmd in (None, []):
+            pass                                  # sonde disque : la commande par défaut de l'image
+        elif cmd == CGROUP_PROBE_CMD:
+            _check_cgroup_probe(body, hc)
+        else:
             raise Refused("container sans étiquette nokker.sandbox : commande non autorisée")
         if _image_name(body.get("Image", "")) not in {_image_name(i) for i in cfg.probe_images}:
             raise Refused(f"container sans étiquette nokker.sandbox : image {body.get('Image')!r} non autorisée")
-        body["Labels"] = {**labels, LABEL: "probe"}
+        labels = body["Labels"] = {**labels, LABEL: "probe", INSTANCE_LABEL: cfg.instance}
         hc["NetworkMode"] = "none"
         body.pop("NetworkingConfig", None)
 
+    if labels.get(INSTANCE_LABEL) != cfg.instance or not cfg.instance:
+        raise Refused(f"étiquette {INSTANCE_LABEL} absente ou d'une autre instance : création refusée")
     if hc.get("Privileged"):
         raise Refused("privileged")
     caps = {c.upper().removeprefix("CAP_") for c in (hc.get("CapAdd") or [])}
@@ -168,6 +241,9 @@ def check_create(body: dict, cfg: Config) -> dict:
         t = m.get("Type", "volume")
         if t == "tmpfs":
             continue
+        if t == "volume":
+            _check_volume(m, cfg)
+            continue
         if t != "bind":
             raise Refused(f"montage de type {t} refusé")
         _check_bind(m.get("Source", ""), m.get("Target", ""), bool(m.get("ReadOnly")), cfg)
@@ -182,13 +258,18 @@ def check_create(body: dict, cfg: Config) -> dict:
         if net == cfg.network:
             given = {e.split("=", 1)[0]: e.split("=", 1)[1] for e in (body.get("Env") or []) if "=" in e}
             env = [e for e in (body.get("Env") or []) if e.split("=", 1)[0].lower() not in
-                   ("http_proxy", "https_proxy", "no_proxy", "all_proxy")]
+                   ("http_proxy", "https_proxy", "no_proxy", "all_proxy", "nokker_ssh_proxy")]
             for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
                 # Le noyau peut poser l'identité du bac à sable (`nokker:<jeton>@`, injection de secrets par egress,
                 # docs/EGRESS-SECRETS.md) : gardée SEULEMENT si l'URL vise exactement le même proxy ; sinon écrasée.
                 v = given.get(k, "")
                 env.append(f"{k}={v if v and same_proxy(v, cfg.egress_proxy) else cfg.egress_proxy}")
             env += ["NO_PROXY=localhost,127.0.0.1", "no_proxy=localhost,127.0.0.1"]
+            # Client ssh des outils `ssh_*` (nokker/tools/ssh.py) : ProxyCommand CONNECT vers egress (hôte:port), qui
+            # n'ouvre que les hôtes déclarés dans hosts.yaml. Toujours la valeur d'egress, jamais celle du noyau.
+            e = urlsplit(cfg.egress_proxy)
+            if e.hostname and e.port:
+                env.append(f"NOKKER_SSH_PROXY={e.hostname}:{e.port}")
             body["Env"] = env
     return body
 
@@ -210,8 +291,9 @@ def check_exec(body: dict) -> dict:
     return body
 
 
-def filter_list_query(query: str) -> str:
-    """GET /containers/json : on ne laisse voir que les bacs à sable."""
+def filter_list_query(query: str, instance: str) -> str:
+    """GET /containers/json : on ne laisse voir que les bacs à sable de CETTE instance. Les filtres de label se
+    cumulent (ET) : un filtre `nokker.instance=<autre>` du client ne peut donc que vider la liste."""
     q = parse_qs(query, keep_blank_values=True)
     try:
         filters = json.loads(q.get("filters", ["{}"])[0] or "{}")
@@ -222,6 +304,8 @@ def filter_list_query(query: str) -> str:
         lab = [k for k, v in lab.items() if v]
     if LABEL not in lab and not any(x.startswith(LABEL + "=") for x in lab):
         lab = [*lab, LABEL]
+    if f"{INSTANCE_LABEL}={instance}" not in lab:
+        lab = [*lab, f"{INSTANCE_LABEL}={instance}"]
     filters["label"] = lab
     q["filters"] = [json.dumps(filters)]
     return urlencode({k: v[-1] for k, v in q.items()})
@@ -361,8 +445,10 @@ class Proxy:
             w.close()
 
     async def is_sandbox(self, ref: str) -> bool:
+        """Vrai seulement pour un bac étiqueté `nokker.sandbox` ET `nokker.instance=<celle de ce proxy>`."""
         status, info = await self.call_json("GET", f"/containers/{quote(ref, safe='')}/json")
-        return status == 200 and LABEL in ((info or {}).get("Config", {}).get("Labels") or {})
+        labels = ((info or {}).get("Config", {}).get("Labels") or {}) if status == 200 else {}
+        return LABEL in labels and bool(self.cfg.instance) and labels.get(INSTANCE_LABEL) == self.cfg.instance
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -384,13 +470,13 @@ class Proxy:
                 headers = [(k, v) for k, v in headers if k.lower() != "content-type"] + \
                           [("Content-Type", "application/json")]
             elif kind == "list":
-                query = filter_list_query(query)
+                query = filter_list_query(query, self.cfg.instance)
             elif kind == "ctr":
                 if not await self.is_sandbox(ref):
-                    raise Refused(f"container {ref} hors bac à sable")
+                    raise Refused(f"container {ref} hors des bacs à sable de cette instance")
             elif kind == "exec_create":
                 if not await self.is_sandbox(ref):
-                    raise Refused(f"container {ref} hors bac à sable")
+                    raise Refused(f"container {ref} hors des bacs à sable de cette instance")
                 body = json.dumps(check_exec(json.loads(body or b"{}"))).encode()
             elif kind == "exec":
                 if ref not in self.execs:
@@ -461,8 +547,8 @@ async def main() -> None:
         await Proxy(cfg, execs, reader).handle(reader, writer)
 
     server = await asyncio.start_server(on_client, cfg.listen_host, cfg.listen_port, limit=1 << 16)
-    log.info("écoute %s:%s → %s ; dossiers %s ; skills %s ; réseau %s", cfg.listen_host, cfg.listen_port,
-             cfg.upstream, cfg.workspaces, cfg.skills, cfg.network)
+    log.info("écoute %s:%s → %s ; dossiers %s ; skills %s ; réseau %s ; instance %s", cfg.listen_host, cfg.listen_port,
+             cfg.upstream, cfg.workspaces, cfg.skills, cfg.network, cfg.instance)
     async with server:
         await server.serve_forever()
 

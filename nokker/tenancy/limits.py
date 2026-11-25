@@ -26,6 +26,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from nokker.approvals.rule_labels import _l
+from nokker.core.person_texts import pick
 from nokker.core.ports import Policy, RouteDecision, RouteState
 from nokker.core.turn import Decision, Gate, Tier, Verdict
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant, tenant_scope
@@ -35,7 +37,8 @@ DAY_RESET_UTC_HOUR = 12
 WEEK_RESET_UTC_HOUR = 6  # le lundi
 DEFAULT_LIMITS: dict[str, Any] = {"mode": "soft", "turns_per_day": 40, "turns_per_week": 200,
                                   "hard_turns_per_day": 150, "deep_per_day": 20}
-KINDS = ("turns", "deep", "week_turns")
+KINDS = ("turns", "deep", "week_turns", "speech_chars", "byok_turns")  # speech_chars : caractères lus à voix haute (web)
+# byok_turns : tours servis par le point d'accès du client (BYOK cloud, migration 066), hors du quota du Router.
 UNBOUNDED = 2**31 - 1
 
 LIMIT_REPLY_DAY = (
@@ -58,6 +61,44 @@ NOTICE_WEEK = (
     "coupé : on compte pour régler l'offre. Le compteur repart lundi à {at} (heure suisse).\n"
     "— You just passed the {n} weekly messages of the Solo plan. During the beta nothing is cut: we count to tune "
     "the plan. The counter resets on Monday at {at} (Swiss time).")
+
+# Les mêmes quatre textes en fr/en/de/it, vus de la PERSONNE. fr : le texte d'origine ci-dessus, mot pour mot (français
+# puis anglais, empreintes testées) ; en/de/it : la seule langue de la personne, avec les mêmes trous ({n}, {at}). La
+# langue est celle du tour (`rule_labels.current_lang`, posée par `Kernel.run_turn`), ou `lang` passé explicitement.
+_LIMIT_DAY_EN = ("Daily limit reached: {n} messages per day and per account. The counter resets at {at} (Swiss time); "
+                 "your conversation is kept and you can pick it up where you left off.")
+_LIMIT_WEEK_EN = ("Weekly limit reached: {n} messages per week and per account. The counter resets on Monday at {at} "
+                  "(Swiss time); your conversation is kept.")
+_NOTICE_DAY_EN = ("— You just passed the {n} daily messages of the Solo plan. During the beta nothing is cut: we count "
+                  "to tune the plan. The counter resets at {at} (Swiss time).")
+_NOTICE_WEEK_EN = ("— You just passed the {n} weekly messages of the Solo plan. During the beta nothing is cut: we "
+                   "count to tune the plan. The counter resets on Monday at {at} (Swiss time).")
+LIMIT_REPLY_TEXTS: dict[str, dict[str, str]] = {
+    "day": _l(LIMIT_REPLY_DAY, _LIMIT_DAY_EN,
+              "Tageslimit erreicht: {n} Nachrichten pro Tag und Konto. Der Zähler startet um {at} (Schweizer Zeit) neu; "
+              "dein Gespräch bleibt erhalten, du kannst es dort fortsetzen, wo es aufgehört hat.",
+              "Limite giornaliero raggiunto: {n} messaggi al giorno per account. Il contatore riparte alle {at} (ora "
+              "svizzera); la tua conversazione è conservata e potrai riprenderla da dove si era fermata."),
+    "week": _l(LIMIT_REPLY_WEEK, _LIMIT_WEEK_EN,
+               "Wochenlimit erreicht: {n} Nachrichten pro Woche und Konto. Der Zähler startet am Montag um {at} "
+               "(Schweizer Zeit) neu; dein Gespräch bleibt erhalten.",
+               "Limite settimanale raggiunto: {n} messaggi a settimana per account. Il contatore riparte lunedì alle "
+               "{at} (ora svizzera); la tua conversazione è conservata."),
+}
+NOTICE_TEXTS: dict[str, dict[str, str]] = {
+    "day": _l(NOTICE_DAY, _NOTICE_DAY_EN,
+              "— Du hast soeben die {n} Nachrichten pro Tag überschritten, die der Solo-Tarif vorsieht. Während der "
+              "Beta wird nichts gesperrt: Wir zählen, um den Tarif richtig einzustellen. Der Zähler startet um {at} "
+              "(Schweizer Zeit) neu.",
+              "— Hai appena superato i {n} messaggi al giorno previsti dal piano Solo. Durante la beta non viene "
+              "interrotto nulla: contiamo per tarare il piano. Il contatore riparte alle {at} (ora svizzera)."),
+    "week": _l(NOTICE_WEEK, _NOTICE_WEEK_EN,
+               "— Du hast soeben die {n} Nachrichten pro Woche überschritten, die der Solo-Tarif vorsieht. Während der "
+               "Beta wird nichts gesperrt: Wir zählen, um den Tarif richtig einzustellen. Der Zähler startet am Montag "
+               "um {at} (Schweizer Zeit) neu.",
+               "— Hai appena superato i {n} messaggi a settimana previsti dal piano Solo. Durante la beta non viene "
+               "interrotto nulla: contiamo per tarare il piano. Il contatore riparte lunedì alle {at} (ora svizzera)."),
+}
 
 
 def day_window(now: datetime) -> tuple[datetime, datetime]:
@@ -119,6 +160,13 @@ class MemoryUsage:
         with self._lock:
             return self._counts.get((tenant_id, account, day, kind), 0)
 
+    def add(self, tenant_id: str, account: str, day: date, kind: str, n: int) -> int:
+        """Compteur sans plafond (ex. caractères lus à voix haute) : ajoute `n`, rend le total du jour."""
+        key = (tenant_id, account, day, kind)
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + max(0, int(n))
+            return self._counts[key]
+
 
 class PgUsage:
     """Table `tenant_usage` (migrations 007, 011). Une connexion par opération, `app.tenant_id` posé avant toute
@@ -157,6 +205,14 @@ class PgUsage:
         with self._conn(tenant_id) as conn:
             conn.execute(f"UPDATE tenant_usage SET {k} = GREATEST({k} - 1, 0) "
                          "WHERE tenant_id = %s AND account = %s AND day = %s", (tenant_id, account, day))
+
+    def add(self, tenant_id: str, account: str, day: date, kind: str, n: int) -> int:
+        k = self._kind(kind)
+        sql = (f"INSERT INTO tenant_usage AS u (tenant_id, account, day, {k}) VALUES (%s, %s, %s, %s) "
+               f"ON CONFLICT (tenant_id, account, day) DO UPDATE SET {k} = u.{k} + EXCLUDED.{k} RETURNING u.{k}")
+        with self._conn(tenant_id) as conn:
+            row = conn.execute(sql, (tenant_id, account, day, max(0, int(n)))).fetchone()
+        return int(row[0]) if row else 0
 
     def read(self, tenant_id: str, account: str, day: date, kind: str) -> int:
         k = self._kind(kind)
@@ -222,19 +278,30 @@ class TenantLimits:
         return self.turns_per_week if self.mode == "hard" else None
 
     # ── tour ──────────────────────────────────────────────────────────────────────────────────────────────────────
-    def check_turn(self, sender: str | None, *, shared: bool = False) -> Verdict | None:
+    def check_turn(self, sender: str | None, *, shared: bool = False, byok: bool = False) -> Verdict | None:
         """None : le tour passe (et il est compté). Sinon le verdict à journaliser ; le tour répond `reply(verdict)`.
 
         `shared` : le compte est membre d'un foyer (lot X23) ; son quota est celui du foyer (nokker/household/quota.py),
-        compté à part. Le tour reste compté ici, et seule la garde de coût `hard_turns_per_day` coupe."""
+        compté à part. Le tour reste compté ici, et seule la garde de coût `hard_turns_per_day` coupe.
+
+        `byok` : tour servi par le point d'accès du client (BYOK cloud, docs/CLOUD-BYOK.md §5). Rien n'est compté au
+        quota du Router (`turns`, `week_turns`) ; le tour est compté à part (`byok_turns`) sous la seule garde de débit
+        `hard_turns_per_day` (même plafond journalier que la garde de coût)."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.check_turn(sender, shared=shared)
+            return eff.check_turn(sender, shared=shared, byok=byok)
         tid = current_tenant()  # hors scope : NoTenant, jamais un tour sans quota par défaut
         if tid == INTERNAL_TENANT:
             return None
         who = sender or ""
         (day, _), (week, _) = self._keys()
+        if byok:
+            cap = self.hard_turns_per_day
+            if not self.counter.take(tid, who, day.date(), "byok_turns", UNBOUNDED if cap is None else cap):
+                return Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0, rule="limits:byok_turns_per_day",
+                               reason=f"{cap} tours BYOK par jour atteints pour {sender or '(compte inconnu)'}",
+                               subject="reply")
+            return None
         day_cap, week_cap = self._day_cap(), self._week_cap()
         if shared:
             day_cap, week_cap = self.hard_turns_per_day, None
@@ -251,24 +318,40 @@ class TenantLimits:
                            subject="reply")
         return None
 
-    def reply(self, verdict: Verdict | None = None) -> str:
+    def reply(self, verdict: Verdict | None = None, lang: str | None = None) -> str:
+        """Refus du tour, dans la langue du tour (`lang`, sinon celle du contexte, sinon `fr`)."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.reply(verdict)
+            return eff.reply(verdict, lang)
         (_, day_end), (_, week_end) = self._keys()
         if verdict is not None and verdict.rule == "limits:turns_per_week":
-            return LIMIT_REPLY_WEEK.format(n=self.turns_per_week, at=_swiss_hour(week_end))
-        if verdict is not None and verdict.rule == "limits:hard_turns_per_day":
-            return LIMIT_REPLY_DAY.format(n=self.hard_turns_per_day, at=_swiss_hour(day_end))
-        return LIMIT_REPLY_DAY.format(n=self._day_cap(), at=_swiss_hour(day_end))
+            return pick(LIMIT_REPLY_TEXTS["week"], lang).format(n=self.turns_per_week, at=_swiss_hour(week_end))
+        if verdict is not None and verdict.rule in ("limits:hard_turns_per_day", "limits:byok_turns_per_day"):
+            return pick(LIMIT_REPLY_TEXTS["day"], lang).format(n=self.hard_turns_per_day, at=_swiss_hour(day_end))
+        return pick(LIMIT_REPLY_TEXTS["day"], lang).format(n=self._day_cap(), at=_swiss_hour(day_end))
 
-    def notice(self, sender: str | None, *, shared: bool = False) -> str | None:
+    def resets_at(self, verdict: Verdict | None) -> datetime | None:
+        """Fin de la fenêtre dont le plafond du verdict est atteint (UTC) : lundi 06:00 pour le plafond de semaine,
+        12:00 UTC du lendemain pour les plafonds du jour. None sans verdict ou pour une règle inconnue (rien d'inventé)."""
+        eff = self._for(current_tenant())
+        if eff is not self:
+            return eff.resets_at(verdict)
+        if verdict is None:
+            return None
+        (_, day_end), (_, week_end) = self._keys()
+        if verdict.rule == "limits:turns_per_week":
+            return week_end
+        if verdict.rule in ("limits:turns_per_day", "limits:hard_turns_per_day", "limits:byok_turns_per_day"):
+            return day_end
+        return None
+
+    def notice(self, sender: str | None, *, shared: bool = False, lang: str | None = None) -> str | None:
         """Mode soft : avertissement à ajouter à la réponse du tour qui vient de DÉPASSER le quota du jour ou de la
         semaine (une seule fois par fenêtre : le tour n° cap + 1). None sinon, et toujours None en mode hard ou pour un
         membre d'un foyer (`shared` : son quota est celui du foyer)."""
         eff = self._for(current_tenant())
         if eff is not self:
-            return eff.notice(sender, shared=shared)
+            return eff.notice(sender, shared=shared, lang=lang)
         tid = current_tenant()
         if self.mode != "soft" or shared or tid == INTERNAL_TENANT:
             return None
@@ -276,10 +359,10 @@ class TenantLimits:
         (day, day_end), (week, week_end) = self._keys()
         if self.turns_per_day is not None and \
                 self.counter.read(tid, who, day.date(), "turns") == self.turns_per_day + 1:
-            return NOTICE_DAY.format(n=self.turns_per_day, at=_swiss_hour(day_end))
+            return pick(NOTICE_TEXTS["day"], lang).format(n=self.turns_per_day, at=_swiss_hour(day_end))
         if self.turns_per_week is not None and \
                 self.counter.read(tid, who, week.date(), "week_turns") == self.turns_per_week + 1:
-            return NOTICE_WEEK.format(n=self.turns_per_week, at=_swiss_hour(week_end))
+            return pick(NOTICE_TEXTS["week"], lang).format(n=self.turns_per_week, at=_swiss_hour(week_end))
         return None
 
     def allow_deep(self, sender: str | None) -> bool:
@@ -327,6 +410,11 @@ class TenantLimits:
         }
 
 
+def _forced(policy: Any) -> bool:
+    """Palier IMPOSÉ (`route/forced.py`, `delegate` avec `tier`) : l'hôte qui le permet le garde, `escalate: false` comprise."""
+    return type(policy).__name__ == "ForcedTierPolicy"
+
+
 @dataclass
 class LimitedPolicy:
     """Enveloppe d'une `Policy` : un choix Deep au-delà du plafond du compte reste sur Ship."""
@@ -336,6 +424,16 @@ class LimitedPolicy:
 
     def choose(self, state: RouteState) -> RouteDecision:
         route = self.inner.choose(state)
+        from nokker.byok.context import active as byok_active
+
+        if byok_active() is not None:  # tour BYOK : un seul point d'accès, celui du client ; aucun Deep décompté
+            return route
+        if route.tier is Tier.DEEP and not _forced(self.inner):
+            from nokker.core import session_opts
+
+            if not session_opts.escalation_allowed(state.turn.thread_id):  # `escalate: false` : jamais de montée automatique, rien décompté
+                return RouteDecision(tier=Tier.SHIP, reasoning=bool(getattr(self.inner, "ship_reasoning", False)),
+                                     reason=f"session escalate:false, reste sur Ship ; demandé : {route.reason}")
         if route.tier is not Tier.DEEP or self.limits.allow_deep(state.turn.sender):
             return route
         return RouteDecision(tier=Tier.SHIP, reasoning=False,
@@ -343,5 +441,5 @@ class LimitedPolicy:
                                     f"demandé : {route.reason}")
 
 
-__all__ = ["DEFAULT_LIMITS", "LIMIT_REPLY_DAY", "LIMIT_REPLY_WEEK", "LimitedPolicy", "MemoryUsage", "PgUsage",
-           "TenantLimits", "UsageCounter", "day_window", "week_window"]
+__all__ = ["DEFAULT_LIMITS", "LIMIT_REPLY_DAY", "LIMIT_REPLY_TEXTS", "LIMIT_REPLY_WEEK", "NOTICE_TEXTS", "LimitedPolicy",
+           "MemoryUsage", "PgUsage", "TenantLimits", "UsageCounter", "day_window", "week_window"]

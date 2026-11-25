@@ -15,7 +15,9 @@ Chaque décision est tracée (`approval_events`, verdict `approvals:auto_review`
 (`Approval.auto_review`, rendu par l'API). Le propriétaire peut la RÉVOQUER après coup
 (`POST /v1/approvals/{id}/auto-review/revoke`) : un refus révoqué rend la carte à l'humain (`pending`) ; une
 approbation révoquée reste exécutée (l'effet a eu lieu, la carte le dit) mais le relecteur n'approuve plus cet outil
-sur ce fil pendant 30 jours (lu dans l'historique des cartes) : les cartes suivantes vont à l'humain.
+sur ce fil pendant 30 jours (lu dans l'historique des cartes) : les cartes suivantes vont à l'humain. Pour une écriture
+de fichier, la révocation propose aussi le point de retour de la carte (`rollback`, `nokker/tools/card_snapshots.py`),
+appliqué seulement par `POST /v1/approvals/{id}/auto-review/rollback`.
 
 Jamais relues (liste FERMÉE, `excluded()`, testée famille par famille) : carte forte, plancher prod `ops:prod*`, envoi
 externe ou de masse, dépense, suppression (effet destructif ou commande qui supprime), publication de page, profil
@@ -40,6 +42,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.core.model_texts import judge_language_line
 from nokker.tools.code import EXCLUDED_COMMAND
 
 logger = logging.getLogger("nokker.approvals.auto_review")
@@ -56,6 +59,7 @@ EXCLUDED_RULES = frozenset({
     "effect:destructive", "effect:destructive:unauthorized_sender",
     "effect:send_external", "effect:send_bulk", "effect:spend",
     "pages:publish",                       # sortie vers le public
+    "wall:publish",                        # écran du mur d'une pièce commune (V7)
     "household:guardian",                  # profil mineur : son représentant décide
     "permissions:relayed_connector",       # connecteur d'un compte nokker.ai
     "permissions:relayed_strong",          # tour venu du web
@@ -67,6 +71,7 @@ EXCLUDED_RULES = frozenset({
     "improve:proposal",                    # auto-amélioration (nokker/improve/proposal.py) : toujours à l'humain
     "learning:card",                       # skill appris (skill_create|update|revert) : escalade par règle, jamais seul
     "family:calendar",                     # calendrier familial : la relecture des lignes extraites EST la carte
+    "family:project",                      # projet du foyer : la relecture du plan EST la carte
     "provenance:envoi", "provenance:exec", "provenance:recherche",  # valeur lue dans une source non fiable : l humain seul
     "payments:to_pay",                     # carte « à payer » (et paiement par l'agent de paiement) : passkey seule
 })
@@ -215,6 +220,29 @@ def _short(value: Any, n: int) -> str:
     return text if len(text) <= n else text[:n] + "…"
 
 
+TRAJECTORY_ARG_CHARS = 200  # ce que `render_trajectory` montre des arguments d'une action passée
+CARD_ARG_CHARS = 1500  # ce que `prompt` montre des arguments de la carte
+
+
+def _is_cut(value: Any, n: int) -> bool:
+    """Vrai si `_short(value, n)` tronquerait : le relecteur ne verrait qu'une partie."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return len(" ".join(str(text).split())) > n
+
+
+def unseen_text(card: Any, trajectory: list[dict[str, Any]]) -> str | None:
+    """Nom de ce que le relecteur ne verrait pas en entier (arguments de la carte, arguments d'une action passée), ou
+    None. Un texte à écrire ou à envoyer dont la suite échappe au juge ne s'approuve pas : l'humain décide."""
+    if _is_cut(card.arguments or {}, CARD_ARG_CHARS):
+        return "le contenu de cette carte"
+    from nokker.core.loop import human_tool  # import tardif : le noyau importe ce module
+
+    for it in trajectory:
+        if _is_cut(it.get("arguments") or {}, TRAJECTORY_ARG_CHARS):
+            return f"le contenu de l'action précédente : {human_tool(it['name'])}"
+    return None
+
+
 def trajectory_of(turn: Any, current_call_id: str | None, max_calls: int = 8) -> list[dict[str, Any]]:
     """Les appels du tour AVANT la carte (nom, arguments, début du résultat), les plus récents."""
     results = {m.tool_call_id: m.content for m in getattr(turn, "messages", []) if m.role == "tool"}
@@ -289,7 +317,7 @@ class AutoReviewer:
             policy=self.policy.strip(), request=fence("demande", (request or "(vide)")[:2000]),
             trajectory=fence("trajectoire", render_trajectory(trajectory)), tool=card.tool_name,
             arguments=fence("arguments", _short(card.arguments or {}, 1500)),
-            reason=fence("motif", (card.reason or "")[:300]))
+            reason=fence("motif", (card.reason or "")[:300])) + judge_language_line()
 
     def review(self, turn: Any, card: Any, call_id: str | None = None, approvals: Any = None) -> ReviewDecision:
         trajectory = trajectory_of(turn, call_id, self.trajectory_calls)
@@ -312,10 +340,16 @@ class AutoReviewer:
         if missing:
             return ReviewDecision("escalate", "dates ou heures de la carte absentes de la demande : "
                                               + ", ".join(missing[:4]), by_rule=True)
-        strangers = unmatched_addresses(request, card.arguments or {}, self.own_addresses)
+        # Une adresse que la demande désigne (« réponds à l'expéditeur », « à l'équipe ») et qu'un outil de LECTURE de
+        # la trajectoire a rendue à cette place (en-tête d'un mail lu, ligne d'équipe d'un fichier) : admise ; une
+        # adresse donnée par une page, un corps de mail ou une consigne : escalade (`dates.designated_addresses`).
+        strangers = unmatched_addresses(request, card.arguments or {}, self.own_addresses, trajectory=trajectory)
         if strangers:
             return ReviewDecision("escalate", "adresse absente de la demande : " + ", ".join(strangers[:3]),
                                   by_rule=True)
+        hidden = unseen_text(card, trajectory)
+        if hidden:
+            return ReviewDecision("escalate", f"Ce texte est trop long pour être relu automatiquement ({hidden}) : à toi de le vérifier.", by_rule=True)
         body = {"messages": [{"role": "user", "content": self.prompt(request, card, trajectory)}],
                 "max_tokens": self.max_tokens, "temperature": 0}
         t0 = time.monotonic()

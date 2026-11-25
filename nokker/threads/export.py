@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from nokker.core.model_texts import SECRET_NOTICE_MARKS
 from nokker.core.turn import Effect, Turn
 
 FORMAT = "nokker-thread-export/1"
@@ -38,7 +39,8 @@ MAX_BYTES = 4 * 1024 * 1024  # export entier (JSON), au-delà : tours plus ancie
 SEALED_TEXT = "[résultat d'outil secret scellé : la valeur reste dans le coffre et n'est jamais exportée]"
 # Marque du résultat déjà scellé par le noyau (`_seal_secret_result`) : scellé ici aussi, même si l'outil a disparu
 # du registre ou changé d'effet depuis.
-_KERNEL_SEAL_MARK = "Résultat de l'outil secret"
+_KERNEL_SEAL_MARK = "Résultat de l'outil secret"  # français ; les autres langues : `_KERNEL_SEAL_MARKS`
+_KERNEL_SEAL_MARKS = SECRET_NOTICE_MARKS
 
 Scrub = Callable[[str], str]
 EffectOf = Callable[[str], "Effect | None"]
@@ -75,7 +77,7 @@ def default_effect_of(tools: Any) -> EffectOf:
 
 
 def is_sealed(name: str | None, content: str, effect_of: EffectOf) -> bool:
-    if _KERNEL_SEAL_MARK in (content or ""):
+    if any(m in (content or "") for m in _KERNEL_SEAL_MARKS):
         return True
     try:
         return bool(name) and effect_of(str(name)) is Effect.SECRET
@@ -95,7 +97,12 @@ def _turn_messages(t: Turn, *, include_tools: bool, public: bool, scrub: Scrub,
         if t.images:
             user["images"] = [i.to_dict() for i in t.images]
     elif t.images:
-        user["images_count"] = len(t.images)
+        # partage public : seulement des comptes ; une image rendue par un outil n'est jamais comptée comme envoyée
+        own = sum(1 for i in t.images if not i.from_tool)
+        if own:
+            user["images_count"] = own
+        if own != len(t.images):
+            user["tool_images_count"] = len(t.images) - own
     out.append(user)
     if include_tools:
         names: dict[str, str] = {}

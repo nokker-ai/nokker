@@ -31,7 +31,7 @@ D() { docker run --rm --network $P-api -e DOCKER_HOST=tcp://$P-proxy:2375 docker
 echo "— sondes"
 D version --format '{{.Server.Version}}' >/dev/null 2>&1 && pass version || fail version
 D info --format '{{.OSType}}' >/dev/null 2>&1 && pass info || fail info
-D run --rm --cpus 0.5 --memory 64m --pids-limit 32 alpine:3.20 true >/dev/null 2>&1 && pass "sonde cgroup (run --rm … true)" || fail "sonde cgroup"
+D run --rm --cpus 0.5 --memory 64m --pids-limit 32 alpine:3.20 sleep 0 >/dev/null 2>&1 && pass "sonde cgroup (run --rm … sleep 0)" || fail "sonde cgroup"
 id=$(D create --storage-opt size=1m hello-world 2>&1); case "$id" in *Forbidden*|*nokker*) fail "sonde disque : $id";; *)
   pass "sonde disque create (ou refus du pilote de stockage, hors proxy)"; D rm "$id" >/dev/null 2>&1;; esac
 

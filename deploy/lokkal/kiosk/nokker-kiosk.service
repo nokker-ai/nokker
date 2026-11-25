@@ -1,0 +1,17 @@
+# Kiosque HDMI d'un Lokkal (docs/KIOSK.md §4) — unit UTILISATEUR :
+#   install -Dm644 nokker-kiosk.service ~/.config/systemd/user/nokker-kiosk.service
+#   install -Dm755 nokker-kiosk.sh ~/.local/bin/nokker-kiosk
+#   systemctl --user daemon-reload && systemctl --user enable --now nokker-kiosk.service
+[Unit]
+Description=Nokker — kiosque HDMI
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nokker-kiosk
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

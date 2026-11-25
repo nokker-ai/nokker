@@ -260,9 +260,12 @@ def test_admit_result_truncates_long_results_with_mention(tmp_path):
     assert len(out.content) > 10  # texte tronqué + mention, pas juste coupé net
 
 
-def test_estimate_tokens_is_len_over_4():
-    assert estimate_tokens("abcdefgh") == 2
+def test_estimate_tokens_is_the_calibrated_estimator():
+    """Plus `len // 4` (sous-estimait ×1,9 le français/JSON/UUID) : l'estimateur par classes de `context/tokens.py`."""
     assert estimate_tokens("") == 0
+    assert estimate_tokens("abcdefgh") >= 2
+    text = '{"id": "3f2a9c1e-7b4d-4e8a-9c3b-0123456789ab", "t": 0.000123}' * 20
+    assert estimate_tokens(text) > 1.5 * (len(text) // 4)
 
 
 def test_missing_prefix_file_gives_empty_layer_not_crash(tmp_path):

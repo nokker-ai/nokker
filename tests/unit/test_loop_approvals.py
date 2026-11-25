@@ -170,3 +170,28 @@ def test_approvals_request_receives_the_verdict_rule_and_reason():
     approval = backend.pending()[0]
     assert approval.rule == "effect:destructive"
     assert approval.reason == "sans GO"
+
+
+def test_normalize_args_hook_shapes_the_card_and_only_for_its_tool():
+    """Le crochet `ToolSpec.normalize_args` : la carte (arguments ET empreinte) porte les arguments normalisés ; un
+    autre outil, sans crochet, garde ceux du modèle ; un crochet qui échoue laisse l'appel tel quel."""
+    from nokker.approvals.crypto import args_sha256
+
+    def fix(thread, a):
+        assert thread == "t1"
+        return {**a, "label": "VRAI"}
+
+    def broken(thread, a):
+        raise RuntimeError("boum")
+
+    backend = InMemoryApprovals()
+    k, tools = make_kernel([Message("assistant", tool_calls=[tc("hooked", label='"'), tc("plain", label='"'),
+                                                             tc("broken", label='"')]),
+                            Message("assistant", "fait")], approvals=backend)
+    for n, h in (("hooked", fix), ("plain", None), ("broken", broken)):
+        tools.specs[n] = ToolSpec(n, n, {}, Effect.DESTRUCTIVE, normalize_args=h)
+    k.run_turn(TurnInput("t1", "go"))
+    by = {a.tool_name: a for a in backend.pending()}
+    assert by["hooked"].arguments == {"label": "VRAI"}
+    assert by["hooked"].args_sha256 == args_sha256({"label": "VRAI"})
+    assert by["plain"].arguments == {"label": '"'} and by["broken"].arguments == {"label": '"'}

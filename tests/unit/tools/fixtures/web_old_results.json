@@ -1,0 +1,67 @@
+[
+ {
+  "name": "web_search",
+  "args": {
+   "query": "horaires train Genève Lausanne"
+  },
+  "content": "1. Horaire CFF — www.sbb.ch [exa, parallel]\n   https://www.sbb.ch/fr/horaire.html\n   Trains Genève – Lausanne toutes les 15 minutes.\n\n<!-- nokker:web_search:data -->\n{\"query\": \"horaires train Genève Lausanne\", \"limit\": 8, \"engines_queried\": [\"exa\", \"parallel\"], \"results\": [{\"url\": \"https://www.sbb.ch/fr/horaire.html\", \"title\": \"Horaire CFF\", \"snippet\": \"Trains Genève – Lausanne toutes les 15 minutes.\", \"domain\": \"www.sbb.ch\", \"favicon_url\": \"https://www.sbb.ch/favicon.ico\", \"engines\": [\"exa\", \"parallel\"], \"rank\": 1}]}\n<!-- /nokker:web_search:data -->",
+  "origin": "noyau avant r44"
+ },
+ {
+  "name": "web_fetch",
+  "args": {
+   "urls": [
+    "https://www.lausanne.ch/piscines",
+    "https://x.example/"
+   ]
+  },
+  "content": "1. https://www.lausanne.ch/piscines — Piscines\nLundi : 06:00-22:00\n\n2. https://x.example/ — échec : délai dépassé\n\n<!-- nokker:web_fetch:data -->\n{\"documents\": [{\"url\": \"https://www.lausanne.ch/piscines\", \"title\": \"Piscines\", \"content\": \"Lundi : 06:00-22:00\", \"engine\": \"direct\"}, {\"url\": \"https://x.example/\", \"title\": \"\", \"content\": \"\", \"error\": \"délai dépassé\"}]}\n<!-- /nokker:web_fetch:data -->",
+  "origin": "noyau avant r44"
+ },
+ {
+  "name": "web_search",
+  "args": {
+   "query": "horaires de fermeture Migros Zurich samedi 5 septembre 2026",
+   "limit": 1
+  },
+  "content": "{\"title\": \"Horaires du Migros Zurich – Samedi 5 septembre 2026\", \"url\": \"https://www.migros.ch/zh/horaire\", \"snippet\": \"Le magasin ferme à 19h30 le samedi.\", \"date\": \"2026-09-04\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "web_search",
+  "args": {
+   "query": "Öffnungszeiten Museum für Kunst Basel heute"
+  },
+  "content": "{\"results\":[{\"title\":\"Museum für Kunst Basel – Öffnungszeiten\",\"url\":\"https://www.museumkunz.ch/oeffnungszeiten\",\"snippet\":\"Montag bis Freitag: 10:00–18:00, Samstag: 10:00–18:00, Sonntag: geschlossen\"}]}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "web_fetch",
+  "args": {
+   "urls": [
+    "https://www.lausanne.ch/ville/piscines.html"
+   ]
+  },
+  "content": "{\"content\": \"Horaires d'ouverture :\\nLundi-Vendredi : 06:00-22:00\\nSamedi : 08:00-20:00\\nDimanche : 08:00-18:00\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "web_fetch",
+  "args": {
+   "urls": [
+    "https://example.com/ma-commande"
+   ]
+  },
+  "content": "… Numéro de suivi : •••• •••• •••• •••• …\n[Masque] 1 numéro(s) au format carte bancaire remplacé(s) par des « • ». Ne cherche pas à les retrouver ; si c'est un numéro de commande ou de suivi, dis à la personne de le lire sur sa page.",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "web_search",
+  "args": {
+   "query": "Le Gourmet restaurant heure de fermeture aujourd'hui",
+   "limit": 1
+  },
+  "content": "[{\"title\":\"Le Gourmet – Horaires\",\"link\":\"https://le-gourmet.ch/horaires\",\"snippet\":\"Le restaurant ferme à 22h30 du mardi au dimanche.\"}]",
+  "origin": "mélange d'entraînement"
+ }
+]

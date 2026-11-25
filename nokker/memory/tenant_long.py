@@ -30,15 +30,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import Recall, ToolContext, ToolSpec
 from nokker.core.turn import ToolResult
+from nokker.memory.dedup import equivalent
+from nokker.memory.provenance import PERSON, THIRD_PARTY_UNKNOWN
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
 
 log = logging.getLogger("nokker.memory.tenant_long")
 
 SCOPES = ("user", "household")
 AUDIENCES = ("all", "adults")
-KINDS = ("rule", "feedback", "fact")  # = nokker.context.project_memory.KINDS
+KINDS = ("rule", "preference", "feedback", "fact")  # = nokker.context.project_memory.KINDS (migration 086)
 MAX_TITLE = 120
 MAX_TEXT = 1500
 HOUSEHOLD_PREFIX = "foyer:"  # = nokker.household.memory.PREFIX : même espace de noms que les notes du foyer de l'app
@@ -73,6 +76,7 @@ class Settings:
     vector_weight: float = 0.7
     max_candidates: int = 500  # notes lues par portée et par tour (recherche exacte)
     tools: bool = False  # memory_search / memory_get pour les testeurs (textes existants) — à valider avant d'allumer
+    note_tool: bool = False  # `memory_note` (quarantaine, nokker/memory/long_note.py) : demande `memory_pending` ; éteint : aucun texte
 
     @classmethod
     def from_config(cls, raw: dict[str, Any] | None) -> Settings:
@@ -119,6 +123,9 @@ class LongNote:
     audience: str = "all"
     origin: str = ""
     created_at: float = 0.0
+    # Provenance du texte (nokker/memory/provenance.py) : rendue au rappel (marqueur de source pour un fait de tiers).
+    # Une note d'avant la migration 080 : `unknown_legacy`, rendue comme avant.
+    provenance: str = "unknown_legacy"
     updated_at: float = 0.0
     embed_model: str | None = None
     embedding: list[float] | None = field(default=None, repr=False)
@@ -316,15 +323,16 @@ class MemoryLongStore:
 
 
 _COLS = ("tenant_id, account_id, name, scope, household_id, audience, kind, title, body, author_account, origin, "
-         "embed_model, created_at, updated_at")
+         "embed_model, created_at, updated_at, provenance")
 
 
 def _row(r: tuple) -> LongNote:
     (tenant_id, account_id, name, scope, household_id, audience, kind, title, body, author, origin, model, created,
-     updated) = r[:14]
+     updated, provenance) = r[:15]
     return LongNote(name=name, scope=scope, kind=kind, title=title, text=body, account_id=account_id,
                     tenant_id=tenant_id, author_account=author, household_id=household_id, audience=audience,
-                    origin=origin, created_at=float(created), updated_at=float(updated), embed_model=model)
+                    origin=origin, created_at=float(created), updated_at=float(updated), embed_model=model,
+                    provenance=provenance or "unknown_legacy")
 
 
 def _vec_literal(v: list[float]) -> str:
@@ -346,8 +354,9 @@ class PgLongMemoryStore:
 
             from nokker.store.conn import migrate
 
-            mig = Path(__file__).parent.parent / "store" / "migrations" / "049_tenant_long_memory.sql"
-            migrate(dsn, mig.read_text(encoding="utf-8"))
+            migs = Path(__file__).parent.parent / "store" / "migrations"
+            migrate(dsn, (migs / "049_tenant_long_memory.sql").read_text(encoding="utf-8"),
+                    (migs / "080_memory_provenance.sql").read_text(encoding="utf-8"))  # colonne `provenance`
 
     def _conn(self, actor: Actor):
         from nokker.store.conn import connect
@@ -385,12 +394,13 @@ class PgLongMemoryStore:
         vector = self.vector and vec is not None
         cols = _COLS + (", embedding" if vector else "")
         vals = [n.tenant_id, n.account_id, n.name, n.scope, n.household_id, n.audience, n.kind, n.title, n.text,
-                n.author_account, n.origin, model if vector else None, n.created_at, n.updated_at]
+                n.author_account, n.origin, model if vector else None, n.created_at, n.updated_at, n.provenance]
         marks = ", ".join(["%s"] * len(vals)) + (", %s::vector" if vector else "")
         if vector:
             vals.append(_vec_literal(vec))
         upd = ("title = EXCLUDED.title, body = EXCLUDED.body, kind = EXCLUDED.kind, audience = EXCLUDED.audience, "
-               "origin = EXCLUDED.origin, embed_model = EXCLUDED.embed_model, updated_at = EXCLUDED.updated_at"
+               "origin = EXCLUDED.origin, embed_model = EXCLUDED.embed_model, updated_at = EXCLUDED.updated_at, "
+               "provenance = EXCLUDED.provenance"
                + (", embedding = EXCLUDED.embedding" if vector else ""))
         with self._conn(actor) as c:
             c.execute(f"INSERT INTO nokker_long_memory ({cols}) VALUES ({marks}) "
@@ -416,7 +426,7 @@ class PgLongMemoryStore:
             args = [*params, int(limit)]
         with self._conn(actor) as c:
             rows = c.execute(sel, args).fetchall()
-        return [(_row(r), float(r[14]) if r[14] is not None else None) for r in rows]
+        return [(_row(r), float(r[15]) if r[15] is not None else None) for r in rows]
 
     def find(self, actor: Actor, name: str, m: Membership | None) -> LongNote | None:
         with self._conn(actor) as c:
@@ -445,9 +455,10 @@ class PgLongMemoryStore:
 
         with self._conn(actor) as c:
             c.execute("INSERT INTO nokker_memory_pending (tenant_id, account_id, id, source, kind, title, body, scope, "
-                      "derived_from, project, links, thread_id, turn_index, at, status, author_account, audience) "
+                      "derived_from, project, links, thread_id, turn_index, at, status, author_account, audience, "
+                      "provenance) "
                       "VALUES (%s, %s, %s, 'household', %s, %s, %s, 'household', 'user', %s, %s, '', NULL, %s, "
-                      "'pending', %s, %s)",
+                      "'pending', %s, %s, 'person')",
                       (m.tenant_id, m.payer_account, row["id"], row["kind"], row["title"], row["text"],
                        m.household_id, Jsonb([]), row["at"], actor.account_id, row.get("audience", "all")))
 
@@ -504,7 +515,7 @@ class LongMemory:
     # ── comptes ──
     def actor(self, account_id: str) -> Actor:
         if not account_id or not account_id.startswith("us_"):
-            raise LongMemoryError(403, "no_account", "mémoire longue : compte requis")
+            raise LongMemoryError(403, "no_account", mt.pick(mt.MEMORY_ACCOUNT_REQUIRED))
         tid = current_tenant()
         if tid == INTERNAL_TENANT:
             raise LongMemoryError(403, "internal", "le locataire interne a sa propre mémoire longue")
@@ -558,49 +569,62 @@ class LongMemory:
         if kind not in KINDS or scope not in SCOPES or audience not in AUDIENCES:
             raise LongMemoryError(400, "bad_note", f"kind ∈ {KINDS}, scope ∈ {SCOPES}, audience ∈ {AUDIENCES}")
         if scope == "user" and audience != "all":
-            raise LongMemoryError(400, "bad_note", "audience : seulement pour une note du foyer")
+            raise LongMemoryError(400, "bad_note", mt.pick(mt.MEMORY_AUDIENCE_HOUSEHOLD_ONLY))
         if not title or not text or len(title) > MAX_TITLE or len(text) > MAX_TEXT:
-            raise LongMemoryError(400, "bad_note", f"title (≤ {MAX_TITLE} car.) et text (≤ {MAX_TEXT} car.) requis")
+            raise LongMemoryError(400, "bad_note",
+                                  mt.pick(mt.MEMORY_TITLE_TEXT_REQUIRED).format(max_title=MAX_TITLE, max_text=MAX_TEXT))
         if self.scrub is not None:
             title, text = self.scrub(title), self.scrub(text)
         return title, text
 
     def write(self, account_id: str, *, scope: str, kind: str = "fact", title: str, text: str, audience: str = "all",
-              origin: str = "app") -> dict[str, Any]:
-        """Geste du compte (route) ou fait approuvé : `{note}` écrite, ou `{pending}` (proposition d'un membre au
-        foyer, relue par le payeur)."""
+              origin: str = "app", provenance: str | None = None) -> dict[str, Any]:
+        """Geste du compte (route, `provenance = person`) ou fait approuvé : `{note}` écrite, ou `{pending}`
+        (proposition d'un membre au foyer, relue par le payeur). `provenance` absente : doute, tiers
+        (nokker/memory/provenance.py)."""
+        from nokker.memory.provenance import for_new_fact
+
+        provenance = for_new_fact(provenance)
         actor = self.actor(account_id)
         title, text = self._clean(kind, title, text, audience, scope)
         m = None
         if scope == "household":
             m = self._member(account_id)
             if m is None:
-                raise LongMemoryError(404, "no_household", "aucun foyer actif pour ce compte")
+                raise LongMemoryError(404, "no_household", mt.pick(mt.MEMORY_NO_HOUSEHOLD))
             if m.payer_account != account_id:
                 return {"pending": self._submit(actor, m, kind, title, text, audience)}
         for n, _ in self.store.candidates(actor, scope, m, None, None, self.settings.max_candidates):
-            if n.kind == kind and _norm(n.text) == _norm(text):
+            if equivalent(n.text, text):  # T6 : note équivalente active, quel que soit son type
                 return {"note": n.public(account_id), "duplicate": True}
-        return {"note": self._put(actor, scope, m, kind, title, text, audience, account_id, origin).public(account_id)}
+        return {"note": self._put(actor, scope, m, kind, title, text, audience, account_id, origin,
+                                  provenance).public(account_id)}
+
+    def equivalent_note(self, account_id: str, text: str) -> LongNote | None:
+        """Note de portée user du compte, active, équivalente à `text` (`dedup.equivalent`) ; None sinon (T6)."""
+        actor = self.actor(account_id)
+        for n, _ in self.store.candidates(actor, "user", None, None, None, self.settings.max_candidates):
+            if equivalent(n.text, text):
+                return n
+        return None
 
     def _put(self, actor: Actor, scope: str, m: Membership | None, kind: str, title: str, text: str, audience: str,
-             author: str, origin: str) -> LongNote:
+             author: str, origin: str, provenance: str = THIRD_PARTY_UNKNOWN) -> LongNote:  # doute = tiers
         now = float(self.now_fn())
         if scope == "household" and (m is None or m.tenant_id != actor.tenant_id or m.payer_account != actor.account_id):
-            raise LongMemoryError(403, "payer_only", "seul le payeur écrit dans la mémoire du foyer")
+            raise LongMemoryError(403, "payer_only", mt.pick(mt.MEMORY_PAYER_WRITES))
         n = LongNote(name=note_name(kind, title, text, now), scope=scope, kind=kind, title=title, text=text,
                      account_id=actor.account_id, tenant_id=actor.tenant_id, author_account=author,
                      household_id=m.household_id if scope == "household" and m else None,
                      audience=audience if scope == "household" else "all", origin=origin, created_at=now,
-                     updated_at=now)
+                     updated_at=now, provenance=provenance)
         vec, model = self._embed_doc(title, text)
         self.store.put(actor, n, vec, model)
         return n
 
     def _submit(self, actor: Actor, m: Membership, kind: str, title: str, text: str, audience: str) -> dict[str, Any]:
         if not self.review:
-            raise LongMemoryError(409, "review_off", "proposer au foyer demande la relecture du payeur "
-                                                    "(memory_pending éteint)")
+            raise LongMemoryError(409, "review_off", mt.pick(mt.MEMORY_REVIEW_OFF))
         import uuid
         from datetime import UTC, datetime
 
@@ -624,7 +648,9 @@ class LongMemory:
         meta = self.store.pending_meta(actor, note.id)
         author, audience = meta if meta else (acc, "all")
         title, text = self._clean(note.kind, note.title, note.text, audience, "household")
-        return self._put(actor, "household", m, note.kind, title, text, audience, author, f"pending:{note.id}").name
+        # proposition écrite par un membre (route) : ses mots
+        return self._put(actor, "household", m, note.kind, title, text, audience, author, f"pending:{note.id}",
+                         PERSON).name
 
     def delete(self, account_id: str, name: str) -> bool:
         actor = self.actor(account_id)
@@ -718,9 +744,9 @@ class LongMemory:
         except Exception:  # noqa: BLE001 — la mémoire en panne ne casse jamais un tour
             self._warn("recherche en échec")
             return []
-        u = [Recall(note=n.name, text=user_line(n), score=s) for n, s in user]
-        h = [Recall(note=HOUSEHOLD_PREFIX + n.name, text=HOUSEHOLD_LINE.format(title=n.title, text=n.text), score=s)
-             for n, s in hh]
+        u = [Recall(note=n.name, text=user_line(n), score=s, provenance=n.provenance) for n, s in user]
+        h = [Recall(note=HOUSEHOLD_PREFIX + n.name, text=HOUSEHOLD_LINE.format(title=n.title, text=n.text), score=s,
+                    provenance=n.provenance) for n, s in hh]
         if self.household_recall is not None:  # notes du foyer écrites dans l'app (team_notes), rappel lexical
             try:
                 h += self.household_recall.recall_for_account(account_id, query, k)
@@ -784,7 +810,9 @@ class LongMemoryPort:
     def recall_for(self, thread_id: str, query: str, k: int = 5) -> list[Recall]:
         return self.recall(query, k)
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
+        """Faits de la consolidation (approuvés si la quarantaine est allumée) : rangés AVEC leur provenance ;
+        absente = doute = tiers."""
         for fact in facts:
             text = " ".join(str(fact or "").split())[:MAX_TEXT]
             if not text:
@@ -792,7 +820,7 @@ class LongMemoryPort:
             title = text if len(text) <= MAX_TITLE else text[:MAX_TITLE - 3].rstrip() + "…"
             try:
                 self.service.write(self.account_id, scope="user", kind="fact", title=title, text=text,
-                                   origin=f"propose:{thread_id}")
+                                   origin=f"propose:{thread_id}", provenance=provenance)
             except Exception:
                 log.warning("fait proposé non écrit (fil %s)", thread_id, exc_info=True)
 
@@ -800,7 +828,7 @@ class LongMemoryPort:
         return []
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
 
 
 class LongMemoryTools:
@@ -825,7 +853,7 @@ class LongMemoryTools:
 
         port = self.service.for_tenant(current_tenant())
         if port is None:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         try:
             if name == "memory_search":
                 rows = self.service.search(port.account_id, str(arguments.get("query") or ""),
@@ -835,11 +863,11 @@ class LongMemoryTools:
                 nm = str(arguments.get("note_name") or "")
                 n = self.service.get_note(port.account_id, nm)
                 if n is None:
-                    return ToolResult(call_id="", name=name, content=f"note introuvable : {nm}", is_error=True)
+                    return ToolResult(call_id="", name=name, content=mt.pick(mt.MEMORY_NOTE_NOT_FOUND).format(name=nm), is_error=True)
                 return ToolResult(call_id="", name=name, content=f"# {n.title}\n\n{n.text}")
         except LongMemoryError as e:
             return ToolResult(call_id="", name=name, content=e.message, is_error=True)
-        return ToolResult(call_id="", name=name, content=f"outil mémoire inconnu : {name}", is_error=True)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.MEMORY_UNKNOWN_TOOL).format(name=name), is_error=True)
 
 
 __all__ = [

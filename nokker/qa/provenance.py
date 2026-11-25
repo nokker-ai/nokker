@@ -28,6 +28,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.approvals.rule_labels import current_lang
+from nokker.core import model_texts as mt
 from nokker.core.turn import Decision, Effect, Gate, Verdict
 
 # ─────────────────────────────── étiquettes ───────────────────────────────
@@ -50,6 +52,7 @@ SOURCES: dict[str, tuple[str, Trust]] = {
     "mail-en-tête": ("l'en-tête d'un mail", Trust.INTERNE),
     "mail": ("le contenu d'un mail", Trust.NON_FIABLE),
     "web": ("une page ou une recherche web", Trust.NON_FIABLE),
+    "site": ("une page d'un site connecté (réseau social)", Trust.NON_FIABLE),
     "pièce-jointe": ("une pièce jointe", Trust.NON_FIABLE),
     "agenda": ("un événement d'agenda", Trust.NON_FIABLE),
     "sous-agent": ("le compte rendu d'un sous-agent", Trust.NON_FIABLE),
@@ -62,6 +65,13 @@ SOURCES: dict[str, tuple[str, Trust]] = {
 
 MAIL_TOOLS = frozenset({"mail_search", "mail_read"})
 WEB_TOOLS = frozenset({"web_search", "web_fetch"})
+# Pack Essentiels (docs/ESSENTIALS.md) : sources publiques récupérées sur le réseau (même rang que le web). Les outils de
+# calcul local du pack (`unit_convert`, `math_calc`, `date_calc`, `holidays`) ne lisent rien d'extérieur : rang « outil ».
+ESSENTIALS_WEB_TOOLS = frozenset({"weather_ch", "pollen", "transit_departures", "transit_trip", "fx_rate",
+                                  "wiki_summary", "avalanche_bulletin",
+                                  # vague 2 (`essentials_v2`) : toutes des sources publiques récupérées sur le réseau
+                                  "weather_alerts_fr", "mobility_nearby", "charging_nearby", "water_status", "air_quality_fr",
+                                  "school_holidays"})
 DELEGATE_TOOLS = frozenset({"delegate", "delegate_status"})
 MEMORY_TOOLS = frozenset({"memory_search", "memory_get", "recall_context"})
 WORKSPACE_TOOLS = frozenset({"read_file", "search_files", "write_file", "patch", "terminal", "process_start",
@@ -94,7 +104,12 @@ _IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 _DOMAIN = re.compile(r"(?<![\w@.\-/])(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?![\w\-])")
 _PATH = re.compile(r"(?<![\w.~/:\-])(?:~/|/)[\w.\-]+(?:/[\w.\-]+)*/?")
 _TOKEN = re.compile(r"[a-z0-9]{3,}")
-_BLOCK = re.compile(r'<untrusted-data kind="([^"]*)" id="([^"]+)">\n?(.*?)\n?</untrusted-data id="\2">', re.DOTALL)
+_BLOCK = re.compile(r'<untrusted-data kind="([^"]*)" id="([^"]+)"(?: suspect="[^"]*")?>\n?(.*?)\n?</untrusted-data id="\2">',
+                    re.DOTALL)
+# Pièces jointes clôturées (r46 : fichier, dossier ; P9 : texte de l'appareil) : leur source, pas « web »
+_ATTACHED_KIND = {"attachment:file": ("pièce-jointe", "fichier"), "attachment:folder": ("espace-de-travail", "dossier joint"),
+                  "attachment:ocr": ("pièce-jointe", "texte reconnu"),
+                  "attachment:transcript": ("pièce-jointe", "transcription")}
 _FILE_BLOCK = re.compile(r"\[Fichier : [^\n]*\]\n(.*?)\n\[/Fichier\]", re.DOTALL)
 _DIR_BLOCK = re.compile(r"\[Dossier : [^\n]*\]\n(.*?)\n\[/Dossier\]", re.DOTALL)
 # Extensions de fichier courantes : `main.py` ou `notes.md` ne sont pas des hôtes.
@@ -271,7 +286,8 @@ class ProvenanceGuard:
         attached = str(getattr(turn, "attached", "") or "")
         if attached:
             for kind, _id, body in _BLOCK.findall(attached):
-                self._add(tid, "web", f"{SOURCES['web'][0]} (pièce jointe url, {at})", body)
+                src, what = _ATTACHED_KIND.get(kind, ("web", "pièce jointe url"))
+                self._add(tid, src, f"{SOURCES[src][0]} ({what}, {at})", body)
             rest = _BLOCK.sub(" ", attached)
             for body in _DIR_BLOCK.findall(rest):
                 self._add(tid, "espace-de-travail", f"{SOURCES['espace-de-travail'][0]} (dossier joint, {at})", body)
@@ -283,8 +299,10 @@ class ProvenanceGuard:
     def source_of(self, name: str, spec: Any, arguments: dict[str, Any]) -> str:
         if name in MAIL_TOOLS:
             return "mail"
-        if name in WEB_TOOLS or name.startswith("browser"):
+        if name in WEB_TOOLS or name in ESSENTIALS_WEB_TOOLS or name.startswith("browser"):
             return "web"
+        if name.startswith("sites_"):  # sites connectés (docs/CONNECTED-SITES.md §10.2) : écrit par des tiers
+            return "site"
         if name in DELEGATE_TOOLS:
             return "sous-agent"
         if name.startswith("calendar_"):
@@ -585,7 +603,42 @@ def _de(phrase: str) -> str:
     return "de " + phrase
 
 
+def _explain_lang(family: str, findings: list[Finding], mode: str, lang: str) -> str:
+    """Motif en en/de/it : la source est dite par `mt.SOURCE_FROM` (avec sa préposition), sans le détail de l'origine."""
+    def pk(table: dict[str, str]) -> str:
+        return mt.pick(table, lang)
+
+    def origins(segs: list[Segment]) -> str:
+        seen: list[str] = []
+        for sg in segs:
+            if sg.source not in seen:
+                seen.append(sg.source)
+        shown = [pk(mt.SOURCE_FROM.get(x, mt.SOURCE_FROM["outil"])) for x in seen[:2]]
+        return pk(mt.PROV_AND).join(shown) + (pk(mt.PROV_ORIGINS_MORE).format(n=len(seen) - 2) if len(seen) > 2 else "")
+
+    parts: list[str] = []
+    for f in findings[:MAX_FINDINGS]:
+        what = pk(mt.PROV_ATOMS.get(f.kind, mt.PROV_ATOMS["value"]))
+        if not f.origins:
+            parts.append(pk(mt.PROV_UNKNOWN).format(what=what, value=_clip(f.value), arg=_clip(f.arg, 40)))
+        elif f.kind == "url" and family == "fetch":
+            parts.append(pk(mt.PROV_FETCH).format(what=what, value=_clip(f.value), origins=origins(f.origins),
+                                                  extra=f.extra))
+        else:
+            parts.append(pk(mt.PROV_UNTRUSTED).format(what=what, value=_clip(f.value), arg=_clip(f.arg, 40),
+                                                      origins=origins(f.origins)))
+    if len(findings) > MAX_FINDINGS:
+        parts.append(pk(mt.PROV_MORE).format(n=len(findings) - MAX_FINDINGS))
+    unknown = all(not f.origins for f in findings)
+    subject = pk((mt.PROV_SUBJECT_STRICT if unknown else mt.PROV_SUBJECT)[family])
+    tail = pk(mt.PROV_TAIL_CARD) if mode == "carte" else pk(mt.PROV_TAIL_REFUSED)
+    return pk(mt.PROV_LINE).format(body=" ; ".join(parts), subject=subject, tail=tail)
+
+
 def explain(family: str, findings: list[Finding], mode: str) -> str:
+    lang = current_lang()
+    if lang != "fr":  # en/de/it : tables de `core/model_texts.py` ; le français garde sa grammaire (accords, élisions)
+        return _explain_lang(family, findings, mode, lang)
     parts: list[str] = []
     for f in findings[:MAX_FINDINGS]:
         what = ATOM_WORDS.get(f.kind, "la valeur")

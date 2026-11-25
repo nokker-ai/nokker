@@ -127,7 +127,7 @@ def test_declare_after_add_replaces_the_list(src, tmp_path):
     call(src, "mcp_server_add", name="tracker", url=URL, read_tools=["list_issues"])
     r, out = call(src, "mcp_server_read_tools", name="tracker", read_tools=["get_issue"])
     assert not r.is_error and out == {"server": "tracker", "read_tools": ["get_issue"], "confirmed_writes": [],
-                                      "active": "au prochain redémarrage du noyau"}
+                                      "active": "au prochain redémarrage de Nokker"}
     assert load_user_servers(tmp_path / "mcp-servers.yaml")[0]["read_tools"] == ["get_issue"]
     r, out = call(src, "mcp_server_read_tools", name="tracker", read_tools=[])
     assert not r.is_error and "read_tools" not in load_user_servers(tmp_path / "mcp-servers.yaml")[0]
@@ -273,3 +273,13 @@ def test_local_route_declares_reads_and_refuses_write_names(tmp_path):
     assert api.handle("PUT", "/v1/local/mcp-servers/nope/read-tools", auth, {"read_tools": []})[0] == 404
     assert api.handle("PUT", "/v1/local/mcp-servers/tracker/read-tools", auth, {"read_tools": "x"})[0] == 400
     assert api.handle("PUT", "/v1/local/mcp-servers/tracker/read-tools", "Bearer faux", {"read_tools": []})[0] == 401
+
+
+def test_description_cap_of_a_config_server_reaches_its_source():
+    from nokker.api import server
+    from nokker.config import NokkerConfig
+
+    cfg = NokkerConfig(mcp_tool_servers=[{"name": "a", "url": URL, "description_max_chars": 1500},
+                                         {"name": "b", "url": URL}])
+    caps = [s.inner.description_max_chars for s in server.mcp_tool_sources(cfg, EffectsTable(), None)]
+    assert caps == [1500, 4000]

@@ -119,7 +119,7 @@ def test_budget_max_calls_stops_the_run_cleanly(tmp_path):
     assert w.model.calls == 3
     assert run.status == "failed" and "budget atteint (3 appels modèle sur 3)" in run.summary
     turn = w.kernel.store.history(run.thread_id)[0]
-    assert turn.error == "stopped" and turn.reply.startswith("Arrêté par le noyau : budget atteint")
+    assert turn.error == "stopped" and turn.reply.startswith("Je m'arrête : budget atteint")
 
 
 def test_budget_max_cost_in_eur(tmp_path):

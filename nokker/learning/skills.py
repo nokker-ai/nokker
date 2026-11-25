@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, ToolResult, Turn, Verdict
 from nokker.learning.store import NAME_RE, JournalEntry, LearningConflict, SkillVersion
@@ -396,13 +397,13 @@ class LearningToolSource:
             if name == "skill_view" and self.catalog:
                 v = svc.current(account, str(a.get("name") or "").strip())
                 if v is None or not v.active:
-                    return out(f"compétence introuvable : {a.get('name')!r} (skill_list pour voir les noms)", True)
+                    return out(mt.pick(mt.SKILL_NOT_FOUND).format(name=repr(a.get("name"))), True)
                 return out(svc.skill_json(v))
         except LearningError as e:
-            return out(f"refusé : {e.message}", True)
+            return out(mt.pick(mt.TOOL_REFUSED).format(error=e.message), True)
         except (TypeError, ValueError) as e:
             return out(f"arguments invalides : {e}", True)
-        return out(f"outil inconnu : {name}", True)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
 
 @dataclass

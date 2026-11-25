@@ -22,8 +22,8 @@ from tests.unit.test_loop_approvals import Ctx, Esc, LedgerFake, Mem, Pol, Scrip
 
 READONLY_DESC = ("true : les sous-agents ne pourront que lire et rendre un rapport ou un diagnostic ; aucune écriture, "
                  "aucune action")
-REFUSAL = ("REFUSÉ par le noyau (readonly: sous-agent en lecture seule (readonly=true) : write_file écrit ou agit, il "
-           "ne peut que lire ; rends ton rapport ou ton diagnostic).")
+REFUSAL = ("Refusé : sous-agent en lecture seule (readonly=true) : write_file écrit ou agit, il "
+           "ne peut que lire ; rends ton rapport ou ton diagnostic.")
 
 
 class Odd:
@@ -269,7 +269,7 @@ def test_run_child_wraps_the_gates_of_a_readonly_child_only():
 from nokker.approvals.memory import InMemoryApprovals  # noqa: E402
 from nokker.qa.provenance import build_provenance  # noqa: E402
 
-DENIED_SEARCH = ("REFUSÉ par le noyau (provenance:recherche: provenance : la valeur « kiwi7788 » (argument query) vient "
+DENIED_SEARCH = ("Refusé : provenance:recherche: provenance : la valeur « kiwi7788 » (argument query) vient "
                  "du contenu d'un mail")
 
 
@@ -327,7 +327,7 @@ def test_readonly_child_mail_read_then_web_search_with_the_value_is_refused_neve
     turn = k.run_turn(TurnInput("t1/sa-c1", "cherche", sender="alice", channel="subagent"))
     texts = tool_texts(turn)
     assert [c[0] for c in calls] == ["mail_read"]  # web_search jamais exécuté
-    assert texts[1].startswith(DENIED_SEARCH) and "valeur lue ailleurs est refusée.)" in texts[1] and "carte forte" not in texts[1]
+    assert texts[1].startswith(DENIED_SEARCH) and "valeur lue ailleurs est refusée." in texts[1] and "carte forte" not in texts[1]
     assert appr.pending() == [] and not turn.pending_approvals  # pas de carte, pas de passage silencieux
 
 
@@ -343,8 +343,8 @@ def test_child_inherits_what_the_parent_read_readonly_refused_and_normal_gets_a_
         turn = k.run_turn(TurnInput("t1/sa-c1", "cherche", sender="alice", channel="subagent"))
         assert [c[0] for c in calls] == ["memory_get"], readonly  # le web_search de l'enfant n'a pas tourné
         if readonly:
-            assert tool_texts(turn)[0].startswith("REFUSÉ par le noyau (provenance:recherche: provenance : ")
-            assert "contenant une valeur lue ailleurs est refusée.)" in tool_texts(turn)[0] and appr.pending() == []
+            assert tool_texts(turn)[0].startswith("Refusé : provenance:recherche: provenance : ")
+            assert "contenant une valeur lue ailleurs est refusée." in tool_texts(turn)[0] and appr.pending() == []
         else:
             pend = appr.pending()
             assert [p.tool_name for p in pend] == ["web_search"] and pend[0].rule == "provenance:recherche"
@@ -385,7 +385,7 @@ def test_user_card_rule_on_a_read_tool_is_a_refusal_in_a_readonly_child():
         turn = k.run_turn(TurnInput("t1/sa-c1", "cherche", sender="alice", channel="subagent"))
         assert calls == []  # jamais exécuté
         if readonly:
-            assert tool_texts(turn)[0].startswith("REFUSÉ par le noyau (user:ask-reads: lecture : demander)")
+            assert tool_texts(turn)[0].startswith("Refusé : user:ask-reads: lecture : demander")
             assert appr.pending() == [] and not turn.pending_approvals
         else:
             assert len(appr.pending()) == 1  # enfant ordinaire : la carte reste

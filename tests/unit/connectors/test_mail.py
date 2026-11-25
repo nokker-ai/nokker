@@ -1,3 +1,4 @@
+import datetime
 import email
 import email.policy
 import json
@@ -8,6 +9,7 @@ import pytest
 
 from nokker.connectors import imap_utf7
 from nokker.connectors.errors import ConnectorError
+from nokker.connectors.net import IMPLICIT_TLS
 from nokker.connectors.mail import (
     MailConnector, _PinnedIMAP, _PinnedSMTP, normalize_settings, translate_query,
 )
@@ -151,12 +153,92 @@ def test_normalize_presets_and_validation():
             normalize_settings(bad)
 
 
+def test_presets_table_help_and_endpoints():
+    from nokker.connectors.mail import PRESET_HELP, PRESETS
+    from nokker.connectors.net import check_endpoint
+
+    assert set(PRESET_HELP) == set(PRESETS)
+    assert {"hotmail", "office365", "proton", "tuta"}.isdisjoint(PRESETS)  # Bridge / pas d'IMAP
+    assert PRESETS["outlook"]["auth"] == "oauth"  # Outlook : connexion Microsoft seulement (XOAUTH2)
+    for name, p in PRESETS.items():
+        assert PRESET_HELP[name]["fr"] and PRESET_HELP[name]["en"] and "\n" not in PRESET_HELP[name]["fr"]
+        n = normalize_settings({"preset": name, "address": "a.b@example.org"})
+        public = lambda *a, **k: [(2, 1, 6, "", ("93.184.215.14", 0))]  # noqa: E731 — IP publique factice
+        for proto in ("imap", "smtp"):
+            hop = check_endpoint(n[f"{proto}_host"], n[f"{proto}_port"], proto, resolver=public)
+            assert hop.hostname == p[f"{proto}_host"] or name == "zoho"
+    assert PRESETS["icloud"]["smtp_port"] == 587 and ("smtp", 587) not in IMPLICIT_TLS  # STARTTLS
+    assert PRESETS["gmx"]["smtp_port"] == 587 and PRESETS["web_de"]["smtp_port"] == 587
+
+
+def test_preset_specials_icloud_zoho_bluewin():
+    ic = normalize_settings({"preset": "icloud", "address": "jo.apple@icloud.com"})
+    assert ic["imap_username"] == "jo.apple" and ic["username"] == "jo.apple@icloud.com"  # IMAP : partie locale
+    assert "imap_username" not in normalize_settings({"preset": "icloud", "address": "jo@icloud.com", "username": "x"})
+    z = normalize_settings({"preset": "zoho", "address": "a@example.org"})
+    assert (z["imap_host"], z["smtp_host"], z["region"]) == ("imap.zoho.eu", "smtp.zoho.eu", "eu")
+    z = normalize_settings({"preset": "zoho", "address": "a@example.org", "region": "com"})
+    assert (z["imap_host"], z["smtp_host"]) == ("imap.zoho.com", "smtp.zoho.com")
+    with pytest.raises(ConnectorError):
+        normalize_settings({"preset": "zoho", "address": "a@example.org", "region": "evil.example"})
+    assert normalize_settings({"preset": "bluewin", "address": "a@bluewin.ch"})["smtp_auth"] == "plain"
+
+
 def test_translate_query():
     crit, notes = translate_query('from:alice subject:"rapport mensuel" is:unread after:2026/10/01 -spam facture has:attachment')
     assert crit == ["FROM", '"alice"', "SUBJECT", '"rapport mensuel"', "UNSEEN", "SINCE", "01-Oct-2026",
-                    "NOT", "TEXT", '"spam"', "TEXT", '"facture"']
-    assert len(notes) == 1
+                    "NOT", "TEXT", '"spam"', "TEXT", '"facture"', "HEADER", "Content-Type", '"multipart/mixed"']
+    assert len(notes) == 1 and "approxim" in notes[0]
     assert translate_query("") == ([], [])
+
+
+_NOW = datetime.datetime(2026, 11, 15, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+@pytest.mark.parametrize("q,exp", [
+    ("larger:10", ["LARGER", "10"]),
+    ("larger:10k", ["LARGER", "10240"]),
+    ("smaller:5M", ["SMALLER", str(5 * 1024**2)]),
+    ("older_than:3d", ["BEFORE", "12-Nov-2026"]),
+    ("newer_than:2m", ["SINCE", "16-Sep-2026"]),
+    ("newer_than:1y", ["SINCE", "15-Nov-2025"]),
+    ("since:2026/10/01", ["SINCE", "01-Oct-2026"]),
+    ("after:2026-10-01", ["SINCE", "01-Oct-2026"]),
+    ("before:2026/10/01", ["BEFORE", "01-Oct-2026"]),
+    ("cc:bob", ["CC", '"bob"']),
+    ("-from:x", ["NOT", "FROM", '"x"']),
+    ("-larger:1k", ["NOT", "LARGER", "1024"]),
+    ("has:attachment", ["HEADER", "Content-Type", '"multipart/mixed"']),
+    ("-has:attachment", ["NOT", "HEADER", "Content-Type", '"multipart/mixed"']),
+])
+def test_translate_query_criteria(q, exp):
+    crit, _ = translate_query(q, now=_NOW)
+    assert crit == exp
+
+
+def test_translate_query_combination():
+    crit, notes = translate_query("from:a smaller:2m older_than:1d is:unread", now=_NOW)
+    assert crit == ["FROM", '"a"', "SMALLER", "2097152", "BEFORE", "14-Nov-2026", "UNSEEN"]
+    assert notes == []
+
+
+@pytest.mark.parametrize("q", ["in:inbox", "label:work", "category:promotions", "has:drive", "larger:abc",
+                               "older_than:3w", "after:demain"])
+def test_translate_query_ignored_gets_note(q):
+    crit, notes = translate_query(q, now=_NOW)
+    assert crit == [] and len(notes) == 1 and "ignoré" in notes[0]
+
+
+def test_translate_query_no_injection():
+    # le tokenizer coupe au guillemet ; « OR »/« ALL » deviennent des mots libres TEXT entre guillemets, jamais des mots-clés IMAP
+    crit, _ = translate_query('from:"x\\" OR ALL" subject:y', now=_NOW)
+    assert crit[:2] == ["FROM", '"x\\\\"']  # le \ final est échappé, le guillemet fermant reste le nôtre
+    assert [c for c in crit if not c.startswith('"')] == ["FROM", "TEXT", "TEXT", "SUBJECT"]
+    assert "OR" not in crit and "ALL" not in crit
+    # CR/LF/NUL : refusé net, jamais envoyé au serveur
+    for bad in ("from:\"a\rb\"", "subject:\"a\nb\"", "from:\"a\x00b\""):
+        with pytest.raises(ConnectorError):
+            translate_query(bad, now=_NOW)
 
 
 def test_search_returns_newest_first_with_ids_snippet_unread():
@@ -407,3 +489,20 @@ def test_pinned_smtp_sends_a_message():
     m.send_message(msg)
     m.quit()
     assert any(b"Subject: Hi" in line for line in got)
+
+
+def test_frozen_notes_fingerprint_and_safe_value():
+    """Textes gelés par la relecture des textes (15.11.2026) : toute dérive repasse par la relecture ; {val} vient du modèle."""
+    import hashlib
+
+    from nokker.connectors import mail as M
+
+    def fp(s: str) -> str:
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+    assert fp(M._IGNORED_NOTE) == "9aa9cfe9e192d8c1"
+    assert fp(M._ATT_NOTE) == "b588ba76d6304b76"
+    assert M._safe_note_part("a«b»\nc") == "ab c"
+    assert len(M._safe_note_part("x" * 100)) == 40 and M._safe_note_part("x" * 100).endswith("…")
+    _crit, notes = M.translate_query('label:"va«l»\nx"')
+    assert notes and "«l»" not in notes[0].split("label:", 1)[1] and "\n" not in notes[0]

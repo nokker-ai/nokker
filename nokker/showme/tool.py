@@ -19,6 +19,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.payments.detect import refs_of
@@ -102,7 +103,7 @@ class ShowMeSource:
     # ── appel ──
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if name != T.POINT_TOOL:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         args = arguments or {}
         caption = self._clean(args.get("caption") or "", CAPTION_MAX).strip()
         if not caption:

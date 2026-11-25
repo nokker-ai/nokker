@@ -91,8 +91,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.approvals.rule_labels import current_lang, norm_lang
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
+from nokker.core.refusal import refused_text
 from nokker.core.turn import Effect, ToolResult, TurnInput
+from nokker.tools import router_rules
 
 logger = logging.getLogger("nokker.tools.delegate")
 
@@ -142,9 +146,115 @@ _TIER_PARAM = {"type": "string", "enum": list(TIERS),
 _READONLY_PARAM = {"type": "boolean", "default": False,
                    "description": "true : les sous-agents ne pourront que lire et rendre un rapport ou un diagnostic ; "
                                   "aucune écriture, aucune action"}
-READONLY_REFUSED = ("sous-agent en lecture seule (readonly=true) : {name} écrit ou agit, il ne peut que lire ; rends "
-                    "ton rapport ou ton diagnostic")
+READONLY_REFUSED = mt.DELEGATE_READONLY["fr"]  # figés ; langue du tour : `model_texts`
 READONLY_RULE = "readonly"
+# Description de `delegate` en conversation avec paliers (pas de session de code) : sans git ni worktree.
+CONV_DESCRIPTION = ("Confie un travail à un sous-agent et attends son compte rendu : tier ship pour une exécution technique "
+                    "bornée (code, build, opérations), tier deep pour une conception ou un diagnostic difficile. Tu "
+                    "restes la voix : transmets le compte rendu fidèlement, sans rien ajouter.")
+
+
+# Paliers choisis par l'hôte (`delegate_tiers`) : textes vus par le modèle, NOUVEAUX (à valider en relecture). Absents tant que
+# `delegate_tiers` est vide : les textes ci-dessus restent ceux d'avant.
+CONV_DESCRIPTION_NAMED = ("Confie un travail à un sous-agent et attends son compte rendu : choisis le palier qui convient "
+                          "à la nature du travail (ne le nomme pas à la personne). Tu restes la voix : transmets le "
+                          "compte rendu fidèlement, sans rien ajouter.")
+TIER_INVALID_NAMED = mt.DELEGATE_TIER_INVALID_NAMED["fr"]
+
+
+def tier_param(names: list[str], descriptions: dict[str, str] | None = None) -> dict[str, Any]:
+    """Paramètre `tier` de `delegate` avec les paliers choisis par l'hôte : l'enum, et une description qui les cite, chacun
+    suivi de sa description entre parenthèses quand l'hôte en a fourni une (sans description : le nom seul)."""
+    descriptions = descriptions or {}
+    cited = ", ".join(f"{n} ({descriptions[n]})" if descriptions.get(n) else n for n in names)
+    return {"type": "string", "enum": list(names),
+            "description": "palier du modèle des sous-agents : " + cited
+                           + " ; choisis celui qui convient à la tâche ; absent : le palier habituel"}
+
+
+# ── Routeur (drapeau `delegate_router`, défaut éteint, harnais du 70B) ──
+# La voix (profondeur 0) confie et attend, sans choisir qui travaille ; le noyau lance UN enfant « routeur » (son propre
+# modèle, `delegate_router_settings.model`) qui choisit ship, deep ou les deux, attend, et rend UN compte rendu.
+# Profondeur : voix → routeur → ship/deep (ce chemin seulement). Textes vus par le modèle, NOUVEAUX (à valider).
+ROUTER_VOICE_DESCRIPTION = ("Confie un travail à l'équipe technique et attends son compte rendu : décris le but et le "
+                            "contexte utile ; elle choisit qui travaille et comment. Avant l'appel, dis en une "
+                            "phrase à la personne ce que tu confies et que tu attends la réponse ; ne conclus rien "
+                            "avant le compte rendu. Tu restes la voix : transmets-le fidèlement, sans rien ajouter, en "
+                            "précisant que c'est l'équipe technique qui répond.")
+# Consigne du routeur, v2 (04.11, correctif du banc d'orchestration B : orchestration juste 8/24). NOUVEAU TEXTE, À FAIRE
+# VALIDER EN RELECTURE MOT POUR MOT avant la prod. Le noyau tranche lui-même la lecture seule (`router_rules.actions`) et
+# le plancher deep (`router_rules.deep_markers`) ; le routeur ne choisit plus que ship ou deep (et le découpage).
+ROUTER_PROMPT = ("Tu es le routeur : tu ne réponds pas toi-même à la demande ci-dessous, tu la confies avec "
+                 "delegate : un appel par palier nécessaire (un seul si un palier suffit). Pour chaque appel, "
+                 "choisis le palier (tier) : ship pour relever, chercher, lister, trier ou comparer des faits, "
+                 "ou pour exécuter une action précise ; deep dès qu'il faut juger, recommander, diagnostiquer "
+                 "une cause, repérer ce qui manque ou concevoir une organisation, même si la demande commence "
+                 "par une recherche. S'il y a un message de la personne, lis-le : c'est lui qui dit ce qu'elle "
+                 "veut ; la demande de la voix n'en est qu'un résumé. Écris chaque but complet, avec ce que la "
+                 "personne a demandé de faire ou de juger. L'équipe n'envoie aucun message : si la demande en "
+                 "exige un, fais préparer le texte et dis dans le compte rendu qu'il reste à l'envoyer. Attends"
+                 " les comptes rendus des sous-agents, puis rends UN seul compte rendu, fidèle et complet : "
+                 "chiffres, noms et sources tels qu'ils ont été rapportés, ce qui n'a pas été trouvé ou pas "
+                 "fait, et ce qui reste à décider ; sans rien inventer ni ajouter. Tu ne parles pas à la "
+                 "personne : s'il manque une information, dis-le dans le compte rendu.")
+# En-têtes du message du routeur (NOUVEAUX, à faire valider en relecture) : le message de la personne, puis les tâches.
+ROUTER_REQUEST_HEADER = "Message de la personne :"
+ROUTER_TASKS_HEADER = "Demande de la voix :"
+ROUTER_REQUEST_MAX = 2000  # caractères du message de la personne recopiés chez le routeur
+# `delegate` du ROUTEUR (NOUVEAUX textes, à faire valider en relecture) : tier obligatoire, raison courte (traces).
+_ROUTER_TIER_PARAM = {"type": "string", "enum": list(TIERS),
+                      "description": "ship : relever, chercher, lister, trier, comparer des faits, exécuter une action "
+                                     "précise ; deep : juger, recommander, diagnostiquer, repérer ce qui manque, "
+                                     "concevoir"}
+_ROUTER_REASON_PARAM = {"type": "string", "description": "en une phrase courte : pourquoi ce palier"}
+_ROUTER_TASK_ITEM = {"type": "object", "required": ["goal"], "properties": {
+    "goal": _SPECS_PARAMS["properties"]["tasks"]["items"]["properties"]["goal"],
+    "context": _SPECS_PARAMS["properties"]["tasks"]["items"]["properties"]["context"]}}
+# Qui a répondu, dans `routed` (texte vu par la voix, validé en relecture le 03.11) ; le modèle reste aux traces.
+ROUTER_ROLES = {"ship": "exécution technique", "deep": "analyse approfondie"}
+# Reprise après une carte d'un enfant de ROUTEUR, notée dans le fil de la voix (validé en relecture le 03.11) ; ailleurs,
+# le gabarit d'avant (`[sous-agent {id}] repris après la carte : …`), inchangé.
+ROUTER_RESUMED_NOTE = "[sous-agent {id} — {role}] repris après la carte : {status}, {exit_reason} — {summary}"
+ROUTER_MODEL = "qwen/qwen3.5-397b-a17b"
+TRACE_ONLY = ("model", "readonly", "rule")  # champs de `routed` gardés au journal, retirés du résultat rendu à la voix
+ROUTER_DEPTH = 2  # voix (0) → routeur (1) → ship/deep (2) ; ship/deep ne délèguent pas
+# Fournisseur du modèle du routeur, posé par `build_kernel` drapeau allumé ; None = drapeau éteint (rien ne change).
+ROUTER: dict[str, Any] = {"provider": None}
+
+
+def router_on() -> bool:
+    return ROUTER.get("provider") is not None
+
+
+def person_request(ctx: ToolContext) -> str:
+    """Le message de la personne du tour en cours (caviardé par les invariants d'entrée), vide hors tour ou pour la
+    suite d'une carte (`origin` posé par le noyau : ce n'est pas un texte de la personne)."""
+    inp = getattr(getattr(ctx, "turn", None), "input", None)
+    if inp is None or getattr(inp, "origin", ""):
+        return ""
+    return str(getattr(inp, "text", "") or "")
+
+
+def voice_delegate_spec(effect_of: Any = None) -> ToolSpec:
+    """Le `delegate` de la voix quand le routeur est allumé : tâches seulement, bloquant."""
+    return ToolSpec(name="delegate", core=False, source=SOURCE, effect=Effect.WRITE, effect_of=effect_of,
+                    description=ROUTER_VOICE_DESCRIPTION, parameters=_VOICE_PARAMS)
+
+
+def voice_thread() -> bool:
+    """Fil courant de profondeur 0 (la voix), ou hors tour."""
+    from nokker.tools.scope import current_thread
+
+    return (current_thread() or "").count("/sa-") == 0
+
+
+_VOICE_PARAMS: dict[str, Any] = {
+    "type": "object", "required": ["tasks"], "properties": {
+        "tasks": {"type": "array", "minItems": 1, "maxItems": MAX_TASKS, "items": {
+            "type": "object", "required": ["goal"], "properties": {
+                "goal": _SPECS_PARAMS["properties"]["tasks"]["items"]["properties"]["goal"],
+                "context": _SPECS_PARAMS["properties"]["tasks"]["items"]["properties"]["context"],
+                "output_schema": _SPECS_PARAMS["properties"]["tasks"]["items"]["properties"]["output_schema"]}}}}}
 
 
 def read_only_ok(spec: Any, arguments: dict[str, Any] | None = None) -> bool:
@@ -161,7 +271,7 @@ def read_only_ok(spec: Any, arguments: dict[str, Any] | None = None) -> bool:
 
 
 def readonly_refusal(name: str) -> str:
-    return f"REFUSÉ par le noyau ({READONLY_RULE}: {READONLY_REFUSED.format(name=name)})."
+    return refused_text(mt.pick(mt.DELEGATE_READONLY).format(name=name))
 
 
 class _ReadonlyProvenance:
@@ -203,7 +313,7 @@ class _ReadonlyGates:
             from nokker.core.turn import Decision, Gate, Verdict
 
             return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule=READONLY_RULE,
-                            reason=READONLY_REFUSED.format(name=call.name), subject=call.id)]
+                            reason=mt.pick(mt.DELEGATE_READONLY).format(name=call.name), subject=call.id)]
         from nokker.core.turn import Decision
 
         # Aucune carte depuis un enfant en lecture seule : toute décision HITL des portes (règles de l'utilisateur,
@@ -213,16 +323,11 @@ class _ReadonlyGates:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
-TIER_INVALID = "tier : ship ou deep attendu"
-TIER_NOT_SERVED = "tier={tier} refusé : ce palier n'est pas servi ici ; relance sans tier ou avec l'autre palier"
-TIER_NO_DEEP = ("tier=deep refusé : ton compte n'a pas (ou plus) droit au palier deep ; relance sans tier ou avec "
-                "tier=ship")
-FORK_NOTE = ("[Sous-agent fork] Tu es un sous-agent lancé depuis la conversation ci-dessus : tu en as tout le contexte. "
-             "Ne poursuis pas le tour de l'agent principal : fais seulement la tâche ci-dessous, puis réponds par un "
-             "résumé de ce que tu as fait et trouvé ; ce résumé revient à l'agent principal. Tu ne peux ni déléguer, ni "
-             "poser de question à l'utilisateur, ni envoyer de message.\n[/Sous-agent]\n\nTâche : ")
-FORK_UNAVAILABLE = ("fork indisponible : le contexte de ce tour n'est pas disponible ici. Relance sans fork, avec un but "
-                    "complet et autonome.")
+TIER_INVALID = mt.DELEGATE_TIER_INVALID["fr"]
+TIER_NOT_SERVED = mt.DELEGATE_TIER_NOT_SERVED["fr"]
+TIER_NO_DEEP = mt.DELEGATE_TIER_NO_DEEP["fr"]
+FORK_NOTE = mt.DELEGATE_FORK_NOTE["fr"]  # figé ; langue du tour : `model_texts`
+FORK_UNAVAILABLE = mt.DELEGATE_FORK_UNAVAILABLE["fr"]
 _STATUS_PARAMS: dict[str, Any] = {"type": "object", "properties": {
     "ids": {"type": "array", "items": {"type": "string"}, "description": "child_id à lire (défaut : tous)"},
     "wait_s": {"type": "number", "minimum": 0, "maximum": MAX_STATUS_WAIT_S,
@@ -248,28 +353,41 @@ def coerce_schema(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
     m = _schema_module()
     if m is not None:
         try:
-            return m.coerce_output_schema(raw)
+            schema, err = m.coerce_output_schema(raw)
         except Exception:  # noqa: BLE001
             pass
+        else:  # la validation est celle de la brique ; ses messages anglais sont remplacés par nos textes
+            return schema, (_local_schema_error(raw, err) if err else None)
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except ValueError:
-            return None, "output_schema n'est pas un JSON valide"
+            return None, mt.pick(mt.DELEGATE_SCHEMA_NOT_JSON)
     if not isinstance(raw, dict):
-        return None, "output_schema doit être un objet JSON Schema"
+        return None, mt.pick(mt.DELEGATE_SCHEMA_NOT_OBJECT)
     return raw, None
 
 
+def _local_schema_error(raw: Any, err: str) -> str:
+    """Message de la brique amont (anglais) → notre texte dans la langue du tour, même sens."""
+    if "non-JSON string" in err:
+        return mt.pick(mt.DELEGATE_SCHEMA_NOT_JSON)
+    if err.startswith("output_schema must be a JSON Schema object"):
+        return mt.pick(mt.DELEGATE_SCHEMA_NOT_OBJECT)
+    path = "$"
+    try:  # chemin du champ fautif, relu par la bibliothèque de validation elle-même
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+        schema = json.loads(raw) if isinstance(raw, str) else raw
+        validator_for(schema).check_schema(schema)
+    except Exception as exc:  # noqa: BLE001
+        parts = list(getattr(exc, "absolute_path", None) or [])
+        path += "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
+    return mt.pick(mt.DELEGATE_SCHEMA_INVALID).format(path=path)
+
+
 def append_contract(context: str, schema: dict[str, Any]) -> str:
-    m = _schema_module()
-    if m is not None:
-        try:
-            return m.append_output_contract(context, schema)
-        except Exception:  # noqa: BLE001
-            pass
-    block = ("[Contrat de sortie] Ta réponse finale doit être UN objet JSON conforme à ce schéma, sans autre texte :\n"
-             + json.dumps(schema, ensure_ascii=False))
+    """Toujours NOTRE bloc, dans la langue du tour (la brique amont écrit le sien en anglais)."""
+    block = mt.pick(mt.DELEGATE_OUTPUT_CONTRACT) + json.dumps(schema, ensure_ascii=False)
     return f"{context}\n\n{block}" if context else block
 
 
@@ -309,32 +427,40 @@ def _check(value: Any, schema: dict[str, Any], path: str, errors: list[str]) -> 
             _check(item, schema["items"], f"{path}[{i}]", errors)
 
 
-def validate_reply(text: str, schema: dict[str, Any]) -> tuple[bool, list[str]]:
+def _local_reply_errors(errors: list[Any], lang: str | None) -> list[str]:
+    """Erreurs de validation de la brique (anglais) → nos textes ; le chemin du champ fautif est gardé entre guillemets."""
+    out = []
+    for e in errors:
+        e = str(e)
+        if e.startswith("Response was empty"):
+            out.append(mt.pick(mt.DELEGATE_REPLY_EMPTY, lang))
+        elif e.startswith("Response is not valid JSON"):
+            out.append(mt.pick(mt.DELEGATE_REPLY_NOT_JSON, lang))
+        else:
+            m = re.match(r"(\$[^:]*): ", e)
+            out.append(mt.pick(mt.DELEGATE_REPLY_FIELD_INVALID, lang).format(path=m.group(1) if m else "$"))
+    return out
+
+
+def validate_reply(text: str, schema: dict[str, Any], lang: str | None = None) -> tuple[bool, list[str]]:
     m = _schema_module()
     if m is not None:
         try:
             ok, errors = m.validate_output(text, schema)
-            return bool(ok), [str(e) for e in errors]
+            return bool(ok), _local_reply_errors(list(errors), lang)
         except Exception:  # noqa: BLE001
             pass
     try:
         value = json.loads(_json_candidate(text))
     except ValueError:
-        return False, ["la réponse n'est pas un JSON valide"]
+        return False, [mt.pick(mt.DELEGATE_REPLY_NOT_JSON, lang)]
     errors: list[str] = []
     _check(value, schema, "", errors)
     return not errors, errors
 
 
-def retry_message(errors: list[str]) -> str:
-    m = _schema_module()
-    if m is not None:
-        try:
-            return m.build_retry_message(errors)
-        except Exception:  # noqa: BLE001
-            pass
-    return ("Ta réponse finale a été refusée par le contrat de sortie : " + " ; ".join(errors[:10])
-            + ". Réponds de nouveau par UN objet JSON conforme au schéma, sans autre texte.")
+def retry_message(errors: list[str], lang: str | None = None) -> str:
+    return mt.pick(mt.DELEGATE_RETRY, lang).format(errors=" ; ".join(errors[:10]))
 
 
 # ─────────────────────────────── git dans le bac à sable ───────────────────────────────
@@ -437,8 +563,7 @@ def finalize_worktree(run: Run, info: dict[str, Any], prune: bool = True) -> dic
         failed.append("dirty")
     if failed:
         payload["inspection_failed"] = True
-        payload["note"] = (f"inspection git en échec ({', '.join(failed)} inconnus, non prouvés nuls) : worktree et "
-                           f"branche conservés, à relire avant de conclure que l'enfant n'a rien fait.")
+        payload["note"] = mt.pick(mt.DELEGATE_INSPECTION_FAILED).format(failed=", ".join(failed))
         return payload
     if prune and payload["commits"] == 0 and not payload["dirty"]:
         rc, _ = run(_git(repo, "worktree", "remove", "--force", path))
@@ -452,11 +577,7 @@ def finalize_worktree(run: Run, info: dict[str, Any], prune: bool = True) -> dic
 
 
 def worktree_context_note(info: dict[str, Any]) -> str:
-    return ("\n\n[ISOLATION WORKTREE] Tu travailles dans un worktree git isolé : "
-            f"{info['path']}\nTa branche : {info['branch']}\n"
-            "Toutes tes modifications et commandes restent dans ce dossier (ton terminal y démarre). Ne va PAS dans le "
-            "dépôt principal. Commite ton travail sur ta branche quand tu as fini ; le parent relira et fusionnera. "
-            "Si tu ne commites rien et laisses l'arbre propre, le worktree est supprimé automatiquement.")
+    return mt.pick(mt.DELEGATE_WORKTREE_NOTE).format(path=info["path"], branch=info["branch"])
 
 
 # ─────────────────────────────── enfants ───────────────────────────────
@@ -476,6 +597,7 @@ class _Child:
     parent_thread_id: str = ""
     code: Any = None  # source de code du fil parent (résolue par for_thread)
     cancelled: bool = False
+    lang: str | None = field(default_factory=lambda: norm_lang(current_lang()))  # langue du tour du parent
     done: threading.Event = field(default_factory=threading.Event)
     result: dict[str, Any] = field(default_factory=dict)
     tokens: int = 0
@@ -496,6 +618,12 @@ class _Child:
     registry: Any = None  # registre du parent résolu à l'appel (`bind` d'une fonction : multi-locataire)
     tier: str = ""  # palier imposé par `delegate(tier=…)` ; vide = politique habituelle
     readonly: bool = False  # `delegate(readonly=true)` : le noyau ne laisse passer que les outils READ
+    router: bool = False  # enfant « routeur » (`delegate_router`) : lecture + delegate (tier, readonly) seulement
+    # Enfant d'un routeur : le fil de la VOIX (racine), où sa reprise après une carte est notée — le tour du routeur
+    # est fini, il n'est jamais relancé. Vide : la note va au parent, comme avant.
+    voice_thread: str = ""
+    rule: str = ""  # enfant d'un routeur : règle du noyau qui a fixé son palier et sa lecture seule (traces)
+    model: str = ""  # modèle réel du dernier appel (traces du routeur)
     fork_base: Any = None  # fork : contexte du dernier appel du parent (`Kernel.fork_base`), None = fenêtre neuve
 
     def touch(self) -> None:
@@ -511,13 +639,13 @@ class _Child:
         if self.elapsed_final is None:
             self.elapsed_final = self.elapsed()
 
-    def cancel(self, reason: str = "cancelled", summary: str = "annulé à la demande : le sous-agent a été arrêté")\
-            -> bool:
+    def cancel(self, reason: str = "cancelled", summary: str = "") -> bool:
         """Arrête l'enfant (une fois) : résultat `interrupted`, outils muets, noyau prévenu. False s'il avait fini."""
+        summary = summary or mt.pick(mt.DELEGATE_CANCELLED)
         if self.parked and not self.cancelled:  # en attente d'une carte : il ne la reprendra pas
             self.cancelled = True
             self.result = {"status": "interrupted", "exit_reason": reason,
-                           "summary": summary + " (sa carte en attente ne sera pas exécutée)"}
+                           "summary": summary + mt.pick(mt.DELEGATE_CANCELLED_PARKED)}
             if self.final is not None:
                 self.final = {**self.final, **self.result}
             self.freeze()
@@ -594,22 +722,28 @@ class _ChildSource:
     def __init__(self, inner: Any, child: _Child, denied: tuple[str, ...]) -> None:
         self._inner, self._child, self._denied = inner, child, denied
 
+    @property
+    def inner(self) -> Any:
+        """La source du parent, sous l'enveloppe (comme les autres enveloppes de source) : le registre de l'enfant reconnaît ainsi
+        ses serveurs MCP (`mcp_required` : sondage du fils, serveur écarté pour le tour) même quand leurs outils sont retirés."""
+        return self._inner
+
     def _is_denied(self, name: str) -> bool:
         return any(fnmatch.fnmatchcase(name, p) for p in self._denied)
 
     def specs(self) -> list[ToolSpec]:
-        return [s for s in self._inner.specs()
-                if not self._is_denied(s.name) and (not self._child.readonly or read_only_ok(s))]
+        ro = self._child.readonly or self._child.router  # le routeur lit ; il fait faire par delegate
+        return [s for s in self._inner.specs() if not self._is_denied(s.name) and (not ro or read_only_ok(s))]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if self._child.cancelled:
-            why = ("a été annulé" if self._child.result.get("exit_reason") == "cancelled"
-                   else "a dépassé son délai d'inactivité")
-            return ToolResult(call_id="", name=name, content=f"INTERROMPU : le sous-agent {why}, aucun outil n'est "
-                              "plus exécuté.", is_error=True)
+            why = (mt.pick(mt.DELEGATE_CANCELLED) if self._child.result.get("exit_reason") == "cancelled"
+                   else mt.pick(mt.DELEGATE_IDLE))
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.DELEGATE_INTERRUPTED).format(why=why),
+                              is_error=True)
         if self._is_denied(name):
             return ToolResult(call_id="", name=name, content=f"outil interdit à un sous-agent : {name}", is_error=True)
-        if self._child.readonly:  # le noyau, pas le prompt : tout chemin (boucle, execute_code, appel direct) passe ici
+        if self._child.readonly or self._child.router:  # le noyau, pas le prompt : tout chemin passe ici
             spec = next((s for s in self._inner.specs() if s.name == name), None)
             if not read_only_ok(spec, arguments or {}):
                 return ToolResult(call_id="", name=name, content=readonly_refusal(name), is_error=True)
@@ -647,7 +781,9 @@ class DelegateToolSource:
                  max_background: int = MAX_TASKS, note: Callable[[str, str], None] | None = None,
                  state_path: str | os.PathLike[str] | None = None, max_live: int | None = None,
                  require_isolation: bool = False, fork: bool = False, tier: bool = False,
-                 tenants: frozenset[str] | None = None) -> None:
+                 tenants: frozenset[str] | None = None, routable: bool = True,
+                 tier_choices: list[str] | None = None, tier_provider: Callable[[str], Any] | None = None,
+                 tier_descriptions: dict[str, str] | None = None) -> None:
         self.kernel_factory, self.code_source = kernel_factory, code_source
         self.max_children, self.max_depth, self.idle_timeout_s = max(1, max_children), max_depth, idle_timeout_s
         self._emit_fn, self.parent_observer, self.poll_s = emit, parent_observer, poll_s
@@ -662,9 +798,23 @@ class DelegateToolSource:
         # Palier imposé (drapeau `delegate_tier`, défaut éteint) : paramètre `tier` au schéma. Éteint : schéma et
         # comportement d'avant, un `tier` envoyé quand même est ignoré.
         self.tier = tier
+        # `delegate_tiers` : noms de `tiers` choisis par l'hôte, enum du paramètre `tier` ; `tier_provider(nom)` rend le
+        # fournisseur de ce palier. None (défaut) : `ship` et `deep`, comme avant.
+        self.tier_choices, self.tier_provider = (list(tier_choices) if tier_choices else None), tier_provider
+        self.tier_descriptions = dict(tier_descriptions or {})
+        # Outils retirés d'un fil (`deny_tools` de la session) : `(thread_id) -> noms`, aussi retirés à ses enfants ;
+        # None (défaut) : rien de plus que DENIED_FOR_CHILD.
+        self.thread_hidden: Callable[[str], Any] | None = None
         # `tenants` (config `delegate_tenants`) : locataires à qui la source est offerte ; None = tous (inchangé).
         self.tenants = tenants
         self._registry: Any = None
+        # `delegate_router` : fils des enfants routeurs de cette source, et traces de leurs enfants (palier, modèle, durée).
+        # `routable` faux : jamais de schéma ni de chemin du routeur (prototypes de schéma calculés à l'import).
+        self.routable = routable
+        self._routers: set[str] = set()
+        self._routed: dict[str, list[dict[str, Any]]] = {}
+        # Signaux du noyau par fil de routeur (`router_rules`), lus du message de la personne et des tâches de la voix.
+        self._signals: dict[str, dict[str, list[str]]] = {}
         self._slots = threading.BoundedSemaphore(self.max_children)
         # Enfants par fil parent : ceux de fond (lus par delegate_status) et ceux de premier plan en cours (pour
         # l'annulation du fil). Un enfant de premier plan sort de la table à la fin de son `delegate`.
@@ -707,11 +857,37 @@ class DelegateToolSource:
         if self.fork:
             extra["fork"] = _FORK_PARAM
         if self.tier:
-            extra["tier"] = _TIER_PARAM
+            extra["tier"] = _TIER_PARAM if self.tier_choices is None else tier_param(self.tier_choices, self.tier_descriptions)
             extra["readonly"] = _READONLY_PARAM
         return {**_SPECS_PARAMS, "properties": {**_SPECS_PARAMS["properties"], **extra}} if extra else _SPECS_PARAMS
 
+    def _router_role(self) -> str:
+        """`voice` (profondeur 0 ou hors tour), `router` (fil d'un enfant routeur de cette source) ou `` (sans routeur,
+        ou un autre fil)."""
+        if not router_on() or not self.routable:
+            return ""
+        from nokker.tools.scope import current_thread
+
+        thread = current_thread() or ""
+        if thread in self._routers:
+            return "router"
+        return "voice" if self.depth_of(thread) == 0 else ""
+
     def specs(self) -> list[ToolSpec]:
+        role = self._router_role()
+        if role == "voice":  # la voix confie et attend : ni tier, ni fork, ni readonly, ni fond
+            return [voice_delegate_spec(self._effect_of)]
+        if role == "router":
+            return [self._router_spec()]
+        if not self.background and self.code_source is None and self.tier:
+            # Conversation (`delegate_tenants`, sans dossier de travail) avec paliers : ni git ni worktree, donc ni ce
+            # texte ni `isolate`. Texte vu par le modèle, validé mot pour mot en relecture (Run6, 03.11.2026).
+            params = self._params(False)
+            params = {**params, "properties": {k: v for k, v in params["properties"].items() if k != "isolate"}}
+            return [ToolSpec(
+                name="delegate", core=False, source=SOURCE, effect=Effect.WRITE, effect_of=self._effect_of,
+                description=CONV_DESCRIPTION if self.tier_choices is None else CONV_DESCRIPTION_NAMED,
+                parameters=params)]
         if not self.background:
             return [ToolSpec(
                 name="delegate", core=False, source=SOURCE, effect=Effect.WRITE, effect_of=self._effect_of,
@@ -733,6 +909,19 @@ class DelegateToolSource:
                      description="Arrête des sous-agents en arrière-plan de ce fil (worktree conservé).",
                      parameters=_CANCEL_PARAMS)]
 
+    def _router_spec(self) -> ToolSpec:
+        """Le `delegate` du routeur : tâches (but, contexte ; ni rôle ni output_schema) et palier OBLIGATOIRE, raison
+        courte. Ni fork ni fond. `readonly` seulement en session de code : en conversation, le noyau le tranche d'après
+        le message (`router_rules.actions`) ; `isolate` seulement en session (worktree)."""
+        props: dict[str, Any] = {"tasks": {**_SPECS_PARAMS["properties"]["tasks"], "items": _ROUTER_TASK_ITEM},
+                                 "tier": _ROUTER_TIER_PARAM, "reason": _ROUTER_REASON_PARAM}
+        if self.code_source is not None:
+            props["readonly"] = _READONLY_PARAM
+            props["isolate"] = _SPECS_PARAMS["properties"]["isolate"]
+        return ToolSpec(name="delegate", core=False, source=SOURCE, effect=Effect.WRITE, effect_of=self._effect_of,
+                        description=CONV_DESCRIPTION,
+                        parameters={"type": "object", "required": ["tasks", "tier"], "properties": props})
+
     def _code_for(self, thread_id: str) -> Any | None:
         """La source de code du fil : `for_thread` si la source est par fil (None = pas de session de code)."""
         if self.code_source is None:
@@ -753,7 +942,18 @@ class DelegateToolSource:
         """WRITE seulement si l'enfant est confiné à un worktree jetable ; DESTRUCTIVE sinon (voir le docstring).
         `readonly=true` (drapeau `delegate_tier`) : READ, car le noyau filtre ses outils aux READ et refuse tout autre
         appel (`_ChildSource`)."""
-        if self.tier and args.get("readonly") is True:
+        role = self._router_role()
+        if role == "voice":
+            # `delegate_router` : la voix confie, sans choisir ni outils ni palier. La porte n'est PAS sur cet appel : le
+            # routeur ne fait que confier, et chaque enfant passe par les portes outil par outil (mail_move,
+            # calendar_delete… ; jamais *_send, DENIED_FOR_CHILD : l'envoi reste à la voix).
+            # WRITE (tracé, sans carte), en conversation comme en session (worktree).
+            return Effect.WRITE
+        if role == "router" and self.code_source is None:
+            # Même règle pour le delegate du routeur en conversation (porte : l'outil réel). Sa lecture seule est
+            # tranchée par le noyau après coup (`_router_decision`), un `readonly` envoyé quand même est ignoré.
+            return Effect.WRITE
+        if (self.tier or role == "router") and args.get("readonly") is True:
             return Effect.READ
         if args.get("isolate", True) is False or self.code_source is None:
             return Effect.DESTRUCTIVE
@@ -780,31 +980,52 @@ class DelegateToolSource:
 
         if name in ("delegate_status", "delegate_cancel"):
             if not self.background:
-                return out(f"outil inconnu : {name}", True)
+                return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
             if self.depth_of(ctx.thread_id) >= self.max_depth:
-                return out("un sous-agent ne lit ni n'arrête d'autres sous-agents", True)
+                return out(mt.pick(mt.DELEGATE_NO_NESTED_STATUS), True)
             return self._status_call(arguments or {}, ctx) if name == "delegate_status" \
                 else self._cancel_call(arguments or {}, ctx)
         if name != "delegate":
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
+        routing = router_on() and self.routable
+        is_router = routing and ctx.thread_id in self._routers
+        voice = routing and not is_router and self.depth_of(ctx.thread_id) == 0
+        if voice or is_router:  # routeur : jamais en fond, jamais de fork (le noyau attend le compte rendu)
+            arguments = {k: v for k, v in (arguments or {}).items() if k not in ("background", "fork")}
+        if voice:  # la voix ne choisit ni palier ni lecture seule
+            arguments = {k: v for k, v in arguments.items() if k not in ("tier", "readonly")}
+            # Ni rôle : `_VOICE_PARAMS` n'a que goal, context, output_schema ; un `role` inventé (« advisor »,
+            # « tier-1 »…) faisait échouer tout l'appel (banc B P3, 04.11 : 5 appels perdus sur 21). Ignoré, pas refusé.
+            if isinstance(arguments.get("tasks"), list):
+                arguments = {**arguments, "tasks": [{k: v for k, v in t.items() if k != "role"}
+                                                    if isinstance(t, dict) else t for t in arguments["tasks"]]}
         background = arguments.get("background", False) is True
         if background and not self.background:
-            return out("delegate en arrière-plan indisponible ici (le processus s'arrête avec le tour) : relance "
-                       "sans background", True)
+            return out(mt.pick(mt.DELEGATE_NO_BACKGROUND), True)
         registry = self._parent_registry()
         if registry is None:
-            return out("delegate indisponible : registre du parent non lié (bind)", True)
-        if self.depth_of(ctx.thread_id) >= self.max_depth:
-            return out(f"profondeur max atteinte ({self.max_depth}) : un sous-agent ne délègue pas", True)
+            return out(mt.pick(mt.DELEGATE_NO_REGISTRY), True)
+        depth_cap = ROUTER_DEPTH if is_router else self.max_depth  # relevée pour le chemin du routeur seulement
+        if self.depth_of(ctx.thread_id) >= depth_cap:
+            return out(mt.pick(mt.DELEGATE_DEPTH).format(cap=depth_cap), True)
         tasks = arguments.get("tasks")
         if not isinstance(tasks, list) or not tasks or len(tasks) > MAX_TASKS:
             return out(f"tasks : 1 à {MAX_TASKS} tâches requises", True)
         tier = ""
-        if self.tier and arguments.get("tier") is not None:
-            tier, refusal = self._check_tier(arguments.get("tier"), ctx)
-            if refusal:
-                return out(refusal, True)
-        readonly = self.tier and arguments.get("readonly") is True
+        rule = ""
+        if is_router:  # règles du noyau d'abord (router_rules) : plancher deep, palier par défaut, lecture seule
+            tier, readonly, rule = self._router_decision(arguments, ctx)
+            if tier.startswith("REFUS:"):
+                return out(tier[len("REFUS:"):], True)
+            arguments = {**arguments, "tasks": [{k: v for k, v in t.items() if k not in ("output_schema", "role")}
+                                                if isinstance(t, dict) else t for t in tasks]}
+            tasks = arguments["tasks"]  # le compte rendu de chaque enfant est libre : le routeur les fusionne
+        else:
+            if self.tier and arguments.get("tier") is not None:
+                tier, refusal = self._check_tier(arguments.get("tier"), ctx, self.tier_choices)
+                if refusal:
+                    return out(refusal, True)
+            readonly = self.tier and arguments.get("readonly") is True
         base = None
         if self.fork and arguments.get("fork", False) is True:
             # Le contexte EXACT du dernier appel du parent dans CE tour (et pour CE locataire) ; sinon, refus clair :
@@ -812,55 +1033,67 @@ class DelegateToolSource:
             getter = getattr(ctx.kernel, "fork_base", None)
             base = getter(ctx.thread_id, ctx.turn_index) if callable(getter) else None
             if base is None:
-                return out(FORK_UNAVAILABLE, True)
+                return out(mt.pick(mt.DELEGATE_FORK_UNAVAILABLE), True)
         children: list[_Child] = []
         code = self._code_for(ctx.thread_id)
         for i, t in enumerate(tasks):
             if not isinstance(t, dict) or not str(t.get("goal") or "").strip():
                 return out(f"tasks[{i}] : goal requis", True)
             if t.get("role", "worker") not in ("worker", "reviewer"):
-                return out(f"tasks[{i}] : role doit être worker ou reviewer", True)
+                return out(mt.pick(mt.DELEGATE_BAD_ROLE).format(i=i), True)
             schema, err = coerce_schema(t.get("output_schema"))
             if err:
                 return out(f"tasks[{i}] : {err}", True)
             cid = uuid.uuid4().hex[:8]
             children.append(_Child(index=i, id=cid, thread_id=f"{ctx.thread_id}/sa-{cid}", task=t, schema=schema,
                                    parent_thread_id=ctx.thread_id, code=code, background=background,
-                                   registry=registry, fork_base=base, tier=tier, readonly=readonly))
+                                   registry=registry, fork_base=base, tier=tier, readonly=readonly,
+                                   voice_thread=ctx.thread_id.split("/sa-", 1)[0] if is_router else "", rule=rule))
+        if voice:  # UN enfant routeur reçoit toutes les tâches ; il choisit qui travaille
+            rid = uuid.uuid4().hex[:8]
+            request = person_request(ctx)
+            texts = [request] + [str(c.task.get(k) or "") for c in children for k in ("goal", "context")]
+            router = _Child(index=0, id=rid, thread_id=f"{ctx.thread_id}/sa-{rid}",
+                            task={"goal": self._router_goal(children, request), "role": "worker"}, schema=None,
+                            parent_thread_id=ctx.thread_id, code=code, background=False, registry=registry,
+                            router=True)
+            children = [router]
+            with self._table_lock:
+                self._routers.add(router.thread_id)
+                self._routed[router.thread_id] = []
+                self._signals[router.thread_id] = {"actions": router_rules.actions(*texts),
+                                                   "deep": router_rules.deep_markers(*texts)}
         with self._table_lock:
             if self.max_live is not None:
                 live = self._live_locked()
                 if live + len(children) > self.max_live:
-                    return out(f"trop de sous-agents vivants dans cette session : {live} en cours, au plus "
-                               f"{self.max_live} à la fois (delegate_status pour suivre, delegate_cancel pour "
-                               "arrêter)", True)
+                    return out(mt.pick(mt.DELEGATE_TOO_MANY).format(live=live, max=self.max_live), True)
             if background:
                 live = sum(1 for kids in self._by_parent.values() for c in kids.values()
                            if c.background and c.final is None)
                 if live + len(children) > self.max_background:
-                    return out(f"trop de sous-agents en arrière-plan : {live} en cours, au plus "
-                               f"{self.max_background} à la fois (delegate_status pour suivre, delegate_cancel pour "
-                               "arrêter)", True)
+                    return out(mt.pick(mt.DELEGATE_TOO_MANY_BG).format(live=live, max=self.max_background), True)
             table = self._by_parent.setdefault(ctx.thread_id, {})
             for ch in children:
                 table[ch.id] = ch
 
         run, cwd = self._sandbox_run(ctx.thread_id, code)
-        isolate = arguments.get("isolate", True) is not False
+        isolate = arguments.get("isolate", True) is not False and not voice  # le routeur ne touche à aucun fichier
         for ch in children:  # worktrees créés l'un après l'autre : un seul git à la fois sur le dépôt
+            if ch.router:
+                continue  # ses enfants ship/deep auront chacun leur worktree
             if not isolate:
-                ch.note = "isolate=false : l'enfant travaille directement dans le dossier de travail."
+                ch.note = mt.pick(mt.DELEGATE_NOTE_NO_ISOLATE)
             elif run is None:
-                ch.note = "pas de dossier de travail : aucune isolation."
+                ch.note = mt.pick(mt.DELEGATE_NOTE_NO_WORKDIR)
             else:
                 try:
                     ch.info = create_worktree(run, cwd, ch.id)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("worktree de %s : %s", ch.id, e)
                 if ch.info is None:
-                    ch.note = ("pas de dépôt git (ou aucun commit) : isolation impossible, l'enfant travaille dans "
-                               "le dossier de travail.")
-        if isolate and self.require_isolation and any(ch.info is None for ch in children):
+                    ch.note = mt.pick(mt.DELEGATE_NOTE_NO_GIT)
+        if isolate and self.require_isolation and any(ch.info is None and not ch.router for ch in children):
             for ch in children:  # rien ne part : les worktrees déjà créés (vides) sont retirés avec la preuve habituelle
                 if ch.info is not None and run is not None:
                     try:
@@ -873,9 +1106,7 @@ class DelegateToolSource:
                     table.pop(ch.id, None)
                 if not table:
                     self._by_parent.pop(ctx.thread_id, None)
-            return out("isolation impossible (pas de dépôt git avec au moins un commit dans le dossier de travail) : "
-                       "aucun sous-agent lancé. Relance avec isolate=false pour qu'ils travaillent directement dans le "
-                       "dossier (carte forte), ou commite d'abord.", True)
+            return out(mt.pick(mt.DELEGATE_NO_ISOLATION), True)
         self._persist()  # avant le départ : un redémarrage pendant le travail retrouve enfants et worktrees
         for ch in children:
             started = {"thread_id": ctx.thread_id, "parent_thread_id": ctx.thread_id, "parent_turn": ctx.turn_index,
@@ -891,13 +1122,24 @@ class DelegateToolSource:
             threading.Thread(target=cx.run, args=(self._watch, children, run), daemon=True,
                              name=f"nokker-sa-watch-{children[0].id}").start()
             return out({"background": True, "children": [self._view(ch) for ch in children],
-                        "note": "les sous-agents tournent en arrière-plan : delegate_status pour l'état ou le résultat "
-                                "(wait_s pour attendre), delegate_cancel pour arrêter ; tu seras prévenu au tour "
-                                "suivant quand ils ont fini."})
+                        "note": mt.pick(mt.DELEGATE_BACKGROUND_NOTE)})
         try:
             self._wait(children)
             results = [self._finish(ch, run) for ch in children]
+            if voice:  # la voix sait QUI a répondu (role), pas quel modèle : le nom reste aux traces (journal, routeur)
+                results = [{k: v for k, v in r.items() if k != "model"} | (
+                    {"routed": [{k: v for k, v in t.items() if k not in TRACE_ONLY} for t in r["routed"]]}
+                    if "routed" in r else {}) for r in results]
+                for r in results:  # la carte d'un enfant (mail_move…) : la voix le sait, comme sans routeur
+                    if any(t.get("exit_reason") == "approval_pending" for t in r.get("routed", [])):
+                        r["status"], r["exit_reason"] = "interrupted", "approval_pending"
         finally:
+            if voice:
+                with self._table_lock:
+                    for ch in children:
+                        self._routers.discard(ch.thread_id)
+                        self._routed.pop(ch.thread_id, None)
+                        self._signals.pop(ch.thread_id, None)
             with self._table_lock:
                 table = self._by_parent.get(ctx.thread_id, {})
                 for ch in children:
@@ -907,22 +1149,57 @@ class DelegateToolSource:
             self._persist()  # premier plan rendu : seuls ses enfants en attente d'une carte restent dans l'état
         return out(results)
 
+    def _router_decision(self, arguments: dict[str, Any], ctx: ToolContext) -> tuple[str, bool, str]:
+        """(palier, lecture seule, règle) d'un appel du routeur ; palier « REFUS:<texte> » si l'appel est refusé.
+
+        - palier : `deep` dès que la demande porte un marqueur de jugement (`router_rules.deep_markers`) — plancher que
+          le routeur ne peut pas descendre ; sinon celui du routeur ; absent ou invalide : ship. Deep refusé au compte
+          (plafond, non servi) : repli sur ship plutôt qu'un refus, sauf si le routeur l'avait demandé lui-même.
+        - lecture seule : en conversation, AUCUNE action demandée (`router_rules.actions`), le routeur ne la choisit
+          pas ; en session de code, celle du routeur (`readonly`, défaut faux)."""
+        sig = self._signals.get(ctx.thread_id) or {"actions": [], "deep": []}
+        asked = arguments.get("tier")
+        asked = asked if asked in TIERS else None
+        if sig["deep"] and asked != "deep":
+            tier, refusal = self._check_tier("deep", ctx)
+            rule = "plancher deep (" + ", ".join(sig["deep"][:3]) + ")"
+            if refusal:
+                tier, rule = "ship", "deep indisponible, repli ship"
+        elif asked is None:
+            tier, rule = "ship", "palier absent : ship"
+        else:
+            tier, refusal = self._check_tier(asked, ctx)
+            if refusal:
+                return "REFUS:" + refusal, False, ""
+            rule = f"palier du routeur ({asked})"
+        if self.code_source is None:
+            readonly = not sig["actions"]
+            rule += "; lecture seule (aucune action demandée)" if readonly else \
+                "; écriture (action : " + ", ".join(sig["actions"][:3]) + ")"
+        else:
+            readonly = arguments.get("readonly") is True
+            rule += "; lecture seule du routeur" if readonly else "; écriture (session de code)"
+        return tier, readonly, rule
+
     @staticmethod
-    def _check_tier(value: Any, ctx: ToolContext) -> tuple[str, str]:
+    def _check_tier(value: Any, ctx: ToolContext, choices: list[str] | None = None) -> tuple[str, str]:
         """(palier, refus). Un enfant ne dépasse pas les droits du parent : palier servi, et pour deep le plafond du
-        compte (`deep_per_day`) du locataire courant."""
+        compte (`deep_per_day`) du locataire courant. `choices` (`delegate_tiers`) : les noms que l'hôte a choisis ; un nom
+        qui n'est pas un palier du noyau (`Tier`) est servi par son fournisseur de config, sans autre contrôle ici."""
         from nokker.core.turn import Tier
 
-        if value not in TIERS:
-            return "", TIER_INVALID
+        if value not in (choices or TIERS):
+            return "", mt.pick(mt.DELEGATE_TIER_INVALID) if choices is None else mt.pick(
+                mt.DELEGATE_TIER_INVALID_NAMED).format(names=", ".join(choices))
         kernel = ctx.kernel
         providers = getattr(kernel, "providers", None)
-        if providers is not None and Tier(value) not in providers:
-            return "", TIER_NOT_SERVED.format(tier=value)
+        core_tier = next((t for t in Tier if t.value == value), None)
+        if providers is not None and core_tier is not None and core_tier not in providers:
+            return "", mt.pick(mt.DELEGATE_TIER_NOT_SERVED).format(tier=value)
         limits = getattr(kernel, "limits", None)
         if value == "deep" and limits is not None and hasattr(limits, "deep_available") \
                 and not limits.deep_available(ctx.sender):
-            return "", TIER_NO_DEEP
+            return "", mt.pick(mt.DELEGATE_TIER_NO_DEEP)
         return value, ""
 
     # ── arrière-plan ──
@@ -948,8 +1225,7 @@ class DelegateToolSource:
             done = ", ".join(f"{c.id} ({(c.final or {}).get('status')}, {(c.final or {}).get('exit_reason')})"
                              for c in children)
             try:
-                self.note(children[0].parent_thread_id, f"[sous-agents en arrière-plan] terminés : {done} — "
-                                                        "delegate_status pour lire leurs résultats.")
+                self.note(children[0].parent_thread_id, mt.pick(mt.DELEGATE_DONE_NOTE).format(done=done))
             except Exception:  # noqa: BLE001 — l'avis est un plus ; le résultat reste lisible
                 logger.debug("note au parent a levé", exc_info=True)
 
@@ -1081,6 +1357,8 @@ class DelegateToolSource:
                     "task_index": ch.index, "goal": str(ch.task.get("goal") or "")[:300],
                     "role": ch.task.get("role", "worker"), "background": ch.background, "parked": ch.parked,
                     "created_at": ch.created_at}
+                if ch.voice_thread:
+                    rec["voice_thread"] = ch.voice_thread
                 if ch.info is not None:
                     rec["worktree"] = {"path": ch.info["path"], "branch": ch.info["branch"]}
                 if ch.final is not None and not ch.parked:
@@ -1132,22 +1410,23 @@ class DelegateToolSource:
                                                                    "role": rec.get("role", "worker")},
                             schema=None, parent_thread_id=str(rec["parent_thread_id"]),
                             background=bool(rec.get("background")), restored=True,
-                            created_at=float(rec.get("created_at") or time.time()))
+                            created_at=float(rec.get("created_at") or time.time()),
+                            voice_thread=str(rec.get("voice_thread") or ""))
             except (KeyError, TypeError, ValueError):
                 continue
             wt = rec.get("worktree") if isinstance(rec.get("worktree"), dict) else None
             final = rec.get("final") if isinstance(rec.get("final"), dict) else None
             if final is None:
                 changed = True
-                why = ("interrompu par un redémarrage du noyau : le sous-agent ne tourne plus et n'est pas repris")
+                why = mt.pick(mt.DELEGATE_RESTART_INTERRUPTED)
                 if rec.get("parked"):
-                    why += ("; sa carte en attente est refusée (jamais exécutée avec le noyau du parent)")
+                    why += mt.pick(mt.DELEGATE_RESTART_PARKED)
                 final = {"task_index": ch.index, "child_id": ch.id, "thread_id": ch.thread_id,
                          "status": "interrupted", "exit_reason": "restart",
-                         "summary": why + ("; worktree conservé : relis la branche" if wt else "")}
+                         "summary": why + (mt.pick(mt.DELEGATE_RESTART_KEPT) if wt else "")}
                 if wt:
                     final["worktree"] = {"path": wt.get("path"), "branch": wt.get("branch"), "kept": True,
-                                         "note": "conservé au redémarrage, non inspecté"}
+                                         "note": mt.pick(mt.DELEGATE_RESTART_WORKTREE_NOTE)}
             ch.final, ch.result, ch.cancelled = final, dict(final), True
             ch.last_tool = rec.get("last_tool") if isinstance(rec.get("last_tool"), str) else None
             try:  # durée figée gardée ; un état d'avant ce champ : figée au redémarrage (borne haute)
@@ -1212,8 +1491,14 @@ class DelegateToolSource:
         if self.note is not None:
             summary = str(res.get("summary") or "")
             try:
-                self.note(ch.parent_thread_id, f"[sous-agent {ch.id}] repris après la carte : {res.get('status')}, "
-                                               f"{res.get('exit_reason')} — {summary[:1500]}")
+                # enfant d'un routeur : la VOIX (le routeur a fini son tour, il n'est jamais relancé), avec son rôle
+                if ch.voice_thread and ch.tier in ROUTER_ROLES:
+                    line = ROUTER_RESUMED_NOTE.format(id=ch.id, role=ROUTER_ROLES[ch.tier], status=res.get("status"),
+                                                      exit_reason=res.get("exit_reason"), summary=summary[:1500])
+                else:
+                    line = (f"[sous-agent {ch.id}] repris après la carte : {res.get('status')}, "
+                            f"{res.get('exit_reason')} — {summary[:1500]}")
+                self.note(ch.voice_thread or ch.parent_thread_id, line)
             except Exception:  # noqa: BLE001
                 logger.debug("note au parent a levé", exc_info=True)
 
@@ -1254,30 +1539,54 @@ class DelegateToolSource:
         from nokker.tools.registry import Registry
 
         denied = DENIED_FOR_CHILD + (REVIEWER_DENIED if ch.task.get("role") == "reviewer" else ())
+        if self.thread_hidden is not None:  # outils retirés du fil parent (`deny_tools` de la session) : aussi aux enfants
+            denied += tuple(self.thread_hidden(ch.parent_thread_id or ch.thread_id))
         sources: list[Any] = []
-        for src in (ch.registry if ch.registry is not None else self._registry).sources:
+        base = ch.registry if ch.registry is not None else self._registry
+        # `voice_read_only` : le registre de la voix porte `child_sources`, le jeu COMPLET (les enfants écrivent).
+        for src in getattr(base, "child_sources", None) or base.sources:
             if src is self or getattr(src, "is_delegate_source", False):
-                if parent_depth + 1 < self.max_depth and not ch.readonly:  # sous la profondeur max, jamais en lecture seule
+                if ch.router and src is self:  # le routeur fait faire (sa profondeur est relevée : ROUTER_DEPTH)
                     sources.append(src)
+                elif parent_depth + 1 < self.max_depth and not ch.readonly and not ch.router:
+                    sources.append(src)  # sous la profondeur max, jamais en lecture seule
                 continue
+            if ch.router:
+                continue  # le routeur ne fait que confier (04.11 : avec la lecture, il répondait parfois lui-même)
             if self.code_source is not None and (src is self.code_source
                                                  or getattr(src, "inner", None) is self.code_source):
                 continue  # remplacé par la source ouverte sur le worktree
             sources.append(_ChildSource(src, ch, denied))
-        if self.code_source is not None:
+        if self.code_source is not None and not ch.router:
             sources.append(_ChildSource(scoped if scoped is not None else self.code_source, ch, denied))
         return Registry(sources=sources)
+
+    def _router_goal(self, children: list[_Child], request: str = "") -> str:
+        """Message du routeur : sa consigne (ROUTER_PROMPT), le message de la personne (s'il y en a un), puis les tâches
+        de la voix, telles quelles."""
+        tasks = []
+        for ch in children:
+            item = {"goal": str(ch.task.get("goal") or "")}
+            if ch.task.get("context"):
+                item["context"] = str(ch.task["context"])
+            if ch.task.get("output_schema") is not None:
+                item["output_schema"] = ch.task["output_schema"]
+            tasks.append(item)
+        head = ROUTER_PROMPT
+        if request.strip():
+            head += f"\n\n{ROUTER_REQUEST_HEADER}\n{request.strip()[:ROUTER_REQUEST_MAX]}"
+        return head + f"\n\n{ROUTER_TASKS_HEADER}\n" + json.dumps(tasks, ensure_ascii=False, indent=1)
 
     def _prompt(self, ch: _Child) -> str:
         t = ch.task
         text = str(t["goal"]).strip()
         if ch.fork_base is not None:
-            text = FORK_NOTE + text
+            text = mt.pick(mt.DELEGATE_FORK_NOTE) + text
         ctx = str(t.get("context") or "").strip()
         if ctx:
-            text += "\n\nContexte :\n" + ctx
+            text += mt.pick(mt.DELEGATE_CONTEXT_LABEL) + ctx
         if t.get("role") == "reviewer":
-            text += ("\n\nRôle : relecteur. Tu lis, lances les tests et rapportes ; tu ne modifies aucun fichier.")
+            text += mt.pick(mt.DELEGATE_REVIEWER_ROLE)
         if ch.schema is not None:
             text = append_contract(text, ch.schema)
         if ch.info is not None:
@@ -1296,11 +1605,25 @@ class DelegateToolSource:
             if ch.fork_base is not None:
                 # Fork : même contexte que le dernier appel du parent, même affinité de cache (fil parent).
                 kernel = kernel.forked(ch.fork_base, session_key=ch.parent_thread_id, child_thread=ch.thread_id)
-            if ch.tier:
+            if ch.router:  # son propre modèle (`delegate_router_settings.model`), en palier ship forcé
                 from nokker.core.turn import Tier
                 from nokker.route.forced import force_tier
 
-                kernel = dataclasses.replace(kernel, policy=force_tier(kernel.policy, Tier(ch.tier)))
+                kernel = dataclasses.replace(kernel, providers={**kernel.providers, Tier.SHIP: ROUTER["provider"]},
+                                             policy=force_tier(kernel.policy, Tier.SHIP))
+            elif ch.tier:
+                from nokker.core.turn import Tier
+                from nokker.route.forced import force_tier
+
+                served = next((t for t in Tier if t.value == ch.tier and t in kernel.providers), None)
+                if served is None and self.tier_choices and ch.tier in self.tier_choices and self.tier_provider is not None:
+                    # Nom choisi par l'hôte qui n'est pas un palier servi du noyau : son fournisseur de config prend la
+                    # place du palier `ship` pour CET enfant, forcé dessus (même mécanisme que l'enfant routeur).
+                    kernel = dataclasses.replace(
+                        kernel, providers={**kernel.providers, Tier.SHIP: self.tier_provider(ch.tier)},
+                        policy=force_tier(kernel.policy, Tier.SHIP))
+                else:
+                    kernel = dataclasses.replace(kernel, policy=force_tier(kernel.policy, served or Tier(ch.tier)))
             if ch.readonly and hasattr(kernel, "gates"):  # le noyau de l'enfant refuse tout appel non READ
                 kernel = dataclasses.replace(kernel, gates=_ReadonlyGates(kernel.gates))
                 if getattr(kernel, "provenance", None) is not None:
@@ -1309,15 +1632,17 @@ class DelegateToolSource:
             if ch.cancelled:  # annulé pendant la construction : rien ne part
                 return dict(ch.result)
             turn = kernel.run_turn(TurnInput(thread_id=ch.thread_id, user_text=self._prompt(ch),
-                                             channel=CHILD_CHANNEL, sender=ctx.sender))
+                                             channel=CHILD_CHANNEL, sender=ctx.sender, lang=ch.lang))
             self._account(ch, turn)
+            if getattr(turn, "calls", None):
+                ch.model = str(getattr(turn.calls[-1], "model", "") or "")
             if ch.schema is not None and not turn.error and not turn.pending_approvals:
-                ok, errors = validate_reply(turn.reply, ch.schema)
+                ok, errors = validate_reply(turn.reply, ch.schema, ch.lang)
                 if not ok:
-                    turn = kernel.run_turn(TurnInput(thread_id=ch.thread_id, user_text=retry_message(errors),
-                                                     channel=CHILD_CHANNEL, sender=ctx.sender))
+                    turn = kernel.run_turn(TurnInput(thread_id=ch.thread_id, user_text=retry_message(errors, ch.lang),
+                                                     channel=CHILD_CHANNEL, sender=ctx.sender, lang=ch.lang))
                     self._account(ch, turn)
-                    ok, errors = validate_reply(turn.reply, ch.schema)
+                    ok, errors = validate_reply(turn.reply, ch.schema, ch.lang)
                     if not ok and not turn.error and not turn.pending_approvals:
                         return {"status": "failed", "exit_reason": "output_schema_invalid",
                                 "summary": turn.reply, "errors": errors[:10]}
@@ -1332,14 +1657,20 @@ class DelegateToolSource:
 
     @staticmethod
     def _status(ch: _Child, turn: Any) -> dict[str, Any]:
+        failure = getattr(turn, "failure", None)
+        if turn.error == "mcp_required_unavailable" and isinstance(failure, dict):
+            # Serveur MCP indispensable à la session injoignable : le fils n'a pas démarré (aucun appel modèle). Le parent reçoit
+            # une erreur d'outil claire, sans adresse ni jeton, et continue son tour (jamais un 503 du tour parent).
+            return {"status": "failed", "exit_reason": "mcp_required_unavailable", "error": "mcp_required_unavailable",
+                    "summary": mt.pick(mt.DELEGATE_NOT_LAUNCHED).format(message=failure.get("message", "")),
+                    "servers": [dict(x) for x in failure.get("servers") or []]}
         if turn.error:
             return {"status": "failed", "exit_reason": "error", "summary": turn.reply or str(turn.error),
                     "error": str(turn.error)}
         if turn.pending_approvals:
             names = ", ".join(c.name for c in turn.pending_approvals)
             return {"status": "interrupted", "exit_reason": "approval_pending",
-                    "summary": (turn.reply or "") + f"\n[carte d'approbation en attente sur le fil {ch.thread_id} : "
-                                                    f"{names}]"}
+                    "summary": (turn.reply or "") + mt.pick(mt.DELEGATE_CARD_PENDING).format(thread=ch.thread_id, names=names)}
         if getattr(turn, "escalated", False):
             return {"status": "interrupted", "exit_reason": "escalated", "summary": turn.reply}
         return {"status": "completed", "exit_reason": "completed", "summary": turn.reply}
@@ -1362,6 +1693,24 @@ class DelegateToolSource:
         res["thread_id"] = ch.thread_id
         if ch.tier:
             res["tier"] = ch.tier
+        if router_on():  # traces de chaque niveau (modèle réel, palier, durée) : drapeau `delegate_router` seulement
+            trace = {"level": "router" if ch.router else (ch.tier or "default"), "model": ch.model,
+                     "duration_s": round(time.monotonic() - ch.created, 2)}
+            if ch.tier in ROUTER_ROLES:
+                trace["role"] = ROUTER_ROLES[ch.tier]
+            if ch.rule:  # enfant d'un routeur : lecture seule et règle du noyau (traces seulement, jamais à la voix)
+                trace.update(readonly=ch.readonly, rule=ch.rule)
+            if res.get("exit_reason") in ("approval_pending", "escalated"):
+                trace["exit_reason"] = res["exit_reason"]  # une carte d'un enfant remonte jusqu'à la voix
+            res.update({"model": trace["model"], "duration_s": trace["duration_s"]})
+            logger.info("delegate %s %s : modèle %s, %.2f s%s", trace["level"], ch.thread_id, trace["model"] or "?",
+                        trace["duration_s"], f", readonly={ch.readonly}, règle {ch.rule}" if ch.rule else "")
+            with self._table_lock:
+                routed = self._routed.get(ch.parent_thread_id)
+                if routed is not None:  # enfant d'un routeur : sa trace remonte avec le compte rendu du routeur
+                    routed.append(trace)
+                if ch.router:
+                    res["routed"] = list(self._routed.get(ch.thread_id, []))
         commits, dirty, kept = 0, False, False
         ch.run = run
         if ch.info is not None and run is not None:

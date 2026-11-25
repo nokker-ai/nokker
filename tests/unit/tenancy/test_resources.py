@@ -241,7 +241,7 @@ def test_tester_escalation_names_nobody_internal(rig):
 
 def test_packaged_product_prefix():
     text = PRODUCT_PREFIX_PATH.read_text(encoding="utf-8")
-    assert 4000 <= len(text) <= 6500
+    assert 4000 <= len(text) <= 7000  # 6500 avant le vocabulaire produit Lokkal / cloud du 17.11.2026, 6800 puis 7000 (marge)
     for word in ("Atlas", "Alice", "Bruno", "ninabot", "hote21", "hote", "Vaultwarden", "memory_search"):
         assert word.lower() not in text.lower()
     for tool in ("tool_find", "recall_context", "clarify", "escalate_to_human"):

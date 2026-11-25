@@ -58,7 +58,7 @@ inputs:
   image:
     description: Container image that runs the review.
     required: false
-    default: ghcr.io/nokker-ai/nokker:0.1.0-rc.8-lokkal
+    default: ghcr.io/nokker-ai/nokker:0.1.0-rc.9.5-lokkal
 
 outputs:
   verdict:

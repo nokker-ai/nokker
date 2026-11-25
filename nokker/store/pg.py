@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import psycopg
 from psycopg.types.json import Jsonb
 
 from nokker.core.turn import (
@@ -55,14 +56,19 @@ def apply_migrations(dsn: str, *, strict: bool = False) -> bool:
 
 
 def _enc_usage(u: Usage) -> dict[str, Any]:
-    return {"prompt": u.prompt, "completion": u.completion, "cached": u.cached, "reasoning": u.reasoning,
-            "cached_reported": u.cached_reported, "reasoning_reported": u.reasoning_reported}
+    d = {"prompt": u.prompt, "completion": u.completion, "cached": u.cached, "reasoning": u.reasoning,
+         "cached_reported": u.cached_reported, "reasoning_reported": u.reasoning_reported}
+    if u.cache_write:  # amont au format Anthropic seulement : sans écriture de cache, le JSON est celui d'avant
+        d["cache_write"] = u.cache_write
+        if u.cache_ttl != "5m":  # défaut non écrit : le JSON des tours d'avant ne change pas
+            d["cache_ttl"] = u.cache_ttl
+    return d
 
 
 def _dec_usage(d: dict[str, Any]) -> Usage:
     return Usage(prompt=d.get("prompt", 0), completion=d.get("completion", 0), cached=d.get("cached", 0),
                  reasoning=d.get("reasoning", 0), cached_reported=d.get("cached_reported", False),
-                 reasoning_reported=d.get("reasoning_reported", False))
+                 reasoning_reported=d.get("reasoning_reported", False), cache_write=d.get("cache_write", 0), cache_ttl=d.get("cache_ttl", "5m"))
 
 
 def _enc_tool_call(tc: ToolCall) -> dict[str, Any]:
@@ -75,21 +81,27 @@ def _dec_tool_call(d: dict[str, Any]) -> ToolCall:
 
 
 def _enc_message(m: Message) -> dict[str, Any]:
-    return {"role": m.role, "content": m.content, "tool_calls": [_enc_tool_call(t) for t in m.tool_calls],
-            "tool_call_id": m.tool_call_id, "name": m.name}
+    d = {"role": m.role, "content": m.content, "tool_calls": [_enc_tool_call(t) for t in m.tool_calls],
+         "tool_call_id": m.tool_call_id, "name": m.name}
+    if m.thinking_blocks:  # JSONB : clé ajoutée seulement quand il y en a, les anciens tours se relisent à l'identique
+        d["thinking_blocks"] = m.thinking_blocks
+    return d
 
 
 def _dec_message(d: dict[str, Any]) -> Message:
     return Message(role=d["role"], content=d.get("content", ""),
                     tool_calls=[_dec_tool_call(t) for t in d.get("tool_calls", [])],
-                    tool_call_id=d.get("tool_call_id"), name=d.get("name"))
+                    tool_call_id=d.get("tool_call_id"), name=d.get("name"),
+                    thinking_blocks=list(d.get("thinking_blocks") or []))
 
 
 def _enc_call(c: LLMCall) -> dict[str, Any]:
     return {"tier": c.tier.value, "model": c.model, "reasoning": c.reasoning,
             "prefix_sha256": c.prefix_sha256, "layer_tokens": c.layer_tokens, "usage": _enc_usage(c.usage),
             "latency_s": c.latency_s, "route_reason": c.route_reason, "chf": c.chf,
-            "reusable_tokens": c.reusable_tokens}
+            "reusable_tokens": c.reusable_tokens, "call_id": c.call_id,
+            **({"model_served": c.model_served} if c.model_served else {}),
+            **({"upstream": c.upstream} if c.upstream else {})}
 
 
 def _dec_call(d: dict[str, Any]) -> LLMCall:
@@ -97,7 +109,8 @@ def _dec_call(d: dict[str, Any]) -> LLMCall:
                    prefix_sha256=d["prefix_sha256"], layer_tokens=d.get("layer_tokens", {}),
                    usage=_dec_usage(d["usage"]), latency_s=d.get("latency_s", 0.0),
                    route_reason=d.get("route_reason", ""), chf=d.get("chf"),
-                   reusable_tokens=d.get("reusable_tokens"))
+                   reusable_tokens=d.get("reusable_tokens"), **({"call_id": d["call_id"]} if d.get("call_id") else {}),
+                   model_served=d.get("model_served") or None, upstream=d.get("upstream") or None)
 
 
 def _enc_verdict(v: Verdict) -> dict[str, Any]:
@@ -114,15 +127,19 @@ def _dec_verdict(d: dict[str, Any]) -> Verdict:
 
 
 def _enc_input(i: InputCheck) -> dict[str, Any]:
-    return {"text": i.text, "redacted": i.redacted, "domain_flags": sorted(i.domain_flags)}
+    out = {"text": i.text, "redacted": i.redacted, "domain_flags": sorted(i.domain_flags)}
+    if i.origin:
+        out["origin"] = i.origin
+    return out
 
 
 def _dec_input(d: dict[str, Any]) -> InputCheck:
-    return InputCheck(text=d["text"], redacted=d.get("redacted", []), domain_flags=set(d.get("domain_flags", [])))
+    return InputCheck(text=d["text"], redacted=d.get("redacted", []), domain_flags=set(d.get("domain_flags", [])),
+                      origin=str(d.get("origin") or ""))
 
 
 def turn_to_dict(turn: Turn) -> dict[str, Any]:
-    return {
+    out = {
         "thread_id": turn.thread_id, "index": turn.index, "input": _enc_input(turn.input),
         "channel": turn.channel, "sender": turn.sender,
         "reply": turn.reply, "messages": [_enc_message(m) for m in turn.messages],
@@ -131,6 +148,11 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
         "error": turn.error, "injected": list(turn.injected), "head": turn.head,
         "images": [i.to_dict() for i in turn.images],  # références seules (X7), jamais les octets
     }
+    if turn.texts:  # pièces texte de l'appareil (P9), absentes des tours d'avant
+        out["texts"] = [dict(t) for t in turn.texts]
+    if turn.lang_seen:  # dernière langue reconnue sur le fil (absente des tours d'avant et des tours sans message humain)
+        out["lang"] = turn.lang_seen
+    return out
 
 
 def turn_from_dict(d: dict[str, Any]) -> Turn:
@@ -144,10 +166,20 @@ def turn_from_dict(d: dict[str, Any]) -> Turn:
         pending_approvals=[_dec_tool_call(t) for t in d.get("pending_approvals", [])],
         error=d.get("error"), injected=list(d.get("injected", [])), head=d.get("head", ""),
         images=[ImageRef.from_dict(i) for i in d.get("images", [])],
+        texts=[dict(t) for t in d.get("texts", [])], lang_seen=str(d.get("lang") or ""),
     )
 
 
 # ──────────────────────────────── Store Postgres ────────────────────────────────
+
+
+SEARCH_TIMEOUT_MS = 2000  # `GET /v1/threads/search` : réponse en 2 s au plus (contrat C3 ; le client coupe à 3 s)
+
+
+def _like_escape(text: str, *, wrap: bool = True) -> str:
+    """Texte littéral pour LIKE/ILIKE (échappement `\\` par défaut de Postgres) ; `wrap` : contient."""
+    esc = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%" if wrap else esc
 
 
 @dataclass
@@ -218,6 +250,37 @@ class PgStore:
                         "ORDER BY created_at, thread_id, turn_index LIMIT %s", (*after, limit))
             return [(r[0].isoformat(), r[1], r[2], r[3]) for r in cur.fetchall()]
 
+    def search_turns(self, thread_ids: list[str], needle: str, limit: int, prefix: str | None = None
+                     ) -> list[tuple[str, int, datetime | None, str, str]]:
+        """(fil, indice, date, texte de l'humain, réponse) des tours des fils DONNÉS (ceux que l'appelant voit), et des
+        fils qui commencent par `prefix` (copies du miroir), dont le texte ou la réponse contient `needle` (sans
+        casse), les plus récents d'abord ; locataire courant (RLS). `GET /v1/threads/search`, LOKKAL-PHONE.md §1.2."""
+        from nokker.threads.search import FOLD_FROM, FOLD_TO, fold
+
+        if not needle or not (thread_ids or prefix):
+            return []
+        like = _like_escape(fold(needle))  # sans accents (translate) ni casse (ILIKE)
+        try:
+            return self._search_turns(thread_ids, prefix, like, FOLD_FROM, FOLD_TO, limit)
+        except psycopg.errors.QueryCanceled:
+            raise TimeoutError("recherche plus longue que 2 s") from None
+
+    def _search_turns(self, thread_ids: list[str], prefix: str | None, like: str, f_from: str, f_to: str,
+                      limit: int) -> list[tuple[str, int, datetime | None, str, str]]:
+        FOLD_FROM, FOLD_TO = f_from, f_to  # noqa: N806
+        with self._lock:
+            conn = self._conn  # `get()` SOUS le verrou : une connexion prise avant serait celle d'avant une reconnexion
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute("SELECT set_config('statement_timeout', %s, true)", (str(SEARCH_TIMEOUT_MS),))
+                cur.execute("SELECT thread_id, turn_index, created_at, turn->'input'->>'text', turn->>'reply' FROM turns "
+                            "WHERE (thread_id = ANY(%s) OR (%s::text IS NOT NULL AND thread_id LIKE %s)) "
+                            "AND (translate(turn->'input'->>'text', %s, %s) ILIKE %s "
+                            "OR translate(turn->>'reply', %s, %s) ILIKE %s) "
+                            "ORDER BY created_at DESC, turn_index DESC LIMIT %s",
+                            (list(thread_ids), prefix, (_like_escape(prefix, wrap=False) + "%") if prefix else None,
+                             FOLD_FROM, FOLD_TO, like, FOLD_FROM, FOLD_TO, like, int(limit)))
+                return [(r[0], r[1], r[2], r[3] or "", r[4] or "") for r in cur.fetchall()]
+
     def erase_mirror_copies(self, prefix: str) -> int:
         """Efface les COPIES du miroir dont le fil commence par `prefix` (`lokkal-<machine>-` chez nokker.ai,
         `mirror-web-` sur une machine), chez le locataire courant seulement : fonction `nokker_mirror_erase`
@@ -259,6 +322,26 @@ class MemoryStore:
 
     def last_turn_at(self, thread_id: str) -> datetime | None:
         return self._at.get(thread_id)
+
+    def search_turns(self, thread_ids: list[str], needle: str, limit: int, prefix: str | None = None
+                     ) -> list[tuple[str, int, datetime | None, str, str]]:
+        """Comme `PgStore.search_turns` ; l'ordre d'ajout tient lieu d'horodatage (date : celle du fil)."""
+        from nokker.threads.search import fold
+
+        wanted, n = set(thread_ids), fold(needle)
+        if not n or not (wanted or prefix):
+            return []
+        by_key = {(t.thread_id, t.index): t for turns in self._by_thread.values() for t in turns}
+        out = []
+        for key in reversed(self._order):
+            t = by_key.get(key)
+            if t is None or not (t.thread_id in wanted or (prefix and t.thread_id.startswith(prefix))):
+                continue
+            if n in fold(t.input.text or "") or n in fold(t.reply or ""):
+                out.append((t.thread_id, t.index, self._at.get(t.thread_id), t.input.text or "", t.reply or ""))
+                if len(out) >= limit:
+                    break
+        return out
 
     def erase_mirror_copies(self, prefix: str) -> int:
         """Comme `PgStore.erase_mirror_copies` (même refus : copies du miroir seulement)."""

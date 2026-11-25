@@ -29,8 +29,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSource, ToolSpec, call_effect
 from nokker.core.turn import Effect, ToolResult
+
+# Texte vu du modèle ET de la personne quand un fil n'a pas de dossier de travail : aucun nom d'outil ni de route.
+NO_WORKSPACE = mt.NO_WORKSPACE["fr"]  # figé ; langue du tour : `model_texts`
 
 logger = logging.getLogger("nokker.tools.checkpoints")
 
@@ -169,25 +173,22 @@ def _manager_class(cm: Any) -> Any:
             done = {"success": True, "restored_to": commit_hash[:8], "reason": subject or "unknown",
                     "directory": abs_dir, "file": rel}
             if not target.exists() and not target.is_symlink():
-                return {**done, "deleted": False, "message": "absent au point et déjà absent : rien à faire"}
+                return {**done, "deleted": False, "message": mt.pick(mt.CKPT_ABSENT)}
             if target.is_symlink() or not target.is_file():
-                return {"success": False, "error": f"{rel} n'est pas un fichier ordinaire (dossier ou lien) : "
-                                                   "restaure le dossier entier"}
+                return {"success": False, "error": mt.pick(mt.CKPT_NOT_FILE).format(rel=rel)}
             if self._exceeds_size_cap(target):
-                return {"success": False, "error": f"{rel} non capturé par les points de retour (trop gros) : "
-                                                   "pas supprimé, ce serait la seule copie"}
+                return {"success": False, "error": mt.pick(mt.CKPT_TOO_BIG).format(rel=rel)}
             self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})", prune=False)
             snap = self.tip(abs_dir)
             ok_blob, in_snap, _ = cm._run_git(["rev-parse", "--verify", "-q", f"{snap}:{rel}"], store, abs_dir,
                                               allowed_returncodes={1, 128}) if snap else (False, "", "")
             ok_now, now, _ = cm._run_git(["hash-object", f"--path={rel}", str(target)], store, abs_dir)
             if not (ok_blob and ok_now and in_snap.strip() and in_snap.strip() == now.strip()):
-                return {"success": False, "error": f"{rel} non capturé par les points de retour (exclu ou ignoré) : "
-                                                   "pas supprimé, ce serait la seule copie"}
+                return {"success": False, "error": mt.pick(mt.CKPT_EXCLUDED).format(rel=rel)}
             try:
                 target.unlink()
             except OSError as exc:
-                return {"success": False, "error": f"suppression de {rel} impossible : {exc}"}
+                return {"success": False, "error": mt.pick(mt.CKPT_DELETE_FAILED).format(rel=rel, exc=exc)}
             self._prune(store, abs_dir, cm._ref_name(cm._project_hash(abs_dir)))
             return {**done, "deleted": True, "snapshot": snap}
 
@@ -336,15 +337,22 @@ class CheckpointingToolSource:
     Délègue `specs`, `call`, `turn_done` et `close` à `inner`. Autour de `call` : `new_turn()` quand `turn_index`
     change pour ce fil ; `ensure_checkpoint(root, "avant <outil>")` si `call_effect` n'est pas READ ;
     `record_agent_write(chemin hôte)` après un `write_file`/`patch` réussi. Un échec de capture est journalisé et
-    n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente."""
+    n'empêche JAMAIS l'appel. Sans l'amont (`manager` None) : transparente.
+
+    `cards` (`nokker/tools/card_snapshots.py`) : un `write_file`/`patch` approuvé par le relecteur automatique
+    (`ctx.auto_approval_id`) reçoit en plus un point de retour PAR CARTE (copie des fichiers visés juste avant l'outil),
+    avec ou sans l'amont : la révocation de cette approbation propose de le restaurer."""
 
     def __init__(self, inner: ToolSource, root_of: Callable[[str], Path | None], home: Path | None = None,
                  manager: Any | None = None, links: TurnLinks | None = None,
-                 emit: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
+                 emit: Callable[[str, dict[str, Any]], Any] | None = None, cards: Any = None) -> None:
         self.inner = inner
         self.root_of = root_of
         self.manager = manager if manager is not None else make_manager(home)
         self.links = links
+        self.cards = cards  # CardSnapshots | None
+        if cards is not None:  # chemins vus par l'outil → chemins hôte, comme le ledger ci-dessous
+            cards.mount = lambda: getattr(self.inner, "mount", WORKSPACE_MOUNT)
         self.emit = emit  # `checkpoint.created` (posé par le serveur local)
         self._turns: dict[str, int] = {}
         self._mu = threading.Lock()
@@ -381,9 +389,35 @@ class CheckpointingToolSource:
             logger.warning("capture avant %s en échec", name, exc_info=True)
         return root
 
+    def _card_before(self, name: str, args: dict[str, Any], ctx: ToolContext) -> Path | None:
+        """Point de retour de la carte approuvée automatiquement (avant l'outil) ; la racine, ou None."""
+        approval_id = getattr(ctx, "auto_approval_id", None)
+        if self.cards is None or not approval_id or name not in WRITE_TOOLS:
+            return None
+        from nokker.tools.card_snapshots import touched_paths
+
+        root = self._root(ctx.thread_id)
+        if root is None:
+            return None
+        mount = getattr(self.inner, "mount", WORKSPACE_MOUNT)
+        try:
+            self.cards.before(approval_id, ctx.thread_id, root, name,
+                              [host_path(root, p, mount) for p in touched_paths(name, args)])
+        except Exception:  # noqa: BLE001 — la capture ne fait jamais échouer l'outil
+            logger.warning("point de retour de la carte %s en échec", approval_id, exc_info=True)
+        return root
+
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         root = self._before(name, arguments, ctx)
-        result = self.inner.call(name, arguments, ctx)
+        card_root = self._card_before(name, arguments, ctx)
+        try:
+            result = self.inner.call(name, arguments, ctx)
+        finally:
+            if card_root is not None:
+                try:
+                    self.cards.after(ctx.auto_approval_id, card_root)
+                except Exception:  # noqa: BLE001
+                    logger.warning("empreintes après %s en échec", name, exc_info=True)
         if root is not None and name in WRITE_TOOLS and not result.is_error:
             try:
                 for p in _written_paths(name, arguments):
@@ -411,8 +445,7 @@ def _clip_diff(text: str) -> str:
     if len(raw) <= MAX_DIFF_BYTES:
         return text
     return (raw[:MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
-            + f"\n[… diff tronqué : {len(raw) - MAX_DIFF_BYTES} octets de plus ; précise un fichier ou "
-              "un point plus récent …]")
+            + mt.pick(mt.CKPT_DIFF_CUT).format(n=len(raw) - MAX_DIFF_BYTES))
 
 
 class CheckpointToolSource:
@@ -437,13 +470,13 @@ class CheckpointToolSource:
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
         if name not in CHECKPOINT_TOOLS:
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         if self.manager is None:
             return out(UNAVAILABLE, True)
         try:
             root = self.root_of(ctx.thread_id)
             if root is None:
-                return out("aucun dossier de travail pour ce fil", True)
+                return out(mt.pick(mt.NO_WORKSPACE), True)
             root_s, a, m = str(root), arguments, self.manager
             if name == "checkpoint_create":
                 reason = str(a.get("reason") or "").strip() or "manuel"
@@ -454,21 +487,21 @@ class CheckpointToolSource:
                 if new:
                     _announce(self.links, self.emit, new[0]["hash"], ctx, name)
                     return out({"created": True, **self._linked([new[0]])[0]})
-                return out({"created": False, "message": "aucun changement depuis le dernier point de retour"})
+                return out({"created": False, "message": mt.pick(mt.CKPT_NO_CHANGE_SINCE_LAST)})
             if name == "checkpoint_list":
                 return out(self._linked(_fr_entries(m.list_checkpoints(root_s))))
             if name == "checkpoint_diff":
                 h = str(a.get("hash") or "").strip()
                 r = m.diff(root_s, h) if h else m.session_diff(root_s)
                 if not r.get("success"):
-                    return out(str(r.get("error") or "diff impossible"), True)
+                    return out(str(r.get("error") or mt.pick(mt.CKPT_DIFF_FAILED)), True)
                 if r.get("empty"):
-                    return out({"stat": "", "diff": "", "message": "aucun changement"})
+                    return out({"stat": "", "diff": "", "message": mt.pick(mt.CKPT_NO_CHANGE)})
                 return out({"stat": r.get("stat", ""), "diff": _clip_diff(str(r.get("diff", ""))),
                             **({"baseline": r["baseline"]} if r.get("baseline") else {})})
             # checkpoint_restore
             if not a.get("hash"):
-                return out("argument manquant : hash", True)
+                return out(mt.pick(mt.MISSING_ARG).format(name="hash"), True)
             before_tip = _tip(m, root)
             r = None
             created = getattr(m, "restore_created", None)
@@ -558,6 +591,8 @@ def direct_result_body(name: str, result: ToolResult) -> dict[str, Any]:
     body: dict[str, Any] = {"content": result.content, "is_error": result.is_error}
     if getattr(result, "reason", None):
         body["reason"] = result.reason
+    if getattr(result, "refused", False):
+        body["status"] = "refused"
     codes = reason_codes(name, result.content) if not result.is_error else None
     if codes:
         body["reason_codes"] = codes
@@ -572,10 +607,15 @@ def checkpoint_sources(inner: ToolSource, root_of: Callable[[str], Path | None],
                        emit: Callable[[str, dict[str, Any]], Any] | None = None
                        ) -> tuple[CheckpointingToolSource, CheckpointToolSource]:
     """Enveloppe + outils, sur le MÊME gestionnaire et les MÊMES liens point ↔ tour : `Registry(sources=[wrapper,
-    tools, …])`. `emit(nom, données)` publie `checkpoint.created`."""
+    tools, …])`. `emit(nom, données)` publie `checkpoint.created`. Les points par carte du relecteur automatique vont
+    sous `<état>/checkpoints/cards` (`wrapper.cards`)."""
+    from nokker.tools.card_snapshots import CardSnapshots
+
     manager = make_manager(home)
     links = TurnLinks(links_path(home))
-    return (CheckpointingToolSource(inner, root_of, home, manager, links=links, emit=emit),
+    cards_dir = links_path(home).parent / "cards"  # état local de la machine, hors du dossier de travail
+    cards = CardSnapshots(root_of, lambda _root: cards_dir)
+    return (CheckpointingToolSource(inner, root_of, home, manager, links=links, emit=emit, cards=cards),
             CheckpointToolSource(root_of, home, manager, links=links, emit=emit))
 
 

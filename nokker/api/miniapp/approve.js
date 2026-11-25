@@ -496,6 +496,11 @@ function showTerminalStatus(approval, status) {
       title: "Décision déjà transmise",
       detail: "Une décision est déjà partie vers ta machine ; elle la vérifie et l'applique.",
     },
+    interrupted: {
+      icon: "⚠",
+      title: "Exécution interrompue",
+      detail: "Interrompue : le résultat est inconnu, à vérifier.",
+    },
     failed: {
       icon: "⚠",
       title: "Exécution en échec",
@@ -514,7 +519,7 @@ function showTerminalStatus(approval, status) {
       /* hors Telegram : rien à fermer */
     }
   };
-  safeHaptic(status === "rejected" || status === "failed" ? "error" : "success");
+  safeHaptic(status === "rejected" || status === "failed" || status === "interrupted" ? "error" : "success");
 }
 
 function renderCard(approval) {

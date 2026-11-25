@@ -159,7 +159,14 @@ def install(kernel: Any, lrn: Learning | None, *, account_of: Callable[[ToolCont
         lrn.pending.emit = emit
         inner = kernel.memory
         if lrn.pending.commit_fact is None:
-            lrn.pending.commit_fact = lambda note: (inner.propose(note.thread_id, [note.text]), None)[1]
+            from nokker.memory.provenance import UNKNOWN_LEGACY, propose_facts
+
+            def commit_fact(note: Any) -> None:
+                # Provenance rangée avec le fait ; un fait en attente d'avant la provenance : `unknown_legacy`.
+                prov = getattr(note, "provenance", "") or (UNKNOWN_LEGACY if note.source == "propose" else "")
+                propose_facts(inner, note.thread_id, [note.text], prov)
+
+            lrn.pending.commit_fact = commit_fact
         kernel.memory = PendingMemoryPort(inner=inner, pending=lrn.pending)
 
 

@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from nokker.ambient.presence import RoomsConfig, StatesPresence
+from nokker import bg_stop
 from nokker.cast.server import RELAY_HEADERS  # en-têtes posés par un relais : jamais le noyau
 from nokker.homebridge.audio import AudioRouter, ClipStore, build_sink
 from nokker.homebridge.config import BridgeConfig
@@ -48,6 +49,7 @@ MAX_OP_BODY = 12 * 1024 * 1024  # audio en base64
 _RE_OP = re.compile(r"^/v1/op/([a-z_]+\.[a-z_]+)$")
 _RE_CLIP = re.compile(r"^/clip/([A-Za-z0-9_-]{20,64})$")
 _RE_PNG = re.compile(r"^/eink/(nkd_[A-Za-z0-9_-]{32,64})\.png$")
+_RE_HASNAP = re.compile(r"^/media/v1/hasnap/([A-Za-z0-9_-]{32})\.jpg$")
 
 
 class OpError(Exception):
@@ -91,7 +93,12 @@ class Bridge:
             wanted = rooms_cfg.entities()
             presence = StatesPresence(states=lambda: [s for s in ha.states() if s.get("entity_id") in wanted],
                                       cfg=rooms_cfg)
-        ha_ops = HaOps(ha=ha, entities=tuple(str(e) for e in ha_raw.get("entities") or [])) \
+        from nokker.homebridge.ha import tracker_id
+
+        zone_members = ha_raw.get("zone_members") or list(rooms_cfg.members)  # zones de l'app : membres déclarés
+        ha_ops = HaOps(ha=ha, entities=tuple(str(e) for e in ha_raw.get("entities") or []),
+                       notify_services=tuple(str(e) for e in ha_raw.get("notify_services") or []),
+                       lan_url=cfg.lan_url, trackers=frozenset(tracker_id(str(m)) for m in zone_members)) \
             if ha is not None and hasattr(ha, "registry") else None
         if watch is None:
             from nokker.homebridge.watch import Watch
@@ -212,8 +219,15 @@ OPS: dict[str, Callable[[Bridge, dict[str, Any]], dict[str, Any]]] = {
     "ha.states": _ha_op("states"),
     "ha.registry": _ha_op("registry"),
     "ha.call_service": _ha_op("call"),
+    "ha.tracker_see": _ha_op("tracker_see"),  # présence d'un membre venue d'une zone de l'app (traceur nokker_*)
     "ha.write_config": _ha_op("write_config"),
     "ha.events": _ha_op("events"),
+    "ha.query": _ha_op("query"),
+    "ha.history": _ha_op("history"),
+    "ha.logbook": _ha_op("logbook"),
+    "ha.notify": _ha_op("notify"),
+    "ha.camera_show": _ha_op("camera_show"),
+    "ha.delete_config": _ha_op("delete_config"),
     "presence.get": Bridge._presence,
     "audio.play": Bridge._play,
     "eink.publish": Bridge._publish,
@@ -334,6 +348,20 @@ def lan_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
                     _json(self, 200, {"status": 200, "api_key": token, "friendly_id": "", "filename": "setup",
                                       "image_url": self._image_url(token, "setup"), "message": "Écran relié au foyer"})
                 return
+            m = _RE_HASNAP.match(path)
+            if m:  # caméra de HA affichée sur un écran (ha.camera_show) : jeton à capacité, 5 min
+                try:
+                    got = bridge.ha_ops.snapshot(m.group(1)) if bridge.ha_ops is not None else None
+                except (HaError, LanError) as e:
+                    logger.info("hasnap : %s", e)
+                    got = None
+                logger.info("hasnap : tirage par %s, %s", self.client_address[0],
+                            f"{len(got[0])} octets" if got else "refusé")
+                if got is None:
+                    _json(self, 404, {"error": "not found"})
+                else:
+                    _send(self, 200, got[0], got[1])
+                return
             if path.startswith("/media/v1/"):  # veille : vignette ou direct, URL signée par le noyau (≤ 5 min)
                 from urllib.parse import parse_qs
 
@@ -379,11 +407,42 @@ def lan_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
     return Lan_
 
 
+class _Serving:
+    """Les deux serveurs HTTP de la passerelle, leurs fils et ce que `Bridge` y rattache ; `close()` les arrête (idempotent)."""
+
+    def __init__(self, bridge: Bridge, api: ThreadingHTTPServer, lan: ThreadingHTTPServer) -> None:
+        self.bridge, self.servers, self.threads = bridge, (api, lan), []
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def start(self) -> None:
+        for s, name in zip(self.servers, ("home-bridge-api", "home-bridge-lan"), strict=True):
+            t = threading.Thread(target=s.serve_forever, name=name, daemon=True)
+            self.threads.append(t)
+            t.start()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        for s in self.servers:
+            s.shutdown()  # rend la main quand `serve_forever` est sorti
+            s.server_close()
+        for t in self.threads:
+            t.join(2.0)
+        if self.bridge.knock is not None:
+            self.bridge.knock.close()
+        if self.bridge.ha_ops is not None:
+            self.bridge.ha_ops.stop()
+
+
 def serve(bridge: Bridge) -> tuple[ThreadingHTTPServer, ThreadingHTTPServer]:
     api = ThreadingHTTPServer(bridge.cfg.api_listen, api_handler(bridge))
     lan = ThreadingHTTPServer(bridge.cfg.lan_listen, lan_handler(bridge))
-    for s, name in ((api, "home-bridge-api"), (lan, "home-bridge-lan")):
-        threading.Thread(target=s.serve_forever, name=name, daemon=True).start()
+    serving = _Serving(bridge, api, lan)
+    serving.start()
+    bg_stop.track(serving, hold=True)  # arrêt en test seulement (`bg_stop.stop_all`) ; en prod le process vit autant que les fils
     if bridge.knock is not None:
         bridge.knock.serve_socket()  # home-audio → passerelle (socket Unix du volume home-sock)
     return api, lan

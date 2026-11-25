@@ -24,12 +24,16 @@ from __future__ import annotations
 import enum
 import fnmatch
 import json
+import logging
+import os
 import posixpath
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, ToolCall, Turn, Verdict
 
@@ -47,11 +51,27 @@ GO_SANDBOX_RULE = "permissions:go_sandbox_only"
 # Seuls outils dont l'exécution tient dans le bac à sable de la session (dossier monté seul, points de retour).
 SANDBOX_GO_TOOLS = frozenset({"terminal", "process_start"})
 LOCAL_STRONG_RULE = "permissions:local_connector_strong"  # boîte mail posée dans Lokkal : envoi, corbeille
+# Bureau (docs/DESKTOP.md §3.1) : une écriture dans une appli est toujours demandée, même en mode `auto` ; seule une
+# règle `allow` (« pour cette session », `desktop_act(<appli>:write)`) la couvre. Envoi et destruction : carte.
+DESKTOP_TOOLS = frozenset({"desktop_act", "desktop_open"})
 _RULE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*(?:\((.*)\))?\s*$")
 _STRICTNESS = {"plan": 3, "default": 2, "accept_edits": 1, "auto": 0}
 MODES = ("default", "accept_edits", "auto", "plan")
 # Codes stables des refus (`Verdict.code`, puis `reason` du `tool.result`) : pour les clients, jamais vus par le modèle.
+# Mode plan : rien ne s'exécute, donc aucune étape du plan de travail (`todo`) ne peut être terminée. Texte vu du modèle.
+PLAN_TODO_WHY = mt.PERM_PLAN_TODO["fr"]  # figé ; langue du tour : `plan_todo_why()`
 PLAN_MODE, DENY_RULE, HARDLINE, NO_CODE_SESSION = "plan_mode", "deny_rule", "hardline", "no_code_session"
+# Codes stables des CARTES (`Verdict.code` d'un HITL, puis `reason_code` de la carte) : nommés d'après la CAUSE, posés
+# au même endroit que le texte du motif, jamais déduits de ce texte. Pour les clients seulement (jamais vus du modèle).
+ASK_MATCHED = "ask_rule"  # une règle `ask` (utilisateur, dépôt ou équipe) couvre l'appel
+DEFAULT_WRITE = "default_write"  # mode default : toute écriture / commande est demandée
+ACCEPT_EDITS_WRITE = "accept_edits_write"  # mode accept_edits : écriture hors fichiers du dossier (commande…)
+DESKTOP_WRITE = "desktop_write"  # écriture sur le bureau : toujours demandée sans pas validé à l'écran
+RELAYED_CONNECTOR = "relayed_connector"  # connecteur relayé nokker.ai : une carte par appel à effet
+LOCAL_CONNECTOR_STRONG = "local_connector_strong"  # boîte mail de la machine : envoi, corbeille
+RELAYED_STRONG = "relayed_strong"  # tour venu du web : destructif, envoi externe, dépense
+GO_SANDBOX_ONLY = "go_sandbox_only"  # destructif hors du bac à sable : le GO écrit ne suffit pas
+_WRITE_ASKED_CODE = {"default": DEFAULT_WRITE, "accept_edits": ACCEPT_EDITS_WRITE}
 
 
 class Mode(str, enum.Enum):
@@ -92,12 +112,23 @@ def _subjects(call: ToolCall) -> list[str]:
 
         subject = ssh_subject(call.name, a)
         return [subject] if subject else []
+    if call.name in DESKTOP_TOOLS:  # bureau : `appli:classe` (classe = write | send_external | destructive)
+        from nokker.desktop.policy import desktop_subject
+
+        subject = desktop_subject(call.name, a)
+        return [subject] if subject else []
     if call.name == "patch" and str(a.get("mode")) == "patch":
         return [p.strip() for p in re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", str(a.get("patch", "")),
                                               re.MULTILINE)]
     path = str(a.get("path") or "").strip()
     # normpath : « ./src/a.py » → « src/a.py », « ./../x » → « ../x » (qu'aucune règle « src/** » ne couvre)
     return [posixpath.normpath(path)] if path else []
+
+
+def _completes_todo(arguments: Any) -> bool:
+    todos = arguments.get("todos") if isinstance(arguments, dict) else None
+    return isinstance(todos, list) and any(isinstance(t, dict) and str(t.get("status") or "").strip().lower() == "completed"
+                                           for t in todos)
 
 
 @dataclass
@@ -114,6 +145,14 @@ class LocalPermissions:
     # Mode choisi pour UNE session en cours de route (`PUT /v1/local/sessions/{fil}/mode`, docs/LOKKAL.md §7.4.10) :
     # remplace `mode` pour ce fil (et ses sous-agents), toujours restreint par le dépôt et les équipes. En mémoire.
     thread_mode: dict[str, Mode] = field(default_factory=dict)
+    # Fichier où le mode choisi d'une session survit au redémarrage du noyau (`<état>/session-modes.json`, 0600, posé par
+    # serve) : `set_thread_mode` l'y écrit, `restore_thread_mode` le relit à la reprise du fil. None (défaut) : en mémoire seulement.
+    modes_path: Path | None = None
+    _modes_lock: Any = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    # Bureau en mode session (B2, docs/DESKTOP.md §12) : chaque action ouvre un PAS que la personne valide à l'écran
+    # (« Vas-y », lié à l'id du pas et à args_sha256) ; ce pas remplace la carte d'écriture. Envoi et suppression gardent
+    # leur carte (les invariants décident, pas cette règle). None = pas de pas : l'écriture du bureau reste une carte.
+    desktop_steps: Any = None
 
     def chosen_mode(self, thread_id: str | None = None) -> Mode:
         """Le mode choisi pour ce fil (celui de la session, sinon celui de l'utilisateur), AVANT restriction."""
@@ -135,7 +174,51 @@ class LocalPermissions:
         if proj is not None and _STRICTNESS[proj.value] > _STRICTNESS[mode]:
             raise ValueError(f"mode {mode} plus permissif que celui du projet ({proj.value})")
         self.thread_mode[thread_id] = Mode(mode)
+        self._save_mode(thread_id, mode)
         return self.mode_for(thread_id)
+
+    MAX_STORED_MODES = 5000
+
+    def _save_mode(self, thread_id: str, mode: str) -> None:
+        """Écrit le mode du fil dans `modes_path` (atomique, 0600). Un échec d'écriture ne casse pas le changement de mode : il
+        reste en vigueur jusqu'au redémarrage, et l'échec est journalisé."""
+        if self.modes_path is None:
+            return
+        with self._modes_lock:
+            try:
+                stored = self._load_modes()
+                stored.pop(thread_id, None)
+                stored[thread_id] = mode  # le plus récent en dernier
+                while len(stored) > self.MAX_STORED_MODES:
+                    stored.pop(next(iter(stored)))
+                tmp = self.modes_path.with_name(self.modes_path.name + ".tmp")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"v": 1, "modes": stored}, fh)
+                os.replace(tmp, self.modes_path)
+            except OSError:
+                logging.getLogger("nokker.qa.permissions").warning("mode de session non conservé (écriture impossible)")
+
+    def _load_modes(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self.modes_path.read_text(encoding="utf-8")) if self.modes_path else {}
+        except (OSError, ValueError):
+            return {}
+        modes = raw.get("modes") if isinstance(raw, dict) else None
+        return {k: v for k, v in modes.items() if isinstance(k, str) and v in _STRICTNESS} if isinstance(modes, dict) else {}
+
+    def restore_thread_mode(self, thread_id: str) -> Mode | None:
+        """À la reprise d'un fil (après un redémarrage) : le mode que l'hôte lui avait réglé, relu de `modes_path`. Sans effet si
+        le fil a déjà un mode en mémoire ou n'en a jamais eu. Pas de contrôle contre le dépôt ici : `mode_for` prend toujours
+        le plus strict des deux."""
+        if self.modes_path is None or thread_id in self.thread_mode:
+            return self.thread_mode.get(thread_id)
+        with self._modes_lock:
+            stored = self._load_modes().get(thread_id)
+        if stored is None:
+            return None
+        self.thread_mode[thread_id] = Mode(stored)
+        return self.thread_mode[thread_id]
 
     def restrict_for_thread(self, thread_id: str, project_settings: str | Path) -> None:
         try:
@@ -194,32 +277,38 @@ class LocalPermissions:
 
     def decide_coded(self, call: ToolCall, effect: Effect, thread_id: str | None = None
                      ) -> tuple[Decision | None, str, str | None]:
-        """`decide` plus le code stable d'un refus (`deny_rule`, `plan_mode`), None ailleurs."""
+        """`decide` plus le code stable d'un refus (`deny_rule`, `plan_mode`) ou d'une carte (HITL), None pour un ALLOW."""
         _, proj_ask, proj_deny = self._project(thread_id)
         mode = self.mode_for(thread_id)
         for r in [*self.deny, *proj_deny]:
             if r.matches(call):
-                return Decision.DENY, f"règle deny {r.tool}({r.pattern or ''})", DENY_RULE
+                return Decision.DENY, mt.pick(mt.PERM_DENY_RULE).format(rule=f"{r.tool}({r.pattern or ''})"), DENY_RULE
         if effect is not Effect.READ and mode is Mode.PLAN:
-            return Decision.DENY, "mode plan : lecture seule", PLAN_MODE
-        decision, why = self._decide_rest(call, effect, thread_id, mode, proj_ask)
-        return decision, why, None
+            return Decision.DENY, mt.pick(mt.PERM_PLAN_READONLY), PLAN_MODE
+        if mode is Mode.PLAN and call.name == "todo" and _completes_todo(call.arguments):
+            return Decision.DENY, mt.pick(mt.PERM_PLAN_TODO), PLAN_MODE
+        decision, why, code = self._decide_rest(call, effect, thread_id, mode, proj_ask)
+        return decision, why, code if decision is Decision.HITL else None
 
     def _decide_rest(self, call: ToolCall, effect: Effect, thread_id: str | None, mode: Mode,
-                     proj_ask: list[Rule]) -> tuple[Decision | None, str]:
+                     proj_ask: list[Rule]) -> tuple[Decision | None, str, str | None]:
         for r in [*self.ask, *proj_ask]:
             if r.matches(call):
-                return Decision.HITL, f"règle ask {r.tool}({r.pattern or ''})"
+                return Decision.HITL, mt.pick(mt.PERM_ASK_RULE).format(rule=f"{r.tool}({r.pattern or ''})"), ASK_MATCHED
         for r in [*self.allow, *self.thread_allow.get(thread_id or "", [])]:
             if r.matches(call):
-                return Decision.ALLOW, f"règle allow {r.tool}({r.pattern or ''})"
+                return Decision.ALLOW, f"règle allow {r.tool}({r.pattern or ''})", None
         if effect is Effect.READ:
-            return Decision.ALLOW, f"mode {mode.value} : lecture"
+            return Decision.ALLOW, f"mode {mode.value} : lecture", None
         if effect is Effect.WRITE:
+            if call.name in DESKTOP_TOOLS:
+                if self.desktop_steps is not None and self.desktop_steps():
+                    return Decision.ALLOW, "bureau en session : chaque pas est validé à l'écran par la personne", None
+                return Decision.HITL, mt.pick(mt.PERM_DESKTOP_WRITE).format(mode=mode.value), DESKTOP_WRITE
             if mode is Mode.AUTO or (mode is Mode.ACCEPT_EDITS and call.name in FILE_EDIT_TOOLS | MEMORY_EDIT_TOOLS):
-                return Decision.ALLOW, f"mode {mode.value} : écriture dans le dossier"
-            return Decision.HITL, f"mode {mode.value} : écriture demandée"
-        return None, ""  # DESTRUCTIVE, SEND_*, SPEND, SECRET : les invariants décident (carte forte, refus…)
+                return Decision.ALLOW, f"mode {mode.value} : écriture dans le dossier", None
+            return Decision.HITL, mt.pick(mt.PERM_WRITE_ASKED).format(mode=mode.value), _WRITE_ASKED_CODE.get(mode.value)
+        return None, "", None  # DESTRUCTIVE, SEND_*, SPEND, SECRET : les invariants décident (carte forte, refus…)
 
     # ── chargement ──
     @classmethod
@@ -247,6 +336,12 @@ def _read(path: str | Path | None) -> dict[str, Any]:
     if not p.is_file():
         return {}
     return dict(json.loads(p.read_text(encoding="utf-8")).get("permissions") or {})
+
+
+def _session_refused(thread_id: str) -> bool:
+    from nokker.tools.code import session_refused  # import tardif : `tools.code` importe les portes
+
+    return session_refused(thread_id)
 
 
 @dataclass
@@ -279,8 +374,8 @@ class PermissionGates:
         if call.name in self.session_tools and self.code_session is not None \
                 and not self.code_session(getattr(turn, "thread_id", "") or ""):
             return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:no_code_session",
-                            reason="pas de session de code sur ce fil : ouvre une session sur un dossier pour lancer des "
-                                   "commandes ou toucher des fichiers", subject=call.id, code=NO_CODE_SESSION)]
+                            reason=mt.pick(mt.PERM_SESSION_REFUSED if _session_refused(getattr(turn, "thread_id", "") or "")
+                                           else mt.PERM_NO_CODE_SESSION), subject=call.id, code=NO_CODE_SESSION)]
         if call.name in ("terminal", "process_start", "ssh_run"):
             from nokker.tools.code import hardline_reason
 
@@ -289,6 +384,9 @@ class PermissionGates:
                 return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:hardline",
                                 reason=why, subject=call.id, code=HARDLINE)]
         effect = call_effect(spec, call.arguments)
+        # Le mode DU FIL (celui que `PUT …/sessions/{fil}/mode` a posé, dépôt compris), pas le mode de base : l'étiquette
+        # de règle (`permissions:<mode>`) décide aussi de l'éligibilité au relecteur automatique et aux suggestions.
+        rule_name = f"permissions:{self.permissions.mode_for(getattr(turn, 'thread_id', None)).value}"
         for floor in self.floors:
             imposed = floor(call, spec, turn)
             if imposed is None:
@@ -297,8 +395,7 @@ class PermissionGates:
                 decision, why, code = self.permissions.decide_coded(call, effect, getattr(turn, "thread_id", None))
                 if decision is Decision.DENY:
                     return [Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1,
-                                    rule=f"permissions:{self.permissions.mode.value}", reason=why, subject=call.id,
-                                    code=code)]
+                                    rule=rule_name, reason=why, subject=call.id, code=code)]
             return [imposed]
         decision, why, code = self.permissions.decide_coded(call, effect, getattr(turn, "thread_id", None))
         if getattr(spec, "locality", None) == "cloud" and effect is not Effect.READ and decision is not Decision.DENY:
@@ -310,10 +407,9 @@ class PermissionGates:
             if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
                 return [v1]
             return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=RELAY_CARD_RULE,
-                            reason="outil d'un compte nokker.ai (connecteur relayé) : chaque appel à effet passe par "
-                                   "une carte", subject=call.id,
+                            reason=mt.pick(mt.PERM_RELAY_CARD), subject=call.id,
                             strength="strong" if effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL)
-                            else "standard")]
+                            else "standard", code=RELAYED_CONNECTOR)]
         if getattr(spec, "locality", None) == "local" and str(getattr(spec, "source", "") or "").startswith(
                 "connector:") and effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL) and decision is not Decision.DENY:
             # Boîte posée dans Lokkal (nokker/local/connectors.py) : l'envoi et la corbeille restent une carte FORTE,
@@ -322,8 +418,7 @@ class PermissionGates:
             if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
                 return [v1]
             return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=LOCAL_STRONG_RULE,
-                            reason="boîte mail de la machine : un envoi ou une mise à la corbeille passe par une carte "
-                                   "forte", subject=call.id, strength="strong")]
+                            reason=mt.pick(mt.PERM_LOCAL_STRONG), subject=call.id, strength="strong", code=LOCAL_CONNECTOR_STRONG)]
         if getattr(turn, "channel", None) == RELAY_CHANNEL and decision is not Decision.DENY \
                 and effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL, Effect.SPEND):
             # Tour venu du web (relais `<nom>.nokker.app`, X10) : ni le mode (auto, accept_edits), ni une règle allow,
@@ -332,8 +427,8 @@ class PermissionGates:
             if v1.decision is Decision.DENY:  # envoi de masse : refusé, pas de carte
                 return [v1]
             return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=RELAYED_STRONG_RULE,
-                            reason="action demandée depuis le web : carte forte à signer sur ton téléphone",
-                            subject=call.id, strength="strong")]
+                            reason=mt.pick(mt.PERM_RELAYED_STRONG),
+                            subject=call.id, strength="strong", code=RELAYED_STRONG)]
         if decision is None and effect is Effect.DESTRUCTIVE and self.go_sandbox is not None \
                 and not (call.name in SANDBOX_GO_TOOLS and self.go_sandbox(getattr(turn, "thread_id", None) or "")):
             # Le nom exact de la commande vaut accord dans le bac à sable de la session seulement (réversible par les
@@ -342,8 +437,7 @@ class PermissionGates:
             if v1.decision is Decision.DENY:
                 return [v1]
             return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=GO_SANDBOX_RULE,
-                            reason="action destructive hors du bac à sable d'une session de code : un GO écrit ne "
-                                   "suffit pas", subject=call.id, strength="strong")]
+                            reason=mt.pick(mt.PERM_GO_SANDBOX), subject=call.id, strength="strong", code=GO_SANDBOX_ONLY)]
         if decision is None:
             return self.inner.action(call, spec, turn)
         if decision is Decision.ALLOW:
@@ -351,9 +445,9 @@ class PermissionGates:
             if v1.decision is Decision.DENY:  # ce qui est toujours refusé (envoi de masse) le reste
                 return [v1]
         strength = "strong" if effect is Effect.DESTRUCTIVE and decision is Decision.HITL else None
-        return [Verdict(gate=Gate.ACTION, decision=decision, layer=1, rule=f"permissions:{self.permissions.mode.value}",
+        return [Verdict(gate=Gate.ACTION, decision=decision, layer=1, rule=rule_name,
                         reason=why, subject=call.id, strength=strength,
-                        code=code if decision is Decision.DENY else None)]
+                        code=code if decision in (Decision.DENY, Decision.HITL) else None)]
 
     def switch(self, reply: str, turn: Turn, tier: Any) -> list[Verdict]:
         return self.inner.switch(reply, turn, tier)
@@ -362,5 +456,5 @@ class PermissionGates:
         return getattr(self.inner, name)
 
 
-__all__ = ["MODES", "PLAN_MODE", "FILE_EDIT_TOOLS", "GO_SANDBOX_RULE", "SANDBOX_GO_TOOLS", "MEMORY_EDIT_TOOLS", "RELAYED_STRONG_RULE", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
+__all__ = ["MODES", "PLAN_MODE", "PLAN_TODO_WHY", "FILE_EDIT_TOOLS", "GO_SANDBOX_RULE", "SANDBOX_GO_TOOLS", "MEMORY_EDIT_TOOLS", "RELAYED_STRONG_RULE", "RELAY_CARD_RULE", "LocalPermissions", "Mode", "PermissionGates",
            "Rule"]

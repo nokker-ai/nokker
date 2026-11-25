@@ -55,7 +55,7 @@ def run_code(monkeypatch, tmp_path, app, *flags, config=""):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(config or "{}\n", encoding="utf-8")
     args = cli_mod.build_parser().parse_args(["--config", str(cfg), "code", "fais la tâche", "--workspace", str(app),
-                                              "--backend", "local", "--thread", "code-t1", *flags])
+                                              "--backend", "local", "--unsafe-local", "--thread", "code-t1", *flags])
     assert args.func(args) == 0
     skills = [s for s in seen["sources"] if isinstance(s, SkillToolSource)]
     return seen, (skills[0] if skills else None)
@@ -100,3 +100,31 @@ def test_trust_in_the_repo_itself_is_ignored(monkeypatch, tmp_path, repo):
     trust_project_hooks(repo / ".nokker" / "settings.json", str(repo.resolve()), sha, key=PROJECT_TRUST_KEY)
     _, src = run_code(monkeypatch, tmp_path, repo, "--project-skills")
     assert "deploy" not in listed(src)
+
+
+def _code_args(tmp_path, app, *flags):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("{}\n", encoding="utf-8")
+    return cli_mod.build_parser().parse_args(["--config", str(cfg), "code", "fais la tâche", "--workspace", str(app),
+                                              *flags])
+
+
+def test_local_backend_needs_unsafe_local(monkeypatch, tmp_path, repo, capsys):
+    monkeypatch.setattr(cli_mod, "build_kernel", lambda *a, **k: pytest.fail("rien ne doit démarrer"))
+    args = _code_args(tmp_path, repo, "--backend", "local")
+    assert args.func(args) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "--unsafe-local" in cap.err and "bac à sable docker" in cap.err
+
+
+def test_unsafe_local_warns_on_stderr(monkeypatch, tmp_path, repo, capsys):
+    run_code(monkeypatch, tmp_path, repo)
+    err = capsys.readouterr().err
+    assert cli_mod.UNSAFE_LOCAL_WARNING in err
+    assert "jeton d'accès de Nokker" in err and "approuver ses propres cartes" in err
+
+
+def test_docker_backend_has_no_warning_and_unsafe_local_alone_is_harmless(tmp_path, repo):
+    args = _code_args(tmp_path, repo)
+    assert args.backend == "docker" and args.unsafe_local is False

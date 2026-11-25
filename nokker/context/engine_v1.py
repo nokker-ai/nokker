@@ -12,11 +12,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from nokker.context.engine import ContextEngineV0, estimate_tokens, format_now_fr, render_injected
+from nokker.context.engine import ContextEngineV0, date_block, estimate_tokens, render_injected
 from nokker.context.imported import IMPORT_SOURCE, render_imported
-from nokker.context.manager import ContextManager
+from nokker.context.reply_language import turn_line
+from nokker.context.manager import RECALL_TOOL, ContextManager
 from nokker.core.ports import Assembled, Recall, ToolSpec
 from nokker.core.turn import Tier, ToolResult, Turn
+from nokker.memory.provenance import recall_line
+from nokker.redact.markers import CONSIGNE as MASKED_CONSIGNE
+from nokker.redact.markers import consigne_needed
 
 
 @dataclass
@@ -50,8 +54,13 @@ class ContextEngineV1(ContextEngineV0):
         st = mgr.state(turn.thread_id)
         messages: list[dict] = []
 
-        memory_text = mgr.memory_block(turn.thread_id)
-        index_block = self.tools_index_block()
+        as_message = mgr.budgets.memory_as_message
+        # `recall_context` est-il dans le catalogue du fil ? `core()` exclut déjà les outils retirés (`deny_tools`) et ne
+        # le contient pas sans source `RecallContextSource` : sinon l'invitation de la mémoire nommerait un outil absent.
+        recall_ok = any(s.name == RECALL_TOOL for s in core_tools)
+        memory_text = (mgr.frozen_memory_block(turn.thread_id, recall_ok) if as_message
+                       else mgr.memory_block(turn.thread_id, recall_ok))
+        index_block = self.tools_index_block(loaded_tools)
         project_text = self.project_block(turn)
         plan_text = self.plan_block(turn)
         # Du plus stable au moins stable (cache de préfixe) : préfixe, index d'outils, profil, mémoire de projet (change
@@ -62,9 +71,13 @@ class ContextEngineV1(ContextEngineV0):
             system_parts.append(project_text)
         if plan_text:  # consignes héritées du plan (X18) : changent quand la carte ou un ancêtre change
             system_parts.append(plan_text)
-        if memory_text:
+        if memory_text and not as_message:
             system_parts.append(memory_text)
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+        if memory_text and as_message:
+            # Append-only : le message système (préfixe, index, profil, projet) ne change plus à la clôture d'un épisode ;
+            # le résumé est un message `user` de contexte juste après lui, figé jusqu'à la clôture suivante.
+            messages.append({"role": "user", "content": memory_text})
 
         # Couche 4 — l'épisode courant, append-only, chaque tour avec son en-tête d'origine ; les résultats délestés
         # par un stub (état de vue persisté).
@@ -72,7 +85,7 @@ class ContextEngineV1(ContextEngineV0):
         for past in history:
             messages.append(self.user_message(past, self.past_user(past, mgr.replay_head(past, st)), kept))
             for m in past.messages:
-                d = m.to_openai()
+                d = m.to_openai(thinking=True)
                 if m.role == "tool":
                     stub = mgr.shed_stub(past.index, m.tool_call_id, st)
                     if stub is not None:
@@ -81,20 +94,40 @@ class ContextEngineV1(ContextEngineV0):
 
         # Couche 5 — en-tête du tour (même format que V0 + épisodes pertinents après la date), figé par tour.
         def head_parts() -> list[str]:
-            parts = [f"[Date et heure actuelles]\n{format_now_fr(self.now_fn())}\n[/Date]"]
+            parts = [date_block(self.now_fn(), turn)]
+            env = self.self_context_for(turn)
+            if env:  # où tourne le fil, canal, machines liées : juste après la date, avant les épisodes pertinents
+                parts.append(env)
+            if self.reply_language or self.reply_language_tail:
+                # Ligne de langue du tour (`context.reply_language`), comme V0 (même fonction) : figée avec l'en-tête du
+                # tour (append-only), seulement sur un vrai signal de langue. Sans drapeau de langue : en-tête d'avant, à
+                # l'octet près (V0 l'écrit sans drapeau ; V1 la garde derrière eux pour ne rien changer ailleurs).
+                line = turn_line(turn)
+                if line:
+                    parts.append(line)
             relevant = mgr.relevant_block(turn.thread_id, turn.input.text, exclude=mgr.layer3_ids(turn.thread_id))
             if relevant:
                 parts.append(relevant)
             own = [r for r in recall if getattr(r, "source", "") != IMPORT_SOURCE]
             imported = [r for r in recall if getattr(r, "source", "") == IMPORT_SOURCE]
             if own:
-                rappel = "\n".join(
-                    f"- [{r.note}] (score {r.score:.2f}) {r.text[:self.recall_text_limit]}" for r in own)
+                # Ligne d'avant inchangée ; fait de tiers : marqueur de source + inline() (nokker/memory/provenance.py).
+                rappel = "\n".join(recall_line(r, self.recall_text_limit) for r in own)
                 parts.append(f"[Rappel mémoire]\n{rappel}\n[/Rappel]")
             if imported:  # lot 30 d : données importées, bloc à part (nokker/context/imported.py)
                 parts.append(render_imported(imported, self.recall_text_limit))
+            notes = self.feature_notes_block(turn)
+            if notes:  # drapeau `feature_notes` : après le rappel mémoire, avant le contexte reçu
+                parts.append(notes)
+            # Blocs de contexte de l'hôte (`context_blocks`) : seuls les en-têtes ENCORE rejoués comptent comme visibles.
+            parts.extend(self.host_context_parts(
+                turn, [h.head for h in reversed(history) if h.head and mgr.replay_head(h, st)]))
             if turn.injected:
                 parts.append(render_injected(turn.injected))
+            if consigne_needed(turn, history):
+                # Valeurs masquées sur l'appareil (docs/LOKKAL-PHONE.md §4.3.2) : une fois par fil, au premier tour qui
+                # porte un marqueur, juste avant les pièces jointes.
+                parts.append(MASKED_CONSIGNE)
             if turn.attached:
                 # Pièces jointes texte/dossier/url (docs/CONTEXT-FORMAT.md) : en dernier, juste avant le message.
                 parts.append(turn.attached)
@@ -102,7 +135,7 @@ class ContextEngineV1(ContextEngineV0):
 
         head = self.turn_head(turn, head_parts)
         messages.append(self.user_message(turn, self.past_user(turn), kept))
-        messages.extend(m.to_openai() for m in turn.messages)
+        messages.extend(m.to_openai(thinking=True) for m in turn.messages)
 
         tools_payload = [s.to_openai() for s in core_tools] + [s.to_openai() for s in loaded_tools]
         layer_tokens = {

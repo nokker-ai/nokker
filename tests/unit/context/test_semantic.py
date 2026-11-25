@@ -105,6 +105,7 @@ def test_reindex_and_consolidation_refresh_the_index(tmp_path):
         def summarize(self, turns, previous=None):
             return SummaryResult(title="T", summary="Résumé raffiné", keywords=[], facts=[], model="m")
 
+    s.say("Un dernier mot.")  # le consolidateur ne visite que les fils à épisode ouvert
     Consolidator(s.manager, refiner=Refiner()).run_once()
     assert len(s.manager.semantic.indexed) > before + closed  # chaque épisode raffiné est ré-indexé
 

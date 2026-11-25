@@ -646,8 +646,10 @@ class GoalService:
         # Portes du locataire sans GO écrit (le texte de l'objectif est enregistré, ce n'est pas un humain qui parle
         # maintenant), comme un passage Crew ; budget vérifié avant chaque appel modèle.
         rk = dataclasses.replace(kernel, gates=AgentRunGates(inner=kernel.gates, rules=[]), stop_check=stop)
+        resolve = getattr(rk, "resolve_lang", None)  # langue résolue à la soumission : compte, puis fil, puis fr
         inp = TurnInput(thread_id=g.thread_id, user_text=self.continue_text(g), channel=GOAL_CHANNEL,
-                        sender=g.owner or None, control="goal_continue")
+                        sender=g.owner or None, control="goal_continue",
+                        lang=resolve(g.thread_id, g.owner or None) if resolve is not None else None)
         run = self.run_turn or (lambda k, i: k.run_turn(i))
         return run(rk, inp)
 

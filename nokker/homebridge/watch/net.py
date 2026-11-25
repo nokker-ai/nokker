@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 from nokker.homebridge.config import BridgeConfig, BridgeConfigError, Refused
+from nokker.homebridge.lan import PinnedHTTPSConnection
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_MEDIA_BYTES = 8 * 1024 * 1024
@@ -38,12 +39,13 @@ class WatchEnv:
 
     cfg: BridgeConfig
 
-    def check_url(self, url: str) -> None:
+    def check_url(self, url: str) -> str:
+        """IP vérifiée à joindre (résolue une fois), ou `Refused`."""
         parts = urlsplit(url)
         scheme = (parts.scheme or "").lower()
         if scheme not in ("http", "https", "ws", "wss") or not parts.hostname:
             raise Refused("adresse http(s) ou ws(s) attendue")
-        self.cfg.allow.check(parts.hostname, parts.port or (443 if scheme in ("https", "wss") else 80))
+        return self.cfg.allow.check(parts.hostname, parts.port or (443 if scheme in ("https", "wss") else 80))
 
     def secret(self, ref: str) -> str:
         if not isinstance(ref, str) or not ref.startswith(_SECRET):
@@ -106,7 +108,7 @@ class LanHttp:
             if self.verify is False:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-            return http.client.HTTPSConnection(parts.hostname, port, timeout=self.timeout_s, context=ctx), path
+            return PinnedHTTPSConnection(parts.hostname, ip, port, timeout=self.timeout_s, context=ctx), path
         return http.client.HTTPConnection(ip, port, timeout=self.timeout_s), path
 
     @staticmethod

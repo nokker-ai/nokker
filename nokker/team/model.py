@@ -130,6 +130,7 @@ class Invite:
     decided_at: float | None = None
     kind: str = "team"  # `household` : invitation dans un foyer (migration 039)
     profile: str = "adult"  # foyer : profil déclaré par le payeur (adult | teen | child), recopié dans l'adhésion
+    first_name: str = ""  # foyer : prénom saisi par le payeur (migration 072), recopié dans le compte à l'acceptation
 
 
 @dataclass

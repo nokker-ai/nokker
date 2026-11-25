@@ -24,6 +24,7 @@ from nokker.tools.code import PROCESS_TOOLS, CodeToolSource
 from nokker.tools.processes import (
     PreviewSigner, ProcessError, ProcessTable, is_process_id, reap_processes,
 )
+from tests.unit.tools.fenced import parse
 
 CTX = ToolContext(thread_id="th_bg", turn_index=0, channel="api")
 PY = sys.executable
@@ -83,6 +84,17 @@ def _wait(pred, timeout=5.0):
     return pred()
 
 
+def _wait_exit(p, ceiling: float = 180.0) -> bool:
+    """Attend l'ÉVÉNEMENT de fin (le fichier de code de sortie, écrit puis renommé d'un coup), pas une durée : sous
+    charge la commande peut tarder, le test rend la main dès qu'elle a fini. Le plafond ne sert qu'à ne pas pendre."""
+    end = time.time() + ceiling
+    while time.time() < end:
+        if os.path.exists(p.exit_file):
+            return True
+        time.sleep(0.02)
+    return os.path.exists(p.exit_file)
+
+
 def _tampered(sig: str) -> str:
     """La signature avec son dernier caractère CHANGÉ — `sig[:-1] + "0"` ne changeait rien quand elle finissait déjà
     par « 0 » (une fois sur seize : test instable)."""
@@ -119,7 +131,7 @@ def test_start_logs_exit_code_and_own_process_group(tmp_path, tables, host_logs)
     with open(f"/proc/{p.pgid}/environ", "rb") as f:
         assert f"NOKKER_BG={p.id}".encode() in f.read().split(b"\0")  # la marque vérifiée avant tout signal
     short = t.start("echo fini; exit 3")
-    assert _wait(lambda: t.logs(short.id)["state"] == "exited")
+    assert _wait_exit(short) and t.logs(short.id)["state"] == "exited"
     got = t.logs(short.id)
     assert got["returncode"] == 3 and got["output"] == "fini\n" and got["log_bytes"] == 5 and not got["truncated"]
     assert {x.id: x.state for x in t.list()} == {p.id: "running", short.id: "exited"}
@@ -193,7 +205,8 @@ def test_logs_are_tailed_and_clipped(tmp_path, tables):
     # (sous charge, il dépassait les 5 s et le test lisait un journal à moitié écrit sans le savoir).
     (tmp_path / "lignes.txt").write_text("".join(f"ligne {i}\n" for i in range(5000)))
     p = t.start("cat lignes.txt")
-    assert _wait(lambda: t.logs(p.id)["state"] == "exited", timeout=30), "processus pas fini"
+    assert _wait_exit(p), "processus pas fini"
+    assert t.logs(p.id)["state"] == "exited"  # le fichier de sortie existe : l'état suit, sans attente
     assert t.logs(p.id)["returncode"] == 0  # code de sortie écrit d'un coup (fichier renommé), jamais lu vide
     got = t.logs(p.id, tail=10)
     assert got["output"].splitlines() == [f"ligne {i}" for i in range(4990, 5000)] and got["truncated"]
@@ -276,13 +289,13 @@ def test_tools_end_to_end_and_close_stops_everything(tmp_path, monkeypatch):
     try:
         r = src.call("process_start", {"command": f"{PY} -u -c \"print('écoute'); import time; time.sleep(30)\"",
                                        "name": "srv", "port": 5173}, CTX)
-        started = json.loads(r.content)
+        started = parse(r.content)
         assert not r.is_error and started["state"] == "running" and started["port"] == 5173
         assert "aperçu privé" in started["hint"]
         pid = started["id"]
         listing = json.loads(src.call("process_list", {}, CTX).content)["processes"]
         assert [p["id"] for p in listing] == [pid]
-        assert _wait(lambda: "écoute" in json.loads(src.call("process_logs", {"id": pid}, CTX).content)["output"])
+        assert _wait(lambda: "écoute" in parse(src.call("process_logs", {"id": pid}, CTX).content)["output"])
         other = ToolContext(thread_id="th_autre", turn_index=0, channel="api")
         assert src.call("process_stop", {"id": pid}, other).is_error  # un autre fil ne l'arrête pas
         assert json.loads(src.call("process_list", {}, other).content)["processes"] == []
@@ -371,7 +384,7 @@ def test_preview_route_serves_the_port_with_sandbox_headers(tmp_path, monkeypatc
         monkeypatch.setattr(src, "_open", lambda t: code.Workspace(env=ShellEnv(str(app)), ops=None, todos=None,
                                                                    cwd=str(app)))
         ctx = ToolContext(thread_id=tid, turn_index=0, channel="api")
-        started = json.loads(src.call("process_start", {"command": f"{PY} -u -m http.server {dev} --bind 127.0.0.1",
+        started = parse(src.call("process_start", {"command": f"{PY} -u -m http.server {dev} --bind 127.0.0.1",
                                                         "port": dev}, ctx).content)
         pid = started["id"]
         # Prêt quand le serveur le dit (il écoute), pas au bout d'un délai fixe ; le port réservé est alors rendu.
@@ -452,7 +465,7 @@ def test_docker_background_server_logs_preview_and_cleanup(monkeypatch):
                               capture_output=True, text=True, check=True).stdout.split()
 
     try:
-        r = json.loads(src.call("process_start", {"command": "python3 -u -m http.server 8000 --bind 127.0.0.1",
+        r = parse(src.call("process_start", {"command": "python3 -u -m http.server 8000 --bind 127.0.0.1",
                                                   "name": "web", "port": 8000}, ctx).content)
         pid = r["id"]
         assert r["state"] == "running", r
@@ -464,7 +477,7 @@ def test_docker_background_server_logs_preview_and_cleanup(monkeypatch):
         assert _wait(lambda: table.fetch(pid, "/index.html")[0] == 200, timeout=15)
         status, ctype, body, _ = table.fetch(pid, "/index.html")  # joint DANS le bac à sable
         assert "bac à sable" in body.decode() and ctype.startswith("text/html")
-        assert _wait(lambda: "GET /index.html" in json.loads(src.call("process_logs", {"id": pid}, ctx).content)
+        assert _wait(lambda: "GET /index.html" in parse(src.call("process_logs", {"id": pid}, ctx).content)
                      ["output"], timeout=10)
         log_in_box = subprocess.run(["docker", "exec", cid, "ls", "/tmp/.nokker-bg"], capture_output=True,
                                     text=True).stdout

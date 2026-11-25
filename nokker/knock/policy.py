@@ -25,7 +25,7 @@ KNOCK_APPROVABLE_RULES = frozenset({
 
 # Jamais par un toc, même si une carte de ces règles devenait standard un jour (défense en profondeur).
 NEVER_BY_KNOCK = frozenset({
-    "household:guardian", "pages:publish", "ops:prod", "home:strong",
+    "household:guardian", "pages:publish", "wall:publish", "ops:prod", "home:strong",
     "permissions:relayed_connector", "permissions:local_connector_strong",
     "effect:send_external", "effect:spend",
 })

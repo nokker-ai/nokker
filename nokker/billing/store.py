@@ -144,14 +144,16 @@ class PgBilling:
         with self._tenant() as conn:
             r = conn.execute(
                 "INSERT INTO subscriptions AS s (tenant_id, stripe_subscription, stripe_customer, plan, status, "
-                "current_period_end, cancel_at_period_end, last_event_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "current_period_end, cancel_at_period_end, last_event_at, trial_end) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (tenant_id, stripe_subscription) DO UPDATE SET stripe_customer = EXCLUDED.stripe_customer, "
                 "plan = EXCLUDED.plan, status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end, "
+                "trial_end = EXCLUDED.trial_end, "
                 "cancel_at_period_end = EXCLUDED.cancel_at_period_end, last_event_at = EXCLUDED.last_event_at, "
                 "updated_at = now() WHERE s.last_event_at < EXCLUDED.last_event_at "
                 "OR (s.last_event_at = EXCLUDED.last_event_at AND s.status <> 'canceled') RETURNING 1",
                 (tenant, row["stripe_subscription"], row["stripe_customer"], row["plan"], row["status"],
-                 row["current_period_end"], row["cancel_at_period_end"], row["last_event_at"])).fetchone()
+                 row["current_period_end"], row["cancel_at_period_end"], row["last_event_at"],
+                 row.get("trial_end"))).fetchone()
         return r is not None
 
     def subscription(self, tenant_id: str) -> dict[str, Any] | None:
@@ -159,7 +161,7 @@ class PgBilling:
 
         with tenant_scope(tenant_id), self._tenant() as conn:
             return conn.execute("SELECT stripe_subscription, stripe_customer, plan, status, current_period_end, "
-                                "cancel_at_period_end, last_event_at FROM subscriptions "
+                                "cancel_at_period_end, last_event_at, trial_end FROM subscriptions "
                                 "ORDER BY (status = ANY(%s)) DESC, last_event_at DESC LIMIT 1",
                                 (sorted(ACTIVE_STATUSES),)).fetchone()
 

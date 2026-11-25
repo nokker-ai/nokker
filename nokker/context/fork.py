@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.context.tokens import estimate_tokens
 from nokker.core.ports import Assembled, Recall, ToolSpec
 from nokker.core.turn import Tier, Turn
 
@@ -28,7 +29,7 @@ def _tool_name(t: dict[str, Any]) -> str:
 
 
 def _estimate(messages: list[dict[str, Any]]) -> int:
-    return sum(len(str(m.get("content") or "")) for m in messages) // 4
+    return sum(estimate_tokens(str(m.get("content") or "")) for m in messages)
 
 
 @dataclass

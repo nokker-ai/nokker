@@ -1,0 +1,7 @@
+name: design
+version: 1
+title: Design
+description: >-
+  Design guard-rails for the pages and screens Nokker builds: a design floor checked without a browser, a skill to
+  build a new page that looks made rather than generated, and a skill to audit and polish an existing one.
+tools: [skill_view, skill_list, read_file, write_file, design_check, page_create]

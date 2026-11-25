@@ -98,7 +98,7 @@ def rig(world) -> Rig:
     devices = MemoryDevices()
     for acc, (_, dev) in world.keys.items():
         devices.keys[dev.id] = DeviceKey(id=dev.id, user=acc, public_key_spki=dev.public_key_spki, status="approved")
-    cfg = AgentConfig(stripe_key="rk_test_x", webhook_secret=WHSECRET, kernel_token=KTOKEN,
+    cfg = AgentConfig(issuer="stripe_spt", stripe_key="rk_test_x", webhook_secret=WHSECRET, kernel_token=KTOKEN,
                       callback_secret=CBSECRET, webauthn_origin=ORIGIN, sellers=(PROFILE,), max_amount_minor=50_000)
     callbacks: list = []
     agent = PayAgent(cfg, store=MemoryStore(), devices=devices,
@@ -112,7 +112,8 @@ def rig(world) -> Rig:
     world.svc.publish = lambda ev, data: events.append((ev, data))
     world.svc.agent = client
     world.svc.agent_settings = kagent.AgentSettings.from_config(
-        {"url": "http://pay-agent:8790", "publishable_key": "pk_test_x", "sellers": {"www.shop.example.ch": PROFILE}})
+        {"url": "http://pay-agent:8790", "issuer": "stripe_spt", "publishable_key": "pk_test_x",
+         "sellers": {"www.shop.example.ch": PROFILE}})
     return Rig(world=world, agent=agent, stripe=stripe, client=client, callbacks=callbacks, events=events)
 
 
@@ -138,7 +139,7 @@ def test_method_registers_only_on_the_accounts_passkey(rig):
     assert rig.client.method(ALICE) is None
     m = rig.register()
     assert m == {"kind": "card", "brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2030,
-                 "created_at": pytest.approx(time.time(), abs=5)}
+                 "created_at": pytest.approx(time.time(), abs=5), "issuer": "stripe_spt"}
     assert "pm_" not in json.dumps(rig.client.method(ALICE))  # l'identifiant Stripe ne sort pas de l'agent
 
 
@@ -436,7 +437,7 @@ def test_mandate_coherence_ties_human_pays_and_agent_pay(world):
 
 def test_form_encoding_and_config_checks():
     assert _flatten({"a": {"b": 1, "c": None}, "d": True}) == [("a[b]", "1"), ("d", "true")]
-    bad = AgentConfig(stripe_key="sk_live_x", webauthn_origin="http://x")
+    bad = AgentConfig(issuer="stripe_spt", stripe_key="sk_live_x", webauthn_origin="http://x")
     probs = " ".join(bad.problems())
     assert "rk_" in probs and "https://" in probs and "PAYAGENT_DSN" in probs
 

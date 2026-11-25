@@ -133,6 +133,9 @@ def test_turns_count_against_the_account_caps(guarded):
     assert _post(port, {"model": MODEL, "messages": _user("deux")}, mt)[0] == 200
     status, out = _post(port, {"model": MODEL, "messages": _user("trois")}, mt)
     assert status == 403 and out["error"]["code"] == "quota_exceeded" and "Limite du jour" in out["error"]["message"]
+    # Fin de la période du quota (jour de quota : 12:00 UTC à 12:00 UTC) : le client dit quand ça se renouvelle.
+    assert out["error"]["retry_at"] == "2026-10-27T12:00:00Z"
+    assert set(out) == {"error"} and set(out["error"]) == {"code", "message", "retry_at"}
 
 
 def test_calls_per_day_cap_holds_even_without_new_turns(guarded):
@@ -140,6 +143,44 @@ def test_calls_per_day_cap_holds_even_without_new_turns(guarded):
     mt = _machine_token(links)
     codes = [_post(port, {"model": MODEL, "messages": _tool_follow_up()}, mt)[0] for _ in range(5)]
     assert codes[:4] == [200] * 4 and codes[4] == 403
+
+
+def test_calls_per_day_refusal_carries_the_end_of_the_day_window(guarded):
+    port, links, _, _ = guarded
+    mt = _machine_token(links)
+    for _ in range(4):
+        _post(port, {"model": MODEL, "messages": _tool_follow_up()}, mt)
+    status, out = _post(port, {"model": MODEL, "messages": _tool_follow_up()}, mt)
+    assert status == 403 and out["error"]["code"] == "quota_exceeded" and "appels par jour" in out["error"]["message"]
+    assert out["error"]["retry_at"] == "2026-10-27T12:00:00Z"
+
+
+def test_quota_refusal_without_a_computable_period_has_no_retry_at(guarded, monkeypatch):
+    """Fin de période inconnue (foyer suspendu, lecture du quota en panne) : le champ est ABSENT, jamais inventé ; statut
+    et autres champs inchangés."""
+    port, links, _, _ = guarded
+    mt = _machine_token(links)
+    monkeypatch.setattr(cloud_http, "_inference_quota",
+                        lambda *a, **kw: cloud_http._InferenceTicket(refused="Compte suspendu."))
+    status, out = _post(port, {"model": MODEL, "messages": _user("un")}, mt)
+    assert status == 403 and out == {"error": {"code": "quota_exceeded", "message": "Compte suspendu."}}
+
+
+def test_limits_resets_at_follows_the_rule_that_refused():
+    from nokker.core.turn import Decision, Gate, Verdict
+    from nokker.tenancy.context import tenant_scope
+
+    lim = TenantLimits(counter=MemoryUsage(), mode="hard", turns_per_day=2, turns_per_week=10, hard_turns_per_day=150,
+                       clock=lambda: datetime(2026, 10, 28, 9, 0, tzinfo=UTC))  # mercredi 09:00 UTC
+
+    def v(rule):
+        return Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=0, rule=rule, reason="x", subject="reply")
+
+    with tenant_scope("tn_x"):
+        assert lim.resets_at(v("limits:turns_per_day")) == datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+        assert lim.resets_at(v("limits:hard_turns_per_day")) == datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+        assert lim.resets_at(v("limits:turns_per_week")) == datetime(2026, 11, 2, 6, 0, tzinfo=UTC)  # lundi suivant
+        assert lim.resets_at(v("autre:regle")) is None and lim.resets_at(None) is None
 
 
 def test_rate_limit_per_machine(guarded):

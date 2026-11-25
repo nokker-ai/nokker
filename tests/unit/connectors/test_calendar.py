@@ -137,11 +137,95 @@ def test_recurrence_id_override_replaces_the_occurrence():
         ("Série", "2026-10-21T10:00+02:00"), ("Déplacé", "2026-10-22T17:00+02:00"), ("Série", "2026-10-23T10:00+02:00")]
 
 
-@pytest.mark.parametrize("rule", ["FREQ=MONTHLY;BYDAY=2TU", "FREQ=YEARLY;BYMONTH=3", "FREQ=HOURLY", "FREQ=WEEKLY;COUNT=2;UNTIL=20270101T000000Z"])
+@pytest.mark.parametrize("rule", ["FREQ=MONTHLY;BYDAY=2TU;BYSETPOS=1", "FREQ=WEEKLY;BYDAY=2TU", "FREQ=YEARLY;BYDAY=MO", "FREQ=HOURLY", "FREQ=WEEKLY;COUNT=2;UNTIL=20270101T000000Z", "FREQ=MONTHLY;BYWEEKNO=3"])
 def test_unsupported_rrule_gives_first_occurrence_with_note(rule):
     ics = vcal(vevent("UID:u", "SUMMARY:x", "DTSTART:20261022T080000Z", "DTEND:20261022T090000Z", f"RRULE:{rule}"))
     r = between(ics, NOW, NOW + timedelta(days=90))
     assert len(r) == 1 and "récurrence non gérée" in r[0]["note"]
+
+
+def _rec(rule, dtstart="DTSTART;TZID=Europe/Zurich:20261019T100000", dend="DTEND;TZID=Europe/Zurich:20261019T110000", *extra, uid="r"):
+    return vcal(vevent(f"UID:{uid}", "SUMMARY:Série", dtstart, dend, f"RRULE:{rule}", *extra))
+
+
+def _days(ics, a, b):
+    return [e["start"][:16] for e in between(ics, a, b)]
+
+
+def test_weekly_tuesday_thursday_far_from_first_occurrence():
+    ics = _rec("FREQ=WEEKLY;BYDAY=TU,TH", "DTSTART;TZID=Europe/Zurich:20260602T100000", "DTEND;TZID=Europe/Zurich:20260602T110000")
+    # « libre jeudi 19.11 ? » : la première occurrence date de juin, jeudi est pourtant occupé
+    r = between(ics, datetime(2026, 11, 19, tzinfo=TZ), datetime(2026, 11, 20, tzinfo=TZ))
+    assert [e["start"] for e in r] == ["2026-11-19T10:00+01:00"]
+
+
+def test_daily_series_started_years_ago_not_cut_by_iteration_cap():
+    ics = _rec("FREQ=DAILY", "DTSTART;TZID=Europe/Zurich:20150101T080000", "DTEND;TZID=Europe/Zurich:20150101T090000")
+    r = between(ics, datetime(2026, 11, 19, tzinfo=TZ), datetime(2026, 11, 21, tzinfo=TZ))
+    assert [e["start"] for e in r] == ["2026-11-19T08:00+01:00", "2026-11-20T08:00+01:00"]
+
+
+def test_monthly_second_monday_and_last_friday():
+    ics = _rec("FREQ=MONTHLY;BYDAY=2MO")
+    assert _days(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2027, 1, 31, tzinfo=TZ)) == [
+        "2026-10-19T10:00", "2026-11-09T10:00", "2026-12-14T10:00", "2027-01-11T10:00"]
+    ics = _rec("FREQ=MONTHLY;BYDAY=-1FR")
+    assert _days(ics, datetime(2026, 11, 1, tzinfo=TZ), datetime(2027, 1, 31, tzinfo=TZ)) == [
+        "2026-11-27T10:00", "2026-12-25T10:00", "2027-01-29T10:00"]
+
+
+def test_bymonthday_and_bymonth_and_yearly():
+    ics = _rec("FREQ=MONTHLY;BYMONTHDAY=1,-1;COUNT=4")
+    assert _days(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2027, 6, 1, tzinfo=TZ)) == [
+        "2026-10-19T10:00", "2026-10-31T10:00", "2026-11-01T10:00", "2026-11-30T10:00"]
+    ics = _rec("FREQ=YEARLY;BYMONTH=3,11;BYMONTHDAY=5", "DTSTART;VALUE=DATE:20260305", "DTEND;VALUE=DATE:20260306")
+    assert [e["start"] for e in between(ics, datetime(2026, 1, 1, tzinfo=TZ), datetime(2027, 12, 31, tzinfo=TZ))] == [
+        "2026-03-05", "2026-11-05", "2027-03-05", "2027-11-05"]
+    ics = _rec("FREQ=YEARLY;BYMONTH=11;BYDAY=3TH", "DTSTART;VALUE=DATE:20261119", "DTEND;VALUE=DATE:20261120")
+    assert [e["start"] for e in between(ics, datetime(2026, 1, 1, tzinfo=TZ), datetime(2028, 12, 31, tzinfo=TZ))] == [
+        "2026-11-19", "2027-11-18", "2028-11-16"]
+
+
+def test_wkst_changes_biweekly_pairing():
+    base = ("FREQ=WEEKLY;INTERVAL=2;BYDAY=SU,MO;COUNT=4", "DTSTART;VALUE=DATE:20261018", "DTEND;VALUE=DATE:20261019")
+    mo = [e["start"] for e in between(_rec(base[0] + ";WKST=MO", *base[1:]), datetime(2026, 10, 1, tzinfo=TZ), datetime(2027, 1, 1, tzinfo=TZ))]
+    su = [e["start"] for e in between(_rec(base[0] + ";WKST=SU", *base[1:]), datetime(2026, 10, 1, tzinfo=TZ), datetime(2027, 1, 1, tzinfo=TZ))]
+    assert mo == ["2026-10-18", "2026-10-26", "2026-11-01", "2026-11-09"]   # dim 18 seul dans sa semaine, puis lun 26 + dim 1.11
+    assert su == ["2026-10-18", "2026-10-19", "2026-11-01", "2026-11-02"]
+
+
+def test_weekly_wall_time_kept_after_dst_change():
+    ics = _rec("FREQ=WEEKLY;COUNT=3", "DTSTART;TZID=Europe/Zurich:20261019T100000", "DTEND;TZID=Europe/Zurich:20261019T110000")
+    assert [e["start"] for e in between(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2026, 12, 1, tzinfo=TZ))] == [
+        "2026-10-19T10:00+02:00", "2026-10-26T10:00+01:00", "2026-11-02T10:00+01:00"]
+
+
+def test_exdate_variants_timezone_and_all_day():
+    ics = _rec("FREQ=WEEKLY;COUNT=3", "DTSTART;TZID=Europe/Zurich:20261019T100000", "DTEND;TZID=Europe/Zurich:20261019T110000",
+               "EXDATE;TZID=Europe/Zurich:20261026T100000")
+    assert _days(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2026, 12, 1, tzinfo=TZ)) == ["2026-10-19T10:00", "2026-11-02T10:00"]
+    ics = _rec("FREQ=DAILY;COUNT=3", "DTSTART;VALUE=DATE:20261019", "DTEND;VALUE=DATE:20261020", "EXDATE;VALUE=DATE:20261020")
+    assert [e["start"] for e in between(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2026, 12, 1, tzinfo=TZ))] == ["2026-10-19", "2026-10-21"]
+
+
+def test_rdate_adds_occurrences_and_exdate_removes_them():
+    ics = _rec("FREQ=WEEKLY;COUNT=1", "DTSTART;TZID=Europe/Zurich:20261019T100000", "DTEND;TZID=Europe/Zurich:20261019T110000",
+               "RDATE;TZID=Europe/Zurich:20261023T100000,20261024T100000", "EXDATE;TZID=Europe/Zurich:20261024T100000")
+    assert _days(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2026, 12, 1, tzinfo=TZ)) == ["2026-10-19T10:00", "2026-10-23T10:00"]
+
+
+def test_endless_series_is_bounded_and_flagged():
+    ics = _rec("FREQ=DAILY", "DTSTART;TZID=Europe/Zurich:20260101T080000", "DTEND;TZID=Europe/Zurich:20260101T090000")
+    r = between(ics, datetime(2026, 1, 1, tzinfo=TZ), datetime(2030, 1, 1, tzinfo=TZ))   # plage 4 ans demandée
+    assert 1000 <= len(r) <= 1002 and "tronquée" in r[0]["note"]   # plafonnée à MAX_OCC
+    r = between(_rec("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30"), datetime(2026, 1, 1, tzinfo=TZ), datetime(2027, 1, 1, tzinfo=TZ))
+    assert [e["start"] for e in r] == ["2026-10-19T10:00+02:00"] and "tronquée" in r[0]["note"]
+
+
+def test_dtstart_not_matching_rule_is_still_first_instance():
+    ics = _rec("FREQ=WEEKLY;BYDAY=TU,TH;COUNT=3")   # 19.10.2026 = lundi
+    assert _days(ics, datetime(2026, 10, 1, tzinfo=TZ), datetime(2026, 12, 1, tzinfo=TZ)) == [
+        "2026-10-19T10:00", "2026-10-20T10:00", "2026-10-22T10:00"]
 
 
 def test_broken_content_never_raises_and_non_ics_is_protocol_error():
@@ -677,3 +761,11 @@ def test_events_result_shape_and_other_tools_unchanged():
     assert parse_events_result(json.dumps(data)) == data  # un JSON brut reste lisible par le noyau
     assert c.call("calendar_events", {"days": 0}, CTX).is_error  # erreur : texte brut, hors clôture
     assert "untrusted-data" not in c.call("calendar_events", {"days": 0}, CTX).content
+
+
+def test_frozen_truncation_note_fingerprint():
+    import hashlib
+
+    from nokker.connectors import calendar as C
+
+    assert hashlib.sha256(C._TRUNCATED_NOTE.encode()).hexdigest()[:16] == "3db4b4374fe2ef67"

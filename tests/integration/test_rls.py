@@ -38,6 +38,20 @@ CONTENT_TABLES = [
     # équipe (023) : locataire du PROJET ; les politiques d'équipe (membres d'autres locataires) dans test_team_rls.py
     "team_projects", "team_access", "team_members", "team_invites", "team_skills", "team_notes",
     "team_note_quarantine",
+    # partages de connecteurs (068) : locataire du PROPRIÉTAIRE ; la lecture du bénéficiaire dans test_connector_grants_rls.py
+    "connector_grants", "connector_grant_events",
+    # connecteurs OAuth (069) : comptes reliés (jetons chiffrés) et flux en cours, dans le locataire du profil
+    "oauth_accounts", "oauth_flows",
+    # zones de l'app (075) : zones du membre et événements récents (idempotence), dans le locataire du membre
+    "member_zones", "zone_events",
+    # appareils de l'app (076) : capacités de lecture du téléphone, dans le locataire du membre
+    "member_devices",
+    # nœud téléphone (077) : nœuds et file des opérations, dans le locataire du membre
+    "phone_nodes", "phone_tasks", "phone_registrations", "member_egress_hosts",
+    # nœud maison (081) : journal de la maison au cloud, dans le locataire du compte
+    "home_journal",
+    "account_persona",  # « Ton Nokker » (083, V6) : nom, voix et avatar de l'assistant du compte
+    "accord_devices",  # appareils ACCORD (092, docs/ACCORD-DEVICE.md) : clés publiques du bouton physique
     "lokkal_machine_resources", "lokkal_handoffs", "lokkal_mirror_notes",  # délégation par besoin (025, X21)
     "nokker_agent_runs",  # passages des agents Crew (024, X14) : écrits dans le locataire de l'agent
     # plan et incidents (029, X18) : sources signées, signatures reçues, incidents, cartes, propositions, brief
@@ -62,11 +76,15 @@ CONTENT_TABLES = [
     # objectifs et notes du correcteur (050, docs/OUTCOMES-GOAL.md) : locataire du fil
     "nokker_goals", "nokker_goal_grades",
     "ambient_boards",  # tableau commun du foyer (054, docs/AMBIENT.md) : locataire du foyer
+    "wall_screens",  # écrans du mur (083, docs/SCREENS.md, V7) : locataire du compte
     "household_lexicon",  # lexique de prononciation du foyer (060, docs/VOICE.md §6) : locataire du foyer
     # papiers du foyer (055, docs/HOUSEHOLD-PAPER.md) : locataire du compte, aucune politique croisée
     "paper_documents", "paper_exports", "paper_settings",
     # calendrier familial (061, docs/FAMILY-CALENDAR.md) : locataire du compte, aucune politique croisée
     "family_calendar_drafts", "family_calendar_settings",
+    # projets du foyer (084, docs/FAMILY-PROJECTS.md) : brouillons chez l'auteur, projets et tâches chez le foyer ;
+    # aucune politique croisée
+    "household_project_drafts", "household_projects", "household_tasks", "household_project_settings",
     # paiements (056, docs/PAYMENTS.md) : mandats et budgets, locataire du membre
     "pay_mandates", "pay_budgets",
     # ex-« hors RLS » qui portent un locataire (058, chantier rls-out-tables) : RLS forcée, tenant_isolation ; celles
@@ -80,7 +98,7 @@ KEYED = {"accounts": ("id", "email"), "billing_customers": ("stripe_customer",),
          "household_minor_grants": ("account_id",), "lokkal_gateway_codes": ("code_sha256",),
          "lokkal_gateway_refresh": ("token_sha256", "family"),
          "lokkal_machines": ("id", "token_sha256", "host", "account_id"), "sso_domain_claims": ("domain",),
-         "sso_flows": ("state_sha256",), "sso_routes": ("connection_id",), "thread_share_tokens": ("token_sha256",),
+         "sso_flows": ("state_sha256",), "oauth_flows": ("state_sha256",), "sso_routes": ("connection_id",), "thread_share_tokens": ("token_sha256",),
          "ambient_displays": ("id", "token_sha256", "pair_sha256", "account_id")}
 OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", "admin_audit", "beta_applications",
               "devices", "sessions", "totp_secrets", "used_nonces", "auth_email_codes",  # authentification : lues avant le locataire
@@ -95,7 +113,12 @@ OUT_OF_RLS = {"tenants", "account_identities", "telegram_pairing", "operators", 
               # fenêtre de 24 h WhatsApp sous empreinte — lus avant de connaître le locataire
               "channel_pairing", "channel_events", "channel_windows",
               # agent de paiement (063) : sans locataire, rôle nokker_pay_agent seul (test_pay_agent_role_*)
-              "pay_agent_methods", "pay_agent_tokens", "pay_agent_events"}
+              "pay_agent_methods", "pay_agent_tokens", "pay_agent_events",
+              "pay_agent_cards", "pay_agent_3ds", "pay_agent_links",
+              # vouchers d'essai (067) : un code est global à une campagne ; locataire et adresse en empreintes seulement
+              "vouchers", "voucher_uses",
+              # coupon bêta par compte (088) : née à l'invitation, avant le compte ; clé = id d'invitation front1
+              "beta_coupon_grants"}
 
 
 @pytest.fixture(scope="module")
@@ -148,6 +171,19 @@ def pod_env(monkeypatch):
     monkeypatch.setattr(conn, "_warned_unmigrated", False)  # avertissement unique par processus : un test précédent l'a pu consommer
 
 
+# Colonnes obligatoires sous contrainte CHECK : une valeur permise (le reste reste aléatoire).
+CHECKED_VALUES: dict[str, dict[str, object]] = {
+    "zone_events": {"event": "enter"},  # zones de l'app (075)
+    "member_devices": {"platform": "ios"},  # appareils de l'app (076)
+    "phone_nodes": {"platform": "ios", "key_storage": "software"},  # nœud téléphone (077)
+    "phone_registrations": {"platform": "ios", "key_storage": "software", "state": "pending"},  # (078)
+    "household_project_drafts": {"kind": "create", "status": "open"},  # projets du foyer (084)
+    "household_projects": {"visibility": "household"},  # (084)
+    "household_tasks": {"status": "todo"},  # (084)
+    "account_persona": {"name": "Ada", "voice_id": "nina", "avatar_id": "nina", "avatar_version": 1},  # (085)
+}
+
+
 def _dummy_row(conn, table: str) -> tuple[list[str], list]:
     """Colonnes obligatoires sans défaut et des valeurs uniques (clés primaires, unicités)."""
     rows = conn.execute(
@@ -161,8 +197,9 @@ def _dummy_row(conn, table: str) -> tuple[list[str], list]:
     vals = {"text": lambda: uuid.uuid4().hex, "integer": lambda: secrets.randbelow(10**6),
             "bigint": lambda: secrets.randbelow(10**9), "double precision": lambda: 1.0,
             "boolean": lambda: False, "jsonb": lambda: Jsonb({}), "bytea": lambda: b"<p>x</p>",
-            "timestamp with time zone": lambda: datetime.now(timezone.utc)}
-    return [c for c, _ in rows], [vals[t]() for _, t in rows]
+            "timestamp with time zone": lambda: datetime.now(timezone.utc), "ARRAY": lambda: ["x"]}
+    fixed = CHECKED_VALUES.get(table, {})
+    return [c for c, _ in rows], [fixed[c] if c in fixed else vals[t]() for c, t in rows]
 
 
 def _insert(conn, table: str, tenant: str | None = None) -> None:
@@ -177,12 +214,22 @@ def _insert(conn, table: str, tenant: str | None = None) -> None:
         vals[cols.index("kind")], vals[cols.index("status")] = "ics", "ready"
     if table == "family_calendar_drafts":  # calendrier familial (061) : état contraint
         vals[cols.index("status")] = "open"
+    if table == "accord_devices":  # 092 : identifiant, clé publique (base64url, 43 car.) et empreintes contraints
+        vals[cols.index("device_id")] = "acc_" + uuid.uuid4().hex[:12]
+        vals[cols.index("pubkey")] = (uuid.uuid4().hex * 2)[:43]
+        vals[cols.index("key8")], vals[cols.index("host_fp")] = "0" * 8, "f" * 64
     if table == "lokkal_public_pages":  # 040 : page_id ou empreinte
         cols, vals = [*cols, "page_id"], [*vals, "pg_" + uuid.uuid4().hex[:16]]
     if table in ("lokkal_page_moderation", "household_minor_grant_audit"):  # 040, 043 : action contrainte
         vals[cols.index("action")] = "unpublish" if table == "lokkal_page_moderation" else "allow"
     if table == "ambient_displays":  # 054 : profondeur 1 ou 2
         vals[cols.index("depth")] = 1
+    if table == "connector_grants":  # 068 : nature et niveau contraints, propriétaire ≠ bénéficiaire
+        cols, vals = [*cols, "level"], [*vals, "read"]
+        vals[cols.index("kind")] = "mail"
+        vals[cols.index("grantee_account")] = "us_" + uuid.uuid4().hex[:12]
+    if table == "connector_grant_events":  # 068 : événement contraint
+        vals[cols.index("event")] = "granted"
     if tenant is not None:
         cols, vals = [*cols, "tenant_id"], [*vals, tenant]
     names = ", ".join(f'"{c}"' for c in cols)
@@ -527,6 +574,7 @@ def test_auth_tables_work_without_tenant(pg, pod_env):
 
 
 
+@requires_pg
 def test_role_check_flags_superuser_and_passes_the_app_role(pg):
     """`require_rls` (api/server.py::check_rls_role) s'appuie sur ce contrôle."""
     from nokker.store.conn import role_bypasses_rls
@@ -633,6 +681,7 @@ def test_crew_engine_ticks_each_tenant_in_its_own_scope(pg, pod_env, tmp_path):
         w.agents.store.close()
 
 
+@requires_pg
 def test_billing_pg_store_isolation_idempotence_and_stale_events(pg, pod_env):
     """nokker/billing sur le vrai rôle nokker_app : webhook sans locataire (client par sa clé, 058 ; événements hors
     RLS), abonnement sous RLS."""
@@ -989,7 +1038,8 @@ def test_pay_agent_role_reads_four_device_columns_and_its_tables_only(pg):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(sql)
     with psycopg.connect(pg["app"], autocommit=True) as conn:
-        for t in ("pay_agent_methods", "pay_agent_tokens", "pay_agent_events"):
+        for t in ("pay_agent_methods", "pay_agent_tokens", "pay_agent_events", "pay_agent_cards", "pay_agent_3ds",
+                  "pay_agent_links"):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(f"SELECT * FROM {t}")
     with psycopg.connect(pg["su"], autocommit=True) as su:

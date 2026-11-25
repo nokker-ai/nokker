@@ -39,7 +39,8 @@ def ask_terminal(it: ImportItem) -> bool:
     return answer.strip().lower() in ("o", "oui", "y", "yes")
 
 
-def run(args: argparse.Namespace, *, nokker_home: Path, user_settings: Path, memory: Any = None) -> int:
+def run(args: argparse.Namespace, *, nokker_home: Path, user_settings: Path, memory: Any = None,
+        mcp_stdio: bool = False) -> int:
     if getattr(args, "list_paths", False):
         import json
 
@@ -55,7 +56,7 @@ def run(args: argparse.Namespace, *, nokker_home: Path, user_settings: Path, mem
     home = Path(args.home).expanduser() if args.home else Path.home()
     project = Path(args.project).expanduser().resolve() if args.project else None
     if args.source == "claude-code":
-        report = claude_code.scan(home, project, nokker_home=nokker_home)
+        report = claude_code.scan(home, project, nokker_home=nokker_home, mcp_stdio=mcp_stdio)
     elif args.source == "hermes":
         import os
 
@@ -74,8 +75,13 @@ def run(args: argparse.Namespace, *, nokker_home: Path, user_settings: Path, mem
             from nokker.context.project_memory import ProjectMemory
 
             memory = ProjectMemory(root=nokker_home / "project-memory")  # indexée au prochain démarrage du noyau
+        stdio_kw = {}
+        if mcp_stdio:  # drapeau `mcp_stdio.enabled` (docs/NOKKAN-MCP-STDIO.md) : déclarations « à approuver »
+            from nokker.tools.mcp_stdio import FILE_NAME as STDIO_FILE
+
+            stdio_kw["mcp_stdio_path"] = nokker_home / STDIO_FILE
         apply(report, user_settings=user_settings, backup_dir=out / "sauvegarde", mcp_path=nokker_home / MCP_FILE,
-              confirm=ask_terminal, memory=memory)
+              confirm=ask_terminal, memory=memory, **stdio_kw)
     report.write(out)
     c = report.counts()
     print(" · ".join(f"{k} {v}" for k, v in c.items() if v) or "rien trouvé")

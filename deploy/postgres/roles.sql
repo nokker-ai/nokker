@@ -67,7 +67,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE nokker_owner IN SCHEMA public
 DO $$
 DECLARE t text;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['pay_agent_methods', 'pay_agent_tokens', 'pay_agent_events'] LOOP
+    FOREACH t IN ARRAY ARRAY['pay_agent_methods', 'pay_agent_tokens', 'pay_agent_events', 'pay_agent_cards',
+                                'pay_agent_3ds', 'pay_agent_links'] LOOP
         IF to_regclass(t) IS NOT NULL THEN
             EXECUTE format('REVOKE ALL ON %I FROM nokker_app', t);
             EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO nokker_pay_agent', t);

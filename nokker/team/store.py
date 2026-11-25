@@ -297,7 +297,7 @@ _P_COLS = ("project_id, tenant_id, name, description, owner_account, repos, secr
            "created_at, updated_at, kind, household_policy")
 _M_COLS = "project_id, tenant_id, account_id, role, email, added_by, added_at"
 _I_COLS = ("invite_id, project_id, tenant_id, project_name, email, invitee_account, role, invited_by, state, "
-           "created_at, expires_at, decided_at, kind, profile")
+           "created_at, expires_at, decided_at, kind, profile, first_name")
 _S_COLS = "project_id, tenant_id, name, source, description, requires_local, added_by, added_at"
 _N_COLS = ("project_id, tenant_id, name, kind, title, text, sha, updated_at, author_account, author_machine, origin, "
            "derived_from, links, deleted, seq")
@@ -323,7 +323,7 @@ def _invite(r: dict[str, Any]) -> Invite:
                   project_name=r["project_name"], email=r["email"], invitee_account=r["invitee_account"],
                   role=r["role"], invited_by=r["invited_by"], state=r["state"], created_at=r["created_at"],
                   expires_at=r["expires_at"], decided_at=r["decided_at"], kind=r.get("kind") or "team",
-                  profile=r.get("profile") or "adult")
+                  profile=r.get("profile") or "adult", first_name=r.get("first_name") or "")
 
 
 def _skill(r: dict[str, Any]) -> Skill:
@@ -460,9 +460,9 @@ class PgTeamStore:
     def create_invite(self, actor: Actor, inv: Invite) -> None:
         i = inv
         with self._conn(actor) as c:
-            c.execute(f"INSERT INTO team_invites ({_I_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            c.execute(f"INSERT INTO team_invites ({_I_COLS}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                       (i.id, i.project_id, i.tenant_id, i.project_name, i.email, i.invitee_account, i.role,
-                       i.invited_by, i.state, i.created_at, i.expires_at, i.decided_at, i.kind, i.profile))
+                       i.invited_by, i.state, i.created_at, i.expires_at, i.decided_at, i.kind, i.profile, i.first_name))
 
     def invites_of(self, actor: Actor, project_id: str) -> list[Invite]:
         with self._conn(actor) as c:

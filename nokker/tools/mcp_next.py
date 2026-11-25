@@ -50,8 +50,9 @@ APP_SUMMARY = "[Interface interactive de l'outil {tool} affichée à l'utilisate
 TASK_PENDING = ("[Tâche longue du serveur MCP toujours en cours (état : {status}) : résultat pas encore disponible "
                 "dans ce tour.]")
 TASK_FAILED = "Tâche longue du serveur MCP en échec : {message}"
+TASK_FAILED_NOTE = "tâche longue en échec, message du serveur :"  # r44 : phrase du noyau, hors clôture
 TASK_CANCELLED = "Tâche longue du serveur MCP annulée."
-TASK_INPUT = "La tâche longue du serveur MCP attend une saisie que le noyau ne fournit pas : tâche annulée."
+TASK_INPUT = "La tâche longue du serveur MCP attend une saisie qui ne peut pas être fournie : tâche annulée."
 
 # Messages qu'une app peut envoyer à l'hôte (postMessage, spec ext-apps §« View → Host »). Tout autre message est refusé
 # par le client (réponse JSON-RPC -32601). `tools/call` passe par le noyau (POST /v1/apps/{app_id}/tools/call) ;
@@ -170,6 +171,18 @@ def _text_result(text: str, is_error: bool) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=is_error)
 
 
+class KernelNote(types.CallToolResult):
+    """Résultat écrit par le noyau (tâche en cours, annulée, en attente d'une saisie) : aucun texte du serveur, donc
+    pas clôturé. Avec `note` (tâche en échec) : la phrase du noyau va hors clôture et le contenu, message du serveur,
+    dedans. Un résultat de serveur est validé en `CallToolResult`, jamais dans cette classe."""
+
+    note: str = ""
+
+
+def _kernel_note(text: str, is_error: bool) -> KernelNote:
+    return KernelNote(content=[types.TextContent(type="text", text=text)], is_error=is_error)
+
+
 class TasksExtension(ClientExtension):
     """Côté client de l'extension Tasks : annonce la capacité et résout un `resultType: "task"` par `tasks/get`."""
 
@@ -189,7 +202,10 @@ class TasksExtension(ClientExtension):
         while True:
             if status not in ("completed", "failed", "cancelled", "input_required"):
                 if self.clock() + poll > deadline:
-                    return _text_result(TASK_PENDING.format(status=status), False)
+                    from nokker.qa.untrusted import inline
+
+                    # l'état vient du serveur : une ligne bornée, sans crochet ni balise (texte du noyau hors clôture)
+                    return _kernel_note(TASK_PENDING.format(status=inline(status, 40)), False)
                 await anyio.sleep(poll)
             task = await session.send_request(_GetTaskRequest(params=_TaskIdParams(task_id=task_id)), _DetailedTask)
             status, poll = task.status, _poll_s(task.poll_interval_ms)
@@ -197,9 +213,10 @@ class TasksExtension(ClientExtension):
                 return types.CallToolResult.model_validate(task.result or {"content": []})
             if status == "failed":
                 message = str((task.error or {}).get("message") or task.status_message or "erreur inconnue")
-                return _text_result(TASK_FAILED.format(message=message[:300]), True)
+                return KernelNote(content=[types.TextContent(type="text", text=message[:300])], is_error=True,
+                                  note=TASK_FAILED_NOTE)
             if status == "cancelled":
-                return _text_result(TASK_CANCELLED, True)
+                return _kernel_note(TASK_CANCELLED, True)
             if status == "input_required":
                 # Ni élicitation ni échantillonnage déclarés : on n'invente pas de réponse, on libère la tâche.
                 try:
@@ -207,7 +224,7 @@ class TasksExtension(ClientExtension):
                                                types.EmptyResult)
                 except Exception:
                     logger.debug("tasks/cancel en échec", exc_info=True)
-                return _text_result(TASK_INPUT, True)
+                return _kernel_note(TASK_INPUT, True)
 
 
 # ─────────────────────────────── MCP Apps ───────────────────────────────

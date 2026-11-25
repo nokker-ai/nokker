@@ -1,6 +1,7 @@
 """Agent de paiement Nokker (docs/PAY-AGENT.md) — service SÉPARÉ du noyau et de Lokkal : son processus, son conteneur,
-sa clé Stripe restreinte. Seul composant qui crée, révoque et suit des Shared Payment Tokens (Stripe, API preview
-2026-09-30.preview) avec le moyen de paiement enregistré d'une personne.
+ses identifiants d'émetteur. Seul composant qui émet, bloque et suit les cartes virtuelles d'une personne (émetteur
+`wise`, défaut, §10 : 3-D Secure délégué, PAN au coffre) ou ses Shared Payment Tokens (émetteur `stripe_spt`, API
+preview 2026-09-30.preview).
 
 Il ne fait PAS confiance au noyau : chaque demande porte l'enveloppe d'un mandat signé par la passkey de la personne
 (nokker/payments/mandate.py), que l'agent revérifie lui-même (signature, origine épinglée, clé de l'appareil lue en base

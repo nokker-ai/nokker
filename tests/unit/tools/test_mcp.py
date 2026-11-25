@@ -47,14 +47,52 @@ def make_source(tools, call_results, core_tools=frozenset(), effects=None):
     return src
 
 
+def _described(text, **kw):
+    tool = types.Tool(name="big", description=text, inputSchema={})
+    src = make_source([tool], {})
+    for k, v in kw.items():
+        setattr(src, k, v)
+    return src.specs()[0].description
+
+
+def test_a_1000_character_description_stays_whole_with_its_usage_rules(caplog):
+    text = "Premier paragraphe.\n\nRègles d'usage : " + "x" * 1000
+    with caplog.at_level("WARNING", logger="nokker.tools.schema"):
+        assert _described(text) == text
+    assert not caplog.records
+
+
+def test_a_5000_character_description_is_cut_at_4000_and_logged(caplog):
+    with caplog.at_level("WARNING", logger="nokker.tools.schema"):
+        out = _described("y" * 5000)
+    assert out == "y" * 4000
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "sokkan-memory" in msg and "big" in msg and "4000" in msg and "5000" in msg
+
+
+def test_description_cap_is_per_server(caplog):
+    with caplog.at_level("WARNING", logger="nokker.tools.schema"):
+        assert _described("z" * 500, description_max_chars=100) == "z" * 100
+        assert _described("z" * 500, description_max_chars=800) == "z" * 500
+    assert len(caplog.records) == 1
+
+
+def test_cap_comes_from_the_server_entry_of_the_config():
+    from nokker.tools.schema import DESCRIPTION_MAX_CHARS, description_cap
+
+    assert (DESCRIPTION_MAX_CHARS, description_cap(None), description_cap("abc"), description_cap(0)) == (4000,) * 4
+    assert description_cap(1500) == 1500 and description_cap("900") == 900
+
+
 def test_specs_translates_tool_to_toolspec():
-    tool = types.Tool(name="memory_search", description="Cherche dans la mémoire.\nSuite ignorée.",
+    tool = types.Tool(name="memory_search", description="Cherche dans la mémoire.\nRègle d'usage : relis avant d'écrire.",
                        inputSchema={"type": "object", "properties": {"query": {"type": "string"}}})
     src = make_source([tool], {}, core_tools=frozenset({"memory_search"}))
     specs = src.specs()
     assert len(specs) == 1
     s = specs[0]
-    assert s.name == "memory_search" and s.description == "Cherche dans la mémoire."
+    assert s.name == "memory_search" and s.description == "Cherche dans la mémoire.\nRègle d'usage : relis avant d'écrire."  # entière, pas la 1re ligne
     assert s.core is True and s.source == "mcp:sokkan-memory"
     assert s.parameters["properties"]["query"]["type"] == "string"
 
@@ -100,7 +138,9 @@ def test_call_returns_concatenated_text():
     src = make_source([], {"calendar_list": result})
     ctx = ToolContext(thread_id="t1", turn_index=0, channel="api")
     r = src.call("calendar_list", {}, ctx)
-    assert r.content == "2 rendez-vous" and not r.is_error
+    from nokker.tools.result_fence import fence_mcp_result
+
+    assert r.content == fence_mcp_result(src.name, "calendar_list", "2 rendez-vous") and not r.is_error
 
 
 def test_call_propagates_is_error():

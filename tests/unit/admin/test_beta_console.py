@@ -47,7 +47,7 @@ def test_usage_view_aggregates_with_caps_and_plan():
     by = {i["account"]: i for i in v["items"]}
     a, b = by["us_aaaaaaaaaaaa"], by["us_bbbbbbbbbbbb"]
     assert (a["turns_today"], a["turns_week"], a["plan"]) == (45, 210, "solo")
-    assert a["cap_day"] == 150 and not a["over_day"]  # palier solo : 150/jour ; la semaine garde la config (200)
+    assert a["cap_day"] == 40 and a["over_day"]  # palier solo = CGU §8 (05.11) : 40/jour, 200/semaine
     assert a["cap_week"] == 200 and a["over_week"]
     assert b["turns_today"] == 0 and b["plan"] is None and b["cap_day"] == 40
     assert v["by_day"]["2026-11-04"] == {"turns": 45, "deep": 2, "accounts": 1}

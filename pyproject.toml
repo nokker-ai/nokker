@@ -60,9 +60,15 @@ knock = [
   "numpy>=1.26",
   "scipy>=1.11",
 ]
+# ACCORD (docs/ACCORD-DEVICE.md) : annonce mDNS `_nokker-accord._tcp` du bouton physique. LGPL-2.1, pur Python ; OPTIONNEL
+# (jamais dans les dépendances par défaut) : sans lui, l'appareil reçoit l'adresse à la main.
+accord = [
+  "zeroconf>=0.132",
+]
 dev = [
   "ruff>=0.15",
   "pytest>=8",
+  "pytest-xdist>=3.5",   # CI : `pytest -n auto` (603 s en série contre ~60 s)
 ]
 # Écrans du foyer (docs/SCREEN-CAST.md, drapeau `local.cast.enabled`, éteint) : importés à l'usage seulement. MIT tous
 # les deux (vérifié le 01.11.2026 : PyChromecast 14.1.0, pyatv 0.18.0).
@@ -80,7 +86,7 @@ nokker = ["ledger/prices.yaml", "ledger/migrations/*.sql", "threads/migrations/*
           "api/miniapp/*.html", "api/miniapp/*.js", "api/miniapp/*.css", "prompts/*.md", "onboarding/terms/*.md",
           "household/consent/*.md", "household/paper/schemas/*.xsd",
           "tools/browser_pool_tools.json",
-          "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*",
+          "packs/*/pack.yaml", "packs/*/agents/*.yaml", "packs/*/skills/**/*", "screens/fonts/*",
           "admin/ui/*.html", "homebridge/knock/classifier.json", "homebridge/knock/cnn.json",
           "homebridge/knock/triple.json", "homebridge/knock/cnn-ATTRIBUTION.csv",
           "homebridge/knock/triple-ATTRIBUTION.csv"]
@@ -104,6 +110,11 @@ target-version = "py314"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+  # option lue par pytest-asyncio s'il est installé ; sans le plugin, pytest la signale seulement
+  "ignore:Unknown config option. asyncio_default_fixture_loop_scope:pytest.PytestConfigWarning",
+]
 markers = [
   "integration: nécessite un service réel (Postgres, MCP, Router…) ; non exécuté par CI par défaut.",
 ]

@@ -363,6 +363,7 @@ def test_handoffs_inventory_and_mirror_notes_on_postgres_under_tenant_rls(pg):  
     assert notes.erase(tenant, m.id) == 1 and notes.of_tenant(tenant) == []
 
 
+@requires_pg
 def test_relay_strong_nonce_single_use_across_machines_and_tenants(pg):  # noqa: F811
     """Lot X20b (migration 026) : le nonce d'un défi signé ne sert qu'à UN appel exécuté, toutes machines et tous
     locataires confondus (l'index unique ne voit pas la RLS), alors que les lignes restent sous la RLS de leur

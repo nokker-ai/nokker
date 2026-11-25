@@ -131,3 +131,56 @@ def test_inbound_cancel_mid_body_leaves_nothing():
     assert not box.pending and not box.chunks and not box.sizes
     assert box.feed(_frame("body", 7, b"c", False)) is None  # trame tardive d'une requête annulée : jetée
     assert not box.chunks
+
+
+def test_tunnel_bridges_only_the_screen_websocket():
+    """Écran de passation (§4.3) : `wsopen` sur le chemin exact → WebSocket local vers le web de Lokkal, octets relayés ;
+    tout autre chemin → `wsclose` tout de suite, rien n'est ouvert localement."""
+    local_paths: list = []
+
+    async def web(ws):  # faux web de Lokkal : écho inversé
+        local_paths.append(ws.request.path)
+        async for m in ws:
+            await ws.send(m[::-1] if isinstance(m, bytes) else m.encode()[::-1])
+
+    good = "/sites/screen/st_aaaaaaaaaa/websockify?ticket=" + "T" * 32
+    frames: list = []
+    done = threading.Event()
+
+    async def relay(ws):
+        await ws.send(json.dumps({"t": "wsopen", "id": 7, "path": "/sites/screen/st_aaaaaaaaaa/vnc.html?ticket=" + "T" * 32}))
+        await ws.send(json.dumps({"t": "wsopen", "id": 8, "path": good, "protocols": ["binary"]}))
+        async for raw in ws:
+            f = json.loads(raw)
+            frames.append(f)
+            if f.get("t") == "wsok" and f["id"] == 8:
+                await ws.send(json.dumps({"t": "ws", "id": 8, "data": base64.b64encode(b"RFB 003.008\n").decode()}))
+            if f.get("t") == "ws" and f["id"] == 8:
+                await ws.send(json.dumps({"t": "wsclose", "id": 8}))
+            if f.get("t") == "wsclose" and f["id"] == 8:
+                done.set()
+                return
+
+    async def serve(stop: threading.Event, ports: list):
+        async with websockets.serve(relay, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]) as srv, \
+                websockets.serve(web, "127.0.0.1", 0, subprotocols=["binary"]) as wsrv:
+            ports += [srv.sockets[0].getsockname()[1], wsrv.sockets[0].getsockname()[1]]
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+
+    stop, ports = threading.Event(), []
+    threading.Thread(target=lambda: asyncio.run(serve(stop, ports)), daemon=True).start()
+    while len(ports) < 2:
+        time.sleep(0.02)
+    t = Tunnel(url=f"ws://127.0.0.1:{ports[0]}/v1/tunnel", machine_token="mt-1", local_base="http://127.0.0.1:9",
+               web_base=f"http://127.0.0.1:{ports[1]}")
+    t.start()
+    try:
+        assert done.wait(10), frames
+    finally:
+        t.stop()
+        stop.set()
+    assert {"t": "wsclose", "id": 7} in frames and not any(f.get("t") == "wsok" and f["id"] == 7 for f in frames)
+    echo = next(f for f in frames if f.get("t") == "ws" and f["id"] == 8)
+    assert base64.b64decode(echo["data"]) == b"\n800.300 BFR"
+    assert local_paths == [good]  # un seul WebSocket local, sur le chemin exact

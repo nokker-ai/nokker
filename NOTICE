@@ -20,3 +20,10 @@ The knock detector weights (nokker/homebridge/knock/cnn.json and triple.json, co
 clips of FSD50K (Fonseca et al., "FSD50K: An Open Dataset of Human-Labeled Sound Events", IEEE/ACM TASLP 2022;
 annotations CC BY 4.0), restricted to clips under CC0 1.0 or CC BY 3.0. No audio is distributed. Clip authors and
 licenses are credited in cnn-ATTRIBUTION.csv and triple-ATTRIBUTION.csv next to the weights.
+
+The design pack (nokker/packs/design) includes text adapted from two projects, under their own licenses:
+  - Impeccable, Copyright 2025 Paul Bakaus, Apache License 2.0 (LICENSES/Apache-2.0-impeccable.txt),
+    commit 687bc381bc9091bf252c0a05303640561014a425. Files changed for Nokker say so on their first line.
+  - Hallmark, Copyright (c) 2026 Hallmark contributors, MIT License (LICENSES/MIT-hallmark.txt),
+    commit 407fa689f4a276f2fd389208d271d0fef08f5058.
+Neither project's code, scripts or binaries are included; nokker/design/floor.py is written for Nokker.

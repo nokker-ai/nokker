@@ -38,6 +38,10 @@ jobs:
           - {name: sandbox,  context: deploy/lokkal/sandbox,     file: deploy/lokkal/sandbox/Dockerfile,   target: "",     suffix: "",        hermes: false}
           # Passerelle du foyer (docs/LOKKAL-HOME-BRIDGE.md) : profils home, home-mdns (sous-commande discovery), home-mic.
           - {name: home-bridge, context: ".",                    file: deploy/lokkal/home-bridge/Dockerfile, target: "",   suffix: "",        hermes: false}
+          # Bureau (docs/DESKTOP.md, profil desktop) : amd64 SEULEMENT (agent-desktop épinglé en x86_64) ; le contexte
+          # est la racine (paquet nokker copié dans l'image).
+          - {name: nokker-desktop, context: ".",                 file: deploy/desktop/Dockerfile,          target: "",     suffix: "",        hermes: false,
+             platforms: linux/amd64}
           - {name: nokker-web, context: apps-src,                file: apps-src/deploy/web/Dockerfile,     target: "",     suffix: "",        hermes: false, apps: true,
              build_args: "VITE_NOKKER_SHOW_ME=1\nVITE_NOKKER_GUIDE=1"}
     steps:
@@ -78,7 +82,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9   # v3.7.0
         with: {registry: "${{ env.REGISTRY }}", username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
-      - name: Construire et pousser (amd64 + arm64)
+      - name: Construire et pousser (amd64 + arm64, sauf plateformes de la matrice)
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6.19.2
         with:
@@ -86,7 +90,7 @@ jobs:
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
           build-args: ${{ matrix.build_args }}   # web : Montre-moi et Guide compilés allumés (comme la bêta)
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platforms || 'linux/amd64,linux/arm64' }}
           push: true
           provenance: mode=max
           sbom: true

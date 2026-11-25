@@ -37,6 +37,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
+
 MAX_RUNNING = 4  # processus en cours par fil
 MAX_KEPT = 16  # entrées gardées par fil (en cours + terminées, pour lire le journal d'un processus fini)
 TAIL_DEFAULT, TAIL_MAX = 200, 2000
@@ -125,9 +127,8 @@ class ProcessTable:
             self._refresh()
             running = [p for p in self._procs.values() if p.state == "running"]
             if len(running) >= self.max_running:
-                raise ProcessError(
-                    f"déjà {len(running)} processus en cours sur ce fil (plafond {self.max_running}) : arrête-en un "
-                    f"(process_stop) — en cours : {', '.join(f'{p.id} {p.name}' for p in running)}")
+                raise ProcessError(mt.pick(mt.PROC_LIMIT).format(
+                    n=len(running), max=self.max_running, running=", ".join(f"{p.id} {p.name}" for p in running)))
             pid = f"bg_{secrets.token_hex(4)}"
             log = f"{self.log_dir}/{pid}.log"
             exit_file = log[:-4] + ".exit"
@@ -161,7 +162,7 @@ class ProcessTable:
         with self._mu:
             proc = self._procs.get(proc_id)
         if proc is None:
-            raise ProcessError(f"processus inconnu sur ce fil : {proc_id!r} (process_list)")
+            raise ProcessError(mt.pick(mt.PROC_UNKNOWN).format(id=repr(proc_id)))
         return proc
 
     def list(self) -> list[BgProcess]:
@@ -251,9 +252,9 @@ class ProcessTable:
         l'hôte, aucun réseau partagé avec le noyau). Rend (statut, type, corps, Location). Pas de redirection suivie."""
         proc = self.get(proc_id)
         if not proc.port or proc.state != "running":
-            raise ProcessError("pas de port à montrer pour ce processus")
+            raise ProcessError(mt.pick(mt.PROC_NO_PORT))
         if not path.startswith("/") or any(c in path for c in "\r\n "):
-            raise ProcessError("chemin invalide")
+            raise ProcessError(mt.pick(mt.PROC_BAD_PATH))
         if self.host_logs:  # local : le noyau est sur la même machine que le processus
             data = _fetch_here(int(proc.port), path, method)
         else:
@@ -262,7 +263,7 @@ class ProcessTable:
             out = str(self.env.execute(cmd, timeout=30, rewrite_compound_background=False).get("output") or "")
             m = re.search(r"NOKKER_FETCH=(\{.*\})", out)
             if m is None:
-                raise ProcessError("port injoignable dans le bac à sable")
+                raise ProcessError(mt.pick(mt.PROC_PORT_UNREACHABLE))
             data = json.loads(m.group(1))
         if data.get("error"):
             raise ProcessError(f"port injoignable : {data['error']}")

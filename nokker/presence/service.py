@@ -45,6 +45,7 @@ class PresenceService:
     agents: Any = None  # AgentsHub : Crew
     room: Any = None  # HouseRoom (salle Maison) ou None
     tracker: Any = None  # ActivityTracker
+    zones: Any = None  # ZoneService (zones de l'app, docs/LOKKAL-PHONE.md §4.2) : `where(compte)` ; None = sans zones
     entries_cap: int = 100
 
     def view(self, account_id: str) -> dict[str, Any]:
@@ -76,6 +77,7 @@ class PresenceService:
                     IDLE, None), "target": {"type": "thread", "id": tid}, "since": _iso(s.last_used_at)})
         entries += self._crew_entries(pending)
         entries += self._house_entries(member, pending)
+        entries += self._zone_entries(account_id)
         entries.sort(key=lambda e: (rank(e["status"]), -(datetime.fromisoformat(e["since"]).timestamp()
                                                           if e.get("since") else 0)))
         counts = {k: 0 for k in STATUSES}
@@ -145,6 +147,24 @@ class PresenceService:
                         **self._status(status, activity), "target": {"type": "agent", "id": a.id, "thread_id": tid},
                         "since": _iso((run.started_at or run.created_at) if run is not None else a.updated_at)})
         return out
+
+    def _zone_entries(self, account_id: str) -> list[dict[str, Any]]:
+        """La dernière transition de zone du membre LUI-MÊME (jamais celle d'un autre membre) : une entrée `zone`, avec
+        un code (`zone_inside` / `zone_outside`) que le client met en phrase ; aucun texte vu par le modèle."""
+        zones = self.zones
+        if zones is None:  # relu à chaque vue : les zones se montent après « Qui fait quoi »
+            from nokker.zones import http as zones_http
+
+            zones = zones_http.service()
+        if zones is None:
+            return []
+        seen = sorted(_safe(lambda: zones.where(account_id), []), key=lambda z: z.get("at") or "", reverse=True)
+        if not seen:
+            return []
+        z = seen[0]
+        return [{"id": f"zone:{z['id']}", "kind": "zone", "name": z["name"],
+                 **self._status(IDLE, act("zone_inside" if z["state"] == "inside" else "zone_outside")),
+                 "target": {"type": "zone", "id": z["id"]}, "since": z.get("at")}]
 
     def _house_entries(self, member: Any, pending: dict[str, Any]) -> list[dict[str, Any]]:
         if self.room is None or member is None or not member.active:

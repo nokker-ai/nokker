@@ -46,7 +46,17 @@ UNSCOPED_OK = {"operators", "admin_audit", "beta_applications", "used_nonces", "
                "billing_events",  # idempotence des webhooks Stripe : identifiant et type d'événement, aucune donnée de compte
                "lokkal_relay_used_jti",  # jti des jetons de pages (035) : empreintes, 10 min au plus, aucun compte
                # canaux Slack/WhatsApp (048) : identifiants d'événements du fournisseur ; fenêtre de 24 h sous empreinte
-               "channel_events", "channel_windows"}
+               "channel_events", "channel_windows",
+               # vouchers d'essai (067) : campagnes, et usages sous empreintes HMAC salées (aucun locataire en clair) ;
+               # gardés à l'effacement : « un essai par personne » doit survivre au compte
+               "vouchers", "voucher_uses"}
+# Tables sans colonne de rattachement, effacées par une clé dérivée du compte (traitées à part, comme `used_nonces`).
+# Coupon bêta par compte (088, nokker/billing/beta_coupon.py) : la ligne est clée par l'invitation front1 dont le compte
+# est né (`accounts.invitation_id`) ou par `account:<us_…>` (posée après coup) ; les deux partent avec le compte, quel
+# que soit l'état. Une attribution CONSOMMÉE part aussi : son seul rôle (usage unique) meurt avec le compte, et ce qui
+# doit survivre est ailleurs (la remise est sur l'abonnement chez Stripe, l'idempotence dans `billing_events`) ; la
+# garder, même expurgée, laisserait l'id de session Checkout, qui mène au client Stripe de la personne.
+_BY_KEY = {"beta_coupon_grants"}
 _LAST = ("accounts", "tenants")  # supprimées après tout le reste, dans cet ordre
 # Équipe (X17, migration 023) : un compte membre d'un projet d'un AUTRE locataire y a des lignes au locataire du projet.
 # Elles partent avec lui : la transaction pose aussi `app.account_id` / `app.account_email`, que les politiques d'équipe
@@ -78,6 +88,26 @@ _CROSS_TENANT = {
     # agents qu'il a fait parler (politiques `house_room_author_erase*`, pendant l'effacement).
     "house_room_messages": ("tenant_id = %s OR author_account = %s", "acc"),
 }
+# Projets du foyer (084, docs/FAMILY-PROJECTS.md §9) : dans le foyer d'un AUTRE locataire, les tâches et projets
+# appartiennent à ce foyer et RESTENT ; seules les références au compte partent, comme à sa sortie du foyer
+# (`FamilyProjects.member_gone`) : assigné → vide (null dans l'API), relance qu'il a reçue ou faite → retirée, coche
+# qu'il a faite → auteur vide (la tâche reste faite), membre du projet → retiré, auteur du projet → vide. UPDATE et non
+# DELETE (une entrée `_CROSS_TENANT` effacerait les tâches des autres) ; politiques `household_*_erase` et déclencheur
+# `nokker_household_erase_only` (seules ces colonnes peuvent bouger hors du locataire courant). Son propre foyer (payeur)
+# part entier par `tenant_id`. Clé du compte rendu : `<table>:scrubbed`.
+_CROSS_SCRUB = {
+    "household_tasks": (
+        "UPDATE household_tasks SET assignee = CASE WHEN assignee = %(acc)s THEN '' ELSE assignee END, "
+        "nudged_at = CASE WHEN assignee = %(acc)s OR nudged_by = %(acc)s THEN NULL ELSE nudged_at END, "
+        "nudge_text = CASE WHEN assignee = %(acc)s OR nudged_by = %(acc)s THEN '' ELSE nudge_text END, "
+        "nudged_by = CASE WHEN assignee = %(acc)s OR nudged_by = %(acc)s THEN '' ELSE nudged_by END, "
+        "done_by = CASE WHEN done_by = %(acc)s THEN '' ELSE done_by END "
+        "WHERE tenant_id <> %(tenant)s AND %(acc)s IN (assignee, nudged_by, done_by)"),
+    "household_projects": (
+        "UPDATE household_projects SET members = members - %(acc)s::text, "
+        "created_by = CASE WHEN created_by = %(acc)s THEN '' ELSE created_by END "
+        "WHERE tenant_id <> %(tenant)s AND (members ? %(acc)s::text OR created_by = %(acc)s)"),
+}
 
 
 class EraseError(Exception):
@@ -93,6 +123,8 @@ class Report:
     deleted: dict[str, int] = field(default_factory=dict)
     unscoped: list[str] = field(default_factory=list)
     applied: bool = False
+    # Noms des clés BYOK du locataire au coffre du noyau (`byok.<tn_…>.<nom>`, nokker/byok/erase.py) : jamais les valeurs.
+    vault_names: list[str] = field(default_factory=list)
 
     def journal_line(self) -> str:
         return json.dumps({"tenant_id": self.tenant_id,
@@ -106,6 +138,9 @@ class Report:
         lines.append(f"  (tables sans ligne du compte : {', '.join(t for t, n in self.deleted.items() if not n) or '—'})")
         if self.unscoped:
             lines.append(f"  NON CONCERNÉES, à regarder : {', '.join(self.unscoped)}")
+        if self.vault_names:
+            lines.append(f"  clés BYOK du coffre ({'supprimées' if self.applied else 'à supprimer'}, noms seulement) : "
+                         f"{', '.join(self.vault_names)}")
         if self.applied:
             lines += ["À faire hors base :",
                       f"  1. journal des effacements (coffre de l'opérateur) : {self.journal_line()}",
@@ -173,15 +208,36 @@ def _devices(conn: psycopg.Connection, account_id: str) -> list[dict[str, Any]]:
 def erase_scope(config: Any) -> dict[str, Any]:
     """Ce qui vit hors de la base du noyau, d'après la configuration du serveur : à passer à `erase_account` par TOUT
     chemin d'effacement (CLI, file des suppressions demandées par les personnes), pour qu'aucun n'en oublie."""
+    byok = getattr(config, "cloud_byok", None)
     return {"images_root": config.images_root() or None, "code": config.code,
-            "session_memory": dict(config.context_corthexis) if config.context_corthexis else None}
+            "session_memory": dict(config.context_corthexis) if config.context_corthexis else None,
+            "cloud_byok": dict(byok) if byok else None,
+            "jobs_pack": dict(config.jobs_pack) if getattr(config, "jobs_pack", None) else None,
+            "sites_registry": _sites_registry(config), "beta_stripe": _beta_stripe(config)}
+
+
+def _sites_registry(config: Any) -> Any:
+    """Robots Harbor de lecture de l'image privée `sites-chrome` (docs/CONNECTED-SITES.md §3.1.1) : là où nokker.ai
+    les émet (bloc `cloud_link` et identifiants `lokkal-issuer` dans l'env), sinon None."""
+    if not getattr(config, "cloud_link", None):
+        return None
+    from nokker.cloud.sites_registry import SitesRegistry
+
+    reg = SitesRegistry.from_env()
+    return reg if reg.available else None
 
 
 def erase_account(dsn: str, *, email: str | None = None, account_id: str | None = None,
                   apply: bool = False, confirm: str | None = None, images_root: str | None = None,
                   code: dict[str, Any] | None = None, session_memory: dict[str, Any] | None = None,
+                  cloud_byok: dict[str, Any] | None = None, jobs_pack: dict[str, Any] | None = None,
+                  sites_registry: Any = None, beta_stripe: Any = None,
                   before_commit: Callable[[Report], None] | None = None) -> Report:
-    """`images_root` (X7, `NokkerConfig.images_root()`) : le magasin des images jointes ; le dossier du locataire y est
+    """`beta_stripe` (`StripeClient`, posé par `erase_scope` quand la facturation est configurée) : les sessions
+    Checkout Solo encore ouvertes du coupon bêta (attribution `reserved`, 088) sont expirées chez Stripe avant la
+    validation ; sans client, Stripe injoignable ou session déjà payée : `EraseError`, rien n'est validé
+    (`_close_beta_checkouts`). À blanc : comptées, Stripe n'est pas appelé.
+    `images_root` (X7, `NokkerConfig.images_root()`) : le magasin des images jointes ; le dossier du locataire y est
     supprimé APRÈS la validation de la base (à blanc : seulement compté). `code` (`NokkerConfig.code`, sessions de
     code multi-utilisateur, docs/LOKKAL.md §7.28) : espaces de travail, points de retour, confiances des hooks et
     identifiants de forge du locataire, effacés eux aussi après la validation (nokker/code_sessions/erase.py).
@@ -189,13 +245,51 @@ def erase_account(dsn: str, *, email: str | None = None, account_id: str | None 
     AVANT la validation (nokker/context/corthexis_erase.py) ; en échec, `EraseError` et rien n'est validé.
     `before_commit(report)` (validé seulement) : appelé dans la transaction, les suppressions faites, AVANT l'index de
     session et la validation — le journal des effacements de la file (`ErasureJournal`) ; s'il lève, `EraseError` et
-    rien n'est effacé (le compte reste dans la file)."""
+    rien n'est effacé (le compte reste dans la file).
+    `jobs_pack` (`NokkerConfig.jobs_pack`) : comptes partenaires du service emploi, effacés chez lui avant la
+    validation (nokker/jobs/__init__.py::partner_eraser).
+    `cloud_byok` (`NokkerConfig.cloud_byok`) : les clés BYOK du locataire au coffre du noyau (`byok.<tn_…>.*`), listées
+    par leur nom dans le compte rendu, supprimées après la validation (nokker/byok/erase.py).
+    `sites_registry` (`nokker.cloud.sites_registry.SitesRegistry`, posé par `erase_scope` là où nokker.ai émet) : le
+    robot Harbor de lecture `lokkal-<compte>` (image privée des sites connectés, docs/CONNECTED-SITES.md §3.1.1),
+    supprimé AVANT la validation ; Harbor injoignable : `EraseError`, rien n'est validé (tout se rejoue). À blanc :
+    compté (1 ou 0), Harbor seulement lu."""
+    if jobs_pack and jobs_pack.get("enabled"):
+        # Pack Emploi (docs/JOBS-PACK.md §13.3) : comptes partenaires effacés chez le service emploi AVANT la validation ;
+        # en échec, rien n'est validé (effacement Nokker = effacement chez le service).
+        from nokker.jobs import partner_eraser
+
+        erase_partner, outer = partner_eraser(dsn, jobs_pack), before_commit
+
+        def before_commit(rep: Report, _outer: Callable[[Report], None] | None = outer) -> None:
+            if _outer is not None:
+                _outer(rep)
+            erase_partner(rep)
+    if sites_registry is not None:
+        outer_sr = before_commit
+
+        def before_commit(rep: Report, _outer: Callable[[Report], None] | None = outer_sr) -> None:
+            if _outer is not None:
+                _outer(rep)
+            from nokker.cloud.sites_registry import SitesRegistryError
+
+            try:
+                rep.deleted[SITES_REGISTRY_KEY] = int(sites_registry.revoke(rep.account_id, "erase"))
+            except SitesRegistryError as e:
+                raise EraseError(f"robot Harbor du registre privé : suppression impossible ({e})") from None
     report = _erase_db(dsn, email=email, account_id=account_id, apply=apply, confirm=confirm,
-                       session_memory=session_memory, before_commit=before_commit)
+                       session_memory=session_memory, beta_stripe=beta_stripe, before_commit=before_commit)
     if code:
         from nokker.code_sessions.erase import erase_code_tenant
 
         report.deleted.update(erase_code_tenant(code, report.tenant_id, apply=report.applied))
+    if cloud_byok:
+        from nokker.byok.erase import erase_byok_tenant
+
+        report.vault_names = erase_byok_tenant(cloud_byok, report.tenant_id, apply=report.applied)
+        report.deleted["byok: clés du coffre"] = len(report.vault_names)
+    if sites_registry is not None and not report.applied:
+        report.deleted[SITES_REGISTRY_KEY] = _sites_registry_count(sites_registry, report.account_id)
     if images_root:
         from pathlib import Path
 
@@ -205,6 +299,89 @@ def erase_account(dsn: str, *, email: str | None = None, account_id: str | None 
         report.deleted["images (fichiers)"] = (store.erase_tenant(report.tenant_id) if report.applied
                                                else store.count_tenant(report.tenant_id))
     return report
+
+
+SITES_REGISTRY_KEY = "harbor: robot lokkal-private"
+
+
+def _sites_registry_count(sites_registry: Any, account_id: str) -> int:
+    """À blanc : le robot existe-t-il (1) ou non (0) ; Harbor injoignable : -1 (dit, pas d'échec d'un essai à blanc)."""
+    from nokker.cloud.sites_registry import _RE_ACCOUNT
+
+    issuer = getattr(sites_registry, "issuer", None)
+    if issuer is None or not _RE_ACCOUNT.match(account_id or ""):
+        return 0
+    try:
+        return int(issuer.find(account_id) is not None)
+    except Exception:  # noqa: BLE001 — l'essai à blanc ne fait que compter
+        return -1
+
+
+def _beta_coupon_keys(conn: psycopg.Connection, cols: dict[str, set[str]], acc: str) -> list[str]:
+    """Clés des attributions du coupon bêta qui appartiennent au compte : `account:<id>`, et l'id de l'invitation front1
+    dont il est né (une invitation n'a qu'un compte : `Onboarding` la rachète une fois)."""
+    from nokker.billing.beta_coupon import account_key
+
+    keys = [account_key(acc)]
+    if "invitation_id" in cols.get("accounts", set()):
+        inv = conn.execute("SELECT invitation_id FROM accounts WHERE id = %s", (acc,)).fetchone()
+        if inv and inv[0]:
+            keys.append(inv[0])
+    return keys
+
+
+BETA_CHECKOUT_KEY = "stripe: sessions Checkout du coupon bêta à fermer"
+
+
+def _close_beta_checkouts(reserved: list[tuple[str | None, bool]], stripe: Any) -> None:
+    """Une attribution `reserved` (088) = une session Checkout Solo peut-être encore ouverte chez Stripe : payée après
+    l'effacement, elle ferait un abonnement facturé à un compte qui n'existe plus. Validé seulement, après toutes les
+    suppressions en base et avant la validation : chaque session est expirée chez Stripe. Réservation encore sans
+    session (Checkout en cours de création), facturation absente, Stripe injoignable, session déjà payée ou état
+    inconnu : `EraseError`, rien n'est validé, l'effacement se rejoue."""
+    if any(s is None and fresh for s, fresh in reserved):
+        raise EraseError("un paiement Solo (coupon bêta) est en cours de création pour ce compte : "
+                         "rien n'est effacé, rejoue l'effacement dans quelques minutes")
+    sessions = [s for s, _ in reserved if s]
+    if not sessions:
+        return
+    if stripe is None:
+        raise EraseError("une session de paiement Solo (coupon bêta) est ouverte chez Stripe et la facturation n'est "
+                         "pas configurée ici (clé Stripe absente) : impossible de la fermer, rien n'est effacé")
+    from nokker.billing.stripe import StripeError
+
+    for s in sessions:
+        try:
+            stripe.expire_checkout(s)
+            continue
+        except StripeError as e:
+            if not 400 <= e.status < 500:  # réseau ou Stripe en panne : on ne sait rien, on ne valide rien
+                raise EraseError("Stripe injoignable : la session de paiement Solo ouverte n'a pas pu être fermée, "
+                                 "rien n'est effacé ; rejoue l'effacement") from None
+        try:  # expiration refusée (4xx) : la session est déjà fermée, mais payée ou non ?
+            status = stripe.checkout_status(s)
+        except StripeError:
+            raise EraseError("Stripe injoignable : l'état de la session de paiement Solo est inconnu, rien n'est "
+                             "effacé ; rejoue l'effacement") from None
+        if status == "complete":
+            raise EraseError("la personne a payé l'offre Solo (session Checkout complétée) : résilier d'abord "
+                             "l'abonnement (Billing.cancel_for), puis rejouer l'effacement")
+        if status != "expired":
+            raise EraseError(f"session de paiement Solo dans un état inattendu ({status or '?'}) : rien n'est effacé")
+
+
+def _beta_stripe(config: Any) -> Any:
+    """Client Stripe pour fermer les sessions Checkout du coupon bêta à l'effacement, aux mêmes conditions que la
+    facturation du serveur (`billing_enabled`, clé posée, clé live seulement avec `billing_live`) ; sinon None (une
+    session ouverte bloque alors l'effacement)."""
+    key = os.environ.get(getattr(config, "billing_secret_key_env", "") or "", "")
+    if not (getattr(config, "billing_enabled", False) and key):
+        return None
+    if key.startswith(("sk_live_", "rk_live_")) and not getattr(config, "billing_live", False):
+        return None
+    from nokker.billing.stripe import StripeClient
+
+    return StripeClient(key)
 
 
 def _tenant_threads(conn: psycopg.Connection, cols: dict[str, set[str]], tenant: str) -> set[str]:
@@ -222,7 +399,7 @@ def _tenant_threads(conn: psycopg.Connection, cols: dict[str, set[str]], tenant:
 
 
 def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: bool, confirm: str | None,
-              session_memory: dict[str, Any] | None = None,
+              session_memory: dict[str, Any] | None = None, beta_stripe: Any = None,
               before_commit: Callable[[Report], None] | None = None) -> Report:
     with psycopg.connect(dsn) as conn:
         acc, tenant, mail = _find_account(conn, email, account_id)
@@ -266,20 +443,36 @@ def _erase_db(dsn: str, *, email: str | None, account_id: str | None, apply: boo
                 plan[t] = ("account_id = %s", (acc,))
             elif "user" in cs:
                 plan[t] = ('"user" = %s', (acc,))
-            elif t not in UNSCOPED_OK:
+            elif t not in UNSCOPED_OK and t not in _BY_KEY:
                 report.unscoped.append(t)
         if "used_nonces" in cols:  # défis de connexion des appareils du compte
             n = conn.execute("DELETE FROM used_nonces WHERE scope_id = ANY(%s)",
                              ([f"login:{d['id']}" for d in report.devices],)).rowcount
             report.deleted["used_nonces"] = n
+        reserved: list[tuple[str | None, bool]] = []
+        if "beta_coupon_grants" in cols:  # coupon bêta (088) : son attribution par compte, et celle de son invitation
+            keys = _beta_coupon_keys(conn, cols, acc)
+            reserved = conn.execute(  # verrouillées jusqu'à la fin : le webhook ne peut plus les toucher
+                "SELECT checkout_session, reserved_until > now() FROM beta_coupon_grants "
+                "WHERE invitation_id = ANY(%s) AND state = 'reserved' FOR UPDATE", (keys,)).fetchall()
+            report.deleted[BETA_CHECKOUT_KEY] = sum(1 for s, _ in reserved if s)
+            report.deleted["beta_coupon_grants"] = conn.execute(
+                "DELETE FROM beta_coupon_grants WHERE invitation_id = ANY(%s)", (keys,)).rowcount
+        for t, sql in _CROSS_SCRUB.items():  # références dans le foyer d'un autre : retirées, rien d'autre ne bouge
+            if t in cols:
+                report.deleted[f"{t}:scrubbed"] = conn.execute(sql, {"acc": acc, "tenant": tenant}).rowcount
         for t in _children_first(conn, list(plan)):
             where, params = plan[t]
             report.deleted[t] = conn.execute(f'DELETE FROM "{t}" WHERE {where}', params).rowcount
         report.deleted["accounts"] = conn.execute("DELETE FROM accounts WHERE id = %s", (acc,)).rowcount
         report.deleted["tenants"] = conn.execute("DELETE FROM tenants WHERE id = %s", (tenant,)).rowcount
+        if apply and reserved:  # Checkout Solo ouvert : fermé chez Stripe avant le journal et la validation
+            _close_beta_checkouts(reserved, beta_stripe)
         if apply and before_commit is not None:  # journal écrit (fsync) avant tout effacement hors base et la validation
             try:
                 before_commit(report)
+            except EraseError:  # message déjà juste (service emploi : nokker/jobs/__init__.py::partner_eraser)
+                raise
             except Exception as e:  # noqa: BLE001 — la transaction est annulée, le compte reste dans la file
                 raise EraseError(f"journal des effacements : écriture impossible ({type(e).__name__})") from None
         if session_memory:  # avant la validation : en échec, l'exception annule la transaction (tout se rejoue)

@@ -26,13 +26,14 @@ class FrontError(Exception):
 
 
 class Front(Protocol):
-    def send(self, candidature_id: int, lang: str | None, actor: str) -> dict[str, Any]: ...
+    def send(self, candidature_id: int, lang: str | None, actor: str, beta_coupon: bool = False) -> dict[str, Any]: ...
     def invitations(self, candidature_id: int) -> list[dict[str, Any]]: ...
     def preview(self, candidature_id: int, lang: str | None = None) -> dict[str, Any]: ...
     def check(self, token: str) -> dict[str, Any]: ...
     def redeem(self, token: str) -> dict[str, Any]: ...
     def release(self, invitation_id: int) -> None: ...
     def send_code(self, email: str, code: str, lang: str) -> None: ...
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]: ...
 
 
 Transport = Callable[[str, dict[str, Any], dict[str, str], float], tuple[int, dict[str, Any]]]
@@ -79,9 +80,12 @@ class FrontInvitations:
             raise FrontError("unauthorized", status)
         raise FrontError(str(data.get("error") or "unavailable"), status)
 
-    def send(self, candidature_id: int, lang: str | None, actor: str) -> dict[str, Any]:
-        r = self._call("send", {"candidature_id": candidature_id, "lang": lang, "actor": actor})
-        return {k: r[k] for k in ("invitation_id", "sent_at", "expires_at", "lang")}
+    def send(self, candidature_id: int, lang: str | None, actor: str, beta_coupon: bool = False) -> dict[str, Any]:
+        r = self._call("send", {"candidature_id": candidature_id, "lang": lang, "actor": actor,
+                                "beta_coupon": bool(beta_coupon)})
+        # Un front1 d'avant C16 ignore le champ et ne le rend pas : l'éligibilité n'est alors PAS posée, on le dit.
+        return {**{k: r[k] for k in ("invitation_id", "sent_at", "expires_at", "lang")},
+                "beta_coupon": r.get("beta_coupon") is True}
 
     def invitations(self, candidature_id: int) -> list[dict[str, Any]]:
         return self._call("list", {"candidature_id": candidature_id})["invitations"]
@@ -96,7 +100,7 @@ class FrontInvitations:
 
     def redeem(self, token: str) -> dict[str, Any]:
         r = self._call("redeem", {"token": token})
-        return {k: r[k] for k in ("invitation_id", "email", "lang", "prenom")}
+        return {**{k: r[k] for k in ("invitation_id", "email", "lang", "prenom")}, "beta_coupon": r.get("beta_coupon") is True}
 
     def release(self, invitation_id: int) -> None:
         self._call("release", {"invitation_id": invitation_id})
@@ -104,6 +108,17 @@ class FrontInvitations:
     def send_code(self, email: str, code: str, lang: str) -> None:
         """Code de connexion (6 chiffres) : front1 l'envoie avec son gabarit figé, seulement à une adresse invitée."""
         self._internal("auth/code/send", {"email": email, "code": code, "lang": lang})
+
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]:
+        """Invitation ouverte par un code de campagne (`voucher_grants_invite`) : front1 crée l'invitation de cette
+        adresse et l'envoie (lien d'invitation avec `code=` pour le Checkout). Le noyau a déjà refusé ou réservé."""
+        r = self._internal("voucher/invite", {"email": email, "lang": lang, "code": code})
+        return {k: r[k] for k in ("invitation_id", "expires_at") if k in r}
+
+    def send_trial_reminder(self, email: str, lang: str, kind: str, info: dict[str, Any]) -> None:
+        """Rappel de fin d'essai (voucher) : `kind` = `trial_7d` | `trial_2d`, `info` = {plan, first_charge_at, price}.
+        Le front l'envoie avec son gabarit figé (expéditeur commercial, repli beta@)."""
+        self._internal("billing/trial-reminder", {"email": email, "lang": lang, "kind": kind, **info})
 
 
 class MemoryFront:
@@ -116,7 +131,7 @@ class MemoryFront:
         self.codes: list[tuple[str, str, str]] = []  # (adresse, code, langue) envoyés par send_code
         self.fail_send = False
 
-    def send(self, candidature_id: int, lang: str | None, actor: str) -> dict[str, Any]:
+    def send(self, candidature_id: int, lang: str | None, actor: str, beta_coupon: bool = False) -> dict[str, Any]:
         cand = self.candidates.get(candidature_id)
         if cand is None:
             raise FrontError("unknown_candidature", 404)
@@ -129,9 +144,10 @@ class MemoryFront:
         token = secrets.token_urlsafe(16)
         lang = lang or cand.get("lang", "fr")
         self.tokens[token] = {"id": inv_id, "candidature_id": candidature_id, "email": cand["email"], "lang": lang,
-                              "prenom": cand.get("prenom", ""), "redeemed": False, "superseded": False}
+                              "prenom": cand.get("prenom", ""), "redeemed": False, "superseded": False,
+                              "beta_coupon": bool(beta_coupon)}
         r = {"invitation_id": inv_id, "sent_at": "2026-10-22T09:00:00Z", "expires_at": "2026-10-29T09:00:00Z",
-             "lang": lang}
+             "lang": lang, "beta_coupon": bool(beta_coupon)}
         self.sent.append({**r, "to": cand["email"], "actor": actor})
         return r
 
@@ -160,7 +176,8 @@ class MemoryFront:
         if t is None:
             raise FrontError("invalid_token", 410)
         t["redeemed"] = True
-        return {"invitation_id": t["id"], "email": t["email"], "lang": t["lang"], "prenom": t["prenom"]}
+        return {"invitation_id": t["id"], "email": t["email"], "lang": t["lang"], "prenom": t["prenom"],
+                "beta_coupon": bool(t.get("beta_coupon"))}
 
     def release(self, invitation_id: int) -> None:
         for t in self.tokens.values():
@@ -173,3 +190,13 @@ class MemoryFront:
         if self.fail_send:
             raise FrontError("send_failed", 502)
         self.codes.append((email, code, lang))
+
+    def voucher_invite(self, email: str, lang: str, code: str) -> dict[str, Any]:
+        if self.fail_send:
+            raise FrontError("send_failed", 502)
+        inv_id = len(self.tokens) + 1
+        token = secrets.token_urlsafe(16)
+        self.tokens[token] = {"id": inv_id, "candidature_id": None, "email": email, "lang": lang, "prenom": "",
+                              "redeemed": False, "superseded": False, "voucher": code}
+        self.sent.append({"invitation_id": inv_id, "to": email, "lang": lang, "voucher": code, "actor": "voucher"})
+        return {"invitation_id": inv_id, "expires_at": "2026-10-29T09:00:00Z"}

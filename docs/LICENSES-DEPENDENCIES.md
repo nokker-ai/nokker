@@ -268,6 +268,7 @@ Dépendances directes par workspace (hors dev) : `web` 23 (MIT 18, ISC 2, Apache
 | git (Windows) | 2.53.0 | git-for-windows | GPL-2.0 | Windows seulement |
 | dmgbuild | 1.2.5 | electron-builder-binaries | MIT | build macOS |
 | Bot Screen (`HERMES_BOT_DESKTOP=1`, `Dockerfile:92`) | apt | tigervnc (GPL-2.0), xfce4 (GPL), chromium apt | GPL | **variante `-desktop` seulement** |
+| agent-desktop (+ `agent-desktop-linux-clipboard-owner`) | 1.2.0 | github vercel-labs, sha256 épinglés (`deploy/desktop/agent-desktop.lock.json`) | Apache-2.0 | image `desktop` du Bureau seulement (docs/DESKTOP.md) ; Xvfb (MIT), metacity (GPL-2.0), at-spi2-core (LGPL-2.1) y sont des binaires apt séparés |
 
 ## Ajout P1 — service d'aperçus (`nokker/previews/`, 18.10.2026, docs/BUBBLES.md §5)
 
@@ -307,3 +308,10 @@ déjà couverte par ce document (cœur). Aucun des deux ajouts ne change le verd
 6. Vérifier ou retirer `@photon-ai/*` (sidecar Photon, licence non déclarée).
 7. Contrôle continu : script de cette analyse à intégrer en CI (uv.lock + lockfiles npm → table, échec sur
    GPL/AGPL/SSPL/BUSL/NC hors liste d'exceptions).
+
+## Texte tiers dans les packs (lot V8, 07.11.2026)
+
+| Composant | Licence | Où | Nature |
+|---|---|---|---|
+| Impeccable (commit 687bc381) | Apache-2.0 (`LICENSES/Apache-2.0-impeccable.txt`) | `nokker/packs/design/skills/design/impeccable/references/` | texte de skill, modifications marquées en tête de fichier ; aucun code ni binaire |
+| Hallmark (commit 407fa689) | MIT (`LICENSES/MIT-hallmark.txt`) | `nokker/packs/design/skills/design/hallmark/references/` | texte de skill ; aucun script |

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from nokker.context.text import is_constraint, is_revocation
+from nokker.memory.provenance import UNKNOWN_LEGACY, of_turns, reclassify_legacy
+from nokker.memory.provenance import tool as tool_provenance
 
 log = logging.getLogger("nokker.memory.consolidation.signals")
 
@@ -43,9 +45,14 @@ class KernelSignals:
                 keep = []
                 for e in eps:
                     last = e.last_turn if e.last_turn is not None else e.first_turn
-                    texts = [_text(turns[i]) for i in range(e.first_turn, last + 1) if i in turns]
+                    ep_turns = [turns[i] for i in range(e.first_turn, last + 1) if i in turns]
+                    texts = [_text(t) for t in ep_turns]
                     if any(is_revocation(t) or is_constraint(t) for t in texts):
                         continue  # couche 3 : décision ou exigence en vigueur, jamais condensée
+                    # Épisode d'avant la provenance : tiers seulement si sa trace le montre (en mémoire, pour le
+                    # résumé de cette nuit ; l'épisode lui-même n'est pas réécrit ici).
+                    e.provenance = reclassify_legacy(getattr(e, "provenance", UNKNOWN_LEGACY), ep_turns)
+                    e.trace = ep_turns  # tours de l'épisode : provenance par fait du résumé de la nuit
                     keep.append(e)
                 if keep:
                     yield thread_id, keep
@@ -68,16 +75,19 @@ class KernelSignals:
                 if t is None or getattr(t, "sender", None) != account_id or not is_revocation(_text(t)):
                     continue
                 prev = turns.get(i - 1)
+                # les deux réponses de l'assistant ont pu se nourrir d'un contenu de tiers : provenance des deux tours
                 out.append({"source": "correction", "key": f"c:{thread_id}:{i}", "thread_id": thread_id, "turn": i,
                             "before": getattr(prev, "reply", "") if prev is not None else "", "user": _text(t),
-                            "after": getattr(t, "reply", "") or ""})
+                            "after": getattr(t, "reply", "") or "", "provenance": of_turns([prev, t])})
         if self.refusals is not None and by_thread:
             try:
                 for r in self.refusals(sorted(by_thread), since):
                     out.append({"source": "refused" if r["status"] == "rejected" else "failed",
                                 "key": f"a:{r['id']}", "thread_id": r["thread_id"], "turn": r.get("turn_index"),
                                 "tool": r.get("tool_name", ""),
-                                "reason": (r.get("error") if r["status"] == "failed" else r.get("reason")) or ""})
+                                "reason": (r.get("error") if r["status"] == "failed" else r.get("reason")) or "",
+                                # erreur rendue par l'outil, ou motif d'une carte sur ses arguments : tiers
+                                "provenance": tool_provenance(str(r.get("tool_name") or ""))})
             except Exception:
                 log.warning("consolidation : cartes illisibles", exc_info=True)
         return out

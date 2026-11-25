@@ -1,0 +1,11 @@
+-- Nokker — ledger : modèle réellement RENVOYÉ par l'amont (docs/HOST-EMBED.md §11).
+--
+-- `model_served` : champ `model` de la RÉPONSE de l'amont (non-flux : `model` du corps ; flux : premier chunk
+-- OpenAI-compatible, `message_start` au format Anthropic). La colonne `model` garde le modèle du palier. NULL quand
+-- l'amont n'a rien déclaré, pour toute ligne d'avant et pour tout appel hors providers (jamais une valeur déduite, jamais
+-- le modèle du palier recopié). Chaîne bornée par le noyau (≤ 200 caractères, sans caractère de contrôle).
+--
+-- La RLS de `ledger_entries` (006, 037, 039) n'est pas touchée : une colonne de plus, mêmes politiques ; l'effacement
+-- par locataire (`nokker erase`) vise des lignes entières, rien à ajouter. Idempotente : rejouée à chaque démarrage
+-- (`PostgresLedger.migrate` la rejoue aussi pour un ledger migré seul).
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS model_served TEXT;

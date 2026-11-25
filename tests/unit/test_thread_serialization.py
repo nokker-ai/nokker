@@ -218,7 +218,7 @@ def test_decide_answers_before_the_suite_turn_ends(tmp_path):
         httpd.shutdown()
 
 
-def test_decision_while_a_turn_runs_is_queued_and_reject_has_no_continuation(tmp_path):
+def test_decision_while_a_turn_runs_is_queued_and_a_reject_resumes_the_turn(tmp_path):
     httpd, port, api, kernel, approvals, tools, model, _ = _server(tmp_path)
     thread = "th_queued"
     try:
@@ -234,14 +234,15 @@ def test_decision_while_a_turn_runs_is_queued_and_reject_has_no_continuation(tmp
         model.release.set()
         t.join(10)
         assert _wait(lambda: len(kernel.store.history(thread)) == 2)
-        # Un refus : rien ne tourne après (comme avant), réponse 200.
+        # Un refus : le tour reprend comme pour une approbation (n°27 b), réponse 202.
         model.card_posed.clear()
         second: list = []
         _chat(port, api.token, "th_reject", "agrandis le volume", second)
         card2 = _pending_card(approvals, "th_reject")
         status, body = _req(port, f"/v1/local/approvals/{card2.id}/decide", token=api.token,
                             body={"decision": "reject", "scope": "once"})
-        assert status == 200 and body["continuation"] == "none" and body["status"] == "rejected"
+        assert status == 202 and body["continuation"] in ("running", "queued") and body["status"] == "rejected"
+        assert _wait(lambda: len(kernel.store.history("th_reject")) == 2)
     finally:
         model.release.set()
         httpd.shutdown()

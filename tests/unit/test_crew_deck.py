@@ -140,7 +140,7 @@ def test_auto_runs_on_the_chosen_machine_with_its_rules_and_the_result_comes_bac
 def test_machine_applies_its_own_gates_and_cards_then_the_result_returns_to_the_run(tmp_path):
     f = Fleet(tmp_path)
     m1, w1, _ = f.add_machine(f.p, "atelier", steps=[("tool", "note_write", {"t": "x"}), ("text", "j'attends"),
-                                                      ("text", "Noté.")])
+                                                      ("text", "Compris.")])
     # la règle d'écriture levée chez nokker.ai ne vaut rien sur la machine : sa carte à elle
     a = f.agent(f.p, placement={"machine": m1.id}, auto_approve=["note_write"])
     assert a.status == "armed"  # placé sur une machine : pas de carte d'armement (rien n'y serait levé)
@@ -153,7 +153,7 @@ def test_machine_applies_its_own_gates_and_cards_then_the_result_returns_to_the_
     (card,) = [c for c in w1.approvals.pending() if c.thread_id == guest.thread_id]
     w1.decide(card.id)  # décidée sur la machine (ou au téléphone, X10)
     done = f.cloud.run(run.id)
-    assert done.status == "succeeded" and done.summary == "Noté." and w1.tools.calls[-1][0] == "note_write"
+    assert done.status == "succeeded" and done.summary == "Compris." and w1.tools.calls[-1][0] == "note_write"
 
 
 def test_explicit_machine_waits_for_it_then_runs_when_its_load_returns(tmp_path):

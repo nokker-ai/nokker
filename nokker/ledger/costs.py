@@ -43,6 +43,15 @@ HOUSEHOLD_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "039_ho
     encoding="utf-8")
 
 
+# Modèle servi par l'amont (migration 093) : même principe, rejouée après la 090.
+SERVED_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "093_ledger_model_served.sql").read_text(
+    encoding="utf-8")
+
+# Écriture de cache et identifiant d'appel (migration 090) : même principe.
+CALL_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "090_ledger_cache_write.sql").read_text(
+    encoding="utf-8")
+
+
 # ─────────────────────────────── vues stockées ───────────────────────────────
 
 
@@ -75,6 +84,18 @@ class CallRecord:
     # Foyer de l'appel (quota commun, lot X23) : None hors foyer.
     household_id: str | None = None
     household_tenant: str | None = None
+    # Jetons du prompt écrits en cache par l'appel (`Usage.cache_write`, amont au format Anthropic) : compris dans
+    # `prompt_tokens`, hors `cached_tokens`. Colonne `cache_write_tokens` (090).
+    cache_write_tokens: int = 0
+    # Identifiant de l'appel posé par le noyau (`nc_…`, le même que l'en-tête `X-Nokker-Call-Id` s'il est parti) ;
+    # None pour une ligne d'avant la migration 090.
+    call_id: str | None = None
+    # Durée du cache des jetons écrits (« 5m » / « 1h », `Usage.cache_ttl`) : en mémoire seulement, PAS de colonne
+    # Postgres (une ligne relue de la base vaut « 5m »). Le prix a été choisi à l'inscription : `chf` est déjà juste.
+    cache_ttl: str = "5m"
+    # Modèle renvoyé par l'amont (`LLMCall.model_served`, colonne `model_served`, migration 093) ; None si l'amont n'a rien
+    # déclaré et pour une ligne d'avant.
+    model_served: str | None = None
 
     @property
     def new_tokens(self) -> int:
@@ -134,7 +155,8 @@ def cost_for_call(call: LLMCall, prices: PriceCatalog) -> tuple[float, str]:
     if call.chf is not None:
         return call.chf, "router"
     new_tokens = max(call.usage.prompt - call.usage.cached, 0)
-    chf = prices.cost_chf(call.model, new_tokens, call.usage.cached, call.usage.completion)
+    chf = prices.cost_chf(call.model, new_tokens, call.usage.cached, call.usage.completion,
+                          getattr(call.usage, "cache_write", 0), getattr(call.usage, "cache_ttl", "5m"))
     if chf is None:
         return 0.0, "unknown"
     return chf, "catalog"
@@ -240,6 +262,8 @@ class InMemoryLedger(_AggregatorMixin):
             project_id=tag.project_id if tag else None, project_tenant=tag.project_tenant if tag else None,
             account=tag.account if tag else None, household_id=tag.household_id if tag else None,
             household_tenant=tag.household_tenant if tag else None,
+            cache_write_tokens=getattr(call.usage, "cache_write", 0), call_id=call.call_id,
+            cache_ttl=getattr(call.usage, "cache_ttl", "5m"), model_served=getattr(call, "model_served", None),
         ))
 
     def record_verdict(self, thread_id: str, turn_index: int, verdict: Verdict) -> None:
@@ -289,7 +313,7 @@ class InMemoryLedger(_AggregatorMixin):
 _CALL_COLS = ("thread_id, turn_index, tier, model, reasoning, prefix_sha256, layer_tokens, prompt_tokens, "
               "cached_tokens, completion_tokens, reasoning_tokens, cached_reported, latency_s, route_reason, "
               "chf, cost_source, created_at, reusable_tokens, project_id, project_tenant, account, household_id, "
-              "household_tenant")
+              "household_tenant, cache_write_tokens, call_id, model_served")
 
 
 def _call_record(r: Any) -> CallRecord:
@@ -298,7 +322,8 @@ def _call_record(r: Any) -> CallRecord:
         layer_tokens=r[6] or {}, prompt_tokens=r[7], cached_tokens=r[8], completion_tokens=r[9],
         reasoning_tokens=r[10], cached_reported=r[11], latency_s=r[12], route_reason=r[13], chf=r[14],
         cost_source=r[15], created_at=r[16], reusable_tokens=r[17], project_id=r[18], project_tenant=r[19],
-        account=r[20], household_id=r[21], household_tenant=r[22],
+        account=r[20], household_id=r[21], household_tenant=r[22], cache_write_tokens=r[23], call_id=r[24],
+        model_served=r[25],
     )
 
 
@@ -320,7 +345,7 @@ class PostgresLedger(_AggregatorMixin):
 
     def migrate(self) -> None:
         # en propriétaire, puis la RLS (nokker/store/conn.py) ; colonnes du projet ensuite (037, gardée)
-        self._pg.migrate(self.dsn, MIGRATION_SQL, PROJECT_SQL, HOUSEHOLD_SQL)
+        self._pg.migrate(self.dsn, MIGRATION_SQL, PROJECT_SQL, HOUSEHOLD_SQL, CALL_SQL, SERVED_SQL)
 
     def record(self, thread_id: str, turn_index: int, call: LLMCall) -> None:
         chf, source = cost_for_call(call, self.prices)
@@ -332,14 +357,15 @@ class PostgresLedger(_AggregatorMixin):
                 "INSERT INTO ledger_entries (thread_id, turn_index, tier, model, reasoning, prefix_sha256, "
                 "layer_tokens, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, "
                 "cached_reported, latency_s, route_reason, chf, cost_source, reusable_tokens, project_id, "
-                "project_tenant, account, household_id, household_tenant) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "project_tenant, account, household_id, household_tenant, cache_write_tokens, call_id, model_served) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (thread_id, turn_index, call.tier.value, call.model, call.reasoning, call.prefix_sha256,
                  json.dumps(call.layer_tokens), call.usage.prompt, call.usage.cached, call.usage.completion,
                  call.usage.reasoning, call.usage.cached_reported, call.latency_s, call.route_reason, chf, source,
                  call.reusable_tokens, tag.project_id if tag else None, tag.project_tenant if tag else None,
                  tag.account if tag else None, tag.household_id if tag else None,
-                 tag.household_tenant if tag else None),
+                 tag.household_tenant if tag else None, getattr(call.usage, "cache_write", 0), call.call_id,
+                 getattr(call, "model_served", None)),
             )
 
     def record_verdict(self, thread_id: str, turn_index: int, verdict: Verdict) -> None:

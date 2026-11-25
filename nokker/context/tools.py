@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from nokker.context.manager import ContextManager
+from nokker.context.manager import RECALL_TOOL, ContextManager
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
-
-RECALL_TOOL = "recall_context"
 
 
 class RecallContextSource:
@@ -33,7 +32,7 @@ class RecallContextSource:
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if name != RECALL_TOOL:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         text = self.manager.recall(ctx.thread_id, ref=str(arguments.get("ref") or "") or None,
                                    query=str(arguments.get("query") or "") or None,
                                    part=str(arguments.get("part") or "auto"),

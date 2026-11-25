@@ -6,23 +6,37 @@ elles se règlent en configuration (`billing_plans`), pas en code.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
 class Plan:
     id: str
     caps: dict[str, int]
+    # Nom affiché, par langue (mêmes noms que la page /tarifs) ; absent = l'identifiant, capitalisé.
+    names: dict[str, str] = field(default_factory=dict)
+
+    def name(self, lang: str) -> str:
+        return self.names.get("en" if lang == "en" else "fr") or self.names.get("fr") or self.id.capitalize()
 
 
 DEFAULT_PLANS: dict[str, Plan] = {
-    "essentiel": Plan("essentiel", {"turns_per_day": 50, "deep_per_day": 5}),
-    "solo": Plan("solo", {"turns_per_day": 150, "deep_per_day": 20}),
+    "essentiel": Plan("essentiel", {"turns_per_day": 50, "deep_per_day": 5}, {"fr": "Essentiel", "en": "Essential"}),
+    # Solo = les CGU §8 (décision produit du 05.11 : les CGU font foi) : 40 tours par jour ET 200 par semaine. Le plafond
+    # de sécurité (150 par jour) reste celui de `tenant_limits` ; un Solo payé reste en soft pendant la bêta.
+    "solo": Plan("solo", {"turns_per_day": 40, "turns_per_week": 200, "deep_per_day": 20}, {"fr": "Solo", "en": "Solo"}),
+    # Formule « byok » (décision du 05.11.2026, 9 CHF/mois) : AUCUNE inférence Nokker, seulement celle du client
+    # (docs/CLOUD-BYOK.md §3) ; sans point d'accès utilisable, le tour est refusé (`byok:not_configured`), jamais servi
+    # par le Router. Pas de plafond Router : il n'y en a pas. Les tours byok gardent la garde de débit de la bêta.
+    # Identifiant `byok` figé : cloud_byok.plans et byok_only_plans le lisent.
+    "byok": Plan("byok", {}, {"fr": "BYOK", "en": "BYOK"}),
     # Paliers de foyer (X23, LOKKAL §7.29 ; décision produit du 25.10 : Famille 49, Large 99 CHF/€ par mois, 6 membres au
     # plus, payeur compris, le tour moins cher que Solo). Quota COMMUN du foyer, lu par `household.Settings` ;
     # `household_members` = sièges, payeur compris (ignoré par les plafonds du locataire).
-    "famille": Plan("famille", {"turns_per_day": 110, "turns_per_week": 550, "household_members": 6}),
-    "large": Plan("large", {"turns_per_day": 230, "turns_per_week": 1150, "household_members": 6}),
+    "famille": Plan("famille", {"turns_per_day": 110, "turns_per_week": 550, "household_members": 6},
+                    {"fr": "Famille", "en": "Family"}),
+    "large": Plan("large", {"turns_per_day": 230, "turns_per_week": 1150, "household_members": 6},
+                  {"fr": "Large", "en": "Large"}),
 }
 
 # Paliers dont l'abonnement porte un foyer (quota partagé entre ses membres).
@@ -37,5 +51,6 @@ def plans_from_config(raw: dict[str, dict[str, int]] | None) -> dict[str, Plan]:
     out = dict(DEFAULT_PLANS)
     for pid, caps in (raw or {}).items():
         base = out[pid].caps if pid in out else {}
-        out[pid] = Plan(pid, {**base, **{k: int(v) for k, v in caps.items()}})
+        names = out[pid].names if pid in out else {}
+        out[pid] = Plan(pid, {**base, **{k: int(v) for k, v in caps.items()}}, names)
     return out

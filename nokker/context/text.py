@@ -69,10 +69,38 @@ _REVOCATION = re.compile(
     r"\bchang\w* d'avis\b|\bon ne (fait|garde) plus\b|"
     r"\b(revert|undo|roll ?back|scratch that|never ?mind)\b", re.IGNORECASE)
 
+# RÉVISIONS DE VALEUR (lot compact-cache, point 5) : « on passe de 1e-3 à 2e-4 », « mets 2e-4 au lieu de 1e-3 »,
+# « 1e-3 → 2e-4 », « change le pas en 2e-4 », « corrige la masse », et leurs équivalents en/de/it. La valeur d'avant est
+# REMPLACÉE par la nouvelle : un résumé qui garde les deux sans l'ordre fait relire l'ancienne comme courante (F5).
+# Formes ciblées (« maintenant », « plutôt », « da … a … » seuls sont trop courants : accolés à un verbe de réglage ou à
+# un nombre). Un faux positif coûte une ligne de contexte ; un oubli, une valeur périmée relue comme actuelle.
+_REVISION = re.compile(
+    # fr
+    r"\bpass(?:e|er|es|ez|ons|ent)\b[^.;!?]{0,50}?\bde\b[^.;!?]{1,40}?\bà\b|\bau lieu (?:de|du|des|d')|"
+    r"\b(?:désormais|dorénavant)\b|"
+    r"\b(?:utilise|mets|met|fixe|prends|passe|règle|c'est|on est|on utilise|on passe)\b[^.;!?]{0,40}\bmaintenant\b|"
+    r"\bmaintenant\b[^.;!?]{0,25}\d|"
+    r"\b(?:utilise|mets|met|prends|choisis|garde|fais|passe)\b[^.;!?]{0,40}\bplutôt\b|\bplutôt (?:que|qu')|"
+    r"(?:^|[.;!?]\s*)plutôt\b|"
+    r"\bchang(?:e|es|er|ez|eons)\b[^.;!?]{1,40}?\ben\b|\bcorrig(?:e|es|er|ez|eons)\b|"
+    # en
+    r"\bchang(?:e|es|ed|ing)\b[^.;!?]{0,40}?\bfrom\b[^.;!?]{1,40}?\bto\b|\binstead of\b|\brather than\b|"
+    r"\b(?:set|use|make|change|switch)\b[^.;!?]{0,30}\bnow\b|\bnow\b[^.;!?]{0,25}\d|"
+    # de
+    r"\bänder(?:e|n|t|n wir)?\b[^.;!?]{0,40}?\bauf\b|\bstatt\b|\banstatt\b|\bkorrigier(?:e|en|t)\b|"
+    r"\bjetzt\b[^.;!?]{0,25}\d|"
+    # it
+    r"\b(?:passa|passare|passiamo|cambia|cambiare|cambiamo)\b[^.;!?]{0,30}?\bda\b[^.;!?]{1,30}?\ba\b|"
+    r"\binvece di\b|\bal posto di\b|\banziché\b|\badesso\b[^.;!?]{0,25}\d|\bcorreggi\b|"
+    # flèche entre deux valeurs : « 1e-3 → 2e-4 », « 5 mm -> 7 mm »
+    r"\S*\d\S*(?:\s?[a-zA-Zµ°%]{1,3})?\s*(?:→|->|=>)\s*\S*\d", re.IGNORECASE)
 
-def is_revocation(text: str) -> bool:
-    """Vrai si le message (ou la phrase) annule ou change une décision antérieure (marqueurs ci-dessus)."""
-    return bool(_REVOCATION.search(text or ""))
+
+def is_revocation(text: str, revisions: bool = True) -> bool:
+    """Vrai si le message (ou la phrase) annule ou change une décision antérieure (marqueurs ci-dessus), ou RÉVISE une valeur
+    (« on passe de X à Y », `_REVISION`) quand `revisions` (défaut vrai ; `ContextBudgets.revision_markers`)."""
+    text = text or ""
+    return bool(_REVOCATION.search(text) or (revisions and _REVISION.search(text)))
 
 
 # Marqueurs d'une EXIGENCE DE PRÉSERVATION posée au fil d'une tâche : ce qui doit survivre aux changements suivants

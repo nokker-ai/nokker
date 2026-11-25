@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 from nokker.core.ports import Completion
+from nokker.core.quota_error import quota_of
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +36,17 @@ class HedgedProvider:
         return self.primary.model
 
     @property
+    def max_tokens_pinned(self) -> bool:
+        return bool(getattr(self.primary, "max_tokens_pinned", False))
+
+    @property
     def vision(self) -> bool:
         """Vision des DEUX modèles (X7) : le repli peut répondre à la place du primaire, une image ne part que si
         l'un comme l'autre sait la lire."""
         return bool(getattr(self.primary, "vision", False)) and bool(getattr(self.fallback, "vision", False))
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
-                 session_key: str, max_tokens: int = 2048,
+                 session_key: str, max_tokens: int | None = None,
                  on_delta: Callable[[str], None] | None = None,
                  on_tool_delta: Callable[[int, str, str, str], None] | None = None) -> Completion:
         lock = threading.Lock()
@@ -116,6 +121,8 @@ class HedgedProvider:
             err = state["error"]
             if state.get("emitted"):  # le client a déjà vu du texte : jamais de bascule (loop.py gère le rejeu)
                 raise err
+            if quota_of(err) is not None:  # quota d'inférence atteint : le repli le serait aussi, ce n'est pas une panne
+                raise err
             logger.warning("amont %s en échec (%s) : repli sur %s", self.primary.model, err, self.fallback.model)
             kw3: dict[str, Any] = {"on_delta": on_delta} if on_delta is not None else {}
             if on_tool_delta is not None and _accepts(self.fallback, "on_tool_delta"):
@@ -123,6 +130,12 @@ class HedgedProvider:
             return self.fallback.complete(messages, tools, reasoning=reasoning, session_key=session_key,
                                           max_tokens=max_tokens, **kw3)
         return state["result"]
+
+    @property
+    def replays_thinking(self) -> bool:
+        """Le primaire rejoue les blocs de réflexion (format anthropic) ; le repli, lui, ne les rejoue que s'il est du
+        même modèle (sinon il les ignore : `AnthropicProvider` compare le modèle producteur, `SokkanProvider` les retire)."""
+        return bool(getattr(self.primary, "replays_thinking", False))
 
     def close(self) -> None:
         for p in (self.primary, self.fallback):

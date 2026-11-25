@@ -42,10 +42,13 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.tools.lsp import LSP_TOOL, language_of
@@ -63,9 +66,17 @@ MAX_OUTPUT_CHARS = 30_000  # sortie de commande gardée (tête + queue) ; le ré
 # n'est READ que si CHAQUE segment l'est et qu'aucune redirection n'écrit.
 _READ_ONLY = {"ls", "cat", "head", "tail", "wc", "pwd", "grep", "rg", "file", "stat", "tree", "du", "which",
               "echo", "diff", "sort", "uniq", "cut", "basename", "dirname", "realpath", "env", "printenv",
-              "id", "whoami", "groups", "uname", "nproc"}
-# Lecture seulement SANS argument : `env CMD…` lance CMD.
-_READ_ONLY_BARE = {"env"}
+              "id", "whoami", "groups", "uname", "nproc",
+              # état d'un hôte (ops, ssh_run : test réel du 05.11, « uptime » demandait une carte)
+              "uptime", "df", "free", "w", "who", "ps", "lsblk", "vmstat", "hostname"}
+# Lecture seulement SANS argument : `env CMD…` lance CMD, `hostname NOM` renomme la machine.
+_READ_ONLY_BARE = {"env", "hostname"}
+# Sous-commandes de lecture (comme `git`) : docker et systemctl ; journalctl sauf ses options qui écrivent.
+_DOCKER_READ = {"ps", "images", "logs", "inspect", "version", "info", "stats"}
+_SYSTEMCTL_READ = {"status", "is-active", "is-enabled", "is-failed", "list-units", "list-timers", "list-unit-files",
+                   "show", "cat"}
+_JOURNALCTL_WRITES = re.compile(r"--(?:vacuum-\w+|rotate|flush|sync|relinquish-var|smart-relinquish-var|setup-keys|"
+                                r"update-catalog)\b")
 # Options qui font écrire une commande de lecture (fichier de sortie, base magique compilée).
 _WRITES_WITH = {"sort": ("-o", "--output"), "tree": ("-o",), "file": ("-C", "--compile"), "uniq": ()}
 _GIT_READ = {"status", "diff", "log", "show", "blame", "rev-parse", "ls-files", "branch", "grep"}
@@ -121,6 +132,14 @@ def _read_only(command: str) -> bool:
         elif head == "find":
             if _FIND_WRITES.search(seg):
                 return False
+        elif head in ("docker", "systemctl"):
+            allowed = _DOCKER_READ if head == "docker" else _SYSTEMCTL_READ
+            sub = next((w for w in words[1:] if not w.startswith("-")), "")
+            if sub not in allowed:
+                return False
+        elif head == "journalctl":
+            if _JOURNALCTL_WRITES.search(seg):
+                return False
         elif head not in _READ_ONLY:
             return False
         elif head in _READ_ONLY_BARE and len(words) > 1:
@@ -162,22 +181,316 @@ def classify_command(command: str) -> Effect:
     return Effect.READ if _read_only(command) else Effect.WRITE
 
 
+# ── classe d'AFFICHAGE d'une commande (`command_kind`) ──
+# `classify_command` décide (cartes, verdicts) ; `command_kind` ne fait QU'ÉTIQUETER pour la carte : « run » = lancer
+# des tests, un linter, un build, un formatage en simple vérification ; « other » = tout le reste. Il ne remplace jamais
+# `effect` et aucune porte ne le lit.
+_KIND_SHELL = re.compile(r"[;&|<>`$()\\\n\r]")  # enchaînement, tube, redirection, substitution, expansion
+# Options qui écrivent (correction, sortie, rapport, mise à jour de snapshots, config, installation) ou ne finissent pas.
+_KIND_WRITE_OPT = re.compile(
+    r"^--?(?:fix|write|update|output(?!-format)|outfile|out-?dir|out-?file|junit|html|report|cov-report|"
+    r"coverage-?dir|\w*profile|trace|watch|init|install|add-noqa|unsafe|config|target-dir|exec|toolexec|overlay|"
+    r"modfile|work|non-interactive|cache-clear)",
+    re.I)
+_KIND_SHORT_WRITE = re.compile(r"^-[A-Za-z]{1,4}$")  # -u -w -o (et groupes) ; pas pour `go` (-run, -count…)
+_KIND_PREFIX = (".venv/bin/", "venv/bin/")
+_KIND_NAMES = frozenset({"pytest", "py.test", "python", "python3", "npm", "pnpm", "yarn", "vitest", "jest", "tsc",
+                         "ruff", "mypy", "eslint", "go", "cargo", "make", "mvn", "gradle", "tox", "nox", "black",
+                         "prettier"})
+
+
+def _kind_head(word: str) -> str | None:
+    if word == "./gradlew":
+        return "gradle"
+    if word == "./mvnw":
+        return "mvn"
+    for pre in _KIND_PREFIX:
+        if word.startswith(pre):
+            word = word[len(pre):]
+            break
+    return word if word in _KIND_NAMES else None
+
+
+def _kind_args_ok(head: str, args: list[str]) -> bool:
+    for i, a in enumerate(args):
+        if _KIND_WRITE_OPT.match(a) or a == "watch":
+            return False
+        if a == "-o" or (head != "go" and _KIND_SHORT_WRITE.match(a) and re.search(r"[uwo]", a[1:])):
+            return False
+        if a.startswith("-p") and head in ("pytest", "py.test", "python", "python3"):  # greffon : seulement `no:`
+            val = a[2:] or (args[i + 1] if i + 1 < len(args) else "")
+            if not val.startswith("no:"):
+                return False
+    return True
+
+
+def _kind_is_run(words: list[str]) -> bool:
+    head = _kind_head(words[0])
+    if head is None:
+        return False
+    args = words[1:]
+    if not _kind_args_ok(head, args):
+        return False
+    sub = next((a for a in args if not a.startswith("-")), "")
+    if head in ("pytest", "py.test", "mypy", "tox", "nox", "vitest", "jest", "eslint"):
+        return True
+    if head in ("python", "python3"):
+        return len(args) >= 2 and args[0] == "-m" and args[1] in ("pytest", "unittest")
+    if head in ("npm", "pnpm", "yarn"):
+        return args[:1] == ["test"] or (args[:1] == ["run"] and args[1:2] in (["test"], ["lint"], ["build"]))
+    if head == "tsc":
+        return "--noEmit" in args and not any(a in ("-b", "--build") for a in args)
+    if head == "ruff":
+        if sub == "check":
+            return True
+        return sub == "format" and any(a in ("--check", "--diff") for a in args)
+    if head in ("black", "prettier"):
+        return any(a in ("--check", "--diff", "-c") for a in args)
+    if head == "go":
+        return args[:1] in (["test"], ["vet"], ["build"])
+    if head == "cargo":
+        return args[:1] in (["test"], ["check"], ["build"], ["clippy"])
+    if head == "make":
+        tg = ("test", "check", "lint", "build")
+        return all(a in tg or re.fullmatch(r"-j\d*", a) for a in args) and any(a in tg for a in args)
+    if head in ("mvn", "gradle"):
+        targets = ("test",) if head == "mvn" else ("test", "build")
+        return sub in targets and all(a in targets or re.fullmatch(r"-[qB]|--(?:quiet|batch-mode|offline)", a)
+                                      for a in args)
+    return False
+
+
+def command_kind(command: str) -> str:
+    """Classe d'AFFICHAGE d'une commande `terminal` : « run » (tests, linter, build, formatage en vérification,
+    reconnus de façon FERMÉE) ou « other ». PUREMENT D'AFFICHAGE : la décision d'approbation reste celle de
+    `classify_command` (qui étiquette `pytest` WRITE) ; aucune porte ne lit ce champ.
+
+    « run » exige : aucun opérateur de shell (`; & | < > ` $ ( )`, retour ligne), une liste d'outils/sous-commandes
+    connue (pytest, python -m pytest|unittest, npm|pnpm|yarn test|run test|run lint|run build, vitest, jest,
+    tsc --noEmit, ruff check, ruff format --check, black|prettier --check, mypy, eslint, go test|vet|build, cargo
+    test|check|build|clippy, make test|check|lint|build, mvn test, gradle test|build, tox, nox), aucune option qui
+    écrit (--fix, --write, -u, -o, --output, rapports, --watch…), et une commande que `classify_command` ne juge pas
+    DESTRUCTIVE (le kind ne masque jamais une destruction ; sans l'amont, `classify_command` rend DESTRUCTIVE :
+    « other »)."""
+    if not isinstance(command, str) or not command.strip() or _KIND_SHELL.search(command):
+        return "other"
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return "other"
+    if not words or not _kind_is_run(words):
+        return "other"
+    return "other" if classify_command(command) is Effect.DESTRUCTIVE else "run"
+
+
+_CD_PREFIX = re.compile(r"^\s*cd\s+[\w./~-]+\s*&&\s*")
+# Forme fermée d'une commande de tests dont la sortie est coupée : `<tests> [2>&1] | tail -N` ou `| head -N` (N entier de 1
+# à 1000, `-N` ou `-n N`). Rien d'autre après le tube : ni autre filtre, ni redirection, ni `;`, ni `&&`.
+_PIPED_TESTS = re.compile(r"(?P<left>[^|\n\r]+?)\s*(?:2>&1\s*)?\|\s*(?:tail|head)\s+(?:-(?:n\s+)?)(?P<n>[1-9][0-9]{0,2}|1000)\s*")
+_REDIR_ERR = re.compile(r"\s*2>&1\s*$")
+
+
+def _piped_tests_split(command: str) -> tuple[str, str] | None:
+    """`(préfixe « cd x && » ou vide, commande de tests nue)` si `command` est de la forme fermée `<tests> [2>&1] | tail|head
+    -N`, sinon None. La commande de tests nue (sans `2>&1` ni tube) doit elle-même être reconnue par `is_test_command`."""
+    if not isinstance(command, str) or "\n" in command or "\r" in command:
+        return None
+    m = _PIPED_TESTS.fullmatch(command.strip())
+    if m is None or "||" in command:
+        return None
+    left = m.group("left")
+    prefix = _CD_PREFIX.match(left)
+    base = _REDIR_ERR.sub("", left)  # un `2>&1` placé juste avant le tube
+    if not is_test_command(base):
+        return None
+    return (prefix.group(0) if prefix else ""), base[len(prefix.group(0)) if prefix else 0:].strip()
+
+
+def is_test_command(command: str) -> bool:
+    """Commande de TESTS reconnue (pytest, python -m pytest|unittest, tox, nox, vitest, jest, npm|pnpm|yarn [run] test, go
+    test, cargo test, make test, mvn test, gradle test), de façon fermée : `command_kind` « run » (aucun opérateur de shell,
+    aucune option qui écrit), un seul préfixe `cd <dossier> &&` toléré. Le linter, le build et le typage n'en sont pas.
+    Forme à sortie coupée aussi reconnue : `<tests> 2>&1 | tail -N` ou `| head -N` (et sans `2>&1`), N de 1 à 1000, rien
+    d'autre après le tube ; son code de retour n'est celui des tests que si la commande est exécutée par
+    `pipefail_command` (le terminal du bac le fait), sinon c'est celui de tail."""
+    command = command or ""
+    if _PIPED_TESTS.fullmatch(command.strip()) is not None:
+        return _piped_tests_split(command) is not None
+    command = _CD_PREFIX.sub("", command)
+    if command_kind(command) != "run":
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    head, args = _kind_head(words[0]), words[1:]
+    if head in ("pytest", "py.test", "tox", "nox", "vitest", "jest"):
+        return True
+    if head in ("python", "python3"):
+        return len(args) >= 2 and args[0] == "-m" and args[1] in ("pytest", "unittest")
+    if head in ("npm", "pnpm", "yarn"):
+        return args[:1] == ["test"] or args[:2] == ["run", "test"]
+    if head in ("go", "cargo"):
+        return args[:1] == ["test"]
+    if head in ("make", "mvn", "gradle"):
+        return "test" in args
+    return False
+
+
+def pipefail_command(command: str) -> str | None:
+    """Pour une commande de tests à sortie coupée reconnue (`<tests> [2>&1] | tail|head -N`), la commande À EXÉCUTER :
+    le tube dans un sous-shell bash où `pipefail` est posé (`[cd x && ](set -o pipefail; <commande telle qu'écrite>)`).
+    Le code de retour devient celui des tests et non celui de `tail` (toujours 0 : un échec de tests passait pour un
+    succès). Rien d'autre ne change : même sortie, même commande vue par la personne et par les portes, aucun état de shell
+    laissé (sous-shell : `pipefail` ne sort pas). None pour toute autre commande : exécutée telle quelle."""
+    split = _piped_tests_split(command)
+    if split is None:
+        return None
+    prefix, _ = split
+    body = command.strip()[len(prefix):] if prefix and command.strip().startswith(prefix) else command.strip()
+    return f"{prefix}(set -o pipefail; {body})"
+
+
+HOST_PATH_HINT = mt.HOST_PATH_HINT["fr"]  # figés ; langue du tour : `model_texts`
+
+SANDBOX_UNAVAILABLE = mt.SANDBOX_UNAVAILABLE["fr"]
+
+
+class OutsideRoot(PermissionError):
+    """Un chemin qui sort du dossier de travail (confinement des outils fichiers). Même texte et même `is_error` pour le
+    modèle que tout `PermissionError` ; en plus, le résultat est un REFUS pour l'hôte (`ToolResult.refused`,
+    `reason="outside_root"` : `status: "refused"` dans `tool.result` et `tools/call`)."""
+
+    outside_root = True
+
+
+OUTSIDE_ROOT = "outside_root"
+
+
+# Fils dont l'OUVERTURE de session de code a été refusée parce que le bac à sable est indisponible (docker absent,
+# plafonds non appliqués) : le refus `permissions:no_code_session` le dit au modèle au lieu de demander d'ouvrir une
+# session. Vidé à l'ouverture réussie et à la fin de la session. Borné, en mémoire (un redémarrage l'oublie).
+_REFUSED_SESSIONS: dict[str, None] = {}
+_REFUSED_MAX = 1000
+
+
+def mark_session_refused(thread_id: str | None) -> None:
+    if not thread_id:
+        return
+    _REFUSED_SESSIONS.pop(thread_id, None)
+    _REFUSED_SESSIONS[thread_id] = None
+    while len(_REFUSED_SESSIONS) > _REFUSED_MAX:
+        _REFUSED_SESSIONS.pop(next(iter(_REFUSED_SESSIONS)), None)
+
+
+def clear_session_refused(thread_id: str | None) -> None:
+    _REFUSED_SESSIONS.pop(thread_id or "", None)
+
+
+def session_refused(thread_id: str | None) -> bool:
+    return (thread_id or "") in _REFUSED_SESSIONS
+
+
+class SandboxUnavailable(RuntimeError):
+    """Backend docker demandé, démon (ou proxy du socket) injoignable : refus net, jamais de repli sur `local`."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(mt.pick(mt.SANDBOX_UNAVAILABLE))
+        self.detail = detail  # cause technique, pour les journaux (jamais renvoyée au modèle)
+
+
+class SandboxLimitsNotApplied(SandboxUnavailable):
+    """Plafond mémoire/CPU demandé par l'hôte (`local.code.memory`, `local.code.cpus`) que docker n'a pas posé (cgroups non
+    délégués à la machine : l'amont omet alors les plafonds avec un simple avertissement). Le bac est supprimé, jamais de
+    bac sans plafond quand l'hôte en a demandé un. Le texte est celui de l'opérateur."""
+
+    def __init__(self, detail: str = "") -> None:
+        RuntimeError.__init__(self, mt.pick(mt.SANDBOX_LIMITS_NOT_APPLIED).format(detail=detail))
+        self.detail = detail
+
+
+class SandboxCreateRefused(SandboxUnavailable):
+    """Le démon docker a refusé de CRÉER le bac (plage de CPU ou de mémoire invalide pour la machine, image introuvable, tout
+    autre refus du démon) : `docker run` a échoué. Session refusée net (503 `sandbox_unavailable`), sans trace au journal. Le texte
+    est celui de l'opérateur : il cite ce qui a été demandé et, quand docker la donne, la limite de la machine."""
+
+    def __init__(self, detail: str = "", asked: str = "") -> None:
+        RuntimeError.__init__(self, mt.pick(mt.SANDBOX_CREATE_REFUSED).format(detail=detail or "?", asked=asked))
+        self.detail = detail
+
+
+
+
+def _docker_refusal(e: BaseException) -> str:
+    """La phrase utile du refus de docker (stderr de `docker run`), sans préfixe ni conseil d'aide : « Range of CPUs is from
+    0.01 to 2.00, as there are only 2 CPUs available. » Jamais la ligne de commande (arguments, variables)."""
+    raw = getattr(e, "stderr", None) or getattr(e, "output", None) or ""
+    text = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("See 'docker")]
+    if not lines:
+        if isinstance(e, subprocess.TimeoutExpired):
+            return "délai dépassé (téléchargement de l'image ?)"
+        return f"{type(e).__name__}"
+    line = lines[-1]
+    for prefix in ("docker: Error response from daemon: ", "Error response from daemon: ", "docker: "):
+        line = line.removeprefix(prefix)
+    return line[:300]
+
+
+SANDBOX_LIMITS_NOT_APPLIED = mt.SANDBOX_LIMITS_NOT_APPLIED["fr"]
+# Texte vu du MODÈLE (refus d'un appel d'outil après expiration) : sans nom de réglage ni jargon, sans consigne de config.
+SANDBOX_LIMITS_FOR_MODEL = mt.SANDBOX_LIMITS_FOR_MODEL["fr"]
+
+
+def check_sandbox(docker: str = "docker", timeout: float = 5.0) -> None:
+    """Le démon docker (DOCKER_HOST : le proxy du socket dans le compose Lokkal) répond-il ? `SandboxUnavailable`
+    sinon (exécutable absent, délai dépassé, code de retour non nul). Ne démarre rien et n'exécute rien du modèle."""
+    import subprocess
+
+    try:
+        r = subprocess.run([docker, "version", "--format", "{{.Server.Version}}"], capture_output=True, text=True,
+                           timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SandboxUnavailable(f"{type(e).__name__}: {e}") from e
+    if r.returncode != 0:
+        raise SandboxUnavailable((r.stderr or "").strip()[:300] or f"docker version : code {r.returncode}")
+
+
+MIN_INSTANCE_LEN = 6  # une étiquette plus courte est refusée : trop proche d'un mot courant, trop facile à partager
+
+
+def instance_sandboxes(instance: str, docker: str = "docker") -> list[str]:
+    """Identifiants des bacs à sable dont l'étiquette `nokker.instance` est EXACTEMENT `instance`. Le filtre de docker
+    sert à réduire la liste ; chaque ligne est re-contrôlée ici sur la valeur exacte de l'étiquette (jamais un préfixe
+    ni une sous-chaîne). Id vide ou trop court : rien (liste vide)."""
+    import subprocess
+
+    if not isinstance(instance, str) or len(instance) < MIN_INSTANCE_LEN or instance != instance.strip():
+        return []
+    r = subprocess.run([docker, "ps", "-a", "--filter", f"label=nokker.instance={instance}", "--format",
+                        '{{.ID}}\t{{.Label "nokker.instance"}}'], capture_output=True, text=True, timeout=30)
+    ids = []
+    for line in (r.stdout or "").splitlines():
+        cid, sep, label = line.partition("\t")
+        if sep and cid.strip() and label == instance:
+            ids.append(cid.strip())
+    return ids
+
+
 def reap_sandboxes(instance: str, docker: str = "docker", processes_dir: str | None = None) -> int:
     """Supprime les bacs à sable de CETTE instance de noyau (`nokker.instance=<instance>`) restés d'un arrêt sans
-    `close()` (container tué, machine éteinte). À appeler au démarrage du noyau local. Seulement les siens : un autre
-    noyau ou un banc peut tourner sur la même machine (vu le 23.10 : un redémarrage a tué les bacs à sable d'un banc
-    en cours). Rend le nombre supprimé ; 0 si docker est absent. Leurs processus en arrière-plan partent avec eux.
+    `close()` (container tué, machine éteinte). À appeler au démarrage du noyau local. Seulement ceux dont l'étiquette
+    est exactement la sienne : un autre noyau ou un banc peut tourner sur la même machine (vu le 23.10 : un
+    redémarrage a tué les bacs à sable d'un banc en cours). Un id vide ou de moins de `MIN_INSTANCE_LEN` caractères ne
+    supprime rien. Rend le nombre supprimé ; 0 si docker est absent. Leurs processus en arrière-plan partent avec eux.
 
     `processes_dir` (backend local, `<état>/processes`) : arrête aussi les processus en arrière-plan laissés par un
     noyau tué (`reap_processes` : seulement ceux qui portent encore leur marque)."""
     import subprocess
 
     reaped = reap_processes(processes_dir) if processes_dir else 0
-    if not instance:
-        return reaped
     try:
-        ids = subprocess.run([docker, "ps", "-aq", "--filter", f"label=nokker.instance={instance}"],
-                             capture_output=True, text=True, timeout=30).stdout.split()
+        ids = instance_sandboxes(instance, docker)
         if ids:
             subprocess.run([docker, "rm", "-f", *ids], capture_output=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
@@ -224,6 +537,7 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
                                                 "enum": ["pending", "in_progress", "completed", "cancelled"]}}}},
             "merge": {"type": "boolean", "default": False}}}),
 )
+MAX_DIR_ENTRIES = 50  # `read_file` d'un dossier : entrées citées au plus
 CODE_TOOLS = tuple(name for name, *_ in _SPECS)
 
 # Commandes en arrière-plan (lot X6) : présentes seulement avec `background=True` (drapeau `local.background_processes`).
@@ -251,6 +565,20 @@ _CLASSIFIED = ("terminal", "process_start")  # effet = celui de la commande (`cl
 
 # ─────────────────────────────── dossier de travail ───────────────────────────────
 
+
+
+def _image_of(r: dict[str, Any], path: str) -> list[Any]:
+    """Octets d'une image lue (base64 de l'amont), contrôlés comme une pièce jointe ; [] si ce n'en est pas une ou si
+    le contrôle refuse (le modèle garde la ligne de description)."""
+    b64 = r.get("base64_content")
+    if not r.get("is_image") or not isinstance(b64, str) or not b64:
+        return []
+    from nokker.images.validate import ImageError, parse_attachments
+
+    try:
+        return parse_attachments([{"data": b64, "name": os.path.basename(path)}])
+    except (ImageError, ValueError):
+        return []
 
 @dataclass
 class Workspace:
@@ -305,11 +633,63 @@ class SharedEnv:
         return getattr(self._inner, name)
 
 
+def _logs_result(logs: dict[str, Any]) -> str:
+    """Journal d'un processus : métadonnées hors clôture, sortie (stdout et stderr) dans la clôture commune."""
+    from nokker.qa.untrusted import fenced_result
+
+    meta = {k: v for k, v in logs.items() if k != "output"}
+    return fenced_result(meta, "process:output", str(logs.get("output") or ""))
+
+
 def _clip(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
     head, tail = text[: limit * 2 // 3], text[-(limit // 3):]
-    return f"{head}\n[… {len(text) - len(head) - len(tail)} caractères coupés …]\n{tail}"
+    return f"{head}" + mt.pick(mt.TEXT_CUT).format(n=len(text) - len(head) - len(tail)) + f"{tail}"
+
+
+_MEMORY_LIMIT = re.compile(r"([1-9][0-9]{0,6})([mMgG])")
+_CPUS_LIMIT = re.compile(r"[0-9]{1,3}(\.[0-9]{1,2})?")
+
+
+def parse_memory_limit(value: Any) -> int:
+    """Plafond mémoire du bac (`local.code.memory`, « 2g » / « 512m ») en Mo ; 0 = pas de plafond (valeur absente ou
+    vide). Forme stricte : un entier positif et `m` ou `g`, rien d'autre (jamais de texte passé tel quel à docker), au
+    moins 64 Mo, au plus 1024 Go. ValueError sinon."""
+    if value is None or value is False or (isinstance(value, str) and not value.strip()):
+        return 0
+    m = _MEMORY_LIMIT.fullmatch(value.strip()) if isinstance(value, str) else None
+    if m is None:
+        raise ValueError(f"local.code.memory invalide : {value!r} (attendu : entier + m ou g, ex. « 2g », « 512m »)")
+    mb = int(m.group(1)) * (1024 if m.group(2) in "gG" else 1)
+    if not 64 <= mb <= 1024 * 1024:
+        raise ValueError(f"local.code.memory hors bornes : {value!r} (64m à 1024g)")
+    return mb
+
+
+def parse_cpus_limit(value: Any) -> float:
+    """Plafond CPU du bac (`local.code.cpus`, ex. 2 ou 1.5) ; 0 = pas de plafond (valeur absente ou 0). Nombre positif
+    (au plus deux décimales, 0.1 à 256), entier, flottant ou texte de cette forme ; un booléen, un exposant, « inf » ou
+    toute autre chaîne est refusé. ValueError sinon."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0.0
+    bad = ValueError(f"local.code.cpus invalide : {value!r} (attendu : nombre, ex. 2 ou 1.5)")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise bad
+    text = value.strip() if isinstance(value, str) else (f"{value:.2f}".rstrip("0").rstrip(".") if isinstance(value, float)
+                                                       else str(value))
+    if not _CPUS_LIMIT.fullmatch(text):
+        raise bad
+    n = float(text)
+    if n == 0:
+        return 0.0
+    if not 0.1 <= n <= 256:
+        raise ValueError(f"local.code.cpus hors bornes : {value!r} (0.1 à 256)")
+    return n
+
+
+_VOLUME_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_VOLUME_SUBPATH = re.compile(r"[A-Za-z0-9_./@+=-]{1,512}")
 
 
 @dataclass
@@ -325,6 +705,10 @@ class CodeToolSource:
     backend: str = "docker"
     image: str = DEFAULT_SANDBOX_IMAGE
     network: bool = True
+    # Plafonds du bac docker (`local.code.memory` / `local.code.cpus`) : mémoire en Mo (`--memory`) et CPU (`--cpus`) ;
+    # 0 = pas de plafond (comportement d'avant). Validés par `parse_memory_limit` / `parse_cpus_limit`.
+    memory_mb: int = 0
+    cpus: float = 0.0
     # Réseau docker des bacs à sable quand `network` est vrai. Compose Lokkal : `nokker-sandbox` (sortie Internet
     # seulement : ni Postgres, ni noyau, ni proxy docker, ni LAN, ni 169.254.169.254 ; le proxy refuse tout autre
     # NetworkMode que lui ou none). None = réseau par défaut du démon (tests, dev).
@@ -336,6 +720,12 @@ class CodeToolSource:
     # Chemin du dossier DANS le bac à sable. /workspace par défaut ; un banc peut monter le dépôt là où l'image de
     # l'environnement l'attend (SWE-bench : /testbed, où l'installation éditable du projet pointe).
     mount: str = WORKSPACE_MOUNT
+    # Volume docker NOMMÉ qui porte `root` (hôte embarquant le noyau dans un container : ses dossiers de travail sont dans
+    # un volume, pas à un chemin de l'hôte). Le bac monte alors CE volume sur `mount`, restreint au sous-dossier
+    # `volume_subpath` (`--mount type=volume,…,volume-subpath=`, docker >= 26) : jamais le volume entier, donc jamais les
+    # dossiers des autres sessions. Vide = montage par chemin (`host_root`).
+    volume: str | None = None
+    volume_subpath: str = ""
     # Identifiant du noyau qui possède ce bac à sable (étiquette `nokker.instance`) : son ménage au démarrage ne
     # touche que les siens. None = pas d'étiquette (banc, `nokker code`), donc jamais ramassé par un noyau.
     instance: str | None = None
@@ -369,6 +759,7 @@ class CodeToolSource:
     sandbox_env: dict[str, str] = field(default_factory=dict)
     _spaces: dict[str, Workspace] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    last_used: float = field(default=0.0, init=False, repr=False)  # dernier appel d'outil (monotone), pour l'expiration
 
     def __post_init__(self) -> None:
         self.root = os.path.realpath(self.root)
@@ -381,6 +772,15 @@ class CodeToolSource:
                 self.mount = str(self.k8s.get("workspace_mount") or WORKSPACE_MOUNT)
         if not os.path.isdir(self.root):
             raise ValueError(f"dossier de travail introuvable : {self.root}")
+        if self.volume is not None:
+            if not _VOLUME_NAME.fullmatch(self.volume):
+                raise ValueError(f"nom de volume invalide : {self.volume!r}")
+            self.volume_subpath = self.volume_subpath.strip("/")
+            if not _VOLUME_SUBPATH.fullmatch(self.volume_subpath or "x") or ".." in self.volume_subpath.split("/"):
+                raise ValueError(f"sous-dossier du volume invalide : {self.volume_subpath!r}")
+        self.memory_mb = parse_memory_limit(f"{self.memory_mb}m") if self.memory_mb else 0
+        self.cpus = parse_cpus_limit(self.cpus) if self.cpus else 0.0
+        self.last_used = time.monotonic()
         self.subdir = self.subdir.strip("/")
         if self.subdir and (os.path.isabs(self.subdir) or ".." in self.subdir.split("/")):
             raise ValueError(f"sous-dossier invalide : {self.subdir!r}")
@@ -444,6 +844,10 @@ class CodeToolSource:
             ws = self._spaces.get(thread_id)
             if ws is None:
                 ws = self._spaces[thread_id] = self._open(thread_id)
+                from nokker.qa.secrets import add_known_path
+
+                for known in (ws.cwd, self.root, self.mount, getattr(self, "_base", "")):  # racines connues : pas d'entropie
+                    add_known_path(known)
             return ws
 
     def _allow_writes_in_workspace(self) -> None:
@@ -490,17 +894,38 @@ class CodeToolSource:
             safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", thread_id)[:48] or "default"
             # Étiquette `nokker.sandbox` : le proxy du socket docker du compose n'accepte que ces containers-là.
             cwd = self.mount + ("/" + self.subdir if self.subdir else "")
-            env = DockerEnvironment(image=self.image, cwd=cwd, timeout=120, task_id=f"nokker-{safe}",
-                                    volumes=[f"{self.host_root or self.root}:{self.mount}"], network=self.network,
-                                    persistent_filesystem=False, persist_across_processes=False,
-                                    # --user <uid:gid> du processus : les fichiers créés dans le dépôt appartiennent à
-                                    # l'utilisateur, pas à root (compose : le noyau tourne sous l'uid de l'hôte).
-                                    run_as_host_user=True, env={"HOME": "/tmp", **self.sandbox_env},
-                                    extra_args=["--label", f"nokker.sandbox={safe}",
-                                                *(["--label", f"nokker.instance={self.instance}"]
-                                                  if self.instance else []),
-                                                *(["--network", self.network_name]
-                                                  if self.network and self.network_name else [])])
+            if self.volume is not None:  # volume nommé, sous-dossier seulement (`--mount` : pas de `:` ni de virgule à échapper)
+                mounts = ["--mount", f"type=volume,source={self.volume},target={self.mount}"
+                          + (f",volume-subpath={self.volume_subpath}" if self.volume_subpath else "")]
+                volumes: list[str] = []
+            else:
+                mounts, volumes = [], [f"{self.host_root or self.root}:{self.mount}"]
+            try:
+                env = DockerEnvironment(image=self.image, cwd=cwd, timeout=120, task_id=f"nokker-{safe}",
+                                        volumes=volumes, network=self.network,
+                                        cpu=self.cpus, memory=self.memory_mb,
+                                        persistent_filesystem=False, persist_across_processes=False,
+                                        # --user <uid:gid> du processus : les fichiers créés dans le dépôt
+                                        # appartiennent à l'utilisateur, pas à root (compose : le noyau tourne sous
+                                        # l'uid de l'hôte).
+                                        run_as_host_user=True, env={"HOME": "/tmp", **self.sandbox_env},
+                                        extra_args=[*mounts, "--label", f"nokker.sandbox={safe}",
+                                                    *(["--label", f"nokker.instance={self.instance}"]
+                                                      if self.instance else []),
+                                                    *(["--network", self.network_name]
+                                                      if self.network and self.network_name else [])])
+            except Exception as e:  # l'amont dit « bascule sur Local » : jamais au modèle
+                if type(e).__name__ == "EnvironmentConnectionError":
+                    raise SandboxUnavailable(str(e)) from e
+                if isinstance(e, subprocess.SubprocessError | OSError):
+                    # `docker run` refusé (plage de CPU ou de mémoire invalide, image, tout refus du démon) : refus net de la
+                    # session, jamais une trace Python ni un 502. Rien d'autre n'est attrapé ici (un bug reste un bug).
+                    asked = ", ".join([f"image {self.image}", *([f"cpus {self.cpus:g}"] if self.cpus else []),
+                                       *([f"mémoire {self.memory_mb} Mo"] if self.memory_mb else [])])
+                    raise SandboxCreateRefused(_docker_refusal(e), asked) from None
+                raise
+        if self.backend == "docker" and (self.memory_mb or self.cpus):
+            self._require_limits(env)
         reader = None
         if self.backend in ("docker", "kubernetes") and self.local_reads:
             from tools.environments.local import LocalEnvironment
@@ -508,18 +933,89 @@ class CodeToolSource:
             reader = ShellFileOperations(LocalEnvironment(cwd=self._base, timeout=60), cwd=self._base)
         return Workspace(env=env, ops=ShellFileOperations(env, cwd=cwd), todos=TodoStore(), cwd=cwd, reader=reader)
 
+    @staticmethod
+    def _inspect_limits(container_id: str) -> tuple[int, int]:
+        """(HostConfig.Memory, HostConfig.NanoCpus) du conteneur, lus par `docker inspect`."""
+        import subprocess
+
+        r = subprocess.run(["docker", "inspect", "--format", "{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}}", container_id],
+                           capture_output=True, text=True, timeout=30, check=False)
+        mem, nano = r.stdout.split()
+        return int(mem), int(nano)
+
+    def _require_limits(self, env: Any) -> None:
+        """Les plafonds demandés sont-ils POSÉS sur le conteneur ? L'amont ne les pose que si les contrôleurs cgroup sont
+        délégués, sinon il les omet avec un avertissement et le bac démarre sans plafond. Vérifié par `docker inspect` ;
+        un écart (ou une lecture impossible) supprime le bac et refuse : `SandboxLimitsNotApplied`."""
+        want_mem, want_nano = self.memory_mb * 1024 * 1024, round(self.cpus * 1_000_000_000)
+        problem = ""
+        try:
+            cid = getattr(env, "_container_id", None)
+            if not cid:
+                raise LookupError("conteneur introuvable")
+            mem, nano = self._inspect_limits(cid)
+            if self.memory_mb and mem != want_mem:
+                problem = f"mémoire demandée {self.memory_mb} Mo, posée {mem // (1024 * 1024)} Mo"
+            elif self.cpus and abs(nano - want_nano) > 1_000_000:
+                problem = f"cpus demandés {self.cpus:g}, posés {nano / 1e9:g}"
+        except Exception as e:  # noqa: BLE001 — impossible de vérifier : même refus
+            problem = f"vérification impossible ({type(e).__name__})"
+        if not problem:
+            return
+        logger.error("bac à sable refusé : %s", problem)
+        try:
+            env.cleanup()
+            from tools.environments.docker import DockerEnvironment
+
+            DockerEnvironment.wait_for_all_teardowns(20.0)
+        except Exception:  # le ménage au démarrage suivant rattrape un reste
+            logger.debug("suppression du bac refusé en échec", exc_info=True)
+        raise SandboxLimitsNotApplied(problem)
+
+    def _host_roots(self) -> list[str]:
+        """Les racines du dossier de session côté hôte, telles que le modèle ou une erreur peut les citer : vue du noyau
+        (réelle et telle que donnée) et vue du démon docker (`host_root`)."""
+        roots = {os.path.realpath(self.root), self.root.rstrip("/") or "/"}
+        if self.host_root:
+            roots.update({self.host_root.rstrip("/") or "/", os.path.realpath(self.host_root)})
+        return sorted((r for r in roots if r != "/"), key=len, reverse=True)
+
+    def _to_mount_view(self, path: str) -> str:
+        """Bac à sable : un chemin ABSOLU de l'hôte situé sous le dossier de la session (ou sous la racine vue par le
+        démon) est traduit vers le montage (`/host/ws/proj/a.py` → `/workspace/a.py`). Le modèle voit /workspace ; un
+        chemin déjà sous le montage, un chemin relatif, un chemin hors du dossier (voisin, parent, `..` qui en sort) ne
+        bougent pas : le bac ne voit pas l'hôte, rien n'en sort. Normalisation lexicale (`..`, `//`, `./`) pour juger de
+        l'appartenance, comme le fait déjà `_inside`. Backend local : aucune traduction (les chemins sont ceux de l'hôte)."""
+        import posixpath
+
+        if self.backend == "local" or not isinstance(path, str):
+            return path
+        raw = path.strip()
+        if not raw.startswith("/"):
+            return path
+        norm = posixpath.normpath(raw)
+        if norm.startswith("//"):  # POSIX garde « // » initial : le tenir pour « / »
+            norm = "/" + norm.lstrip("/")
+        if norm == self.mount or norm.startswith(self.mount + "/"):
+            return path  # déjà vu du bac : jamais de double traduction
+        for root in self._host_roots():
+            if norm == root or norm.startswith(root + "/"):
+                out = self.mount + norm[len(root):]
+                return out + "/" if raw.endswith("/") and not out.endswith("/") else out
+        return path
+
     def _host_path(self, ws: Workspace, path: str) -> str | None:
         """docker : le chemin hôte d'un chemin vu dans le container s'il est sous /workspace (liens symboliques résolus,
         borné au dossier monté), sinon None (lecture laissée au bac à sable)."""
         import posixpath
 
-        p = posixpath.normpath(posixpath.join(ws.cwd, (path or ".").strip()))
+        p = posixpath.normpath(posixpath.join(ws.cwd, self._to_mount_view((path or ".").strip())))
         if p != self.mount and not p.startswith(self.mount + "/"):
             return None
         root = os.path.realpath(self.root)
         full = os.path.realpath(os.path.join(root, p[len(self.mount):].lstrip("/")))
         if full != root and not full.startswith(root + os.sep):
-            raise PermissionError(f"{path!r} sort du dossier de travail")
+            raise OutsideRoot(mt.pick(mt.CODE_OUTSIDE_ROOT).format(path=repr(path)))
         return full
 
     def _to_container(self, text: str) -> str:
@@ -541,24 +1037,45 @@ class CodeToolSource:
     def _inside(self, ws: Workspace, path: str) -> str:
         """Chemin vu par l'environnement. En local, refuse ce qui sort de `root` (liens symboliques compris)."""
         path = (path or ".").strip()
-        if self.backend != "local":  # le container ne voit que /workspace : chemin absolu, pas de borne de plus
+        if self.backend != "local":
             import posixpath
 
-            return posixpath.normpath(posixpath.join(ws.cwd, path))
+            full = posixpath.normpath(posixpath.join(ws.cwd, self._to_mount_view(path)))
+            if full.startswith("//"):  # POSIX garde « // » initial : le tenir pour « / »
+                full = "/" + full.lstrip("/")
+            # n°27 : un chemin absolu hors du montage (ou un `..` qui en sort) atterrirait dans le système de fichiers
+            # ÉPHÉMÈRE du bac : l'écriture serait perdue en silence. Même refus qu'en local. Limite : un lien symbolique
+            # DANS le montage qui pointe hors /workspace n'est jugé que du côté noyau (lectures : `_host_path`) ; les
+            # écritures ne sont bornées que lexicalement.
+            if full != self.mount and not full.startswith(self.mount + "/"):
+                raise OutsideRoot(mt.pick(mt.OUTSIDE_ROOT_DETAIL).format(path=repr(path), base=self.mount))
+            return full
         base = os.path.realpath(self._base)
         full = os.path.realpath(os.path.join(base, os.path.expanduser(path)))
         if full != base and not full.startswith(base + os.sep):
-            raise PermissionError(f"{path!r} est hors du dossier de travail ({base})")
+            raise OutsideRoot(mt.pick(mt.OUTSIDE_ROOT_DETAIL).format(path=repr(path), base=base))
         return full
 
+    def idle_seconds(self, now: float | None = None) -> float:
+        """Secondes depuis le dernier appel d'outil de cette source (ouverture comprise)."""
+        return (time.monotonic() if now is None else now) - self.last_used
+
+    def has_live_processes(self) -> bool:
+        """Un processus en arrière-plan tourne-t-il dans un de ses espaces ? (l'expiration ne l'abat pas)."""
+        with self._lock:
+            tables = [ws.procs for ws in self._spaces.values() if ws.procs is not None]
+        return any(t.running() for t in tables)
+
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        def out(payload: Any, error: bool = False) -> ToolResult:
+        self.last_used = time.monotonic()
+
+        def out(payload: Any, error: bool = False, exit_code: int | None = None) -> ToolResult:
             text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-            return ToolResult(call_id="", name=name, content=text, is_error=error)
+            return ToolResult(call_id="", name=name, content=text, is_error=error, exit_code=exit_code)
 
         if name not in CODE_TOOLS and not (self.background and name in PROCESS_TOOLS) \
                 and not (self.lsp is not None and name == LSP_TOOL):
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         try:
             ws = self.workspace(ctx.thread_id)
             a = arguments
@@ -572,13 +1089,33 @@ class CodeToolSource:
                 if name == "read_file":
                     if not a.get("path"):
                         raise KeyError("path")
+                    # n°host-3f/banc 6 : `read_file` sur un DOSSIER rend sa liste (bornée, filtrée), pas une erreur brute.
+                    if os.path.isdir(path):  # local et lecture directe (docker avec `reader`) : chemin hôte déjà confiné
+                        return self._dir_reply(self._scan_dir(path), a, out, self._search_visible(ctx))
                     r = ops.read_file(path, int(a.get("offset") or 1), min(int(a.get("limit") or 500), 2000)).to_dict()
+                    if r.get("not_found"):
+                        self._missing_hint(ws, str(a.get("path") or ""), r)
+                    elif "not a regular file" in str(r.get("error") or ""):  # bac à sable : `ls` fixe, chemin en argument cité
+                        names = self._list_dir(ws, path)
+                        if names is not None:
+                            return self._dir_reply(names, a, out, self._search_visible(ctx))
                 else:
                     r = ops.search(str(a["pattern"]), path=path, target=str(a.get("target") or "content"),
                                    file_glob=a.get("file_glob"), limit=min(int(a.get("limit") or 50), 200),
                                    context=min(int(a.get("context") or 0), 10)).to_dict()
+                    self._empty_search_hint(ops, path, a, r)
+                images = _image_of(r, str(a.get("path") or "")) if name == "read_file" else []
                 text = json.dumps(r, ensure_ascii=False)
-                return out(self._to_container(text) if host is not None else text, bool(r.get("error")))
+                text = self._to_container(text) if host is not None else text
+                from nokker.tools.result_fence import fence_file_result
+
+                # r44 : contenu d'un fichier, lignes trouvées : clôturés ; chemin et compteurs hors clôture ; une
+                # image : une ligne de description, ses octets dans `ToolResult.images` (jamais de base64 en texte).
+                if a.get("path"):  # l'en-tête du résultat cite le chemin vu du bac : le modèle voit /workspace
+                    a = {**a, "path": self._to_mount_view(str(a["path"]))}
+                res = out(fence_file_result(name, a, text), bool(r.get("error")))
+                res.images = images
+                return res
             if name == "write_file":
                 path, content = self._inside(ws, str(a["path"])), str(a["content"])
                 r = ws.ops.write_file(path, content).to_dict()
@@ -595,12 +1132,20 @@ class CodeToolSource:
 
             text = todo_tool(a.get("todos"), bool(a.get("merge")), store=ws.todos)
             return out(text, "error" in json.loads(text))
+        except SandboxUnavailable as e:
+            logger.warning("bac à sable indisponible : %s", e.detail)
+            why = (mt.pick(mt.SANDBOX_LIMITS_FOR_MODEL) if isinstance(e, SandboxLimitsNotApplied)
+                   else mt.pick(mt.SANDBOX_CREATE_FOR_MODEL) if isinstance(e, SandboxCreateRefused) else e)
+            return out(mt.pick(mt.REFUSED_WHY).format(why=why), True)
         except PermissionError as e:
-            return out(f"REFUSÉ : {e}", True)
+            res = out(mt.pick(mt.REFUSED_WHY).format(why=e), True)
+            if getattr(e, "outside_root", False):   # le chemin sort du dossier : refus pour l'hôte, le modèle ne change pas
+                res.refused, res.reason = True, OUTSIDE_ROOT
+            return res
         except ProcessError as e:
             return out(str(e), True)
         except KeyError as e:
-            return out(f"argument manquant : {e.args[0]}", True)
+            return out(mt.pick(mt.MISSING_ARG).format(name=e.args[0]), True)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
             return out(f"{type(e).__name__}: {e}", True)
 
@@ -608,14 +1153,14 @@ class CodeToolSource:
         mode = str(a.get("mode") or "replace")
         if mode == "replace":
             if a.get("old_string") is None or a.get("new_string") is None or not a.get("path"):
-                return out("mode replace : path, old_string et new_string sont requis", True)
+                return out(mt.pick(mt.CODE_REPLACE_ARGS), True)
             path = self._inside(ws, str(a["path"]))
             r = ws.ops.patch_replace(path, str(a["old_string"]), str(a["new_string"]),
                                      bool(a.get("replace_all"))).to_dict()
         elif mode == "patch":
             text = str(a.get("patch") or "")
             if not text:
-                return out("mode patch : le contenu du patch est requis", True)
+                return out(mt.pick(mt.PATCH_REQUIRED), True)
             # En-têtes réécrits en chemins absolus (vérifiés en local) : l'amont contrôle chaque écriture contre
             # HERMES_WRITE_SAFE_ROOT, et un chemin relatif s'y lirait depuis le dossier du processus, pas d'ici.
             text = re.sub(r"^(\*\*\* (?:Update|Add|Delete) File: )(.+)$",
@@ -625,10 +1170,123 @@ class CodeToolSource:
                                     f"{self._inside(ws, m.group(3).strip())}", text, flags=re.MULTILINE)
             r = ws.ops.patch_v4a(text).to_dict()
         else:
-            return out(f"mode inconnu : {mode!r} (replace | patch)", True)
+            return out(mt.pick(mt.CODE_UNKNOWN_MODE).format(mode=repr(mode)), True)
         if r.get("error") and "Could not find" in str(r["error"]):
-            r["_hint"] = "passage introuvable : relis le fichier (read_file) ou cherche-le (search_files)"
+            r["_hint"] = mt.pick(mt.EDIT_NOT_FOUND)
+        elif r.get("error") and mode == "replace" and not self._exists(ws, path):
+            self._missing_hint(ws, str(a.get("path") or ""), r)
         return out(r, bool(r.get("error")))
+
+    # ── indice de chemins (p2/v-readfile-hint) ──
+    def _exists(self, ws: Workspace, inside: str) -> bool:
+        import shlex
+
+        try:
+            return int(ws.env.execute(f"test -e {shlex.quote(inside)}", timeout=10).get("returncode", 1)) == 0
+        except Exception:  # noqa: BLE001 — sans réponse, on ne dit rien de plus
+            return True
+
+    def _empty_search_hint(self, ops: Any, path: str, a: dict[str, Any], r: dict[str, Any]) -> None:
+        """Une recherche à 0 résultat ne dit pas « dépôt vide » : si le dossier contient des fichiers, le résultat le
+        dit (nombre et premiers noms) et rappelle que `target=files` attend un glob (« * »), pas une expression
+        régulière (« .* » n'y retient que les noms cachés). Recette rc.9.30 : un 0 a fait conclure « dépôt vide »."""
+        if r.get("error") or r.get("matches") or r.get("files") or r.get("matches_text") or r.get("counts"):
+            return
+        if int(r.get("total_count") or 0) != 0:
+            return
+        try:
+            names = [n for n in (self._list_dir_env(getattr(ops, "env", None), path) or []) if n != ".git/"]
+        except Exception:  # noqa: BLE001 — l'aide ne casse jamais le résultat d'origine
+            return
+        if not names:
+            return
+        shown = ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+        text = mt.pick(mt.SEARCH_EMPTY_DIR).format(n=len(names), shown=shown)
+        if str(a.get("target") or "content") == "files":
+            text += mt.pick(mt.SEARCH_GLOB)
+        r["warning"] = (f"{r['warning']} " if r.get("warning") else "") + text + "."
+
+    def _list_dir(self, ws: Workspace, inside: str) -> list[str] | None:
+        """Entrées d'un dossier (« / » final pour un dossier) ; None si le dossier n'existe pas ou n'est pas lisible."""
+        return self._list_dir_env(ws.env, inside)
+
+    @staticmethod
+    def _list_dir_env(env: Any, inside: str) -> list[str] | None:
+        import shlex
+
+        if env is None:
+            return None
+        try:
+            q = shlex.quote(inside)
+            r = env.execute(f"test -d {q} && ls -1Ap -- {q} 2>/dev/null | head -400", timeout=10)
+        except Exception:  # noqa: BLE001
+            return None
+        if int(r.get("returncode", 1)) != 0:
+            return None
+        return [x for x in str(r.get("output") or "").splitlines() if x]
+
+    @staticmethod
+    def _scan_dir(path: str) -> list[str]:
+        """Entrées d'un dossier de l'hôte, au format de `_list_dir_env` (« / » final pour un dossier, lien compris)."""
+        try:
+            with os.scandir(path) as it:
+                return [e.name + ("/" if e.is_dir() else "") for e in it][:400]
+        except OSError:
+            return []
+
+    def _dir_reply(self, names: list[str], a: dict[str, Any], out: Any, with_tail: bool = True) -> ToolResult:
+        """Réponse (non erreur) à `read_file` d'un dossier : ≤ 50 entrées, dossiers puis fichiers, alphabétique. Mêmes filtres
+        que l'indice de chemins (`readfile_hint.visible` : cachés, ignorés, secrets) : un nom masqué n'est jamais cité. Le
+        dossier demandé lui-même peut être caché (`.sokkan-kernel`) : seules ses ENTRÉES passent le filtre, comme une recherche
+        dont la racine est explicite."""
+        from nokker.qa.untrusted import inline
+        from nokker.tools.readfile_hint import visible
+
+        shown_path = inline(self._to_mount_view(str(a.get("path") or ".")), 120)
+        kept = sorted(visible(names), key=lambda n: (not n.endswith("/"), n.lower(), n))
+        if not kept:
+            return out(mt.pick(mt.DIR_EMPTY).format(path=shown_path))  # ne cite aucun outil
+        top = kept[:MAX_DIR_ENTRIES]
+        listing = "\n".join(inline(n, 80) for n in top)
+        if len(kept) > len(top):
+            listing += "\n" + mt.pick(mt.DIR_MORE).format(k=len(kept) - len(top))
+            head = mt.pick(mt.DIR_PART).format(path=shown_path, n=len(top), total=len(kept))
+        else:
+            head = mt.pick(mt.DIR_ALL).format(path=shown_path, n=len(top))
+        tail = f"\n{mt.pick(mt.DIR_TAIL)}" if with_tail else ""  # search_files retiré du fil : on ne le nomme pas
+        return out(f"{head}\n{listing}{tail}")
+
+    @staticmethod
+    def _search_visible(ctx: ToolContext) -> bool:
+        """`search_files` est-il dans le catalogue de ce fil ? Faux seulement s'il est retiré (`deny_tools`, registre par fil,
+        trouvé depuis le noyau de l'appel comme le fait `loop._note_tool_removed`) ; sans noyau (appel direct) ou registre
+        illisible : vrai, comme avant."""
+        reg, seen = getattr(getattr(ctx, "kernel", None), "tools", None), 0
+        while reg is not None and not callable(getattr(reg, "hidden_for", None)) and seen < 8:
+            reg, seen = getattr(reg, "inner", None), seen + 1
+        hidden = getattr(reg, "hidden_for", None)
+        try:
+            return not (callable(hidden) and "search_files" in hidden(ctx.thread_id))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _missing_hint(self, ws: Workspace, rel: str, result: dict[str, Any]) -> None:
+        """Ajoute à une erreur « fichier absent » la liste bornée des entrées réelles (docs : `tools/readfile_hint.py`)."""
+        import posixpath
+
+        from nokker.tools.readfile_hint import hint_text, visible
+
+        try:
+            directory = posixpath.dirname((rel or "").strip()) or "."
+            names = self._list_dir(ws, self._inside(ws, directory))
+            same = names is not None
+            where = directory
+            if names is None:  # le dossier demandé n'existe pas : la racine du dossier de travail
+                names, where = self._list_dir(ws, self._inside(ws, ".")) or [], directory
+            text = hint_text(visible(names), same_dir=same, where=where)
+        except Exception:  # noqa: BLE001 — l'aide ne casse jamais l'erreur d'origine
+            return
+        result["hint"] = (str(result["hint"]) + " " + text) if result.get("hint") else text
 
     # ── diagnostics de langage (lot 13) ──
     def _lsp_thread(self, ws: Workspace, thread_id: str) -> Any:
@@ -673,12 +1331,18 @@ class CodeToolSource:
     def _lsp_tool(self, ws: Workspace, thread_id: str, a: dict[str, Any], out: Any) -> ToolResult:
         raw = a.get("paths")
         if raw is not None and not (isinstance(raw, list) and all(isinstance(p, str) for p in raw)):
-            return out("paths : liste de chemins attendue", True)
+            return out(mt.pick(mt.CODE_PATHS_LIST), True)
         severity = str(a.get("severity") or "error")
         if severity not in ("error", "warning"):
-            return out(f"severity inconnue : {severity!r} (error | warning)", True)
+            return out(mt.pick(mt.CODE_SEVERITY_UNKNOWN).format(severity=repr(severity)), True)
         files = self._lsp_files(ws, raw) if raw else None
         return out(self.lsp.diagnostics(self._lsp_thread(ws, thread_id), files, severity))
+
+    @property
+    def sandbox_mount(self) -> str | None:
+        """Point de montage du dossier de travail DANS l'environnement d'exécution (`/workspace` par défaut, ou
+        `mount`) ; None en backend local (pas de bac à sable : le chemin est celui de l'hôte)."""
+        return None if self.backend == "local" else self.mount
 
     def workspace_path(self, thread_id: str, path: str) -> str:
         """Chemin, tel que le bac à sable le voit, d'une destination relative au dossier de travail (`ssh_copy`, lot
@@ -686,7 +1350,7 @@ class CodeToolSource:
         ws = self.workspace(thread_id)
         full = self._inside(ws, path)
         if self.backend != "local" and full != self.mount and not full.startswith(self.mount + "/"):
-            raise PermissionError(f"{path!r} sort du dossier de travail")
+            raise OutsideRoot(mt.pick(mt.CODE_OUTSIDE_ROOT).format(path=repr(path)))
         return full
 
     def run_hook(self, thread_id: str, command: str, stdin: str, timeout: int) -> tuple[int | None, str]:
@@ -697,20 +1361,26 @@ class CodeToolSource:
         r = ws.env.execute(command, timeout=max(1, int(timeout)), stdin_data=stdin, bounded_capture=True)
         return r.get("returncode"), _clip(str(r.get("output") or ""))
 
-    def script_command(self, thread_id: str, argv: list[str]) -> list[str]:
+    def script_command(self, thread_id: str, argv: list[str], env_names: list[str] | None = None) -> list[str]:
         """argv d'un processus INTERACTIF (stdin/stdout tenus ouverts par l'appelant) lancé DANS le bac à sable du fil,
         dans son dossier courant : `execute_code` (nokker/tools/execute_code.py) y fait passer ses appels d'outils.
         docker : `docker exec -i -w <dossier> <container> …` ; kubernetes : `kubectl exec -i <pod> -- sh -c 'cd … &&
         exec "$@"' …`. Backend local : refusé (ce serait l'hôte du noyau). Un sous-agent `<fil>/sa-<id>` sans espace à
-        lui prend celui de son fil parent (même bac à sable, comme `run_hook`)."""
+        lui prend celui de son fil parent (même bac à sable, comme `run_hook`).
+
+        `env_names` (serveurs MCP stdio, nokker/tools/mcp_stdio.py) : variables passées au processus PAR NOM
+        (`docker exec -e NOM`) — la valeur est lue par le client docker dans SON environnement, posé par l'appelant ;
+        elle n'est jamais dans la ligne de commande. docker seulement (kubectl exec ne sait pas le faire)."""
         if self.backend == "local":
-            raise PermissionError("execute_code tourne dans un bac à sable (docker ou kubernetes), jamais sur l'hôte")
+            raise PermissionError(mt.pick(mt.CODE_EXEC_LOCAL))
         with self._lock:
             ws = self._spaces.get(thread_id)
         if ws is None:
             ws = self.workspace(thread_id.split("/sa-", 1)[0])
         env, cwd = ws.env, str(getattr(ws.env, "cwd", "") or ws.cwd)
         if self.backend == "kubernetes":
+            if env_names:
+                raise PermissionError(mt.pick(mt.CODE_EXEC_ENV_NAMES))
             before = getattr(env, "_before_execute", None)
             if callable(before):
                 before()  # pod recréé s'il a été libéré pour inactivité
@@ -719,19 +1389,37 @@ class CodeToolSource:
         container = getattr(env, "_container_id", None)
         if not container:
             raise RuntimeError("bac à sable docker sans container")
-        return [getattr(env, "_docker_exe", None) or "docker", "exec", "-i", "-w", cwd, container, *argv]
+        by_name = [x for n in env_names or [] for x in ("-e", n)]
+        return [getattr(env, "_docker_exe", None) or "docker", "exec", "-i", *by_name, "-w", cwd, container, *argv]
 
     def _terminal(self, ws: Workspace, a: dict[str, Any], out: Any) -> ToolResult:
         command = str(a.get("command") or "").strip()
         if not command:
-            return out("commande vide", True)
+            return out(mt.pick(mt.EMPTY_COMMAND), True)
         why = hardline_reason(command)
         if why:
-            return out(f"REFUSÉ, jamais exécuté même approuvé : {why}", True)
+            return out(mt.pick(mt.HARDLINE_REFUSED).format(why=why), True)
         timeout = max(1, min(int(a.get("timeout") or 120), 600))
-        r = ws.env.execute(command, timeout=timeout, bounded_capture=True)
-        code = r.get("returncode")
-        return out({"returncode": code, "output": _clip(str(r.get("output") or ""))}, False)
+        # Tests à sortie coupée (`… 2>&1 | tail -N`) : le code de retour doit être celui des tests (règle de fin
+        # `conclude_on_green`). Les portes et la personne ont vu la commande d'origine.
+        r = ws.env.execute(pipefail_command(command) or command, timeout=timeout, bounded_capture=True)
+        from nokker.qa.untrusted import fenced_result
+
+        # La sortie d'une commande est un contenu de TIERS (fichiers du dépôt, réponses réseau, journaux) : clôturée.
+        text = fenced_result({"returncode": r.get("returncode")}, "terminal:output", _clip(str(r.get("output") or "")))
+        if isinstance(self, CodeToolSource) and self._host_path_failed(command, r):  # (tests appellent `_terminal(None, …)`)
+            text += "\n" + mt.pick(mt.HOST_PATH_HINT)  # hors clôture : une note du noyau, pas la sortie de la commande
+        return out(text, False, exit_code=r.get("returncode") if isinstance(r.get("returncode"), int) else None)
+
+    def _host_path_failed(self, command: str, result: dict[str, Any]) -> bool:
+        """Bac docker : la commande cite un chemin ABSOLU de l'hôte sous le dossier de session et a échoué sur un fichier
+        introuvable ou refusé. Seulement un indice : la commande n'est jamais réécrite (le terminal ne traduit pas)."""
+        if self.backend == "local" or not isinstance(result.get("returncode"), int) or result["returncode"] == 0:
+            return False
+        out = str(result.get("output") or "")
+        if "No such file or directory" not in out and "Permission denied" not in out:
+            return False
+        return any(re.search(re.escape(root) + r"(?![\w.-])", command) for root in self._host_roots())
 
     # ── commandes en arrière-plan (lot X6) ──
     def _process_dir(self, thread_id: str) -> str:
@@ -775,22 +1463,22 @@ class CodeToolSource:
         if name == "process_start":
             command = str(a.get("command") or "").strip()
             if not command:
-                return out("commande vide", True)
+                return out(mt.pick(mt.EMPTY_COMMAND), True)
             why = hardline_reason(command)
             if why:
-                return out(f"REFUSÉ, jamais exécuté même approuvé : {why}", True)
+                return out(mt.pick(mt.HARDLINE_REFUSED).format(why=why), True)
             port = a.get("port")
             if port is not None:
                 port = int(port)
                 if not 1 <= port <= 65535:
-                    return out(f"port invalide : {port}", True)
+                    return out(mt.pick(mt.CODE_PORT_INVALID).format(port=port), True)
             table = self.processes(ws, thread_id)
             proc = table.start(command, str(a.get("name") or ""), port)
             first = table.logs(proc.id, tail=40)  # ce que la commande a déjà dit (un échec immédiat se voit ici)
-            hint = "la suite : process_logs ; l'arrêter : process_stop ; il s'arrête aussi à la fin du fil"
+            hint = mt.pick(mt.CODE_PROCESS_HINT)
             if port:
-                hint += f" ; le port {port} est proposé à l'utilisateur en aperçu privé (ne donne pas d'URL)"
-            return out({**first, "hint": hint})
+                hint += mt.pick(mt.CODE_PROCESS_HINT_PORT).format(port=port)
+            return out(_logs_result({**first, "hint": hint}))
         table = self.processes(ws, thread_id)
         if name == "process_list":
             return out({"processes": [p.view() for p in table.list()]})
@@ -798,9 +1486,9 @@ class CodeToolSource:
         if not proc_id:
             raise KeyError("id")
         if name == "process_logs":
-            return out(table.logs(proc_id, int(a.get("tail") or 200)))
+            return out(_logs_result(table.logs(proc_id, int(a.get("tail") or 200))))
         return out(table.stop(proc_id).view())
 
 
 __all__ = ["CODE_TOOLS", "PROCESS_TOOLS", "CodeToolSource", "DEFAULT_SANDBOX_IMAGE", "SharedEnv", "Workspace",
-           "classify_command", "hardline_reason", "reap_sandboxes"]
+           "classify_command", "hardline_reason", "reap_sandboxes", "parse_memory_limit", "parse_cpus_limit", "is_test_command", "pipefail_command"]

@@ -17,11 +17,12 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 from nokker.learning.store import JournalEntry, PendingNote
+from nokker.redact.markers import unmark
 
 log = logging.getLogger("nokker.learning.pending")
 
@@ -60,6 +61,8 @@ class PendingMemory:
             log.debug("emit %s a levé", event, exc_info=True)
 
     def _hold(self, account: str, note: PendingNote) -> PendingNote:
+        # Une note en attente vit hors du fil (puis dans la mémoire) : sans marqueur de l'appareil (P9b).
+        note = replace(note, title=unmark(note.title), text=unmark(note.text))
         self.store.put_pending(account, note)
         self.store.journal_append(account, JournalEntry(
             kind="memory.pending", subject=note.id, at=note.at, actor="agent", thread_id=note.thread_id,
@@ -76,16 +79,22 @@ class PendingMemory:
         account = self.account_of_thread(thread_id)
         if not account:
             raise PendingError(403, "no_account", "pas de compte pour ce fil")
-        for held in self.store.list_pending(account):  # même note déjà en attente : pas de doublon
-            if held.kind == kind and held.project == project and " ".join(held.text.split()) == " ".join(text.split()):
+        from nokker.memory.dedup import equivalent
+
+        for held in self.store.list_pending(account):  # note équivalente déjà en attente : pas de doublon (T6)
+            if held.project == project and equivalent(held.text, text):
                 return held
         return self._hold(account, PendingNote(
             id=f"mp_{uuid.uuid4().hex[:16]}", source="memory_note", kind=kind, title=title, text=text, scope=scope,
             derived_from=derived_from, project=project, links=list(links), thread_id=thread_id,
             turn_index=turn_index, at=self.now_fn()))
 
-    def hold_facts(self, thread_id: str, facts: list[str]) -> list[PendingNote]:
-        """`MemoryPort.propose` : un fait = une note en attente (titre = début du fait)."""
+    def hold_facts(self, thread_id: str, facts: list[str], provenance: str | None = None) -> list[PendingNote]:
+        """`MemoryPort.propose` : un fait = une note en attente (titre = début du fait), avec sa provenance (absente =
+        doute = tiers, nokker/memory/provenance.py), qui le suit jusqu'à l'approbation."""
+        from nokker.memory.provenance import for_new_fact
+
+        prov = for_new_fact(provenance)
         account = self.account_of_thread(thread_id)
         if not account:
             return []
@@ -97,7 +106,7 @@ class PendingMemory:
             title = text if len(text) <= 120 else text[:117].rstrip() + "…"
             out.append(self._hold(account, PendingNote(
                 id=f"mp_{uuid.uuid4().hex[:16]}", source="propose", kind="fact", title=title, text=text,
-                scope="project", derived_from="agent", thread_id=thread_id, at=self.now_fn())))
+                scope="project", derived_from="agent", thread_id=thread_id, at=self.now_fn(), provenance=prov)))
         return out
 
     # ── côté humain ──
@@ -122,6 +131,9 @@ class PendingMemory:
         if done is None:  # décidée entre-temps par un autre geste
             raise PendingError(409, "already_decided", "note déjà décidée")
         kind = "memory.approved" if approve else "memory.rejected"
+        from nokker.memory.corthexis import invalidate_status
+
+        invalidate_status()  # validée ou refusée : l'état de la mémoire (compteur de notes) se refait
         self.store.journal_append(account, JournalEntry(
             kind=kind, subject=note_id, at=at, actor="owner", thread_id=note.thread_id, turn_index=note.turn_index,
             detail={"source": note.source, "kind": note.kind, "scope": note.scope, "title": note.title,
@@ -139,9 +151,9 @@ class PendingMemoryPort:
     inner: Any
     pending: PendingMemory
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         try:
-            self.pending.hold_facts(thread_id, facts)
+            self.pending.hold_facts(thread_id, facts, provenance)
         except Exception:
             log.warning("quarantaine des faits en échec (fil %s)", thread_id, exc_info=True)
 

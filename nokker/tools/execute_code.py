@@ -40,7 +40,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
+from nokker.core.refusal import refused_prefix
 from nokker.core.turn import Effect, ToolResult
 
 logger = logging.getLogger("nokker.tools.execute_code")
@@ -135,7 +137,7 @@ class ToolError(Exception):
 
 
 class ToolRefused(Exception):
-    """Le noyau a refusé l'appel (règle, liste blanche, plafond, jeton)."""
+    """L'appel a été refusé (règle, liste blanche, plafond, jeton)."""
 
 
 class ApprovalPending(Exception):
@@ -162,7 +164,7 @@ def call_tool(name, args=None, **kwargs):
     _rout.flush()
     line = _rin.readline()
     if not line:
-        raise ToolError("canal du noyau fermé")
+        raise ToolError("canal fermé")
     r = json.loads(line)
     status, content = r.get("status"), r.get("content", "")
     if status == "ok":
@@ -356,14 +358,23 @@ def _spec(cfg: ExecuteCodeConfig) -> ToolSpec:
         parameters={"type": "object", "required": ["code"], "properties": {
             "code": {"type": "string", "description": (
                 "Script Python 3. call_tool(\"nom\", {arguments}) ou tools.nom(arg=...) appelle un outil et rend son "
-                "résultat (objet si JSON, texte sinon) ; lève ToolError (échec de l'outil), ToolRefused (refus du "
-                "noyau) ou ApprovalPending (carte posée : l'action attend l'utilisateur, rien n'est fait). Outils "
+                "résultat (objet si JSON, texte sinon) ; lève ToolError (échec de l'outil), ToolRefused (appel refusé) "
+                "ou ApprovalPending (carte posée : l'action attend l'utilisateur, rien n'est fait). Outils "
                 f"appelables : {listing} ; au plus {cfg.max_calls} appels. print() va dans stdout, la valeur de la "
                 "dernière expression dans return (JSON).")},
             "timeout": {"type": "integer", "description": f"secondes (défaut {cfg.timeout_s}, max {cfg.max_timeout_s})",
                         "default": cfg.timeout_s}}},
         # Le script exécute du code arbitraire dans le bac à sable : l'effet d'une commande `python3 …` de terminal.
         effect=Effect.WRITE, core=False, source="builtin:code")
+
+
+def session_only_tools(execute_code_enabled: bool) -> frozenset[str]:
+    """Outils qui n'existent que dans une session de code (Lokkal) : les outils de code, plus `execute_code` quand son
+    drapeau est allumé. Sur un fil sans session, les portes les refusent AVANT toute carte (`session_tools`) : sans cela
+    la personne approuvait une carte pour apprendre ensuite qu'il n'y avait pas de session."""
+    from nokker.tools.code import CODE_TOOLS
+
+    return frozenset(CODE_TOOLS) | (frozenset({TOOL}) if execute_code_enabled else frozenset())
 
 
 @dataclass
@@ -385,28 +396,36 @@ class ExecuteCodeSource:
     def _limits(self) -> tuple[int, int, int]:
         return self.cfg.stdout_chars, self.cfg.return_chars, self.cfg.error_chars
 
-    def _result(self, stdout: str, ret: str, error: str, scrub: Callable[[str], str] | None) -> ToolResult:
-        return ToolResult(call_id="", name=TOOL, content=format_block(stdout, ret, error, self._limits(), scrub),
-                          is_error=bool((error or "").strip()))
+    def _result(self, stdout: str, ret: str, error: str, scrub: Callable[[str], str] | None,
+                note: str = "") -> ToolResult:
+        from nokker.tools.result_fence import fence_code_result
+
+        # r44 : sections clôturées, sans reclôturer les résultats d'outils déjà clôturés que le script a imprimés ;
+        # ce que dit le noyau (refus avant le script, délai, bac à sable) en note hors clôture.
+        if note and scrub is not None:
+            note = scrub(note)
+        return ToolResult(call_id="", name=TOOL,
+                          content=fence_code_result(format_block(stdout, ret, error, self._limits(), scrub), note=note),
+                          is_error=bool((error or "").strip() or note))
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         kernel = ctx.kernel
         scrub = getattr(getattr(kernel, "invariants", None), "scrub_output", None)
         if name != TOOL:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         code = arguments.get("code")
         if not isinstance(code, str) or not code.strip():
-            return self._result("", "", "argument manquant : code", scrub)
+            return self._result("", "", "", scrub, note=mt.pick(mt.MISSING_ARG).format(name="code") + ".")
         if kernel is None or not hasattr(kernel, "script_tool_call"):
-            return self._result("", "", "execute_code n'est appelable que dans un tour du noyau", scrub)
+            return self._result("", "", "", scrub, note=mt.pick(mt.CODE_ONLY_IN_TURN))
         try:
             src = self.resolve(ctx)
         except Exception as e:  # noqa: BLE001
             src, why = None, f"{type(e).__name__}: {e}"
         else:
-            why = "pas de session de code sur ce fil : execute_code tourne dans son bac à sable"
+            why = mt.pick(mt.CODE_NO_SESSION)
         if src is None:
-            return self._result("", "", why, scrub)
+            return self._result("", "", "", scrub, note=why)
         try:
             timeout = max(1, min(int(arguments.get("timeout") or self.cfg.timeout_s), self.cfg.max_timeout_s))
         except (TypeError, ValueError):
@@ -415,9 +434,9 @@ class ExecuteCodeSource:
         try:
             cmd = src.script_command(ctx.thread_id, argv)
         except PermissionError as e:
-            return self._result("", "", f"REFUSÉ : {e}", scrub)
+            return self._result("", "", "", scrub, note=f"{refused_prefix()}{e}")
         except Exception as e:  # noqa: BLE001 — bac à sable indisponible : l'erreur revient au modèle
-            return self._result("", "", f"bac à sable indisponible : {type(e).__name__}: {e}", scrub)
+            return self._result("", "", "", scrub, note=mt.pick(mt.CODE_SANDBOX_UNAVAILABLE).format(error=f"{type(e).__name__}: {e}"))
         turn = kernel.script_turn(ctx)
         session = ScriptSession(allowed=frozenset(self.cfg.tools), max_calls=self.cfg.max_calls,
                                 expires_at=self.clock() + timeout + _GRACE_S,

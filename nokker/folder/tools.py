@@ -34,9 +34,11 @@ from dataclasses import dataclass, field
 from typing import Any
 from xml.etree import ElementTree
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.folder.journal import TRASH_DIR, Journal, sha256_file
+from nokker.qa.untrusted import neutralize_approval
 
 SOURCE = "builtin:folder"
 ZONES = ("dossier", "sortie")
@@ -101,7 +103,9 @@ class FolderError(ValueError):
 
 
 def _neutralize(text: str) -> str:
-    return _UNTRUSTED_TAG.sub("[balise retirée]", text)
+    from nokker.qa.untrusted import neutralize_date, neutralize_env
+
+    return neutralize_date(neutralize_approval(neutralize_env(_UNTRUSTED_TAG.sub("[balise retirée]", text))))
 
 
 def untrusted_block(label: str, text: str) -> str:
@@ -304,7 +308,7 @@ class FolderToolSource:
             with self._lock:
                 content = getattr(self, "_t_" + name)(arguments or {}) if name in FOLDER_TOOLS else None
             if content is None:
-                return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+                return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
             return ToolResult(call_id="", name=name, content=content)
         except FolderError as e:
             return ToolResult(call_id="", name=name, content=str(e), is_error=True)

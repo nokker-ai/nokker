@@ -21,7 +21,9 @@ from typing import Any
 from nokker.tenancy.context import current_tenant
 
 SNAP = ("name", "scope", "household_id", "audience", "kind", "title", "body", "author_account", "origin",
-        "embed_model", "embedding", "created_at", "updated_at")
+        "embed_model", "embedding", "created_at", "updated_at", "provenance")
+LEGACY = "unknown_legacy"  # = nokker.memory.provenance.UNKNOWN_LEGACY : instantané d'avant la migration 080
+PROVENANCE_MIGRATION = Path(__file__).resolve().parents[2] / "store" / "migrations" / "080_memory_provenance.sql"
 MIGRATION = Path(__file__).resolve().parents[2] / "store" / "migrations" / "053_memory_consolidation.sql"
 
 
@@ -79,7 +81,7 @@ def _snap_of(n: Any) -> dict[str, Any]:
     return {"name": n.name, "scope": n.scope, "household_id": n.household_id, "audience": n.audience, "kind": n.kind,
             "title": n.title, "body": n.text, "author_account": n.author_account, "origin": n.origin,
             "embed_model": n.embed_model, "embedding": list(n.embedding) if n.embedding is not None else None,
-            "created_at": float(n.created_at), "updated_at": float(n.updated_at)}
+            "created_at": float(n.created_at), "updated_at": float(n.updated_at), "provenance": n.provenance}
 
 
 class _MemTx:
@@ -111,7 +113,7 @@ class _MemTx:
             household_id=snap.get("household_id"), audience=snap.get("audience") or "all",
             origin=snap.get("origin") or "", created_at=float(snap["created_at"]),
             updated_at=float(snap["updated_at"]), embed_model=snap.get("embed_model"),
-            embedding=list(emb) if isinstance(emb, list) else None)
+            embedding=list(emb) if isinstance(emb, list) else None, provenance=snap.get("provenance") or LEGACY)
 
     def update(self, snap: dict[str, Any]) -> None:
         n = self.s.long.notes.get((*self.key, snap["name"]))
@@ -123,6 +125,7 @@ class _MemTx:
         emb = snap.get("embedding")
         n.title, n.text, n.kind, n.audience = snap["title"], snap["body"], snap["kind"], snap["audience"]
         n.origin, n.embed_model = snap.get("origin") or "", snap.get("embed_model")
+        n.provenance = snap.get("provenance") or LEGACY
         n.embedding = list(emb) if isinstance(emb, list) else None
         n.created_at, n.updated_at = float(snap["created_at"]), float(snap["updated_at"])
 
@@ -221,7 +224,7 @@ class _MemTx:
 # ─────────────────────────────── Postgres (nokker.ai) ───────────────────────────────
 
 _NOTE_COLS = ("name, scope, household_id, audience, kind, title, body, author_account, origin, embed_model, "
-              "created_at, updated_at")
+              "created_at, updated_at, provenance")
 _RUN_COLS = ("id, night, tz, trigger, status, dry_run, model, started_at, finished_at, counts, skipped, error, "
              "undone_at, notified")
 _OP_COLS = "id, run_id, seq, kind, scope, household_id, reason, evidence, changes, authors, at, undone_at"
@@ -247,7 +250,7 @@ class PgConsolidationStore:
         if migrate_now:
             from nokker.store.conn import migrate
 
-            migrate(dsn, MIGRATION.read_text(encoding="utf-8"))
+            migrate(dsn, MIGRATION.read_text(encoding="utf-8"), PROVENANCE_MIGRATION.read_text(encoding="utf-8"))
 
     @property
     def vector(self) -> bool:
@@ -311,8 +314,9 @@ class _PgTx:
         self.k = (actor.tenant_id, actor.account_id)
 
     def _snap(self, r: tuple) -> dict[str, Any]:
-        d = dict(zip(SNAP[:10] + SNAP[11:], r[:12], strict=True))
-        d["embedding"] = r[12] if self.vector else None
+        d = dict(zip(SNAP[:10] + SNAP[11:], r[:13], strict=True))
+        d["embedding"] = r[13] if self.vector else None
+        d["provenance"] = d.get("provenance") or LEGACY
         d["created_at"], d["updated_at"] = float(d["created_at"]), float(d["updated_at"])
         return d
 
@@ -333,11 +337,11 @@ class _PgTx:
         return [snap["scope"], snap.get("household_id"), snap.get("audience") or "all", snap["kind"], snap["title"],
                 snap["body"], snap["author_account"], snap.get("origin") or "",
                 snap.get("embed_model") if self.vector and snap.get("embedding") is not None else None,
-                float(snap["created_at"]), float(snap["updated_at"])]
+                float(snap["created_at"]), float(snap["updated_at"]), snap.get("provenance") or LEGACY]
 
     def insert(self, snap: dict[str, Any]) -> None:
         cols = "tenant_id, account_id, name, scope, household_id, audience, kind, title, body, author_account, " \
-               "origin, embed_model, created_at, updated_at"
+               "origin, embed_model, created_at, updated_at, provenance"
         vals = [*self.k, snap["name"], *self._vals(snap)]
         marks = ", ".join(["%s"] * len(vals))
         if self.vector:
@@ -349,8 +353,8 @@ class _PgTx:
     def update(self, snap: dict[str, Any]) -> None:
         v = self._vals(snap)
         sets = ("audience = %s, kind = %s, title = %s, body = %s, origin = %s, embed_model = %s, created_at = %s, "
-                "updated_at = %s")
-        args = [v[2], v[3], v[4], v[5], v[7], v[8], v[9], v[10]]
+                "updated_at = %s, provenance = %s")
+        args = [v[2], v[3], v[4], v[5], v[7], v[8], v[9], v[10], v[11]]
         if self.vector:
             sets += ", embedding = %s::vector"
             args.append(_vec_literal(snap.get("embedding")))

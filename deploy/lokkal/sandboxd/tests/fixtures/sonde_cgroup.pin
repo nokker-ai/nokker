@@ -1,0 +1,5 @@
+# Épingle amont pour laquelle docker_run_sonde_cgroup.json a été relevé (docker run --rm --cpus 0.5 --memory 64m
+# --pids-limit 32 <image du bac> sleep 0). Le proxy n'accepte que cette sonde, plafonds compris.
+# Quand HERMES.lock change : relever de nouveau la sonde de l'amont (commande, plafonds), mettre à jour la fixture
+# et dockerproxy.py si elle a changé, puis recopier ici le tag de HERMES.lock.
+tag=nokker-hermes-v0.22.2-n1

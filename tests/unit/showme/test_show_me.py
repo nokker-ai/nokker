@@ -145,7 +145,9 @@ def test_scene_guide_me_points_step_by_step_and_never_clicks():
     out = hub.action(b.id, "alice", "done")
     assert out == {"accepted": True, "thread_id": th.id, "closed": False}
     second = k.store.turns[-1]
-    assert second.input.text == f"[Action « Fait » demandée sur la bulle « Étape 1 sur 2 » ({b.id})]"
+    # la personne lit le libellé de son bouton, sans id ni titre ; le modèle garde l'id dans le bloc joint
+    assert second.input.text == "[Action « Fait » demandée sur la bulle]"
+    assert second.attached == f"[Bulle « Étape 1 sur 2 » ({b.id})]"
     assert second.sender == "alice"
     [b2] = pointers(hub, th.id)
     assert b2.id == b.id and b2.title == "Étape 2 sur 2" and b2.state["target"]["ref"] == "e4"

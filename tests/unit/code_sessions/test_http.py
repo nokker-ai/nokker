@@ -174,9 +174,9 @@ def test_tools_call_checkpoints_only_on_own_session(api_tools):
     assert s == 200 and calls[-1][1:3] == ("todo", {})
     calls.pop()
     answer["out"] = ToolResult(call_id="c", name="checkpoint_create", is_error=True, reason="plan_mode",
-                               content="refusé par le noyau (permissions:plan: mode plan : lecture seule)")
+                               content="Refusé : mode plan, lecture seule.")
     s, out = call("POST", url, {"name": "checkpoint_restore", "arguments": {"hash": "abc"}}, who="ana")
-    assert s == 200 and out["reason"] == "plan_mode" and out["content"].startswith("refusé par le noyau")
+    assert s == 200 and out["reason"] == "plan_mode" and out["content"].startswith("Refusé : ")
     calls.pop()
     answer["out"] = "ap_0123"  # restauration qui attend une carte : 202, décidée par /v1/approvals/{id}/decision
     s, out = call("POST", url, {"name": "checkpoint_restore", "arguments": {"hash": "abc"}}, who="ana")

@@ -37,6 +37,7 @@ from typing import Any
 
 import yaml
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 
@@ -97,7 +98,7 @@ def builtin_effects() -> dict[str, Effect]:
                                  *mcp_config._SPECS, *_SPECS):
         out[name] = effect
     out.update({"memory_note": Effect.WRITE, "memory": Effect.WRITE, "agent_draft": Effect.READ,
-                "page_create": Effect.WRITE})
+                "page_create": Effect.WRITE, "design_check": Effect.READ})
     return out
 
 
@@ -538,24 +539,24 @@ class PackToolSource:
             if name == "pack_install":
                 bind = a.get("bind") or {}
                 if not isinstance(bind, dict):
-                    return out("bind doit être un objet", True)
+                    return out(mt.pick(mt.PACK_BIND_NOT_OBJECT), True)
                 payload, err = self.install(str(a.get("name") or ""), bind, ctx)
                 return out(payload, err)
             if name == "pack_remove":
                 return out(self.remove(str(a.get("name") or ""), ctx))
         except PackError as e:
-            return out(f"refusé : {e}", True)
+            return out(mt.pick(mt.TOOL_REFUSED).format(error=e), True)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
             from nokker.tools.skills import _clean
 
             return out(_clean(f"{type(e).__name__}: {e}"), True)
-        return out(f"outil inconnu : {name}", True)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
     def _find(self, name: str) -> Pack:
         d = Path(self.packs_root) / name
         if not _NAME.match(name) or not (d / "pack.yaml").is_file():
-            known = ", ".join(p.name for p in pack_dirs(self.packs_root)) or "aucun"
-            raise PackError(f"pack inconnu : {name!r} (packs : {known})")
+            known = ", ".join(p.name for p in pack_dirs(self.packs_root)) or mt.pick(mt.TOOL_NONE)
+            raise PackError(mt.pick(mt.PACK_UNKNOWN).format(name=repr(name), known=known))
         return load_pack(d)
 
     def list_packs(self, name: str | None = None) -> dict[str, Any]:
@@ -604,7 +605,7 @@ class PackToolSource:
         bind = {str(k): str(v) for k, v in bind.items()}
         bad = [k for k in bind if not (k.startswith("secret:") or "." in k)]
         if bad:
-            return f"bind : clés « rôle.outil » ou « secret:NOM » seulement ({bad})", True
+            return mt.pick(mt.PACK_BAD_BIND).format(bad=bad), True
         drafts = []
         mcp_effects: dict[str, str] = {}
         for tpl in pack.agents:
@@ -618,7 +619,7 @@ class PackToolSource:
         refused = self._scan(pack)
         if refused:
             self._emit(event="pack_install_refused", pack=pack.name, reason="scan")
-            return "installation REFUSÉE par le scanner (rien n'a été installé).\n" + "\n".join(refused), True
+            return mt.pick(mt.PACK_SCAN_REFUSED) + "\n".join(refused), True
         with self._lock:
             prev = self._record(pack.name) or {}
             copied = self._copy(pack)
@@ -654,20 +655,18 @@ class PackToolSource:
                    proposed=[p["template"] for p in proposed])
         payload: dict[str, Any] = {
             "installed": pack.name, "skills": copied, "proposed": proposed,
-            "armed": [], "note": "aucun agent n'est créé ni armé : chaque carte s'active par l'utilisateur, et "
-                                 "armer une écriture demande sa carte forte"}
+            "armed": [], "note": mt.pick(mt.PACK_NOTE_NOTHING_ARMED)}
         if to_propose:
             payload["to_propose"] = to_propose
-            payload["next"] = "propose chaque modèle avec agent_draft (mêmes arguments), sans rien changer"
+            payload["next"] = mt.pick(mt.PACK_NEXT_PROPOSE)
         setup = []
         if pack.connectors:
-            setup.append(f"connecteurs à poser : {', '.join(pack.connectors)}")
+            setup.append(mt.pick(mt.PACK_SETUP_CONNECTORS).format(names=", ".join(pack.connectors)))
         for role in pack.mcp.values():
             setup.append(f"serveur MCP « {role.name} »{' (facultatif)' if role.optional else ''} : {role.purpose}"
                          + (f" ; secrets par NOM : {', '.join(role.secrets)}" if role.secrets else ""))
         if pack.mcp:
-            setup.append("les effets déclarés des outils MCP (jamais plus bas que ceux du noyau) s'appliquent au "
-                         "prochain redémarrage du noyau")
+            setup.append(mt.pick(mt.PACK_SETUP_MCP_EFFECTS))
         if setup:
             payload["setup"] = setup
         return payload, False
@@ -685,11 +684,11 @@ class PackToolSource:
         reste, marqué retiré, avec les effets MCP relevés : retirer un pack ne baisse jamais un effet (un agent créé
         depuis le pack peut encore appeler ces outils)."""
         if not _NAME.match(name or ""):
-            raise PackError(f"nom de pack invalide : {name!r}")
+            raise PackError(mt.pick(mt.PACK_BAD_NAME).format(name=repr(name)))
         rec = self._record(name)
         if rec is None and not (Path(self.packs_root) / name / "pack.yaml").is_file():
-            known = ", ".join(p.name for p in pack_dirs(self.packs_root)) or "aucun"
-            raise PackError(f"pack inconnu : {name!r} (packs : {known})")
+            known = ", ".join(p.name for p in pack_dirs(self.packs_root)) or mt.pick(mt.TOOL_NONE)
+            raise PackError(mt.pick(mt.PACK_UNKNOWN).format(name=repr(name), known=known))
         removed: list[str] = []
         already = not installed(rec)
         bubbles: list[str] = []
@@ -725,11 +724,9 @@ class PackToolSource:
         if follow and follow.get("error"):
             payload["error"] = follow["error"]
         if payload["agents"]:
-            payload["note"] = ("les agents créés depuis ce pack sont gardés tels quels : la carte propose de les "
-                               "désarmer ou de les supprimer, l'utilisateur choisit")
+            payload["note"] = mt.pick(mt.PACK_REMOVE_KEPT_AGENTS)
         elif payload["agents"] is None:
-            payload["note"] = ("les agents déjà créés depuis ce pack ne sont pas touchés : retire-les depuis Crew si "
-                               "l'utilisateur le demande")
+            payload["note"] = mt.pick(mt.PACK_REMOVE_AGENTS_UNTOUCHED)
         return payload
 
     def _copy(self, pack: Pack) -> list[str]:

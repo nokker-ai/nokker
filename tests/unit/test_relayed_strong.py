@@ -482,6 +482,6 @@ def test_local_token_cannot_approve_a_relayed_strong_card(tmp_path):
         assert "téléphone" in body["error"]["message"] and approvals.get(card.id).status == "pending"
         status, _ = _req(port, f"/v1/local/approvals/{card.id}/decide", token=api.token,
                          body={"decision": "reject", "scope": "once"})
-        assert status == 200 and approvals.get(card.id).status == "rejected"  # refuser reste possible en local
+        assert status == 202 and approvals.get(card.id).status == "rejected"  # refuser reste possible en local
     finally:
         httpd.shutdown()

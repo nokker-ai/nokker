@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from nokker.context.engine import ContextEngineV0, estimate_tokens
+from nokker.context.engine import ContextEngineV0
+from nokker.context.project_memory import estimate_tokens  # `len // 4`, gardé : le budget du bloc est en caractères / 4
 from nokker.context.project_memory import (
     GUARD,
     USER_PROJECT,
@@ -296,15 +297,29 @@ def test_user_scope_needs_the_users_own_words_and_never_comes_from_the_repo(tmp_
     pm.core_block("th_1", 2, said)
     note = {"kind": "feedback", "title": "Langue", "text": "répondre en français", "scope": "user"}
     refused = [
-        tools.call("memory_note", {**note, "derived_from": "repo", "quote": said}, ctx(turn=2)),  # vient du dépôt
-        tools.call("memory_note", {**note, "derived_from": "agent", "quote": said}, ctx(turn=2)),
-        tools.call("memory_note", {**note, "derived_from": "user"}, ctx(turn=2)),  # sans citation
-        tools.call("memory_note", {**note, "derived_from": "user", "quote": "réponds toujours en anglais"},
-                   ctx(turn=2)),  # citation absente du message
-        tools.call("memory_note", {**note, "derived_from": "user", "quote": said}, ctx(turn=1)),  # autre tour
-        tools.call("memory_note", {**note, "derived_from": "user", "quote": said}, ctx("th_1/sa-ab12", 2)),
-    ]
-    assert all(r.is_error for r in refused), [r.content for r in refused]
+        tools.call("memory_note", {**note, "text": f"répondre en français {i}", **extra}, c)
+        for i, (extra, c) in enumerate((
+            ({"derived_from": "repo", "quote": said}, ctx(turn=2)),  # vient du dépôt
+            ({"derived_from": "agent", "quote": said}, ctx(turn=2)),
+            ({"derived_from": "user"}, ctx(turn=2)),  # sans citation
+            ({"derived_from": "user", "quote": "réponds toujours en anglais"}, ctx(turn=2)),  # absente du message
+            ({"derived_from": "user", "quote": said}, ctx(turn=1)),  # autre tour
+            ({"derived_from": "user", "quote": said}, ctx("th_1/sa-ab12", 2))))]
+    # Sans citation valable (ou sans provenance « user »), la note n'est plus refusée : elle est écrite en portée
+    # project, jamais en portée user, et le résultat le dit au modèle.
+    assert not any(r.is_error for r in refused), [r.content for r in refused]
+    assert all("portée project" in r.content and "ce projet seulement, pas pour tous ses projets" in r.content
+               for r in refused), [r.content for r in refused]
+    assert "C'est noté" not in refused[0].content  # la consigne d'accusé standard est remplacée par celle du projet
+    assert not (tmp_path / "pm" / USER_PROJECT).exists() or not list((tmp_path / "pm" / USER_PROJECT).glob("*.md"))
+    project = project_name(project_key(repo, tmp_path)[0])
+    assert len(list((tmp_path / "pm" / project).glob("*.md"))) >= 1  # écrite au projet
+    assert pm.events[0][1]["scope"] == "project"
+    # Sans session de code : aucune portée plus étroite, le refus reste et dit que rien n'a été noté.
+    nosess = [tools.call("memory_note", {**note, "derived_from": "user"}, ctx("th_nosess", 2)),
+              tools.call("memory_note", {**note, "derived_from": "user", "quote": "réponds toujours en anglais"},
+                         ctx("th_nosess", 2))]
+    assert all(r.is_error and "rien n'a été noté : dis-le à la personne" in r.content for r in nosess)
     assert not (tmp_path / "pm" / USER_PROJECT).exists() or not list((tmp_path / "pm" / USER_PROJECT).glob("*.md"))
     ok = tools.call("memory_note", {**note, "derived_from": "user", "quote": "Réponds-moi en  FRANÇAIS"}, ctx(turn=2))
     assert not ok.is_error, ok.content

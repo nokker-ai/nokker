@@ -21,9 +21,22 @@ def client(wire):
 def test_send_posts_with_bearer_and_returns_only_the_receipt():
     w = Wire(data={"ok": True, "invitation_id": 3, "sent_at": "a", "expires_at": "b", "lang": "fr", "extra": 1})
     r = client(w).send(12, None, "alice@example.ch")
-    assert r == {"invitation_id": 3, "sent_at": "a", "expires_at": "b", "lang": "fr"}
+    # front1 d'avant C16 ne rend pas `beta_coupon` : l'éligibilité est dite NON posée, jamais supposée
+    assert r == {"invitation_id": 3, "sent_at": "a", "expires_at": "b", "lang": "fr", "beta_coupon": False}
     assert w.calls == [("http://192.0.2.10:8122/internal/invitations/send",
-                        {"candidature_id": 12, "lang": None, "actor": "alice@example.ch"}, "Bearer tok")]
+                        {"candidature_id": 12, "lang": None, "actor": "alice@example.ch", "beta_coupon": False},
+                        "Bearer tok")]
+
+
+def test_beta_coupon_goes_to_front1_and_comes_back_at_redeem():
+    w = Wire(data={"ok": True, "invitation_id": 4, "sent_at": "a", "expires_at": "b", "lang": "fr", "beta_coupon": True})
+    assert client(w).send(12, "fr", "bob@example.ch", beta_coupon=True)["beta_coupon"] is True
+    assert w.calls[-1][1]["beta_coupon"] is True
+    w = Wire(data={"ok": True, "invitation_id": 4, "email": "c@example.org", "lang": "fr", "prenom": "C",
+                   "beta_coupon": True})
+    assert client(w).redeem("t")["beta_coupon"] is True
+    w = Wire(data={"ok": True, "invitation_id": 4, "email": "c@example.org", "lang": "fr", "prenom": "C"})
+    assert client(w).redeem("t")["beta_coupon"] is False  # absent = non éligible
 
 
 def test_check_valid_and_invalid():

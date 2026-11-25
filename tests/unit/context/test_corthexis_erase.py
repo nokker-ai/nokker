@@ -109,7 +109,28 @@ def test_erase_account_wires_the_session_index(monkeypatch):
     cfg.context_corthexis = {"enabled": True, "root_dir": "/var/lib/nokker/session-memory"}
     scope = erase_scope(cfg)
     assert scope["session_memory"] == {"enabled": True, "root_dir": "/var/lib/nokker/session-memory"}
-    assert set(scope) == {"images_root", "code", "session_memory"}
+    assert set(scope) == {"images_root", "code", "session_memory", "cloud_byok", "jobs_pack", "sites_registry",
+                          "beta_stripe"}
+
+
+def test_erase_scope_carries_stripe_only_where_billing_runs(monkeypatch):
+    """Coupon bêta (088) : le client Stripe qui ferme un Checkout Solo ouvert à l'effacement suit les règles de la
+    facturation du serveur : facturation éteinte ou clé absente → None ; clé live seulement avec `billing_live`."""
+    from nokker.admin.erase import erase_scope
+    from nokker.billing.stripe import StripeClient
+    from nokker.config import NokkerConfig
+
+    cfg = NokkerConfig()
+    monkeypatch.setenv(cfg.billing_secret_key_env, "sk_test_factice")
+    assert erase_scope(cfg)["beta_stripe"] is None  # billing_enabled faux
+    cfg.billing_enabled = True
+    assert isinstance(erase_scope(cfg)["beta_stripe"], StripeClient)
+    monkeypatch.setenv(cfg.billing_secret_key_env, "sk_live_factice")
+    assert erase_scope(cfg)["beta_stripe"] is None  # live sans billing_live
+    cfg.billing_live = True
+    assert isinstance(erase_scope(cfg)["beta_stripe"], StripeClient)
+    monkeypatch.delenv(cfg.billing_secret_key_env)
+    assert erase_scope(cfg)["beta_stripe"] is None
 
 
 def test_cli_erase_passes_the_scope(monkeypatch, tmp_path, capsys):

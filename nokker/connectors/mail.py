@@ -6,6 +6,8 @@ et ports passent par `net.check_endpoint` (SSRF) et la connexion est épinglée 
 message d'erreur ni dans un résultat d'outil. `mail_send` est SEND_EXTERNAL : la carte d'approbation du noyau passe avant."""
 from __future__ import annotations
 
+import base64
+import datetime
 import email
 import email.policy
 import email.utils
@@ -25,16 +27,74 @@ from typing import Any
 from nokker.connectors import imap_utf7
 from nokker.connectors.errors import ConnectorError, scrub
 from nokker.connectors.net import ALLOWED_PORTS, IMPLICIT_TLS, TIMEOUT_S, check_endpoint, open_pinned, tls_context
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.previews.ssrf import ResolvedHop
 from nokker.tools.effects import is_trash_destination, mail_move_effect
 
+# Préréglages par mot de passe (d'application quand le fournisseur l'exige). L'essai de connexion à l'enregistrement
+# reste obligatoire : c'est lui qui valide les hôtes. Pas ici : Outlook / Hotmail / Microsoft 365 (OAuth2 XOAUTH2
+# obligatoire), Proton (Bridge local seulement), Tuta (pas d'IMAP).
+# Clés en plus des hôtes : `imap_user: "local"` = identifiant IMAP = partie locale de l'adresse (iCloud, page Apple
+# 102525 ; l'identifiant SMTP reste l'adresse complète) ; `smtp_auth: "plain"` = jamais CRAM-MD5 (bluewin : LOGIN/PLAIN).
 PRESETS: dict[str, dict[str, Any]] = {
     "gmail": {"imap_host": "imap.gmail.com", "imap_port": 993, "smtp_host": "smtp.gmail.com", "smtp_port": 465},
-    "icloud": {"imap_host": "imap.mail.me.com", "imap_port": 993, "smtp_host": "smtp.mail.me.com", "smtp_port": 587},
+    "icloud": {"imap_host": "imap.mail.me.com", "imap_port": 993, "smtp_host": "smtp.mail.me.com", "smtp_port": 587,
+               "imap_user": "local"},
     "infomaniak": {"imap_host": "mail.infomaniak.com", "imap_port": 993, "smtp_host": "mail.infomaniak.com", "smtp_port": 465},
     "fastmail": {"imap_host": "imap.fastmail.com", "imap_port": 993, "smtp_host": "smtp.fastmail.com", "smtp_port": 465},
+    "yahoo": {"imap_host": "imap.mail.yahoo.com", "imap_port": 993, "smtp_host": "smtp.mail.yahoo.com", "smtp_port": 465},
+    "aol": {"imap_host": "imap.aol.com", "imap_port": 993, "smtp_host": "smtp.aol.com", "smtp_port": 465},
+    "posteo": {"imap_host": "posteo.de", "imap_port": 993, "smtp_host": "posteo.de", "smtp_port": 465},
+    "mailbox_org": {"imap_host": "imap.mailbox.org", "imap_port": 993, "smtp_host": "smtp.mailbox.org", "smtp_port": 465},
+    "gmx": {"imap_host": "imap.gmx.net", "imap_port": 993, "smtp_host": "mail.gmx.net", "smtp_port": 587},
+    "web_de": {"imap_host": "imap.web.de", "imap_port": 993, "smtp_host": "smtp.web.de", "smtp_port": 587},
+    "zoho": {"imap_host": "imap.zoho.eu", "imap_port": 993, "smtp_host": "smtp.zoho.eu", "smtp_port": 465},
+    "bluewin": {"imap_host": "imaps.bluewin.ch", "imap_port": 993, "smtp_host": "smtpauths.bluewin.ch", "smtp_port": 465,
+                "smtp_auth": "plain"},
+    "hostpoint": {"imap_host": "imap.mail.hostpoint.ch", "imap_port": 993, "smtp_host": "asmtp.mail.hostpoint.ch",
+                  "smtp_port": 465},
+    "sunrise": {"imap_host": "imap.sunrise.ch", "imap_port": 993, "smtp_host": "smtp2.sunrise.ch", "smtp_port": 465},
+    # Outlook / Hotmail / Microsoft 365 : SEULEMENT par la connexion Microsoft (OAuth, XOAUTH2) — l'authentification
+    # par mot de passe y est coupée. Posé par le callback OAuth, jamais par la route des mots de passe.
+    "outlook": {"imap_host": "outlook.office365.com", "imap_port": 993, "smtp_host": "smtp.office365.com",
+                "smtp_port": 587, "auth": "oauth"},
+}
+# Centre de données Zoho (réglage `region`) : les hôtes .eu par défaut.
+ZOHO_REGIONS = ("eu", "com")
+# Aide d'une ligne sous le champ du mot de passe (web) : quel mot de passe, et où le créer.
+PRESET_HELP: dict[str, dict[str, str]] = {
+    "gmail": {"fr": "Mot de passe d'application : Compte Google → Sécurité → Validation en deux étapes → Mots de passe des applications.",
+              "en": "App password: Google Account → Security → 2-Step Verification → App passwords."},
+    "icloud": {"fr": "Mot de passe pour app : account.apple.com → Connexion et sécurité → Mots de passe pour app.",
+               "en": "App-specific password: account.apple.com → Sign-In and Security → App-Specific Passwords."},
+    "infomaniak": {"fr": "Le mot de passe de l'adresse e-mail, ou un mot de passe d'application si la double authentification est active.",
+                   "en": "The email address password, or an app password if two-factor authentication is on."},
+    "fastmail": {"fr": "Mot de passe d'application : Réglages → Confidentialité et sécurité → Mots de passe d'application (IMAP et SMTP).",
+                 "en": "App password: Settings → Privacy & Security → App passwords (IMAP and SMTP)."},
+    "yahoo": {"fr": "Mot de passe d'application : Sécurité du compte Yahoo → Générer un mot de passe d'application.",
+              "en": "App password: Yahoo Account Security → Generate app password."},
+    "aol": {"fr": "Mot de passe d'application : Sécurité du compte AOL → Générer un mot de passe d'application.",
+            "en": "App password: AOL Account Security → Generate app password."},
+    "posteo": {"fr": "Mot de passe d'application créé dans les réglages Posteo (ou ton mot de passe Posteo).",
+               "en": "App password created in Posteo settings (or your Posteo password)."},
+    "mailbox_org": {"fr": "Ton mot de passe mailbox.org, ou un mot de passe d'application si la double authentification est active.",
+                    "en": "Your mailbox.org password, or an app password if two-factor authentication is on."},
+    "gmx": {"fr": "Ton mot de passe GMX ; active d'abord l'accès POP3/IMAP dans les réglages e-mail de GMX.",
+            "en": "Your GMX password; first turn on POP3/IMAP access in the GMX email settings."},
+    "web_de": {"fr": "Ton mot de passe WEB.DE ; active d'abord l'accès POP3/IMAP dans les réglages e-mail de WEB.DE.",
+               "en": "Your WEB.DE password; first turn on POP3/IMAP access in the WEB.DE email settings."},
+    "zoho": {"fr": "Mot de passe d'application Zoho (Mon compte → Sécurité → Mots de passe d'application) ; choisis ton centre de données.",
+             "en": "Zoho app password (My Account → Security → App passwords); choose your data center."},
+    "bluewin": {"fr": "Le mot de passe e-mail dédié à cette adresse, pas ton Swisscom Login ; identifiant = adresse complète.",
+                "en": "The dedicated email password for this address, not your Swisscom Login; username = full address."},
+    "hostpoint": {"fr": "Le mot de passe de cette adresse e-mail, défini dans le Control Panel Hostpoint.",
+                  "en": "This email address's password, set in the Hostpoint Control Panel."},
+    "sunrise": {"fr": "Le mot de passe de ton adresse e-mail Sunrise.",
+                "en": "Your Sunrise email address password."},
+    "outlook": {"fr": "Pas de mot de passe : connecte ton compte Microsoft (Outlook, Hotmail, Microsoft 365).",
+                "en": "No password: connect your Microsoft account (Outlook, Hotmail, Microsoft 365)."},
 }
 MAX_RESULTS = 25
 MAX_BODY_CHARS = 20_000
@@ -61,11 +121,28 @@ def normalize_settings(settings: dict[str, Any]) -> dict[str, Any]:
     if preset != "custom" and preset not in PRESETS:
         raise ConnectorError("bad_settings", f"préréglage inconnu : {preset}")
     base = dict(PRESETS.get(preset, {}))
+    if preset == "zoho":
+        region = str(settings.get("region") or "eu")
+        if region not in ZOHO_REGIONS:
+            raise ConnectorError("bad_settings", f"centre de données Zoho inconnu : {region}")
+        base = {**base, "imap_host": f"imap.zoho.{region}", "smtp_host": f"smtp.zoho.{region}", "region": region}
     out = {**base, **{k: v for k, v in settings.items() if v not in (None, "")}}
     address = str(out.get("address", "")).strip()
     if not _ADDR_RE.match(address):
         raise ConnectorError("bad_settings", "adresse e-mail invalide")
     norm: dict[str, Any] = {"preset": preset, "address": address, "username": str(out.get("username") or address)}
+    if base.get("imap_user") == "local" and not settings.get("username"):
+        norm["imap_username"] = address.split("@", 1)[0]
+    if base.get("smtp_auth") == "plain":
+        norm["smtp_auth"] = "plain"
+    if base.get("auth") == "oauth" or settings.get("auth") == "oauth":
+        # boîte OAuth (XOAUTH2) : le « secret » est un jeton d'accès frais, donné à chaque construction
+        norm["auth"] = "oauth"
+        for k in ("provider", "oauth_account"):
+            if settings.get(k):
+                norm[k] = str(settings[k])
+    if preset == "zoho":
+        norm["region"] = base["region"]
     for key in ("imap_host", "smtp_host"):
         if not out.get(key):
             raise ConnectorError("bad_settings", f"{key} requis")
@@ -115,6 +192,20 @@ def _auth_or_protocol(exc: Exception, secret: str) -> ConnectorError:
     return ConnectorError("protocol_error", text[:200] or exc.__class__.__name__)
 
 
+def xoauth2(user: str, token: str) -> bytes:
+    """Chaîne SASL XOAUTH2 (Microsoft, Google) : user=…^Aauth=Bearer …^A^A."""
+    return f"user={user}\x01auth=Bearer {token}\x01\x01".encode()
+
+
+def _smtp_oauth_refusal(code: int, resp: Any) -> ConnectorError:
+    text = resp.decode("utf-8", "replace") if isinstance(resp, bytes) else str(resp)
+    if "SmtpClientAuthentication is disabled" in text or "5.7.139" in text:
+        return ConnectorError("smtp_auth_disabled", "l'envoi SMTP est désactivé pour cette organisation Microsoft 365 : "
+                                                    "la boîte lit et prépare des brouillons, mais n'envoie pas (l'administrateur "
+                                                    "peut activer « SMTP authentifié » pour ce compte)")
+    return ConnectorError("auth_failed", f"connexion Microsoft refusée par le serveur d'envoi (code {code})")
+
+
 def connect_imap(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo) -> Any:
     hop = check_endpoint(s["imap_host"], s["imap_port"], "imap", resolver=resolver)
     tls = ("imap", hop.port) in IMPLICIT_TLS
@@ -122,7 +213,10 @@ def connect_imap(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo)
         m = _PinnedIMAP(hop, tls, TIMEOUT_S)
         if not tls:
             m.starttls(tls_context())
-        m.login(s["username"], secret)
+        if s.get("auth") == "oauth":
+            m.authenticate("XOAUTH2", lambda _challenge: xoauth2(s["username"], secret))
+        else:
+            m.login(s.get("imap_username") or s["username"], secret)
     except ConnectorError:
         raise
     except Exception as exc:  # noqa: BLE001 — imaplib/ssl/socket lèvent des types variés
@@ -138,6 +232,18 @@ def connect_smtp(s: dict[str, Any], secret: str, *, resolver=socket.getaddrinfo)
         m.connect(hop.hostname, hop.port)
         if not tls:
             m.starttls(context=tls_context())
+        if s.get("auth") == "oauth":
+            m.ehlo_or_helo_if_needed()
+            code, resp = m.docmd("AUTH", "XOAUTH2 " + base64.b64encode(xoauth2(s["username"], secret)).decode())
+            if code == 334:  # le serveur rend un détail d'erreur en base64 : on termine l'échange
+                code, resp = m.docmd("")
+            if code != 235:
+                raise _smtp_oauth_refusal(code, resp)
+            return m
+        if s.get("smtp_auth") == "plain":  # LOGIN/PLAIN seulement : retire CRAM-MD5 de ce qu'annonce le serveur
+            m.ehlo_or_helo_if_needed()
+            if m.has_extn("auth"):
+                m.esmtp_features["auth"] = " ".join(a for a in m.esmtp_features["auth"].split() if a.upper() != "CRAM-MD5")
         m.login(s["username"], secret)
     except ConnectorError:
         raise
@@ -256,9 +362,48 @@ def _imap_date(v: str) -> str | None:
     return f"{d:02d}-{_MONTHS[mo - 1]}-{y}"
 
 
-def translate_query(query: str) -> tuple[list[str], list[str]]:
-    """Syntaxe façon Gmail (from:, to:, subject:, is:unread, after:, before:, mots libres) → critères IMAP SEARCH.
-    Rend (critères, notes sur ce qui a été ignoré). Les mots libres cherchent dans tout le message."""
+_SIZE = re.compile(r"(\d{1,12})([kmg]?)b?", re.IGNORECASE)
+_AGE = re.compile(r"(\d{1,5})([dmy])", re.IGNORECASE)
+_ATT_NOTE = mt.MAIL_ATT_NOTE["fr"]  # figés (empreintes testées) ; langue du tour : `model_texts`
+_IGNORED_NOTE = mt.MAIL_IGNORED_NOTE["fr"]
+_NOTE_VAL_MAX = 40
+
+
+def _safe_note_part(text: str) -> str:
+    """Morceau de la requête (écrite par le modèle) rendu inoffensif pour une note : sans « » ni retours ligne, ~40 car."""
+    clean = " ".join(str(text).replace("«", "").replace("»", "").split())
+    return clean if len(clean) <= _NOTE_VAL_MAX else clean[: _NOTE_VAL_MAX - 1] + "…"
+
+
+def _imap_size(v: str) -> str | None:
+    """Taille façon Gmail (10, 10k, 5m, 1g ; 1 k = 1024 octets) → octets, sinon None."""
+    m = _SIZE.fullmatch(v.strip())
+    if not m:
+        return None
+    return str(int(m.group(1)) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[m.group(2).lower()])
+
+
+def _imap_age(v: str, now: datetime.datetime) -> str | None:
+    """Âge façon Gmail (3d, 2m, 1y ; mois = 30 j, an = 365 j) → date IMAP « maintenant − âge » (UTC)."""
+    m = _AGE.fullmatch(v.strip())
+    if not m:
+        return None
+    days = int(m.group(1)) * {"d": 1, "m": 30, "y": 365}[m.group(2).lower()]
+    try:
+        d = now - datetime.timedelta(days=days)
+    except OverflowError:
+        return None
+    return f"{d.day:02d}-{_MONTHS[d.month - 1]}-{d.year}"
+
+
+def translate_query(query: str, now: datetime.datetime | None = None) -> tuple[list[str], list[str]]:
+    """Syntaxe façon Gmail → critères IMAP SEARCH (RFC 3501). Rend (critères, notes sur ce qui a été ignoré/approximé).
+    Traduits : from/to/cc/subject, is:unread|read|starred, after:/since: (SINCE, >= jour, inclusif comme Gmail),
+    before: (BEFORE, < jour, exclusif comme Gmail), larger:/smaller: (octets, suffixes k/m/g), older_than:/newer_than:
+    (d/m/y → BEFORE/SINCE depuis maintenant), has:attachment (approximé, note). Non gérés (note) : in:, label:, category:
+    (un dossier IMAP n'est pas un label), autres has:. Les mots libres cherchent dans tout le message.
+    Écart de fuseau : IMAP compare des jours dans le fuseau du serveur, Gmail dans le sien (PST)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
     crit: list[str] = []
     notes: list[str] = []
     for tok in re.findall(r'-?\w+:"[^"]*"|-?"[^"]*"|\S+', query):
@@ -271,10 +416,19 @@ def translate_query(query: str) -> tuple[list[str], list[str]]:
             one = [_SEARCH_KEYS[key.lower()], _q(val)]
         elif sep and key.lower() == "is" and val in ("unread", "read", "starred"):
             one = [{"unread": "UNSEEN", "read": "SEEN", "starred": "FLAGGED"}[val]]
-        elif sep and key.lower() in ("after", "before") and _imap_date(val):
-            one = ["SINCE" if key.lower() == "after" else "BEFORE", _imap_date(val)]  # type: ignore[list-item]
-        elif sep and key.lower() in ("has", "in", "label", "category", "larger", "smaller", "older_than", "newer_than"):
-            notes.append(f"critère « {key}: » non géré hors Gmail, ignoré")
+        elif sep and key.lower() in ("after", "since", "before") and _imap_date(val):
+            one = ["BEFORE" if key.lower() == "before" else "SINCE", _imap_date(val)]  # type: ignore[list-item]
+        elif sep and key.lower() in ("larger", "smaller") and _imap_size(val):
+            one = [key.upper(), _imap_size(val)]  # type: ignore[list-item]
+        elif sep and key.lower() in ("older_than", "newer_than") and _imap_age(val, now):
+            one = ["BEFORE" if key.lower() == "older_than" else "SINCE", _imap_age(val, now)]  # type: ignore[list-item]
+        elif sep and key.lower() == "has" and val.lower() == "attachment":
+            one = ["HEADER", "Content-Type", _q("multipart/mixed")]
+            if mt.pick(mt.MAIL_ATT_NOTE) not in notes:
+                notes.append(mt.pick(mt.MAIL_ATT_NOTE))
+        elif sep and key.lower() in ("has", "in", "label", "category", "larger", "smaller", "older_than", "newer_than",
+                                     "after", "since", "before"):
+            notes.append(mt.pick(mt.MAIL_IGNORED_NOTE).format(key=_safe_note_part(key), val=_safe_note_part(val)))
             continue
         else:
             one = ["TEXT", _q(t.strip('"'))]
@@ -403,7 +557,7 @@ class MailConnector:
             wanted = wanted[6:]
         if wanted in roles["_all"].split("\x00") or wanted.upper() == "INBOX":
             return "INBOX" if wanted.upper() == "INBOX" else wanted
-        raise ConnectorError("bad_settings", f"dossier introuvable : {wanted[:60]}")
+        raise ConnectorError("bad_settings", mt.pick(mt.MAIL_FOLDER_NOT_FOUND).format(name=wanted[:60]))
 
     def _select(self, m: Any, folder: str, *, readonly: bool) -> int:
         _ok(m.select(_q(imap_utf7.encode(folder)), readonly), f"SELECT {folder}")
@@ -425,13 +579,13 @@ class MailConnector:
                 raise ValueError
             return folder, int(validity), uid
         except ValueError:
-            raise ConnectorError("bad_settings", "id de message invalide (utiliser un id de mail_search)") from None
+            raise ConnectorError("bad_settings", mt.pick(mt.MAIL_BAD_ID)) from None
 
     def _open_message(self, m: Any, message_id: str, *, readonly: bool) -> tuple[str, str]:
         folder, validity, uid = self._split_id(message_id)
         actual = self._select(m, folder, readonly=readonly)
         if validity and actual and validity != actual:
-            raise ConnectorError("bad_settings", "id périmé : le dossier a été reconstruit, relancer mail_search")
+            raise ConnectorError("bad_settings", mt.pick(mt.MAIL_STALE_ID))
         return folder, uid
 
     # ── outils ──
@@ -439,13 +593,13 @@ class MailConnector:
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         fn = getattr(self, f"_t_{name}", None) if name in {s.name for s in _SPECS} else None
         if fn is None:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         try:
             out = fn(arguments or {})
         except ConnectorError as exc:
             return ToolResult(call_id="", name=name, content=f"{exc.code} : {scrub(exc.message, self._secret)}", is_error=True)
         except Exception as exc:  # noqa: BLE001 — jamais d'exception hors de call(), jamais de secret dans le texte
-            return ToolResult(call_id="", name=name, content=f"erreur interne : {scrub(str(exc), self._secret)[:200]}",
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.MAIL_INTERNAL_ERROR).format(detail=scrub(str(exc), self._secret)[:200]),
                               is_error=True)
         return ToolResult(call_id="", name=name, content=json.dumps(out, ensure_ascii=False))
 
@@ -500,7 +654,7 @@ class MailConnector:
             typ, data = m.uid("FETCH", uid, f"(BODY.PEEK[]<0.{MAX_FETCH_BYTES}>)")
             raw = next((p[1] for p in (data or []) if isinstance(p, tuple)), None)
             if typ != "OK" or raw is None:
-                raise ConnectorError("bad_settings", "message introuvable")
+                raise ConnectorError("bad_settings", mt.pick(mt.MAIL_MESSAGE_NOT_FOUND))
         msg = email.message_from_bytes(raw, policy=email.policy.default)
         body, atts = _body_text(msg)
         truncated = len(body) > MAX_BODY_CHARS or len(raw) >= MAX_FETCH_BYTES
@@ -516,7 +670,7 @@ class MailConnector:
             raise ConnectorError("bad_settings", f"au plus {MAX_RECIPIENTS} destinataires")
         subject = str(a.get("subject") or "")
         if re.search(r"[\r\n]", subject):
-            raise ConnectorError("bad_settings", "retour à la ligne interdit dans le sujet")
+            raise ConnectorError("bad_settings", mt.pick(mt.MAIL_NEWLINE_IN_SUBJECT))
         msg = EmailMessage()
         msg["From"] = self.s["address"]
         msg["To"] = ", ".join(to)
@@ -541,7 +695,7 @@ class MailConnector:
     def _addresses(value: Any, field: str) -> list[str]:
         parsed = [a for _, a in email.utils.getaddresses([str(value or "")]) if a]
         if not parsed or any(not _ADDR_RE.match(a) for a in parsed):
-            raise ConnectorError("bad_settings", f"adresse invalide dans « {field} »")
+            raise ConnectorError("bad_settings", mt.pick(mt.MAIL_BAD_ADDRESS).format(field=field))
         return parsed
 
     def _t_mail_draft(self, a: dict[str, Any]) -> dict[str, Any]:
@@ -549,7 +703,7 @@ class MailConnector:
             msg = self._compose(a, m if a.get("in_reply_to") else None)
             roles = self._folders(m)
             if "drafts" not in roles:
-                raise ConnectorError("unsupported", "dossier Brouillons introuvable sur ce compte")
+                raise ConnectorError("unsupported", mt.pick(mt.MAIL_NO_DRAFTS))
             _ok(m.append(_q(imap_utf7.encode(roles["drafts"])), "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()),
                          msg.as_bytes()), "APPEND")
         return {"drafted": True, "folder": roles["drafts"], "to": msg["To"], "subject": msg["Subject"]}
@@ -567,7 +721,7 @@ class MailConnector:
         try:
             refused = smtp.send_message(msg, from_addr=self.s["address"], to_addrs=recipients)
         except smtplib.SMTPRecipientsRefused as exc:
-            raise ConnectorError("protocol_error", "tous les destinataires ont été refusés") from exc
+            raise ConnectorError("protocol_error", mt.pick(mt.MAIL_ALL_REJECTED)) from exc
         except (smtplib.SMTPException, OSError) as exc:
             raise _auth_or_protocol(exc, self._secret) from None
         finally:
@@ -600,11 +754,10 @@ class MailConnector:
             if target == roles.get("trash") and not is_trash_destination(dest):
                 # Corbeille sous un nom que la table des effets ne reconnaît pas (dossier marqué \Trash par le
                 # serveur) : l'appel a été classé « rangement », il ne doit pas supprimer. La corbeille a son outil.
-                raise ConnectorError("unsupported", "ce dossier est la corbeille du compte : utiliser mail_trash "
-                                                    "(action destructive, carte d'approbation)")
+                raise ConnectorError("unsupported", mt.pick(mt.MAIL_IS_TRASH))
             src, uid = self._open_message(m, str(a.get("message_id") or ""), readonly=False)
             if src == target:
-                return {"moved": False, "reason": "déjà dans ce dossier", "folder": target}
+                return {"moved": False, "reason": mt.pick(mt.MAIL_ALREADY_THERE), "folder": target}
             return self._relocate(m, uid, src, target)
 
     def _relocate(self, m: Any, uid: str, src: str, target: str) -> dict[str, Any]:
@@ -625,10 +778,10 @@ class MailConnector:
         with self._imap() as m:
             roles = self._folders(m)
             if "trash" not in roles:
-                raise ConnectorError("unsupported", "dossier Corbeille introuvable sur ce compte")
+                raise ConnectorError("unsupported", mt.pick(mt.MAIL_NO_TRASH))
             src, uid = self._open_message(m, str(a.get("message_id") or ""), readonly=False)
             if src == roles["trash"]:
-                return {"moved": False, "reason": "déjà dans la corbeille"}
+                return {"moved": False, "reason": mt.pick(mt.MAIL_ALREADY_TRASHED)}
             return self._relocate(m, uid, src, roles["trash"])
 
     # ── relève de fond (déclencheur mail:<filtre>, nokker/agents/mailwatch.py) ──
@@ -648,7 +801,7 @@ class MailConnector:
             m._encoding = "utf-8"  # noqa: SLF001 — critères non ASCII (SEARCH CHARSET UTF-8)
             typ, data = m.uid("SEARCH", "CHARSET", "UTF-8", "UID", f"{last_uid + 1}:*", *criteria)
             if typ != "OK":
-                raise ConnectorError("protocol_error", "SEARCH refusé par le serveur")
+                raise ConnectorError("protocol_error", mt.pick(mt.MAIL_SEARCH_REFUSED))
             # « n:* » désigne toujours au moins le dernier message (RFC 3501) : on ne garde que ce qui est après le curseur.
             uids = sorted({int(u) for u in (data[0] or b"").split() if u.isdigit() and int(u) > last_uid})
             listed = uids[-fetch:] if fetch > 0 else []
@@ -695,5 +848,5 @@ class MailConnector:
         return f"IMAP et SMTP ok ({count} messages dans la boîte de réception)"
 
 
-__all__ = ["MailConnector", "PRESETS", "WATCH_FOLDER", "connect_imap", "connect_smtp", "normalize_settings",
+__all__ = ["MailConnector", "PRESETS", "PRESET_HELP", "ZOHO_REGIONS", "xoauth2", "WATCH_FOLDER", "connect_imap", "connect_smtp", "normalize_settings",
            "translate_query"]

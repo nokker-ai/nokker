@@ -10,6 +10,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.webpacks.service import WebPackError, WebPacks
@@ -79,8 +80,8 @@ class WebPackTools:
                 return out(payload, err)
         except WebPackError as e:
             extra = f"\n{json.dumps(e.payload, ensure_ascii=False)}" if e.payload else ""
-            return out(f"refusé : {e.message}{extra}", True)
-        return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.TOOL_REFUSED).format(error=f"{e.message}{extra}"), True)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
 
 __all__ = ["WEB_PACK_TOOLS", "WebPackTools"]

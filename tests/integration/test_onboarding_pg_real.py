@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 
@@ -9,9 +10,12 @@ from nokker.onboarding.acceptances import PgAcceptances
 from nokker.store.pg import apply_migrations
 
 DSN = os.environ.get("NOKKER_TEST_PG_DSN")
+requires_pg = pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN non posé — pas de Postgres jetable")
+
+RUN = uuid.uuid4().hex[:10]  # identifiants uniques PAR PASSAGE : tables en ajout seul, base réutilisable
 
 pytestmark = [pytest.mark.integration,
-              pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN non posé — pas de Postgres jetable")]
+              requires_pg]
 
 
 
@@ -27,9 +31,9 @@ def test_acceptance_round_trip_and_migration_idempotent():
     apply_migrations(DSN)
     apply_migrations(DSN)
     acc = PgAcceptances(DSN)
-    acc.record("us_it_1", "42", "ab" * 32, "fr", "203.0.113.9")
-    acc.record("us_it_1", "42", "cd" * 32, "en", None)
-    rows = acc.for_account("us_it_1")
+    acc.record(f"us_it_1_{RUN}", "42", "ab" * 32, "fr", "203.0.113.9")
+    acc.record(f"us_it_1_{RUN}", "42", "cd" * 32, "en", None)
+    rows = acc.for_account(f"us_it_1_{RUN}")
     assert [r["terms_version_sha256"][:2] for r in rows] == ["ab", "cd"]
     assert rows[0]["ip"] == "203.0.113.9" and rows[0]["invitation_id"] == "42" and rows[0]["accepted_at"]
     assert acc.for_account("us_autre") == []
@@ -44,7 +48,7 @@ def test_email_codes_round_trip_attempts_and_burn():
 
     apply_migrations(DSN)
     apply_migrations(DSN)
-    acc = PgTenancy(DSN).create_account(f"code-{os.getpid()}@example.org")
+    acc = PgTenancy(DSN).create_account(f"code-{RUN}@example.org")
     codes, exp = PgCodes(DSN), datetime.now(timezone.utc) + timedelta(minutes=10)
     assert codes.attempt(acc.account_id) is None
     codes.put(acc.account_id, "a" * 64, exp)
@@ -64,10 +68,10 @@ def test_consents_round_trip_append_only_current_is_last():
     apply_migrations(DSN)
     apply_migrations(DSN)
     c = PgConsents(DSN)
-    assert c.current("us_c_1", "training") is False
-    c.record("us_c_1", "training", True, "signup", "ab" * 32, "203.0.113.9")
-    assert c.current("us_c_1", "training") is True
-    c.record("us_c_1", "training", False, "account", None, None)
-    assert c.current("us_c_1", "training") is False
-    assert [(r["granted"], r["source"]) for r in c.history("us_c_1")] == [(True, "signup"), (False, "account")]
+    assert c.current(f"us_c_1_{RUN}", "training") is False
+    c.record(f"us_c_1_{RUN}", "training", True, "signup", "ab" * 32, "203.0.113.9")
+    assert c.current(f"us_c_1_{RUN}", "training") is True
+    c.record(f"us_c_1_{RUN}", "training", False, "account", None, None)
+    assert c.current(f"us_c_1_{RUN}", "training") is False
+    assert [(r["granted"], r["source"]) for r in c.history(f"us_c_1_{RUN}")] == [(True, "signup"), (False, "account")]
     assert c.history("us_autre") == []

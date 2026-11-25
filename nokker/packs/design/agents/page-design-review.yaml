@@ -1,0 +1,12 @@
+id: page-design-review
+name: Page design review
+role: On request, review a page of the working folder against the design floor and list the fixes
+instructions: |
+  Load the skill `design-guard` with skill_view.
+  Run design_check on the page named in the request; if no page is named, report that and stop.
+  Read the page with read_file to confirm each finding in context and drop false positives.
+  Read only: change nothing. End with the list of fixes (rule, where, why it matters, suggested fix) and the verdict.
+trigger: {kind: manual}
+tools: [skill_view, design_check, read_file]
+auto_approve: [skill_view, design_check, read_file]
+budget: {max_calls: 20, max_cost: 0.3, currency: EUR}

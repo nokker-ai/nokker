@@ -11,6 +11,7 @@ from typing import Any
 
 from nokker.bubbles.hub import SESSION_CHANNEL, BubbleHub
 from nokker.bubbles.types import BubbleError, BubbleNotFound
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.threads.types import ThreadError
@@ -220,7 +221,8 @@ class BubbleToolSource:
                      "d'aperçu cliquable : image, titre, description) : profil Instagram/LinkedIn, article, site. À "
                      "utiliser dès qu'on te demande d'afficher / montrer quelque chose. Pseudo connu → URL directe "
                      "(https://www.instagram.com/<pseudo>/, https://www.linkedin.com/in/<id>/), pas une recherche. "
-                     "Le noyau remplit la carte : n'ajoute ni bubble_update ni navigation derrière.", parameters=_BUBBLE_SHOW_PARAMS,
+                     "La carte se remplit d'elle-même : n'ajoute ni bubble_update ni navigation derrière. Lire un profil ou un post "
+                     "d'un site connecté = sites_read ; montrer une page publique quelconque = bubble_show.", parameters=_BUBBLE_SHOW_PARAMS,
                      effect=Effect.READ, source="builtin"),
             ToolSpec(name="bubble_update", description="Met à jour une bulle EXISTANTE du fil courant (bubble_id bu_… "
                      "reçu d'un outil) ; pour en créer une, `bubble_show`.",
@@ -261,8 +263,8 @@ class BubbleToolSource:
             if name == "agent_draft":
                 return propose_agent_draft(self.hub, ctx, arguments, scheduled=agents_engine(self.hub))
         except (BubbleError, ThreadError) as e:
-            return ToolResult(call_id="", name=name, content=f"refusé : {type(e).__name__} {e}", is_error=True)
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.TOOL_REFUSED).format(error=f"{type(e).__name__} {e}"), is_error=True)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
 
     def _show(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         import re
@@ -293,7 +295,7 @@ class BubbleToolSource:
         self.hub.spawn(fill)
         return ToolResult(call_id="", name="bubble_show", content=json.dumps(
             {"bubble_id": b.id, "shown": url,
-             "note": "bulle affichée chez l'utilisateur ; le noyau y pose l'aperçu lui-même. Rien d'autre à faire "
+             "note": "bulle affichée chez l'utilisateur ; l'aperçu se remplit tout seul. Rien d'autre à faire "
                      "sur cette bulle : réponds en une phrase, sans décrire une page que tu n'as pas lue."},
             ensure_ascii=False))
 

@@ -144,8 +144,13 @@ class CorthexisSemanticIndex:
                                    write_index=False, chunk_target=self.chunk_target)
         with self._lock:
             tenant = self._tenant_of.get(project) or INTERNAL_TENANT
-        with _INDEX_LOCK, tenant_scope(tenant):
-            rep = Indexer(guarded_store(), cx_service.embedder(), cfg).run()
+        try:
+            with _INDEX_LOCK, tenant_scope(tenant):
+                rep = Indexer(guarded_store(), cx_service.embedder(), cfg).run()
+        finally:
+            from nokker.memory.corthexis import invalidate_status
+
+            invalidate_status()  # la base vient de changer : le compteur d'état de GET /v1/local/memory se refait
         for w in getattr(rep, "warnings", []) or []:
             logger.warning("corthexis(session %s): %s", project, w)
 

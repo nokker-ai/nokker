@@ -116,6 +116,16 @@ def _imap_server(tls_ctx):
     return lsock.getsockname()[1], seen
 
 
+_EGRESSES: list = []
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _close_fake_egresses():
+    yield
+    while _EGRESSES:
+        _EGRESSES.pop().close()
+
+
 class FakeEgress:
     """Mandataire CONNECT seul, comme `egress` vu de core : route connue -> 200 et tuyau ; refus -> statut et corps
     d'egress ; nom inconnu -> 502 « nom introuvable »."""
@@ -126,12 +136,26 @@ class FakeEgress:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(16)
         self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="nokker-test-egress")
+        self._thread.start()
+        _EGRESSES.append(self)
 
     def _loop(self):
         while True:
-            conn, _ = self.sock.accept()
-            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:  # socket fermée par `close()`
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True, name="nokker-test-egress-conn").start()
+
+    def close(self):
+        """Arrêt idempotent : ferme l'écoute (réveille l'`accept`) et attend le fil."""
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+        self._thread.join(2.0)
 
     @staticmethod
     def _reply(conn, status, reason, msg):

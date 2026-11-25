@@ -50,7 +50,7 @@ def wire_kernel(script, known=None):
 
 
 def test_system_block_and_user_message_leave_redacted_and_handles_do_not_trip_the_router():
-    k, ship = wire_kernel([Message("assistant", "noté")])
+    k, ship = wire_kernel([Message("assistant", "compris")])
     turn = k.run_turn(TurnInput("t1", f"ma clé : {AKIA} / secret {AWS_SECRET}, range-la"))
     sent = json.dumps(ship.seen[0], ensure_ascii=False)
     assert AKIA not in sent and AWS_SECRET not in sent
@@ -58,7 +58,7 @@ def test_system_block_and_user_message_leave_redacted_and_handles_do_not_trip_th
     for m in ship.seen[0]:
         if m["role"] in ("system", "user"):  # rôles que le Router refuse (au lieu de masquer) s'il y voit un secret
             assert not ROUTER_KEY_VALUE.search(m["content"]), m["content"]
-    assert turn.reply == "noté"
+    assert turn.reply == "compris"
 
 
 def test_tool_arguments_replayed_to_the_model_are_redacted_but_the_turn_keeps_them():

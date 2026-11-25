@@ -98,13 +98,28 @@ When something needs your decision, the card shows the tool, its effect, and the
 4. Refuse
 ```
 
-Arrow keys, digits and Enter. For a test command (`pytest`, `unittest`, `npm test`, `pnpm test`, `yarn test`,
-`go test`, `cargo test`, `make test`, `vitest`, `jest`), "For this session" comes first.
+A decision takes **two steps**, so that nothing you type for the prompt can decide a card that appears at the same
+moment:
+
+1. **Choose**: `a` (once), `s` (this session), `r` (refuse), the arrow keys or a digit (`3` / `3b` show the exact rule
+   first). Nothing is chosen when the card appears, and choosing never decides.
+2. **Confirm** with Enter (or `y`). Enter is accepted only after **600 ms without a keystroke**, counted from the
+   moment the card appeared and from your previous key.
+
+Any other key (text meant for the prompt) clears the choice and restarts the wait. While a card waits for a keyboard
+decision, the prompt does not take input. For a test command (`pytest`, `unittest`, `npm test`, `pnpm test`,
+`yarn test`, `go test`, `cargo test`, `make test`, `vitest`, `jest`), "For this session" comes first in the list; it
+is still not chosen until you choose it.
+
+After you approve, the tool runs and the model goes on in a follow-up turn on the same thread; its answer shows in the
+terminal like any other.
 
 - "Always" writes an `allow` rule into your user settings file (see [permissions.md](permissions.md)). The rule is one
   of the suggestions the core computed for that card; the client cannot invent one.
 - A destructive card offers **once** only: no session or always scope.
 - Esc does not decide. Ctrl+C refuses the card and cancels the turn. A card expires after 300 s and counts as a refusal.
+- A standard card decided with your device (`p` this device, `r` refuse, `t` / `x` with a TOTP code) follows the same
+  two steps: choose the key, then Enter after the pause.
 - A destructive card can be approved here, once. Some strong cards cannot be approved in the terminal at all: a change
   on a `prod` host, a send or delete through a connector of your nokker.ai account, and a strong card that comes from
   the web through the gateway. They wait for an enrolled device, such as your phone (see [security.md](security.md));

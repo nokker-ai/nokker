@@ -399,7 +399,7 @@ class RelayedApprovalNotifier:
         chats = self.tenancy.identities_of(card.account, "telegram")
         if not chats:
             return
-        fr = getattr(account, "lang", "fr") != "en"
+        fr = getattr(account, "lang", None) != "en"
         head = (f"Action forte à approuver sur {machine.name}" if fr
                 else f"Strong action awaiting your approval on {machine.name}")
         summary = getattr(card, "summary", None) or {}

@@ -12,7 +12,7 @@ from nokker.context.text import salience
 from nokker.context.types import ContextBudgets
 from nokker.core.turn import InputCheck, Turn
 
-from .harness import make_session
+from .harness import make_session, context_text
 from .test_revocation import CannedProvider
 
 # Textes du scénario X9 (bench/never_clear/scenario.py), tours 89 à 93 puis 124.
@@ -83,7 +83,7 @@ def test_requirement_is_visible_at_the_cleanup(tmp_path):
     # Avant le correctif : l'exigence n'est nulle part dans ce que voit le modèle (ni couche 3, ni épisodes
     # pertinents, ni messages retrouvés) — comme au tour 124 du rejeu.
     assert REQUIREMENT in prompt
-    system = s.provider.seen[-1][0]["content"]
+    system = context_text(s.provider.seen[-1])
     # Couche 3 (toujours présente, ne dépend d'aucune recherche) : l'exigence, son tour, et la consigne qui dit
     # qu'un code qui la porte peut sembler inutilisé.
     assert "[Mémoire de la session]" in system
@@ -103,7 +103,7 @@ def test_requirement_then_revocation_order(tmp_path):
     s.say("Commite.")
     s.manager.new_episode(s.thread)
     s.say(CLEANUP)
-    system = s.provider.seen[-1][0]["content"]
+    system = context_text(s.provider.seen[-1])
     assert system.index("Exigences posées") < system.index("Revirements de la session")
     assert "plus besoin de réexporter" not in system[system.index("Exigences posées"):system.index("Revirements")]
 
@@ -116,15 +116,15 @@ def test_no_requirement_no_section(tmp_path):
             s.say(text)
         s.manager.new_episode(s.thread)
     s.say(CLEANUP)
-    assert "Exigences posées" not in s.provider.seen[-1][0]["content"]
+    assert "Exigences posées" not in context_text(s.provider.seen[-1])
 
 
 def test_requirements_stay_under_the_session_memory_budget(tmp_path):
-    b = ContextBudgets(current_budget=10 ** 6, episodes_budget=600)
+    b = ContextBudgets(current_budget=10 ** 6, episodes_budget=900)  # jetons réels : 900 × 2,9 = 2 610 caractères
     s = make_session(b, tmp_path=tmp_path, provider=CannedProvider())
     for i in range(12):
         s.say(f"Tâche {i} : le module m{i} doit rester importable depuis l'ancien chemin pour ne rien casser. " * 3)
         s.manager.new_episode(s.thread)
     block = s.manager.memory_block(s.thread)
-    assert len(block) <= b.episodes_budget * 4 + 200
+    assert len(block) <= b.episodes_budget * 2.9 + 200
     assert "T11 " in block and "T0 " not in block  # les plus récentes d'abord gardées

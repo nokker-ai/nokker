@@ -468,3 +468,27 @@ def test_media_signature_matches_bridge():
                      clock=lambda: 1000)
     url, exp = c.media_url("thumb", "1730500000.1-abc")
     assert url.endswith(f"sig={media_sig(media_key(BRIDGE_TOKEN), '/media/v1/thumb/1730500000.1-abc', exp)}")
+
+
+def test_camera_brief_templates_are_frozen_and_read_unambiguously():
+    """Relecture du 06.11 : le niveau en mots et entre parenthèses ; « déjà notifiés » seulement s'il y a du dangereux."""
+    from nokker.homewatch.source import brief_texts_sha256, camera_lines
+
+    assert brief_texts_sha256() == "5798d4100188f3afaf057486161966fa5cf7fd0f59b25c16e495cfacee8fbd74"
+    rows = [{"start": 2, "camera": "Entrée", "niveau": "inconnu", "title": "présence humaine"},
+            {"start": 1, "camera": "Portail", "niveau": "suspect", "title": ""}]
+    assert camera_lines(rows, lambda ts: f"t{ts}") == [
+        "Caméras : 2 événement(s) (dangereux 0 ; suspect 1 ; normal 0 ; non résumé 1).",
+        "- t1 Portail (suspect) : (sans résumé)", "- t2 Entrée (non résumé) : présence humaine"]
+
+
+def test_the_raw_word_inconnu_never_reaches_a_reader():
+    """Relecture du 06.11 : veille_cameras et la bulle `camera_review` disent « non résumé », le state garde le code."""
+    from types import SimpleNamespace
+
+    from nokker.homewatch.source import HomeWatchSource, level_word
+
+    assert level_word("inconnu") == level_word(None) == "non résumé" and level_word("suspect") == "suspect"
+    line = HomeWatchSource._review_line(SimpleNamespace(_fmt=lambda ts, date=False: "d"),
+                                        {"start": 1, "camera": "Entrée", "niveau": "inconnu", "title": "Livreur"})
+    assert line == "d | Entrée | non résumé | Livreur"

@@ -45,6 +45,12 @@ class PriceEntry:
     # Devise des trois prix ci-dessus (les noms de champs disent USD pour l'historique : c'est la devise du catalogue
     # Router). Une entrée EUR est servie telle quelle par `PriceCatalog.cost`, jamais convertie sans taux connu.
     currency: str = "USD"
+    # Jetons ÉCRITS en cache par l'appel (amont au format Anthropic : 1,25 x le prix d'entrée à 5 minutes, 2 x à 1 heure),
+    # même unité que les prix ci-dessus. None (défaut) = pas de prix d'écriture connu : ces jetons restent facturés au
+    # prix d'entrée, comme avant — le coût d'une entrée sans ce champ ne change pas.
+    cache_write_usd_per_m: float | None = None
+    # Idem pour un cache d'une heure (2 x l'entrée) ; None = repli sur le prix 5 minutes, puis sur le prix d'entrée.
+    cache_write_1h_usd_per_m: float | None = None
 
 
 class PriceCatalog:
@@ -63,21 +69,35 @@ class PriceCatalog:
         return sorted(self._entries)
 
     def cost(self, model: str, new_tokens: int, cached_tokens: int,
-             completion_tokens: int) -> tuple[float, str] | None:
-        """(montant, devise) dans la devise de l'entrée ; None si le modèle est inconnu (jamais un prix inventé)."""
+             completion_tokens: int, cache_write_tokens: int = 0,
+             cache_ttl: str = "5m") -> tuple[float, str] | None:
+        """(montant, devise) dans la devise de l'entrée ; None si le modèle est inconnu (jamais un prix inventé).
+
+        `new_tokens` = entrée hors lecture de cache, écritures de cache COMPRISES (`prompt - cached`). Si l'entrée porte
+        un prix d'écriture, les `cache_write_tokens` en sortent et sont facturés à ce prix ; sinon (défaut), ils
+        restent au prix d'entrée : même résultat qu'avant ce champ. Durée « 1h » : prix 1 h s'il existe, sinon prix 5 min."""
         entry = self.get(model)
         if entry is None:
             return None
-        amount = (new_tokens * entry.prompt_usd_per_m + cached_tokens * entry.cached_usd_per_m +
-                  completion_tokens * entry.completion_usd_per_m) / 1_000_000
+        write_price = entry.cache_write_usd_per_m
+        if cache_ttl == "1h" and entry.cache_write_1h_usd_per_m is not None:
+            write_price = entry.cache_write_1h_usd_per_m
+        written = 0
+        if write_price is not None and cache_write_tokens > 0:
+            written = min(cache_write_tokens, new_tokens)
+        amount = ((new_tokens - written) * entry.prompt_usd_per_m + cached_tokens * entry.cached_usd_per_m +
+                  completion_tokens * entry.completion_usd_per_m +
+                  written * (write_price or 0.0)) / 1_000_000
         return amount, entry.currency
 
-    def cost_usd(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int) -> float | None:
-        got = self.cost(model, new_tokens, cached_tokens, completion_tokens)
+    def cost_usd(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int,
+                 cache_write_tokens: int = 0, cache_ttl: str = "5m") -> float | None:
+        got = self.cost(model, new_tokens, cached_tokens, completion_tokens, cache_write_tokens, cache_ttl)
         return got[0] if got is not None and got[1] == "USD" else None
 
-    def cost_chf(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int) -> float | None:
-        got = self.cost(model, new_tokens, cached_tokens, completion_tokens)
+    def cost_chf(self, model: str, new_tokens: int, cached_tokens: int, completion_tokens: int,
+                 cache_write_tokens: int = 0, cache_ttl: str = "5m") -> float | None:
+        got = self.cost(model, new_tokens, cached_tokens, completion_tokens, cache_write_tokens, cache_ttl)
         if got is None:
             return None
         amount, currency = got
@@ -87,6 +107,11 @@ class PriceCatalog:
 
     def usd_to_chf(self, usd: float) -> float:
         return usd / self.chf_usd_rate
+
+
+def _opt_price(raw: Any) -> float | None:
+    """Prix optionnel (`cache_write`) : absent ou vide = None (pas de prix connu), jamais 0 par défaut."""
+    return None if raw is None or raw == "" else float(raw)
 
 
 def _entries_from_models(models: list[dict[str, Any]], pricing_key: str, source_fmt: str) -> dict[str, PriceEntry]:
@@ -102,6 +127,8 @@ def _entries_from_models(models: list[dict[str, Any]], pricing_key: str, source_
             cached_usd_per_m=float(pricing["cached"]),
             completion_usd_per_m=float(pricing["completion"]),
             source=source_fmt.format(model=model_id),
+            cache_write_usd_per_m=_opt_price(pricing.get("cache_write")),
+            cache_write_1h_usd_per_m=_opt_price(pricing.get("cache_write_1h")),
         )
     return entries
 
@@ -127,6 +154,8 @@ def load_from_yaml(path: Path | str = DEFAULT_YAML_PATH) -> PriceCatalog:
                 completion_usd_per_m=float(m["completion"]),
                 source=f"yaml:{path.name}@{m.get('fetched_at') or fetched_at}",
                 currency=str(m.get("currency") or default_currency).upper(),
+                cache_write_usd_per_m=_opt_price(m.get("cache_write")),
+                cache_write_1h_usd_per_m=_opt_price(m.get("cache_write_1h")),
             )
         except (KeyError, ValueError, TypeError) as e:
             raise ValueError(f"prices.yaml: entrée invalide pour {m!r}: {e}") from e

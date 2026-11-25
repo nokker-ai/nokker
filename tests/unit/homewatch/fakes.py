@@ -21,7 +21,8 @@ class _Server:
         self.httpd.owner = self  # type: ignore[attr-defined]
         self.port = self.httpd.server_address[1]
         self.requests: list[tuple[str, str, Any]] = []
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        # poll_interval court : shutdown() attend au pire un tour de sondage (0,5 s par défaut, ×3 serveurs ×~20 tests)
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     @property
     def url(self) -> str:
@@ -29,6 +30,7 @@ class _Server:
 
     def close(self) -> None:
         self.httpd.shutdown()
+        self.httpd.server_close()  # libère la prise d'écoute (sinon ResourceWarning au ramasse-miettes)
 
 
 class _Base(BaseHTTPRequestHandler):
@@ -306,8 +308,14 @@ class Foyer:
     def close(self) -> None:
         import nokker.homebridge.config as bcfg
 
+        # les serveurs de la passerelle sondent à 0,5 s (code produit) : on les arrête en parallèle, pas l'un après l'autre
+        stoppers = [threading.Thread(target=s.shutdown) for s in self.servers]
+        for t in stoppers:
+            t.start()
+        for t in stoppers:
+            t.join()
         for s in self.servers:
-            s.shutdown()
+            s.server_close()
         for d in (self.frigate, self.unifi, self.syno):
             d.close()
         bcfg._private = self._private

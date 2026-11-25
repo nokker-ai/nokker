@@ -10,6 +10,7 @@ oublié de fixer le locataire échoue au lieu de tomber dans le locataire intern
 from __future__ import annotations
 
 import contextvars
+import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, Future
 from contextlib import contextmanager
@@ -58,6 +59,16 @@ def submit_in_context(pool: Executor, fn: Callable[..., Any], *args: Any, **kwar
     return pool.submit(ctx.run, fn, *args, **kwargs)
 
 
+def start_thread_in_context(fn: Callable[..., Any], *args: Any, name: str | None = None, daemon: bool = True
+                            ) -> threading.Thread:
+    """Démarre un fil qui emporte le contexte courant (locataire et LANGUE du tour compris) : pour un travail lancé POUR
+    un tour. Jamais pour un fil de fond persistant (balayeur, réconciliation), qui ne doit pas hériter d'un tour."""
+    ctx = contextvars.copy_context()
+    t = threading.Thread(target=ctx.run, args=(fn, *args), name=name, daemon=daemon)
+    t.start()
+    return t
+
+
 def scoped_thread_id(tenant_id: str, client_thread_id: str) -> str:
     """Identifiant de fil interne. Locataire interne : inchangé (données du canari). Testeur : préfixé par son
     locataire, si bien que deux locataires ne peuvent jamais adresser le même fil, même avec le même X-Session-Id."""
@@ -74,4 +85,4 @@ def tenant_of_thread(thread_id: str) -> str:
 
 
 __all__ = ["INTERNAL_TENANT", "NoTenant", "current_tenant", "current_tenant_or_none", "is_internal",
-           "scoped_thread_id", "submit_in_context", "tenant_of_thread", "tenant_scope"]
+           "scoped_thread_id", "start_thread_in_context", "submit_in_context", "tenant_of_thread", "tenant_scope"]

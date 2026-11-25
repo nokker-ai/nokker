@@ -20,6 +20,7 @@ run on the agent engine ([agents.md](agents.md)). Nokker never downloads a third
 | `video` | `video-storyboard`, `video-shots`, `video-edit`, `video-mix` | `video-storyboard` (script and shot list) | ffmpeg in the sandbox; the pack declares `needs: {gpu: true}` |
 | `mcp-builder` | `mcp-scaffold` (with runnable templates), `mcp-test`, `mcp-install` | `mcp-inventory` (servers and missing secret names) | nothing: it builds what you connect |
 | `ops` | `ops-basics`, `ops-disk-full`, `ops-service-down`, `ops-cert-expiry` | `alert-triage` (on an alert: picks the runbook, runs nothing; needs alerts, **beta**, [incidents.md](incidents.md)) | your hosts in `hosts.yaml` ([ops.md](ops.md)) |
+| `design` | `design-guard`, `hallmark` (a new page), `impeccable` (audit and polish) | `page-design-review` (on request, a page against the design floor; reads only) | nothing: `design_check` runs on the machine, without a browser ([design.md](design.md)) |
 
 The charter of the `brand` pack lives in your project memory ([memory.md](memory.md)); the other packs read it when
 it is there.
@@ -164,8 +165,8 @@ rest is left for a machine:
 | Agent templates whose every tool exists on the web (skills, web search, the account's mail and calendar connectors) | proposed as cards, like in Lokkal |
 | Agent templates that call an MCP role, the sandbox or your hosts, or need a GPU | never |
 
-So `mail` installs entirely, `social`, `jobs`, `brand`, `video` and `ops` install in part, and `mcp-builder` does not
-install on the web (409 `machine_only`). A partial install says so (`partial: true`, `machine: {skills, agents, linked,
+So `mail` installs entirely, `social`, `jobs`, `brand`, `video` and `ops` install in part, and `mcp-builder` and `design` do
+not install on the web (409 `machine_only`). A partial install says so (`partial: true`, `machine: {skills, agents, linked,
 handoff, next}`). If one of your linked machines declares a resource the rest needs (an MCP server with the role's
 name, a host), the install can propose to hand the rest over to that machine (`handoff: true`: a
 hand-over card, and nothing runs before you accept; the machine then runs `pack_install` with its own cards). Without a linked machine, the result tells you to install Lokkal and run `pack_install` there.

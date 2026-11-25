@@ -32,6 +32,7 @@ curl -fsSL https://nokker.ai/install.sh | sh -s -- --workspace ~/code --yes
 | `--update` | Keep `.env` and state, change version, restart |
 | `--uninstall` | Stop and remove the containers (add `--purge` to erase data too) |
 | `--no-open` | Do not open the browser |
+| `--lang en\|fr` | Language of the messages (default: `NOKKER_LANG`, then `LC_ALL`, `LC_MESSAGES`, `LANG`; English otherwise), the same rule as the `nokker` command |
 
 `--workspace` is applied on first install only. To change it later, edit `NOKKER_HOST_WORKSPACE` in `~/.nokker/.env`
 and run `docker compose -f ~/.nokker/docker-compose.yml up -d`.
@@ -51,7 +52,7 @@ With options:
 ```
 
 Parameters: `-Version`, `-Workspace` (a path inside the distribution), `-Distro`, `-Yes`, `-Update`, `-Uninstall`,
-`-Purge`, `-NoOpen`.
+`-Purge`, `-NoOpen`, `-Lang en|fr` (language of the messages, same rule as `--lang`; it is passed on to `install.sh`).
 
 The script checks WSL 2 and a distribution (and offers `wsl --install`, which needs administrator rights and a reboot),
 finds Docker in the distribution, runs `install.sh` there, then places `nokker.exe` in `%LOCALAPPDATA%\Nokker\bin`
@@ -136,6 +137,8 @@ is installed, its signature verifies. Details in [cli.md](cli.md).
 ~/.nokker/backup.sh list [--to …]
 ~/.nokker/backup.sh restore <file>|s3://my-bucket/nokker/<file>
 ```
+
+Messages follow the same language rule as the installer (`--lang en|fr`, or the environment).
 
 A backup holds the databases, `.env`, `config/`, `state/`, `vault/` and, with the vault profile, the OpenBao volume.
 Your work folders and downloaded models are not included. It contains the secrets of your install: it is written

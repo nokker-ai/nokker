@@ -57,9 +57,16 @@ Modération des pages publiques (§7.26, point 6 ; nokker/cloud/moderation.py, m
     POST   /v1/gateway/mirror/public-page → 410 moderated pour une copie publique retirée
 Deck multi-machines et agents placés (lot X15, docs/LOKKAL.md §7.19, nokker/cloud/crew.py) :
     GET  /v1/link/deck (session du compte) → toutes les machines du compte, leurs sessions, leurs agents, leurs cartes
-    POST /v1/gateway/machine/deck {sessions, agents, pending_approvals} (jeton de machine) → {stored, at}
+    POST /v1/gateway/machine/deck {v, sessions, agents, threads (v2), pending_approvals} (jeton de machine) → {stored, at}
+    POST /v1/gateway/notify {kind, thread_id, title|null} (jeton de machine, 30/min, sinon 429 + Retry-After)
+         → 202 {queued, channels} | 400 bad_kind | bad_thread : notification SANS
+         contenu aux appareils du propriétaire (docs/LOKKAL-PHONE.md §1.2 point 5)
     POST /v1/gateway/presence {online} (jeton de machine, appelé par le relais) → {stored, online}
     POST /v1/gateway/agent-runs/{run_id}/result {status, thread_id?, summary?, cost?} (jeton de machine) → {stored, status}
+Image privée des sites connectés (docs/CONNECTED-SITES.md §3.1.1, nokker/cloud/sites_registry.py) :
+    POST /v1/lokkal/sites-registry (jeton de machine Lokkal ; un jeton de téléphone : 403 phone_scope)
+         → 200 {registry, username, password, expires_at} | 429 sites_registry_quota | 503 sites_registry_unavailable
+         | 502 sites_registry_upstream : robot Harbor de lecture du compte, créé ou renouvelé (jamais dupliqué)
 """
 from __future__ import annotations
 
@@ -71,10 +78,12 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
+from nokker.config import valid_client_tag
 from nokker.cloud.link import LinkService, Signer
 
 logger = logging.getLogger("nokker.cloud.http")
@@ -144,6 +153,13 @@ class CloudLink:
     # Deck multi-machines et agents placés (lot X15) : nokker.cloud.crew.CloudCrew ; None = routes absentes (404).
     crew: Any = None
     agents: Any = None  # AgentsHub de nokker.ai (agents du deck), posé par serve
+    # Notifications sans contenu d'une machine (`POST /v1/gateway/notify`) : nokker.cloud.notify.MachineNotifier,
+    # posé par serve ; None = route ouverte, aucune voie (`notified: false`).
+    notify_machine: Any = None
+    # Nœud téléphone (P7a, nokker/cloud/phone.py) : PhoneService si `cloud_link.phone_nodes`, sinon None (404) ;
+    # `session_device(h)` : l'appareil enrôlé de la session (inscription : la carte se signe sur un AUTRE appareil).
+    phone: Any = None
+    session_device: Any = None
     # Inférence relayée (revue du train du 2.11, décision 1) : plafonds du compte (`TenantLimits` du noyau, qui suit
     # l'abonnement quand la facturation le lui dit), modèles permis (ceux de la config du noyau sur le point d'accès
     # relayé), débit par machine et appels par jour et par compte. `models` vide = aucun modèle imposé (tests anciens).
@@ -156,6 +172,9 @@ class CloudLink:
     # relayé qui ouvre un tour passe par le même contrôle qu'un tour du noyau ; None = foyer éteint.
     household: Any = None
     gateway_rate_max: int = GATEWAY_RATE_MAX  # `token|refresh|revoke` par minute et par IP du navigateur (§7.3)
+    # Image privée `sites-chrome` (docs/CONNECTED-SITES.md §3.1.1) : nokker.cloud.sites_registry.SitesRegistry ; None
+    # ou sans émetteur (identifiants Harbor absents de l'env) = 503 sites_registry_unavailable.
+    sites_registry: Any = None
     _hits: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque), init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _sweep_at: float = field(default=0.0, init=False, repr=False)
@@ -196,7 +215,12 @@ _RE_HANDOFF = re.compile(r"^/v1/handoffs(?:/(ho_[0-9a-f]{16})(?:/(accept|refuse)
 _RE_HANDOFF_RESULT = re.compile(r"^/v1/gateway/handoffs/(ho_[0-9a-f]{16})/result$")
 _RE_AGENT_RUN_RESULT = re.compile(r"^/v1/gateway/agent-runs/(ar_[0-9a-f]{16})/result$")
 _RE_MIRROR_PAGE = re.compile(r"^/v1/mirror/pages(?:/([^/]+)(/public)?)?$")
-MAX_DECK_BYTES = 64 * 1024  # deck d'une machine : 100 sessions et 200 agents, noms et états
+_RE_PHONE_ENROLL = re.compile(r"^/v1/link/phone(?:/(registrations/)?([A-Za-z0-9_-]{1,64})(/tasks)?)?$")
+_RE_PHONE_CAMERA = re.compile(r"^/v1/link/phone/([A-Za-z0-9_-]{1,64})/camera/(?:(events)|(thumb)|([A-Za-z0-9._-]{1,64})/thumb)$")
+_RE_PHONE_LAN = re.compile(r"^/v1/link/phone/([A-Za-z0-9_-]{1,64})/lan/services$")
+_RE_PHONE_TASK = re.compile(r"^/v1/gateway/phone/tasks/([A-Za-z0-9_-]{1,64})/(lease|result)$")
+_RE_PHONE_MEDIA = re.compile(r"^/v1/gateway/phone/blobs/([A-Za-z0-9_.-]{20,600})$")
+MAX_DECK_BYTES = 128 * 1024  # deck d'une machine : 100 sessions, 200 agents et (v2) 100 fils, noms et états
 
 
 # État du lien vu de `/healthz` (`gateway`) : `on` (clé lue, routes servies), `off` (pas de bloc `cloud_link`),
@@ -262,7 +286,7 @@ def handle(h: Any, method: str, path: str) -> bool:
     if path == "/v1/handoffs" or path.startswith("/v1/handoffs/"):
         _account_handoffs(h, c, method, path)
         return True
-    if not path.startswith(("/v1/link/", "/v1/gateway/", "/v1/inference/", "/v1/mirror/")):
+    if not path.startswith(("/v1/link/", "/v1/gateway/", "/v1/inference/", "/v1/mirror/", "/v1/lokkal/")):
         return False
     ip = h.headers.get("CF-Connecting-IP") or h.client_address[0]
     if path == "/v1/link/device" and method == "POST":
@@ -333,6 +357,18 @@ def handle(h: Any, method: str, path: str) -> bool:
     if path == "/v1/link/deck":
         _account_deck(h, c, method)
         return True
+    pl_ = _RE_PHONE_LAN.match(path)
+    if pl_:
+        _account_lan(h, c, method, pl_)
+        return True
+    pc = _RE_PHONE_CAMERA.match(path)
+    if pc:
+        _account_camera(h, c, method, pc)
+        return True
+    pe = _RE_PHONE_ENROLL.match(path)
+    if pe:
+        _account_phone(h, c, method, pe)
+        return True
     m = _RE_MACHINE.match(path)
     if path == "/v1/link/machines" or m:
         _account_machines(h, c, method, path, m)
@@ -345,6 +381,17 @@ def handle(h: Any, method: str, path: str) -> bool:
     if machine is None:
         h._json(401, {"error": {"message": "jeton de machine requis"}})
         return True
+    # Nœud téléphone (P7a) : son jeton ne vaut QUE sur /v1/gateway/phone/* (avec la preuve de sa clé) ; une machine
+    # Lokkal n'y entre pas. Ni tunnel, ni inférence, ni deck, ni connecteurs relayés pour un téléphone.
+    if machine.kind == "phone" or path.startswith("/v1/gateway/phone/"):
+        if machine.kind != "phone" or not path.startswith("/v1/gateway/phone/"):
+            h._json(403, {"error": {"code": "phone_scope", "message": "jeton de téléphone : /v1/gateway/phone/* seulement"}})
+            return True
+        _phone_gateway(h, c, machine, method, path)
+        return True
+    if path == "/v1/lokkal/sites-registry":
+        _sites_registry(h, c, machine, method)
+        return True
     if path == "/v1/gateway/pages-token" and method == "POST":
         # Le Lokkal demande lui-même le lien d'une de SES pages, pour une interface servie par la passerelle (qui n'a
         # ni l'id de la machine ni de session app.nokker.ai) : il a déjà vérifié le jeton d'accès du compte.
@@ -353,6 +400,7 @@ def handle(h: Any, method: str, path: str) -> bool:
     if path == "/v1/link/revoke" and method == "POST":
         c.links.revoke(_bearer(h))
         _purge_pages(c, machine.tenant, machine.id)  # machine déliée : ses pages copiées partent avec le lien
+        _sites_registry_unlinked(c, machine.account)
         h._json(200, {"revoked": True})
         return True
     if path == "/v1/gateway/machine/load" and method == "POST":
@@ -366,6 +414,9 @@ def handle(h: Any, method: str, path: str) -> bool:
         return True
     if path == "/v1/gateway/presence" and method == "POST":
         _machine_presence(h, c, machine)
+        return True
+    if path == "/v1/gateway/notify" and method == "POST":
+        _machine_notify(h, c, machine)
         return True
     if _RE_AGENT_RUN_RESULT.match(path) and method == "POST":
         _machine_agent_run_result(h, c, machine, _RE_AGENT_RUN_RESULT.match(path).group(1))
@@ -523,11 +574,12 @@ def _account_machines(h: Any, c: CloudLink, method: str, path: str, m: Any) -> N
             h._json(404, {"error": {"message": "not found"}})
             return
         now = time.time()
-        h._json(200, {"machines": [{"machine_id": x.id, "name": x.name, "host": x.host, "created_at": x.created_at,
+        h._json(200, {"machines": [{"machine_id": x.id, "name": x.name, "host": "" if x.kind == "phone" else x.host,
+                                    "created_at": x.created_at,
                                     "last_seen_at": x.last_seen_at, "load": x.load, "load_at": x.load_at,
                                     "load_age_s": None if x.load_at is None else max(0, int(now - x.load_at)),
-                                    "resources": x.resources, "resources_at": x.resources_at}
-                                   for x in c.links.machines_with_load(account, tenant)]})
+                                    "resources": x.resources, "resources_at": x.resources_at, "kind": x.kind}
+                                   for x in c.links.machines_with_load(account, tenant, phones=True)]})
         return
     machine_id, action = m.group(1), m.group(2)
     if method != "POST":
@@ -536,6 +588,12 @@ def _account_machines(h: Any, c: CloudLink, method: str, path: str, m: Any) -> N
     if action == "revoke":
         if c.links.revoke_machine(account, machine_id):
             _purge_pages(c, tenant, machine_id)
+            if c.phone is not None:  # téléphone retiré : ses tâches en file ou en bail sont annulées
+                from nokker.tenancy.context import tenant_scope
+
+                with tenant_scope(tenant):
+                    c.phone.cancel_all(machine_id)
+            _sites_registry_unlinked(c, account)
             h._json(200, {"revoked": True})
         else:
             h._json(404, {"error": {"message": "not found"}})
@@ -595,6 +653,200 @@ def _machine_back(c: CloudLink, machine: Any) -> None:
             logger.exception("reprise des passages d'agents de %s en échec", machine.id)
 
 
+def _raw_body(h: Any, limit: int = 70 * 1024) -> bytes:
+    n = int(h.headers.get("Content-Length") or 0)
+    if n > limit:
+        raise ValueError("corps trop grand")
+    return h.rfile.read(n) if n > 0 else b""
+
+
+def _account_phone(h: Any, c: CloudLink, method: str, m: Any) -> None:
+    """Routes du membre (contrat de front) : `POST /v1/link/phone` (inscription, carte forte), `GET /v1/link/phone`
+    (ses téléphones), `GET /v1/link/phone/registrations/{id}` (retrait du jeton chiffré, une fois ; alias
+    `/v1/link/phone/{id}`), `GET /v1/link/phone/{machine}/tasks` (journal sans contenu). Drapeau `phone_nodes`."""
+    from nokker.cloud.phone import PhoneError, err
+
+    svc = c.phone
+    if svc is None:
+        h._json(404, err("not_found"))
+        return
+    account = c.identity(h)
+    tenant = c.tenant_of(account) if account else None
+    if not account or not tenant:
+        h._json(401, err("unauthorized", "session du compte requise"))
+        return
+    from nokker.tenancy.context import tenant_scope
+
+    regs, ident, tasks = m.group(1), m.group(2), m.group(3)
+    try:
+        with tenant_scope(tenant):
+            if ident is None and method == "POST":
+                device = c.session_device(h) if c.session_device is not None else None
+                h._json(202, svc.enroll(account, tenant, h._read_json_body(), device))
+            elif ident is None and method == "GET":
+                h._json(200, svc.phones(account))
+            elif ident is not None and tasks and not regs and method == "GET":
+                h._json(*svc.task_log(account, ident))
+            elif ident is not None and not tasks and method == "GET":
+                h._json(*svc.pickup(account, ident))
+            else:
+                h._json(404, err("not_found"))
+    except PhoneError as e:
+        h._json(e.status, err(e.code, str(e)))
+
+
+def _account_camera(h: Any, c: CloudLink, method: str, m: Any) -> None:
+    """Caméra du nœud maison (P10c), session du TITULAIRE : `GET …/camera/events?after=`, `POST …/camera/thumb {id}`
+    (alias `GET …/camera/{id}/thumb`). Lecture directe du nœud ; url et clé de la vignette : réponse no-store, jamais
+    écrites en base ni journalisées."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from nokker.cloud import phone_camera
+    from nokker.cloud.phone import PhoneError, err
+    from nokker.tenancy.context import tenant_scope
+
+    cam = phone_camera.service()
+    if c.phone is None or cam is None:
+        h._json(404, err("not_found"))
+        return
+    account = c.identity(h)
+    tenant = c.tenant_of(account) if account else None
+    if not account or not tenant:
+        h._json(401, err("unauthorized", "session du compte requise"))
+        return
+    machine_id, events, thumb, rid = m.group(1), m.group(2), m.group(3), m.group(4)
+    try:
+        with tenant_scope(tenant):
+            if events and method == "GET":
+                q = parse_qs(urlsplit(h.path).query)
+                try:
+                    after = float((q.get("after") or ["0"])[0])
+                except ValueError:
+                    h._json(400, err("bad_request", "after : epoch en secondes"))
+                    return
+                out = cam.events(account, machine_id, after)
+            elif (thumb and method == "POST") or (rid and method == "GET"):
+                body = h._read_json_body() if thumb else {"id": rid}
+                out = cam.thumb(account, machine_id, body.get("id") if isinstance(body, dict) else None)
+            else:
+                h._json(404, err("not_found"))
+                return
+    except phone_camera.CameraError as e:
+        h._json(e.status, err(e.code))
+        return
+    except PhoneError as e:
+        h._json(e.status, err(e.code))
+        return
+    raw = json.dumps(out, ensure_ascii=False).encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(raw)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(raw)
+
+
+def _account_lan(h: Any, c: CloudLink, method: str, m: Any) -> None:
+    """Découverte du réseau de la maison (P10d), session du TITULAIRE : `GET …/lan/services?types=a,b`. Rien gardé."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from nokker.cloud import phone_lan
+    from nokker.cloud.phone import PhoneError, err
+    from nokker.tenancy.context import tenant_scope
+
+    lan = phone_lan.service()
+    if c.phone is None or lan is None or method != "GET":
+        h._json(404, err("not_found"))
+        return
+    account = c.identity(h)
+    tenant = c.tenant_of(account) if account else None
+    if not account or not tenant:
+        h._json(401, err("unauthorized", "session du compte requise"))
+        return
+    q = parse_qs(urlsplit(h.path).query)
+    types = [t for t in ",".join(q.get("types") or []).split(",") if t] or None
+    try:
+        with tenant_scope(tenant):
+            out = lan.services(account, m.group(1), types)
+    except phone_lan.LanError as e:
+        h._json(e.status, err(e.code))
+        return
+    except PhoneError as e:
+        h._json(e.status, err(e.code))
+        return
+    raw = json.dumps(out, ensure_ascii=False).encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(raw)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(raw)
+
+
+def _phone_gateway(h: Any, c: CloudLink, machine: Any, method: str, path: str) -> None:
+    """Routes du nœud téléphone : la preuve de sa clé sur CHAQUE requête (corps brut), dans le locataire du membre."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from nokker.cloud.phone import PROOF_HEADER, PhoneError, err
+    from nokker.tenancy.context import tenant_scope
+
+    svc = c.phone
+    if svc is None:
+        h._json(404, err("not_found"))
+        return
+    try:
+        # un résultat de fetch.get (P11) va jusqu'à 1 Mio de texte : marge pour l'échappement JSON ; 70 Kio ailleurs
+        raw = _raw_body(h, 3 * 1024 * 1024 if path.endswith("/result") else 70 * 1024)
+    except ValueError:
+        h._json(413, err("too_large"))
+        return
+    try:
+        with tenant_scope(machine.tenant):
+            node = svc.store.node(machine.id)
+            if node is None:
+                raise PhoneError(401, "machine_unknown", "nœud inconnu")
+            svc.check_proof(machine, node, method, h.headers.get("Host") or "", h.path, raw, h.headers.get(PROOF_HEADER))
+            body = json.loads(raw) if raw else {}
+            route = urlsplit(path).path
+            if route == "/v1/gateway/phone/beat" and method == "POST":
+                h._json(200, svc.beat(machine, body))
+                return
+            if route == "/v1/gateway/phone/tasks" and method == "GET":
+                q = parse_qs(urlsplit(h.path).query)
+                try:
+                    wait = float((q.get("wait") or ["0"])[0])
+                except ValueError:
+                    wait = 0.0
+                h._json(200, {"tasks": svc.poll(machine, wait)})
+                return
+            mt = _RE_PHONE_TASK.match(route)
+            if mt and method == "POST":
+                if mt.group(2) == "lease":
+                    h._json(200, svc.lease(machine, mt.group(1)))
+                else:
+                    h._json(200, svc.result(machine, mt.group(1), body))
+                return
+            mm = _RE_PHONE_MEDIA.match(route)
+            if mm and method == "GET":
+                ref = svc.take_media(machine, mm.group(1))
+                got = svc.media_source(machine.account, ref) if svc.media_source is not None else None
+                if got is None:
+                    raise PhoneError(404, "not_found")
+                data, mime = got
+                h.send_response(200)
+                h.send_header("Content-Type", mime)
+                h.send_header("Content-Length", str(len(data)))
+                h.send_header("Cache-Control", "no-store")
+                h.end_headers()
+                h.wfile.write(data)
+                return
+            h._json(404, err("not_found"))
+    except PhoneError as e:
+        h._json(e.status, err(e.code, str(e)))
+    except ValueError:
+        h._json(400, err("bad_json", "corps JSON attendu"))
+
+
 def _account_deck(h: Any, c: CloudLink, method: str) -> None:
     """`GET /v1/link/deck` (lot X15, session du compte) : la vue agrégée de toutes les machines du compte — charge,
     sessions actives, agents, cartes en attente — plus les agents `web` et `auto`. Noms et états seulement."""
@@ -624,6 +876,40 @@ def _machine_deck(h: Any, c: CloudLink, machine: Any) -> None:
         h._json(400, {"error": {"message": "deck illisible"}})
         return
     h._json(200, {"stored": True, "at": int(time.time())})
+
+
+def _machine_notify(h: Any, c: CloudLink, machine: Any) -> None:
+    """Notification SANS contenu d'une machine à son propriétaire (docs/LOKKAL-PHONE.md §1.2 point 5,
+    nokker/cloud/notify.py) : 30 par minute et par machine ; titre seulement sous la règle du miroir."""
+    from nokker.cloud.notify import RATE_MAX as NOTIFY_RATE_MAX
+    from nokker.cloud.notify import NotifyError, clean_notify
+
+    wait = c.rate_wait(f"notify:{machine.id}", NOTIFY_RATE_MAX)
+    if wait:  # contrat C4 : 429 au-delà de 30/min par machine, avec `Retry-After`
+        body = json.dumps({"error": "rate", "retry_after_s": wait}).encode()
+        h.send_response(429)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Retry-After", str(int(wait)))
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+        return
+    if int(h.headers.get("Content-Length") or 0) > 4096:
+        h._json(413, {"error": "too_large"})
+        return
+    titles = bool(c.crew is not None and c.crew.titles_allowed and c.crew.titles_allowed(machine.account))
+    try:
+        event = clean_notify(h._read_json_body(), titles=titles)
+    except NotifyError as e:
+        h._json(400, {"error": e.code, "message": str(e)})
+        return
+    used: list[str] = []
+    if c.notify_machine is not None:
+        try:
+            used = list(c.notify_machine(machine, event) or [])
+        except Exception:  # noqa: BLE001 — la machine n'a rien à refaire : la notification est perdue, journalisée
+            logger.exception("notification de la machine %s en échec", machine.id)
+    h._json(202, {"queued": c.notify_machine is not None, "channels": used})
 
 
 def _machine_agent_run_result(h: Any, c: CloudLink, machine: Any, run_id: str) -> None:
@@ -921,6 +1207,49 @@ def _pages_link(h: Any, c: CloudLink, machine: Any, account: str, tenant: str, b
     h._json(200, {"url": url + ("&embed=1" if body.get("embed") else ""), "expires_at": int(time.time()) + 60})
 
 
+def _sites_registry(h: Any, c: CloudLink, machine: Any, method: str) -> None:
+    """`POST /v1/lokkal/sites-registry` (docs/CONNECTED-SITES.md §3.1.1) : identifiants de LECTURE du projet Harbor
+    `lokkal-private` pour le compte de cette machine. Une machine Lokkal seulement (un nœud téléphone n'installe rien).
+    La réponse porte le secret (appel de machine à serveur, jamais d'un navigateur) ; le journal ne le porte pas."""
+    from nokker.cloud.sites_registry import QuotaExceeded, SitesRegistryError
+
+    if method != "POST":
+        h._json(405, {"error": {"code": "method", "message": "POST seulement"}})
+        return
+    if getattr(machine, "kind", "lokkal") != "lokkal":
+        h._json(403, {"error": {"code": "phone_scope", "message": "jeton de téléphone : refusé ici"}})
+        return
+    reg = c.sites_registry
+    if reg is None or not reg.available:
+        h._json(503, {"error": {"code": "sites_registry_unavailable",
+                                "message": "registre privé des sites connectés non configuré"}})
+        return
+    try:
+        h._json(200, reg.issue(machine.account, machine.id))
+    except QuotaExceeded as e:
+        h._json(429, {"error": {"code": "sites_registry_quota", "message": "6 émissions par jour et par compte"},
+                      "retry_after_s": e.retry_after_s})
+    except ValueError:
+        h._json(400, {"error": {"code": "sites_registry_account", "message": "compte illisible"}})
+    except SitesRegistryError as e:
+        logger.warning("sites-registry : émission en échec pour %s (%s)", machine.account, e)
+        h._json(502, {"error": {"code": "sites_registry_upstream", "message": "registre injoignable"}})
+
+
+def _sites_registry_unlinked(c: CloudLink, account: str) -> None:
+    """Déliaison : la dernière machine Lokkal du compte partie, son robot de lecture est supprimé. Au mieux : la
+    déliaison est faite quoi qu'il arrive (le robot expire seul, et l'effacement du compte le supprime)."""
+    reg = c.sites_registry
+    if reg is None or not reg.available:
+        return
+    if any(getattr(m, "kind", "lokkal") == "lokkal" for m in c.links.machines_of(account)):
+        return
+    try:
+        reg.revoke(account, "unlink")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("sites-registry : suppression du robot de %s en échec (%s)", account, type(e).__name__)
+
+
 def _purge_pages(c: CloudLink, tenant: str, machine_id: str) -> int:
     """Copies des pages d'une machine effacées (effacement des copies, révocation, déliaison) ; 0 sans miroir des pages."""
     if c.mirror_pages is None:
@@ -1029,6 +1358,15 @@ def _relay_mirror_page(h: Any, c: CloudLink, method: str, path: str = "/v1/gatew
     h._json(200, got) if got is not None else h._json(404, {"error": {"message": "not found"}})
 
 
+def _served_headers(upstream: Any) -> list[tuple[str, str]]:
+    """En-têtes de réponse du Router relayés au Lokkal : `X-Model-Served` et `X-Sokkan-Upstream` SEULEMENT (liste fermée),
+    valeurs bornées par `clean_served` (≤ 200 caractères, sans caractère de contrôle), ASCII. Jamais un autre en-tête."""
+    from nokker.core.model_served import SERVED_HEADER, UPSTREAM_HEADER, served_from_headers
+
+    served, up = served_from_headers(upstream)
+    return [(n, v) for n, v in ((SERVED_HEADER, served), (UPSTREAM_HEADER, up)) if v and v.isascii()]
+
+
 def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
     """Relaie un appel compatible OpenAI au Router, avec la clé de nokker.ai ; l'usage est compté au locataire de la
     machine. Flux SSE relayé tel quel quand `stream` est demandé.
@@ -1072,16 +1410,24 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
     with tenant_scope(machine.tenant):
         ticket = _inference_quota(c, machine, body, session)
     if ticket.refused is not None:
-        h._json(403, {"error": {"code": "quota_exceeded", "message": ticket.refused}})
+        err: dict[str, Any] = {"code": "quota_exceeded", "message": ticket.refused}
+        if ticket.retry_at is not None:  # fin de la période en cours (ISO 8601 UTC) ; absent quand elle n'est pas calculable
+            err["retry_at"] = ticket.retry_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        h._json(403, {"error": err})
         return
     t0 = time.monotonic()
     url = c.router_base.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {c.router_key()}", "Content-Type": "application/json"}
+    tag = str(h.headers.get("X-Nokker-Client") or "")
+    if valid_client_tag(tag):  # étiquette de déploiement de la machine, relayée telle quelle ; invalide : ignorée
+        headers["X-Nokker-Client"] = tag
     try:
         if body.get("stream"):
             with httpx.Client(timeout=httpx.Timeout(30.0, read=600.0)) as client, \
                     client.stream("POST", url, headers=headers, content=raw) as r:
                 h._begin_stream(r.status_code, r.headers.get("content-type", "text/event-stream"))
+                for name, value in _served_headers(r.headers):
+                    h.send_header(name, value)
                 h.end_headers()
                 usage: dict[str, Any] = {}
                 for chunk in r.iter_raw():
@@ -1095,6 +1441,8 @@ def _relay_inference(h: Any, c: CloudLink, machine: Any) -> None:
             h.send_response(r.status_code)
             h.send_header("Content-Type", r.headers.get("content-type", "application/json"))
             h.send_header("Content-Length", str(len(data)))
+            for name, value in _served_headers(r.headers):
+                h.send_header(name, value)
             h.end_headers()
             h.wfile.write(data)
             try:
@@ -1139,6 +1487,7 @@ _TURN_SESSIONS_MAX = 4096
 class _InferenceTicket:
     """Ce que garde un appel relayé admis : l'étiquette du ledger (foyer) et l'indice de tour où le ranger."""
     refused: str | None = None
+    retry_at: datetime | None = None  # fin de la période du quota atteint (UTC) ; None : inconnue, jamais inventée
     tag: Any = None  # nokker.ledger.attribution.SpendTag | None
     turn_index: int = 0
 
@@ -1162,21 +1511,21 @@ def _turn_index(machine_id: str, session: str, opens: bool) -> int:
         return idx
 
 
-def _household_tag(c: CloudLink, machine: Any, opens: bool) -> tuple[Any, str | None]:
-    """(étiquette du foyer | None, refus | None). Un appel qui ouvre un tour passe par `HouseholdQuota.check`, comme un
+def _household_tag(c: CloudLink, machine: Any, opens: bool) -> tuple[Any, str | None, datetime | None]:
+    """(étiquette du foyer | None, refus | None, fin de la fenêtre du refus | None). Un appel qui ouvre un tour passe par `HouseholdQuota.check`, comme un
     tour du noyau (`Kernel.run_turn`, 0 bis) ; une suite de tour est seulement étiquetée (un tour commencé finit)."""
     q = c.household
     if q is None:
-        return None, None
+        return None, None, None
     if not opens:
-        return q.tag(machine.account), None
+        return q.tag(machine.account), None, None
     ticket = q.check(f"lokkal-{machine.id}", machine.account)
     if ticket is None:
-        return None, None
+        return None, None, None
     if ticket.verdict is not None:
         logger.info("inférence relayée refusée (%s) : %s", ticket.verdict.rule, ticket.verdict.reason)
-        return None, ticket.reply
-    return ticket.tag, None
+        return None, ticket.reply, ticket.resets_at
+    return ticket.tag, None, None
 
 
 def _inference_quota(c: CloudLink, machine: Any, body: dict[str, Any], session: str = "") -> _InferenceTicket:
@@ -1197,22 +1546,23 @@ def _inference_quota(c: CloudLink, machine: Any, body: dict[str, Any], session: 
     if lim is not None and not lim.counter.take(machine.tenant, calls_key, day, "turns", c.inference_calls_per_day):
         return _InferenceTicket(
             refused=(f"Limite du jour atteinte pour l'inférence de Nokker Lokkal : {c.inference_calls_per_day} appels "
-                     "par jour et par compte. Elle repart avec le compteur du jour."))
+                     "par jour et par compte. Elle repart avec le compteur du jour."),
+            retry_at=day_window(lim.clock())[1])
 
     def give_back() -> None:
         if lim is not None:
             lim.counter.give_back(machine.tenant, calls_key, day, "turns")
 
-    tag, refused = _household_tag(c, machine, opens)
+    tag, refused, refused_until = _household_tag(c, machine, opens)
     if refused is not None:
         give_back()
-        return _InferenceTicket(refused=refused)
+        return _InferenceTicket(refused=refused, retry_at=refused_until)
     if opens and lim is not None:
         verdict = lim.check_turn(machine.account, shared=tag is not None)
         if verdict is not None:
             give_back()
             logger.info("inférence relayée refusée (%s) : %s", verdict.rule, verdict.reason)
-            return _InferenceTicket(refused=lim.reply(verdict))
+            return _InferenceTicket(refused=lim.reply(verdict), retry_at=lim.resets_at(verdict))
     return _InferenceTicket(tag=tag, turn_index=_turn_index(machine.id, session, opens))
 
 

@@ -40,8 +40,10 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import Recall, ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.tools.mcp import _SyncMcp, text_of
@@ -62,6 +64,18 @@ _MIN_SEG_LEN = 4
 # Démarrage : nouvel essai du contrôle de la mémoire longue directe (installation neuve : embed qui télécharge son modèle).
 STARTUP_RETRY_S = 600
 STARTUP_RETRY_EVERY_S = 15
+_WARM_STOPS: set[threading.Event] = set()  # contrôles de démarrage en cours (un par `warm_up()` direct)
+_WARM_LOCK = threading.Lock()
+
+
+def stop_all_warm_ups() -> None:
+    """Coupe tous les contrôles de démarrage directs encore en attente (idempotent). Pour les tests et l'arrêt du
+    process : un noyau construit puis abandonné ne laisse pas un fil qui boucle 10 min sur une base injoignable."""
+    with _WARM_LOCK:
+        stops = list(_WARM_STOPS)
+        _WARM_STOPS.clear()
+    for ev in stops:
+        ev.set()
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
@@ -160,7 +174,7 @@ class CorthexisMemory:
             return []
         return _parse_mcp_recall(_rows_from_mcp_result(result), query, self.score_threshold)
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         _log_propose("corthexis(mcp)", thread_id, facts)
 
     # ───────────────────────────── ToolSource ─────────────────────────────
@@ -179,7 +193,7 @@ class CorthexisMemory:
             result = self._io.run(_call())
         except Exception as e:
             logger.warning("corthexis(mcp): %s en échec", name, exc_info=True)
-            return ToolResult(call_id="", name=name, content=f"erreur mémoire ({name}): {e}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.MEMORY_ERROR).format(name=name, error=e), is_error=True)
         return ToolResult(call_id="", name=name, content=text_of(result),
                            is_error=bool(getattr(result, "is_error", False)))
 
@@ -284,7 +298,7 @@ class DirectCorthexisMemory:
     _last_error: str = field(default="", init=False, repr=False)
     _last_warn: float = field(default=0.0, init=False, repr=False)
     _last_recall_s: float | None = field(default=None, init=False, repr=False)
-    _status: tuple[float, dict] | None = field(default=None, init=False, repr=False)
+    _status: tuple[float, dict, int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for env_name, value in (
@@ -369,7 +383,8 @@ class DirectCorthexisMemory:
         """État réel : paquet, base (notes, génération d'index active), serveur d'embeddings (un vrai plongement).
         Ne lève jamais ; `ok` False = la mémoire longue ne répond pas, avec la raison dans `error`."""
         out: dict[str, Any] = {"mode": "direct", "ok": False, "projects": list(self.projects or []) or None,
-                               "profile": os.environ.get("CORTHEXIS_MEMORY_PROFILE") or self.memory_profile}
+                               "profile": os.environ.get("CORTHEXIS_MEMORY_PROFILE") or self.memory_profile,
+                               "checked_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
         try:
             from corthexis import embed as cx_embed
             from corthexis import service as cx_service  # noqa: F401 — sonde de présence
@@ -404,12 +419,15 @@ class DirectCorthexisMemory:
         return out
 
     def status(self, max_age_s: float = 15.0) -> dict:
-        """`check()` gardé `max_age_s` secondes : `/healthz` est sondé toutes les 15 s par le compose."""
+        """`check()` gardé `max_age_s` secondes : `/healthz` est sondé toutes les 15 s par le compose. Toute écriture,
+        tout oubli, toute décision de quarantaine et toute fin d'indexation (`invalidate_status`) périment la copie :
+        le compteur de notes ne retarde jamais sur la base."""
         cached = self._status
-        if cached is not None and time.monotonic() - cached[0] < max_age_s:
+        epoch = _status_epoch()
+        if cached is not None and cached[2] == epoch and time.monotonic() - cached[0] < max_age_s:
             return cached[1]
-        st = self.check()
-        self._status = (time.monotonic(), st)
+        st = self.check()  # l'époque est lue AVANT : une écriture pendant le contrôle périme déjà ce résultat
+        self._status = (time.monotonic(), st, epoch)
         return st
 
     def warm_up(self) -> None:
@@ -432,10 +450,23 @@ class DirectCorthexisMemory:
                     return
                 logger.warning("mémoire longue CortHeXis (direct) pas encore prête : %s — nouvel essai dans %d s",
                                st.get("error"), STARTUP_RETRY_EVERY_S)
-                time.sleep(STARTUP_RETRY_EVERY_S)
-        threading.Thread(target=_go, name="memory-check", daemon=True).start()
+                if stop.wait(STARTUP_RETRY_EVERY_S):  # même pause qu'avant ; `stop_warm_up()` la coupe net
+                    return
+        stop = threading.Event()
+        self._warm_stop = stop
+        with _WARM_LOCK:
+            _WARM_STOPS.add(stop)
+        threading.Thread(target=_go, name="nokker-memory-check", daemon=True).start()
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def stop_warm_up(self) -> None:
+        """Arrête le contrôle de démarrage (idempotent) : `close()` l'appelle ; sans effet s'il n'a jamais démarré."""
+        stop = getattr(self, "_warm_stop", None)
+        if stop is not None:
+            stop.set()
+            with _WARM_LOCK:
+                _WARM_STOPS.discard(stop)
+
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         _log_propose("corthexis(direct)", thread_id, facts)
 
     # ───────────────────────────── ToolSource ─────────────────────────────
@@ -464,14 +495,15 @@ class DirectCorthexisMemory:
                 body = cx_service.get(note_name, projects=self.projects, via="nokker")
                 if body is None:
                     return ToolResult(call_id="", name=name,
-                                      content=f"note introuvable : {note_name}", is_error=True)
+                                      content=mt.pick(mt.MEMORY_NOTE_NOT_FOUND).format(name=note_name), is_error=True)
                 return ToolResult(call_id="", name=name, content=body, is_error=False)
-            return ToolResult(call_id="", name=name, content=f"outil mémoire inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.MEMORY_UNKNOWN_TOOL).format(name=name), is_error=True)
         except Exception as e:
             logger.warning("corthexis(direct): %s en échec", name, exc_info=True)
-            return ToolResult(call_id="", name=name, content=f"erreur mémoire ({name}): {e}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.MEMORY_ERROR).format(name=name, error=e), is_error=True)
 
     def close(self) -> None:
+        self.stop_warm_up()
         try:
             from corthexis import service as cx_service
             cx_service.reset()
@@ -553,6 +585,21 @@ def unwrap(port: Any) -> Any:
     return port
 
 
+_EPOCH = [0]
+_EPOCH_LOCK = threading.Lock()
+
+
+def _status_epoch() -> int:
+    return _EPOCH[0]
+
+
+def invalidate_status() -> None:
+    """La base de la mémoire longue a changé (ou va changer) : le prochain `status()` refait le contrôle. Appelé par
+    la mémoire de projet à chaque écriture, oubli, import et fin d'indexation, et par la quarantaine à chaque décision."""
+    with _EPOCH_LOCK:
+        _EPOCH[0] += 1
+
+
 def status_of(port: Any) -> dict:
     """État de la mémoire longue d'un noyau, pour `/healthz` et `GET /v1/local/memory`. `ok` None : pas de contrôle
     (mode `mcp` : le service distant a le sien ; aucune mémoire : `mode` off)."""
@@ -578,6 +625,7 @@ __all__ = [
     "DirectCorthexisMemory",
     "build",
     "from_config",
+    "invalidate_status",
     "kept",
     "memory_mode",
     "named",

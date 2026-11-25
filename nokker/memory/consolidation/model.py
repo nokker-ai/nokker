@@ -39,7 +39,7 @@ NOTES_SYSTEM = (
 
 NOTES_USER = "Date du jour : {today}.\n\nNotes :\n{notes}"
 NOTE_LINE = "[{n}] ({kind}, {origin}, {date}{protected}) {title} — {text}"
-KIND_LABEL = {"rule": "consigne", "feedback": "retour", "fact": "fait"}
+KIND_LABEL = {"rule": "consigne", "preference": "préférence", "feedback": "retour", "fact": "fait"}
 ORIGIN_USER = "écrite par la personne"
 ORIGIN_AGENT = "apprise par l'assistant"
 PROTECTED = ", protégée"

@@ -315,6 +315,10 @@ class ConnectorRelay:
     cards: Any = None
     origin: str | None = None
     clock: Callable[[], float] = time.time
+    # Plusieurs boîtes par nature (068, docs/CONNECTORS-MULTI.md §4) : `ConnectorProvider` du magasin multi. Une entrée
+    # par nature, ses outils sont ceux de la source regroupée (`mailbox` / `calendar`, boîtes partagées comprises) ;
+    # nokker.ai choisit la boîte et applique les droits. None : un connecteur par nature, comme avant.
+    grouped: Any = None
 
     def _sources(self, account: str) -> list[tuple[str, Any, Any]]:
         """(nature, identifiant, source) des connecteurs du compte ; une source illisible est rendue None."""
@@ -348,6 +352,18 @@ class ConnectorRelay:
     def listing(self, machine: Any) -> dict[str, Any]:
         from nokker.tenancy.context import tenant_scope
 
+        if self.grouped is not None:
+            with tenant_scope(machine.tenant):
+                srcs = self.grouped.grouped(machine.account)
+                boxes = self.grouped.catalog(machine.account)
+            out = []
+            for kind, src in srcs.items():
+                mine = [b for b in boxes if b.kind == kind]
+                first = mine[0] if mine else None
+                out.append({"id": kind, "kind": kind, "locality": "cloud", "state": "ok",
+                            "label": (first.address or first.label) if first else kind,
+                            "tools": [tool_view(s) for s in src.specs()]})
+            return {"connectors": out}
         with tenant_scope(machine.tenant):
             found = self._sources(machine.account)
         return {"connectors": [
@@ -372,17 +388,24 @@ class ConnectorRelay:
 
     def _call(self, machine: Any, kind: str, tool: str, arguments: dict[str, Any],
               approval_raw: Any) -> tuple[int, dict[str, Any]]:
-        try:
-            cred = self.store.get(machine.account, kind)
-        except ConnectorError as e:
-            return 503, _err("connector_unavailable", f"connecteur illisible chez nokker.ai ({e.code})")
-        if cred is None:
-            return 404, _err("not_configured", "aucun connecteur de ce type sur ce compte")
-        try:
-            secret = self._resolve(cred.secret)
-            src = self.build(kind, cred.settings, secret, locality="cloud")
-        except ConnectorError as e:
-            return 503, _err("connector_unavailable", f"connecteur illisible chez nokker.ai ({e.code})")
+        if self.grouped is not None:
+            src = self.grouped.grouped(machine.account).get(kind)
+            if src is None:
+                return 404, _err("not_configured", "aucun connecteur de ce type sur ce compte")
+            scrubs = self.grouped.secrets_for(machine.account, kind)
+        else:
+            try:
+                cred = self.store.get(machine.account, kind)
+            except ConnectorError as e:
+                return 503, _err("connector_unavailable", f"connecteur illisible chez nokker.ai ({e.code})")
+            if cred is None:
+                return 404, _err("not_configured", "aucun connecteur de ce type sur ce compte")
+            try:
+                secret = self._resolve(cred.secret)
+                src = self.build(kind, cred.settings, secret, locality="cloud")
+            except ConnectorError as e:
+                return 503, _err("connector_unavailable", f"connecteur illisible chez nokker.ai ({e.code})")
+            scrubs = [secret, cred.secret]
         spec = next((s for s in src.specs() if s.name == tool), None)
         if spec is None:
             return 404, _err("unknown_tool", f"outil inconnu pour ce connecteur : {tool[:60]}")
@@ -426,7 +449,7 @@ class ConnectorRelay:
                                 is_error=True)
         if self.redact is not None:
             result = self.redact(result, spec)
-        content = scrub(result.content, secret, cred.secret)  # filet : l'identifiant ne sort jamais, même cité
+        content = scrub(result.content, *scrubs)  # filet : l'identifiant ne sort jamais, même cité
         outcome = "error" if result.is_error else "executed"
         self.audit.finish(machine.tenant, audit_id, outcome, None, _sha(content))
         entry["outcome"] = outcome

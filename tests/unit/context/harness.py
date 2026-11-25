@@ -22,6 +22,15 @@ from nokker.tools.registry import Registry, StaticToolSource, builtin_core_sourc
 BIG_MARK = "[[BIG]]"
 
 
+def context_text(messages: list[dict]) -> str:
+    """Le système ET le message de mémoire de session (`memory_as_message`) d'une requête : tout ce que l'ancien système
+    portait. Les tests qui cherchent un bloc de la couche 3 lisent ceci, quel que soit l'emplacement."""
+    out = [messages[0]["content"]]
+    if len(messages) > 1 and messages[1]["role"] == "user" and messages[1]["content"].startswith("[Mémoire de la session]"):
+        out.append(messages[1]["content"])
+    return "\n\n".join(out)
+
+
 class Clock:
     def __init__(self, t0: float = 1_790_000_000.0) -> None:
         self.t = t0
@@ -55,12 +64,14 @@ class ScriptedProvider:
 
 def big_tool_source(size_chars: int = 8000) -> StaticToolSource:
     spec = ToolSpec(name="big_tool", description="renvoie un gros résultat", parameters={"type": "object",
-                    "properties": {}}, effect=Effect.READ, core=False, source="test")
+                    "properties": {"n": {"type": "integer"}}}, effect=Effect.READ, core=False,
+                    source="test")
 
-    def fn(_args, _ctx: ToolContext) -> ToolResult:
+    def fn(args, _ctx: ToolContext) -> ToolResult:
         line = "ligne de log numéro {:05d} — disque hote21 à 91 pourcent, rien d'anormal\n"
+        start = 1000 * int((args or {}).get("n") or 0)  # `n` distingue deux lectures (sinon identiques : servies du cache du tour)
         return ToolResult(call_id="", name="big_tool",
-                          content="".join(line.format(i) for i in range(size_chars // 70 + 1))[:size_chars])
+                          content="".join(line.format(start + i) for i in range(size_chars // 70 + 1))[:size_chars])
 
     return StaticToolSource(entries=[(spec, fn)])
 
@@ -83,9 +94,13 @@ class Session:
 
 def make_session(budgets: ContextBudgets | None = None, tmp_path=None, *, tool_size: int = 8000,
                  store: MemoryStore | None = None, thread: str = "th_test", with_recall: bool = True,
-                 provider=None, episodes=None, reservoir=None) -> Session:
+                 provider=None, episodes=None, reservoir=None,
+                 prefix_text: str = "Tu es Atlas.") -> Session:
+    # Budgets par défaut du banc : mode « délestage rétroactif » (ancien comportement : `retroactive_shed`, `shed_heads`),
+    # que la plupart des tests de ce dossier exercent. Le mode append-only (défaut de production) a ses propres tests.
     budgets = budgets or ContextBudgets(episodes_budget=500, current_budget=1500, compaction_step=500,
-                                        shed_min_tokens=200, reservoir_min_tokens=600, reservoir_excerpt_chars=600)
+                                        shed_min_tokens=200, reservoir_min_tokens=600, reservoir_excerpt_chars=600,
+                                        retroactive_shed=True, shed_heads=True)
     clock = Clock()
     store = store if store is not None else MemoryStore()
     inv = DeterministicInvariants()
@@ -100,7 +115,7 @@ def make_session(budgets: ContextBudgets | None = None, tmp_path=None, *, tool_s
                              on_episode_closed=on_closed, **extra)
     prefix = (tmp_path / "prefix.md") if tmp_path is not None else None
     if prefix is not None:
-        prefix.write_text("Tu es Atlas.")
+        prefix.write_text(prefix_text)
     recall_sources = [RecallContextSource(manager)] if with_recall else []
     registry = Registry(sources=[builtin_core_source(), *recall_sources, big_tool_source(tool_size)])
     engine = ContextEngineV1(tools=registry, prefix_path=str(prefix) if prefix else "/nonexistent",

@@ -419,8 +419,9 @@ def test_schema_repli_maison_et_brique_amont(monkeypatch):
                           "validate_output": staticmethod(lambda t, s: (False, ["e1"])),
                           "build_retry_message": staticmethod(lambda e: "RETRY " + e[0])})
     monkeypatch.setattr(dg, "_schema_module", lambda: fake)
-    assert dg.append_contract("", SCHEMA) == "AMONT" and dg.retry_message(["e1"]) == "RETRY e1"
-    assert dg.validate_reply("x", SCHEMA) == (False, ["e1"])
+    # la brique amont valide, mais le texte du contrat et de la relance est le nôtre (langue du tour), jamais le sien
+    assert "Contrat de sortie" in dg.append_contract("", SCHEMA) and "refusée" in dg.retry_message(["e1"])
+    assert dg.validate_reply("x", SCHEMA) == (False, ["$ : ne respecte pas le schéma"])
 
 
 def test_schema_invalide_deux_fois_failed():

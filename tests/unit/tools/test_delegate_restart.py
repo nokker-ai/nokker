@@ -50,6 +50,8 @@ def test_unfinished_background_children_are_interrupted_by_restart_with_their_wo
         assert c["worktree"]["kept"] is True and c["worktree"]["path"].endswith(c["child_id"])
         assert c["worktree"]["branch"] == f"nokker/sa-{c['child_id']}"
         assert "redémarrage" in c["summary"] and c["goal"].startswith("corrige")
+        assert c["summary"].startswith("interrompu par un redémarrage : le sous-agent ne tourne plus") \
+            and "noyau" not in c["summary"]
     assert _status(after, "autre")["children"] == []  # seulement les enfants du fil appelant
     # un second redémarrage ne change rien (l'état a été réécrit « interrompu »)
     again = _source(Factory(), FakeCode(str(tmp_path)), path)

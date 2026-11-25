@@ -51,7 +51,9 @@ _REF = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/+-]{0,199}$")
 _SECRET_KEYS = ("token", "password", "value", "secret", "auth", "username")
 _SESSION_THREAD = re.compile(r"^tn_[A-Za-z0-9_-]+:cs_[0-9a-f]{16}$")
 SUBAGENT_MARK = "/sa-"
-NO_SESSION = "pas de session de code sur ce fil (POST /v1/code/sessions)"
+from nokker.tools.checkpoints import NO_WORKSPACE  # noqa: E402
+
+NO_SESSION = NO_WORKSPACE
 
 
 class CodeError(Exception):

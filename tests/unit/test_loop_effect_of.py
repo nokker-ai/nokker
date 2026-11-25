@@ -92,7 +92,7 @@ def test_a_reply_cut_by_the_length_limit_is_not_final():
     turn = k.run_turn(TurnInput("t1", "corrige"))
     assert turn.reply == "Corrigé, tests verts."
     assert all(mt == 16384 for _, mt in ship.seen)
-    assert any("[noyau] Ta réponse a été coupée" in m.content for m in turn.messages if m.role == "user")
+    assert any("[système] Ta réponse a été coupée" in m.content for m in turn.messages if m.role == "user")
 
 
 def test_cancel_stops_the_turn_before_the_next_call():

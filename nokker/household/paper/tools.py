@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.household.paper.dates import not_written
@@ -130,7 +131,7 @@ class PaperTools:
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
         if name in self.hidden:
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
         a = arguments or {}
         svc = self.service
@@ -185,7 +186,7 @@ class PaperTools:
                 return out(svc.share(a.get("document_id"), a.get("member")))
         except PaperError as e:
             return out(str(e), True)
-        return out(f"outil inconnu : {name}", True)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
 
 def _review_only(reviewed: list[Any]) -> dict[str, Any]:

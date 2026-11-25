@@ -35,10 +35,19 @@ from urllib.parse import urlsplit
 FORMAT = "nokker.mandate.v1"
 AP2_VCT = "mandate.payment.open.1"  # vct d'un Open Payment Mandate AP2 v0.2
 SOURCES = ("browser", "qr_bill", "pain001")
-# Paiement par l'agent de paiement (drapeau `pay_agent`, docs/PAY-AGENT.md) : seul rail accepté dans un mandat.
+# Paiement par l'agent de paiement (drapeau `pay_agent`, docs/PAY-AGENT.md) : deux rails acceptés dans un mandat.
+#   `stripe_spt`  : Shared Payment Token chez un vendeur Stripe (`seller_profile`) ;
+#   `issuer_card` : carte virtuelle au nom de la personne, émise pour CET achat (`issuer`, `merchant_host` = l'hôte du
+#                   marchand du mandat), payée par le navigateur de checkout de l'agent (docs/PAY-AGENT.md §10).
 AGENT_PAY_VIA = "stripe_spt"
+AGENT_PAY_VIA_CARD = "issuer_card"
+# `own_card` (Lokkal seulement, docs/PAY-AGENT.md §11) : la personne paie avec SA carte, gardée dans le coffre local ;
+# son agent de paiement remplit le paiement sur l'hôte du mandat (`merchant_host`).
+AGENT_PAY_VIA_OWN = "own_card"
 AGENT_PAY_EXECUTOR = "nokker-pay-agent"
+AGENT_PAY_ISSUERS = ("wise",)
 _PROFILE = re.compile(r"^profile_[A-Za-z0-9_]{6,120}$")
+_HOST = re.compile(r"^(?=.{1,120}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 # Devises à 0 décimale (ISO 4217) parmi celles qu'un foyer CH/UE croise ; toutes les autres : 2.
 _ZERO_DECIMALS = {"JPY", "KRW", "ISK", "CLP", "VND"}
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
@@ -187,16 +196,51 @@ def agent_pay_block(seller_profile: str) -> dict[str, Any]:
     return {"via": AGENT_PAY_VIA, "executor": AGENT_PAY_EXECUTOR, "seller_profile": seller_profile}
 
 
+def agent_card_block(issuer: str, merchant_host: str) -> dict[str, Any]:
+    """Bloc `agent_pay` d'un mandat payé par une carte virtuelle émise pour cet achat (`issuer_card`). `merchant_host`
+    doit être l'identifiant du marchand du mandat (`merchant_id`, hôte du lien) : le navigateur de checkout ne paie
+    que sur cet hôte. Lève `MandateError` si l'émetteur ou l'hôte sont illisibles."""
+    if issuer not in AGENT_PAY_ISSUERS:
+        raise MandateError("émetteur de carte inconnu")
+    if not isinstance(merchant_host, str) or not _HOST.match(merchant_host):
+        raise MandateError("hôte du marchand illisible")
+    return {"via": AGENT_PAY_VIA_CARD, "executor": AGENT_PAY_EXECUTOR, "issuer": issuer,
+            "merchant_host": merchant_host}
+
+
+def agent_own_block(merchant_host: str) -> dict[str, Any]:
+    """Bloc `agent_pay` d'un mandat payé avec la carte de la personne par son agent de paiement (`own_card`, Lokkal).
+    Lève `MandateError` si l'hôte est illisible."""
+    if not isinstance(merchant_host, str) or not _HOST.match(merchant_host):
+        raise MandateError("hôte du marchand illisible")
+    return {"via": AGENT_PAY_VIA_OWN, "executor": AGENT_PAY_EXECUTOR, "merchant_host": merchant_host}
+
+
 def agent_pay_of(mandate: dict[str, Any]) -> dict[str, Any] | None:
-    """Le bloc `agent_pay` d'un mandat s'il est bien formé et cohérent (`human_pays` faux), sinon None."""
+    """Le bloc `agent_pay` d'un mandat s'il est bien formé et cohérent (`human_pays` faux), sinon None. Rail
+    `issuer_card` : `merchant_host` doit aussi être l'identifiant du marchand du mandat (`merchant.id`)."""
     block = mandate.get("agent_pay") if isinstance(mandate, dict) else None
     if not isinstance(block, dict) or mandate.get("human_pays") is not False:
         return None
-    if block.get("via") != AGENT_PAY_VIA or block.get("executor") != AGENT_PAY_EXECUTOR:
+    if block.get("executor") != AGENT_PAY_EXECUTOR:
         return None
-    if not isinstance(block.get("seller_profile"), str) or not _PROFILE.match(block["seller_profile"]):
-        return None
-    return block
+    if block.get("via") == AGENT_PAY_VIA:
+        if not isinstance(block.get("seller_profile"), str) or not _PROFILE.match(block["seller_profile"]):
+            return None
+        return block
+    if block.get("via") == AGENT_PAY_VIA_OWN:
+        host = block.get("merchant_host")
+        if not isinstance(host, str) or not _HOST.match(host) or (mandate.get("merchant") or {}).get("id") != host:
+            return None
+        return block
+    if block.get("via") == AGENT_PAY_VIA_CARD:
+        host = block.get("merchant_host")
+        if block.get("issuer") not in AGENT_PAY_ISSUERS or not isinstance(host, str) or not _HOST.match(host):
+            return None
+        if (mandate.get("merchant") or {}).get("id") != host:
+            return None
+        return block
+    return None
 
 
 def build_mandate(cart: Cart, *, mandate_id: str, approval_id: str, args_sha256: str,
@@ -335,7 +379,7 @@ def verify_envelope(env: Any, *, now: float | None = None, trusted_spki: str | N
     return out
 
 
-__all__ = ["AGENT_PAY_EXECUTOR", "AGENT_PAY_VIA", "AP2_VCT", "FORMAT", "agent_pay_block", "agent_pay_of", "SOURCES", "Cart", "MandateError", "Verification", "build_mandate", "canonical_json",
+__all__ = ["AGENT_PAY_EXECUTOR", "AGENT_PAY_ISSUERS", "AGENT_PAY_VIA", "AGENT_PAY_VIA_CARD", "AGENT_PAY_VIA_OWN", "agent_card_block", "agent_own_block", "AP2_VCT", "FORMAT", "agent_pay_block", "agent_pay_of", "SOURCES", "Cart", "MandateError", "Verification", "build_mandate", "canonical_json",
            "principal_handle",
            "format_minor", "mandate_sha256", "merchant_id", "new_mandate_id", "parse_cart", "sha256_hex", "to_minor",
            "verify_envelope"]

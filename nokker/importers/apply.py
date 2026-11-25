@@ -100,6 +100,28 @@ def _mcp(items: list[ImportItem], path: Path, confirm: Callable[[ImportItem], bo
         it.status = "imported"
 
 
+def _mcp_stdio(items: list[ImportItem], path: Path) -> None:
+    """Serveurs stdio : écrits « à approuver » (`approved: false`) — une déclaration inerte, qui n'apporte ni outil ni
+    processus tant que la personne n'a pas signé la carte forte de `mcp_server_add` dans une session."""
+    from nokker.tools.mcp_stdio import MAX_SERVERS as MAX_STDIO, check_stdio_entry, load_stdio_servers, write_stdio_servers
+
+    for it in items:
+        servers = load_stdio_servers(path)
+        name = it.detail["entry"]["name"]
+        if any(s["name"] == name for s in servers):
+            it.status, it.reason = "conflict", f"un serveur MCP stdio s'appelle déjà {name!r}"
+            continue
+        if len(servers) >= MAX_STDIO:
+            it.status, it.reason = "error", f"{MAX_STDIO} serveurs stdio au plus"
+            continue
+        try:
+            write_stdio_servers(path, [*servers, {**check_stdio_entry(it.detail["entry"]), "approved": False}])
+        except ValueError as e:
+            it.status, it.reason = "error", str(e)
+            continue
+        it.status = "imported"
+
+
 def _notes(items: list[ImportItem], memory: Any) -> None:
     for it in items:
         if memory is None:
@@ -169,7 +191,7 @@ def _agents(items: list[ImportItem], create_agent: Callable[[dict], None] | None
 
 def apply(report: Report, *, user_settings: Path, backup_dir: Path, mcp_path: Path | None = None,
           confirm: Callable[[ImportItem], bool] | None = None, memory: Any = None,
-          create_agent: Callable[[dict], None] | None = None) -> Report:
+          create_agent: Callable[[dict], None] | None = None, mcp_stdio_path: Path | None = None) -> Report:
     planned = [i for i in report.items if i.status == "planned"]
     for it in planned:
         try:
@@ -186,6 +208,9 @@ def apply(report: Report, *, user_settings: Path, backup_dir: Path, mcp_path: Pa
     mcp = [i for i in planned if i.kind == "mcp"]
     if mcp and mcp_path is not None:
         _mcp(mcp, mcp_path, confirm)
+    stdio = [i for i in planned if i.kind == "mcp-stdio"]
+    if stdio and mcp_stdio_path is not None:
+        _mcp_stdio(stdio, mcp_stdio_path)
     _notes([i for i in planned if i.kind == "user-note"], memory)
     _codex_memory([i for i in report.items if i.kind == "codex-memory" and i.status == "skipped"], memory)
     _agents([i for i in planned if i.kind == "cron"], create_agent)

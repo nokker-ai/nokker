@@ -4,6 +4,9 @@ déclenche aucun tour : il reçoit la marche à suivre. `/start <code>` relie l'
 
 Ce module n'appelle que `sendMessage`, `sendChatAction` et `sendVoice` (réponse vocale, docs/VOICE.md, éteinte par
 défaut) : jamais `getUpdates` (le webhook est la seule lecture).
+Questions à choix (drapeau `host_clarify_options`, docs/NOKKAN-HOST-API.md §1) : avec un tableau des questions posé
+(`questions`), une question de `clarify` part avec un bouton par option et « Autre (à préciser) », et un appui
+(`callback_query`, à ajouter aux `allowed_updates` du webhook) répond comme un message. Sans tableau : rien ne change.
 Le webhook répond tout de suite ; le tour tourne dans un pool, un tour à la fois par chat.
 """
 from __future__ import annotations
@@ -18,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib import request as urllib_request
 
+from nokker.approvals.rule_labels import norm_lang
 from nokker.core.turn import Turn, TurnInput
 from nokker.tenancy.context import scoped_thread_id, tenant_scope
 from nokker.tenancy.store import IdentityTaken, Tenancy
@@ -25,6 +29,7 @@ from nokker.telegram.pairing import PairingStore
 
 logger = logging.getLogger("nokker.telegram")
 
+CALLBACK_PREFIX = "q:"  # `callback_data` d'un bouton de question : q:<question_id>:<option> (64 octets au plus)
 MAX_LEN = 4000  # Telegram coupe à 4096 ; marge pour les découpes sur un saut de ligne
 
 TEXTS = {
@@ -41,6 +46,8 @@ TEXTS = {
         "voice_on": "Réponses vocales activées : je réponds aussi par une note vocale.",
         "voice_off": "Réponses vocales coupées : je réponds par écrit seulement.",
         "voice_unavailable": "Les réponses vocales ne sont pas disponibles sur cette instance.",
+        "question_other": "D'accord : écris ta réponse ici.",
+        "question_closed": "Cette question n'attend plus de réponse.",
     },
     "en": {
         "unpaired": ("This Telegram account isn't linked to a Nokker account. In the Nokker web app, open “Telegram” "
@@ -55,6 +62,43 @@ TEXTS = {
         "voice_on": "Voice replies on: I'll also answer with a voice note.",
         "voice_off": "Voice replies off: I'll answer in writing only.",
         "voice_unavailable": "Voice replies aren't available on this instance.",
+        "question_other": "OK: write your answer here.",
+        "question_closed": "This question is no longer waiting for an answer.",
+    },
+    "de": {
+        "unpaired": ("Dieses Telegram-Konto ist mit keinem Nokker-Konto verknüpft. Öffne in der Nokker-Web-App "
+                     "«Telegram», um einen Code zu erhalten, und sende ihn dann hier: /start CODE"),
+        "paired": "Erledigt: Dieses Telegram-Konto ist mit deinem Nokker-Konto verknüpft. Du kannst mir hier schreiben.",
+        "bad_code": "Dieser Code ist nicht gültig (bereits verwendet oder abgelaufen). Fordere in der Web-App einen "
+                    "neuen an.",
+        "taken": "Dieses Telegram-Konto ist bereits mit einem anderen Nokker-Konto verknüpft.",
+        "text_only": "Im Moment lese ich hier nur Textnachrichten.",
+        "error": "Ein Fehler hat mich an der Antwort gehindert. Versuche es gleich noch einmal.",
+        "feedback_ok": "Danke! Dein Feedback ist beim Nokker-Team angekommen.",
+        "feedback_empty": "Schreibe dein Feedback nach dem Befehl, zum Beispiel: /feedback Die Antwort zum Kalender "
+                          "war falsch",
+        "voice_on": "Sprachantworten an: Ich antworte zusätzlich mit einer Sprachnachricht.",
+        "voice_off": "Sprachantworten aus: Ich antworte nur schriftlich.",
+        "voice_unavailable": "Sprachantworten sind auf dieser Instanz nicht verfügbar.",
+        "question_other": "In Ordnung: Schreibe deine Antwort hier.",
+        "question_closed": "Diese Frage wartet nicht mehr auf eine Antwort.",
+    },
+    "it": {
+        "unpaired": ("Questo account Telegram non è collegato ad alcun account Nokker. Nell'app web di Nokker apri "
+                     "«Telegram» per ottenere un codice, poi invialo qui: /start CODE"),
+        "paired": "Fatto: questo Telegram è collegato al tuo account Nokker. Puoi scrivermi qui.",
+        "bad_code": "Questo codice non è valido (già usato o scaduto). Chiedine uno nuovo nell'app web.",
+        "taken": "Questo Telegram è già collegato a un altro account Nokker.",
+        "text_only": "Per ora qui leggo solo messaggi di testo.",
+        "error": "Un errore mi ha impedito di rispondere. Riprova tra un momento.",
+        "feedback_ok": "Grazie! Il tuo feedback è arrivato al team di Nokker.",
+        "feedback_empty": "Scrivi il tuo feedback dopo il comando, per esempio: /feedback la risposta sull'agenda "
+                          "era sbagliata",
+        "voice_on": "Risposte vocali attive: rispondo anche con una nota vocale.",
+        "voice_off": "Risposte vocali disattivate: rispondo solo per iscritto.",
+        "voice_unavailable": "Le risposte vocali non sono disponibili su questa istanza.",
+        "question_other": "D'accordo: scrivi qui la tua risposta.",
+        "question_closed": "Questa domanda non attende più una risposta.",
     },
 }
 
@@ -85,6 +129,18 @@ class BotApi:
         """Une rangée de boutons inline : `{"text", "url"}` ou `{"text", "web_app": {"url"}}` (Mini App). `sendMessage`."""
         self._call("sendMessage", {"chat_id": chat_id, "text": text[:MAX_LEN], "disable_web_page_preview": True,
                                    "reply_markup": {"inline_keyboard": [buttons]}})
+
+    def send_keyboard(self, chat_id: int | str, text: str, rows: list[list[dict[str, Any]]]) -> None:
+        """Boutons inline en plusieurs rangées, `{"text", "callback_data"}` (question à choix). `sendMessage`."""
+        self._call("sendMessage", {"chat_id": chat_id, "text": text[:MAX_LEN], "disable_web_page_preview": True,
+                                   "reply_markup": {"inline_keyboard": rows}})
+
+    def answer_callback(self, callback_id: str) -> None:
+        """Accuse réception d'un appui sur un bouton (sinon Telegram laisse le bouton « en attente »)."""
+        try:
+            self._call("answerCallbackQuery", {"callback_query_id": callback_id})
+        except Exception:  # noqa: BLE001 — confort seulement
+            pass
 
     def send_voice(self, chat_id: int | str, ogg_opus: bytes) -> None:
         """Note vocale (OGG/Opus), en `multipart/form-data` : `sendVoice`."""
@@ -130,9 +186,15 @@ class TelegramAdapter:
     # Foyer du compte pour le lexique de prononciation (docs/VOICE.md §6) : `(compte) -> SpeakScope | None`. None
     # (défaut) : rien n'est passé au fournisseur de voix, comme avant.
     speak_scope: Callable[[Any], Any] | None = None
+    # Conditions à réaccepter (`onboarding.http.terms_outdated_for`) : `(account_id) -> bool`. Vrai : AUCUNE note vocale
+    # (aucun texte chez le fournisseur de voix), texte seul. None (défaut) : rien ne change.
+    terms_outdated: Callable[[str], bool] | None = None
     # Transcription d'une note vocale entrante : `(message Telegram) -> texte | None`. None (défaut du noyau) = une note
     # vocale reçoit « je ne lis que le texte », comme avant ; la STT de la passerelle amont n'est pas dans le noyau.
     transcribe: Callable[[dict[str, Any]], str | None] | None = None
+    # Questions à choix (`nokker.tools.clarify.QuestionBoard`, drapeau `host_clarify_options`) : None (défaut) = la
+    # réponse part en texte comme avant et les `callback_query` sont ignorés.
+    questions: Any = None
     workers: int = 4
     _pool: ThreadPoolExecutor = field(init=False, repr=False)
     _chat_locks: dict[str, threading.Lock] = field(default_factory=dict, repr=False)
@@ -147,6 +209,12 @@ class TelegramAdapter:
 
     def handle_update(self, update: dict[str, Any]) -> None:
         """Appelé par le webhook : rien de lent ici, le travail part au pool."""
+        cq = update.get("callback_query")
+        if isinstance(cq, dict) and self.questions is not None:
+            cq_chat = (cq.get("message") or {}).get("chat") or {}
+            if cq_chat.get("type") == "private" and str(cq.get("data") or "").startswith(CALLBACK_PREFIX):
+                self._pool.submit(self._process_choice, cq)
+            return
         msg = update.get("message") or {}
         chat = msg.get("chat") or {}
         sender = msg.get("from") or {}
@@ -157,8 +225,9 @@ class TelegramAdapter:
     def _process(self, msg: dict[str, Any]) -> None:
         chat_id = msg["chat"]["id"]
         tg_id = str(msg["from"]["id"])
-        lang = "fr" if str(msg["from"].get("language_code", "fr")).startswith("fr") else "en"
-        t = TEXTS[lang]
+        code = str(msg["from"].get("language_code", "fr"))
+        lang = "fr" if code.startswith("fr") else "en"  # langue de la synthèse vocale (fr/en seulement)
+        t = TEXTS[norm_lang(code) or "en"]  # textes du bot : fr/en/de/it, toute autre langue d'un client : anglais
         text = (msg.get("text") or "").strip()
         try:
             if text.startswith("/start"):
@@ -186,13 +255,75 @@ class TelegramAdapter:
                 return
             with self._lock(str(chat_id)), tenant_scope(account.tenant_id):
                 self.bot.typing(chat_id)
+                tg_lang = norm_lang(msg["from"].get("language_code"))  # langue du client Telegram, quand il en annonce une
                 inp = TurnInput(thread_id=scoped_thread_id(account.tenant_id, f"tg-{chat_id}"), user_text=text,
-                                channel="telegram", sender=account.account_id)
+                                channel="telegram", sender=account.account_id, lang=tg_lang,
+                                lang_recognized=tg_lang is not None)
                 turn = self.run_turn(inp)
-                self.bot.send(chat_id, turn.reply)
+                self._send_reply(chat_id, turn)
                 self._maybe_voice(chat_id, turn.reply, lang, voice_in, account)
         except Exception:  # noqa: BLE001 — un tour raté ne tue pas le pool
             logger.exception("tour Telegram en échec (chat %s)", chat_id)
+            try:
+                self.bot.send(chat_id, t["error"])
+            except Exception:  # noqa: BLE001
+                logger.warning("réponse d'erreur Telegram impossible", exc_info=True)
+
+    def _send_reply(self, chat_id: int, turn: Turn) -> None:
+        """La réponse du tour ; une question à choix (tableau posé, tour qui en porte une avec des options) part avec
+        ses boutons, un par rangée, « Autre (à préciser) » en dernier. Clavier refusé par Telegram : repli en texte."""
+        q = getattr(turn, "question", None) if self.questions is not None else None
+        keyboard = getattr(self.bot, "send_keyboard", None)
+        if isinstance(q, dict) and q.get("question_id") and q.get("options") and keyboard is not None:
+            qid = q["question_id"]
+            rows = [[{"text": o["label"], "callback_data": f"{CALLBACK_PREFIX}{qid}:{o['id']}"}] for o in q["options"]]
+            other = q.get("other") or {}
+            rows.append([{"text": other.get("label", ""), "callback_data": f"{CALLBACK_PREFIX}{qid}:{other.get('id')}"}])
+            try:
+                keyboard(chat_id, q["question"], rows)
+                return
+            except Exception:  # noqa: BLE001 — la question reste lisible : le texte numéroté part à la place
+                logger.warning("clavier de question refusé (chat %s) : repli en texte", chat_id, exc_info=True)
+        self.bot.send(chat_id, turn.reply)
+
+    def _process_choice(self, cq: dict[str, Any]) -> None:
+        """Appui sur un bouton d'une question : même identité, même fil et même verrou qu'un message du chat. Une
+        option → le tour de suite avec son libellé ; « Autre » → la personne écrit sa réponse (la question reste en
+        attente, son prochain message la ferme)."""
+        from nokker.tools.clarify import OTHER_ID, QuestionError
+
+        chat_id = cq["message"]["chat"]["id"]
+        user = cq.get("from") or {}
+        t = TEXTS["fr" if str(user.get("language_code", "fr")).startswith("fr") else "en"]
+        answer = getattr(self.bot, "answer_callback", None)
+        if answer is not None:
+            answer(str(cq.get("id") or ""))
+        try:
+            qid, _, option = str(cq.get("data") or "")[len(CALLBACK_PREFIX):].partition(":")
+            account = self.tenancy.account_for_identity("telegram", str(user.get("id")))
+            if account is None:
+                self.bot.send(chat_id, t["unpaired"])
+                return
+            thread_id = scoped_thread_id(account.tenant_id, f"tg-{chat_id}")
+            q = self.questions.get(qid)
+            if q is None or q.thread_id != thread_id or q.status != "pending":  # autre chat, autre compte, déjà close
+                self.bot.send(chat_id, t["question_closed"])
+                return
+            if option == OTHER_ID:
+                self.bot.send(chat_id, t["question_other"])
+                return
+            with self._lock(str(chat_id)), tenant_scope(account.tenant_id):
+                try:
+                    _, said = self.questions.answer(qid, choice=option, by=account.account_id, via="telegram")
+                except QuestionError:
+                    self.bot.send(chat_id, t["question_closed"])
+                    return
+                self.bot.typing(chat_id)
+                turn = self.run_turn(TurnInput(thread_id=thread_id, user_text=said, channel="telegram",
+                                               sender=account.account_id))
+                self._send_reply(chat_id, turn)
+        except Exception:  # noqa: BLE001 — un tour raté ne tue pas le pool
+            logger.exception("réponse à une question Telegram en échec (chat %s)", chat_id)
             try:
                 self.bot.send(chat_id, t["error"])
             except Exception:  # noqa: BLE001
@@ -214,6 +345,15 @@ class TelegramAdapter:
         send_voice = getattr(self.bot, "send_voice", None)
         if send_voice is None:
             return
+        if self.terms_outdated is not None:
+            acc_id = getattr(account, "account_id", None)
+            try:
+                blocked = acc_id is not None and self.terms_outdated(acc_id)  # pas de compte : interne, non bloqué
+            except Exception:  # noqa: BLE001 — état des conditions illisible : pas d'envoi au fournisseur
+                logger.warning("conditions du compte illisibles (chat %s) : texte seul", chat_id, exc_info=True)
+                blocked = True
+            if blocked:
+                return
         scope = None
         if self.speak_scope is not None and account is not None:
             try:

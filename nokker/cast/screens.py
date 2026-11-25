@@ -30,6 +30,8 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
 
+from nokker import bg_stop
+
 logger = logging.getLogger("nokker.cast.screens")
 
 PAGE, IMAGE = "page", "image"
@@ -249,6 +251,8 @@ class AirPlayBackend:
     timeout_s: float = 5.0
     _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
     _pairings: dict[str, Any] = field(default_factory=dict, repr=False)
+    _thread: threading.Thread | None = field(default=None, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _lib(self) -> Any:
         if self.lib is None:
@@ -258,10 +262,27 @@ class AirPlayBackend:
         return self.lib
 
     def _run(self, coro: Any) -> Any:
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            threading.Thread(target=self._loop.run_forever, daemon=True, name="nokker-cast-airplay").start()
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=self.timeout_s * 6)
+        with self._lock:  # deux premiers appelants : une seule boucle, un seul fil
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="nokker-cast-airplay")
+                self._thread.start()
+                bg_stop.track(self)
+            loop = self._loop
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=self.timeout_s * 6)
+
+    def close(self) -> None:
+        """Arrête la boucle et son fil ; idempotent. Rouvrable : le prochain appel recrée la boucle."""
+        with self._lock:
+            loop, thread = self._loop, self._thread
+            self._loop = self._thread = None
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(2.0)
+        if not loop.is_running():
+            loop.close()
 
     def _protocol(self) -> Any:
         return self._lib().const.Protocol.AirPlay

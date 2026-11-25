@@ -12,3 +12,10 @@ def test_shipped_config_carries_the_gateway_relay_and_the_web_base():
     local = load_config(str(SHIPPED)).local
     assert local["relay_url"] == "wss://relay.nokker.app/v1/tunnel"  # docs/en/gateway.md
     assert local["web_base"] == "http://web:8080"  # service `web` du compose, nginx sur 8080 (web/lokkal.conf)
+
+
+def test_shipped_config_requires_the_sandbox():
+    code = load_config(str(SHIPPED)).local["code"]
+    assert code["backend"] == "docker"
+    assert code["require_sandbox"] is True
+    assert code["network_name"] == "nokker-sandbox"  # ligne relue à l'identique par l'installeur ≤ rc.8.1

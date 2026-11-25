@@ -18,10 +18,10 @@ def provider_for(config: Any, tier: str) -> tuple[Any, str | None]:
     if t.api_key_env and not t.api_key():
         log.warning("consolidation : palier %r sans clé (%s) — doublons exacts seulement", tier, t.api_key_env)
         return None, None
-    from nokker.providers.sokkan import SokkanProvider
+    from nokker.providers.select import tier_provider
 
     extra = {"reasoning_off_body": t.reasoning_off_body} if t.reasoning_off_body is not None else {}
-    return SokkanProvider(base_url=t.base_url, api_key=t.api_key(), model=t.model, **extra), t.model
+    return tier_provider(t, **extra), t.model  # SokkanProvider, sauf `format: anthropic`
 
 
 def build(config: Any, long_service: Any, *, dsn: str | None, episodes: Any = None, history_from: Any = None,

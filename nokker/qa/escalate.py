@@ -6,9 +6,19 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from nokker.core import person_texts as ptx
+from nokker.core.person_texts import CANNOT_CONTINUE, CANNOT_CONTINUE_BARE, pick
 from nokker.core.turn import Turn
 
 logger = logging.getLogger("nokker.qa.escalate")
+
+
+def cannot_continue_text(why: str, lang: str | None = None) -> str:
+    """Phrase d'une panne qui n'attend personne (≠ une escalade à un humain) ; commune à tous les escaladeurs.
+    `lang` : langue du tour (sinon celle du contexte, sinon fr)."""
+    if why:
+        return pick(CANNOT_CONTINUE, lang).format(why=why)
+    return pick(CANNOT_CONTINUE_BARE, lang)
 
 
 @dataclass
@@ -17,9 +27,18 @@ class EscalatorV0:
 
     def escalate(self, turn: Turn, reason: str) -> str:
         logger.info("escalade: fil=%s tour=%d motif=%s", turn.thread_id, turn.index, reason)
+        lang = getattr(turn, "lang", None) or None  # langue du tour (sinon celle du contexte, sinon fr)
+        if self.addressee == ptx.DEFAULT_ADDRESSEE:  # destinataire par défaut : traduit ; un nom propre reste tel quel
+            return (pick(ptx.TRANSMIT_TEAM, lang).format(reason=reason) if reason
+                    else pick(ptx.TRANSMIT_TEAM_BARE, lang))
         if reason:
-            return f"Je transmets à {self.addressee} : {reason}."
-        return f"Je transmets à {self.addressee}."
+            return pick(ptx.TRANSMIT, lang).format(addressee=self.addressee, reason=reason)
+        return pick(ptx.TRANSMIT_BARE, lang).format(addressee=self.addressee)
+
+    def cannot_continue(self, turn: Turn, why: str) -> str:
+        """Panne qui se règle seule (palier indisponible, boucle non terminée) : rien n'est transmis à personne."""
+        logger.info("arrêt: fil=%s tour=%d motif=%s", turn.thread_id, turn.index, why)
+        return cannot_continue_text(why, getattr(turn, "lang", None) or None)
 
 
 @dataclass
@@ -29,7 +48,12 @@ class LocalEscalator:
 
     def escalate(self, turn: Turn, reason: str) -> str:
         logger.info("escalade (local) : fil=%s tour=%d motif=%s", turn.thread_id, turn.index, reason)
-        return f"J'ai besoin de toi pour continuer : {reason}." if reason else "J'ai besoin de toi pour continuer."
+        lang = getattr(turn, "lang", None) or None
+        return pick(ptx.NEED_YOU, lang).format(reason=reason) if reason else pick(ptx.NEED_YOU_BARE, lang)
+
+    def cannot_continue(self, turn: Turn, why: str) -> str:
+        logger.info("arrêt (local) : fil=%s tour=%d motif=%s", turn.thread_id, turn.index, why)
+        return cannot_continue_text(why, getattr(turn, "lang", None) or None)
 
 
-__all__ = ["EscalatorV0", "LocalEscalator"]
+__all__ = ["EscalatorV0", "LocalEscalator", "cannot_continue_text"]

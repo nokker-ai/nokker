@@ -1,12 +1,13 @@
 # Image des bacs à sable de Lokkal : un container jetable par fil, le dossier de l'utilisateur sur /workspace
 # (nokker/tools/code.py). Les outils d'un poste de développeur courant ; le réseau passe par le proxy `egress`
-# (HTTP(S)_PROXY posé par dockerproxy), pip / npm / git / curl le suivent.
+# (HTTP(S)_PROXY posé par dockerproxy), pip / npm / git / curl le suivent. `python` = python3 (python-is-python3) :
+# un modèle qui tape `python -m pytest` ne perd pas un essai sur « command not found » (répétition du 07.11).
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git openssh-client netcat-openbsd less jq ripgrep fd-find patch file unzip xz-utils procps \
-      build-essential pkg-config python3 python3-pip python3-venv python3-dev nodejs npm \
+      ca-certificates curl git openssh-client netcat-openbsd libnss-wrapper less jq ripgrep fd-find patch file unzip xz-utils procps \
+      build-essential pkg-config python3 python-is-python3 python3-pip python3-venv python3-dev nodejs npm \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
-    && printf '# Lokkal : pas de route directe depuis le bac à sable ; ssh sort par le proxy egress (CONNECT), comme\n# pip et git. egress refuse les plages privées (LAN, box) : seuls les hôtes publics sont joignables.\nHost *\n    ProxyCommand nc -X connect -x egress:3128 %%h %%p\n' > /etc/ssh/ssh_config.d/10-nokker-egress.conf \
+    && printf '# Lokkal : pas de route directe depuis le bac à sable ; ssh sort par le proxy egress (CONNECT), comme\n# pip et git. Port 22 et plages privées (LAN, box, tailnet) : seulement les adresses et ports déclarés dans\n# hosts.yaml (docs/en/ops.md).\nHost *\n    ProxyCommand nc -X connect -x egress:3128 %%h %%p\n' > /etc/ssh/ssh_config.d/10-nokker-egress.conf \
     && rm -rf /var/lib/apt/lists/*
 # pip sans --break-system-packages dans un container jetable ; pas de cache disque inutile
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \

@@ -38,7 +38,9 @@ When the core starts, it checks the database and the embedding server in the bac
 
 - `GET /healthz` carries `"memory": "ok" | "down" | "off"`; the core itself keeps answering;
 - `GET /v1/local/memory` (local token) gives the detail: mode, projects read, number of notes, embedding model and
-  dimension, the last error if any, the duration of the last recall.
+  dimension, the last error if any, the duration of the last recall, and `checked_at` (UTC, ISO 8601: when the check
+  really ran). The copy is kept at most 15 s and dropped on every write, forget, import, quarantine decision and index
+  run, so the note count never lags behind the database.
 
 ## Instruction files
 

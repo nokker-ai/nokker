@@ -25,13 +25,25 @@ class Account:
     tenant_id: str
     account_id: str
     email: str
-    lang: str = "fr"
+    lang: str | None = None  # fr/en/de/it posée par la personne ; None = pas posée (migration 089). Lecture : `lang or "fr"`
     status: str = "active"
     created_at: datetime | None = None
+    first_name: str = ""  # prénom tel que saisi (migration 072) ; vide : nom montré = partie locale de l'adresse
+    invitation_id: str | None = None  # invitation front1 dont le compte est né (coupon bêta par compte, 088)
 
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
+
+
+def _clean_lang(lang: str | None) -> str | None:
+    """fr/en/de/it, ou None (effacer : « pas posée »). Toute autre valeur, y compris vide : ValueError."""
+    if lang is None:
+        return None
+    code = str(lang).strip().lower()
+    if code not in ("fr", "en", "de", "it"):
+        raise ValueError("langue inconnue (fr, en, de ou it)")
+    return code
 
 
 def _norm_email(email: str) -> str:
@@ -39,7 +51,7 @@ def _norm_email(email: str) -> str:
 
 
 class Tenancy(Protocol):
-    def create_account(self, email: str, lang: str = "fr", invitation_id: str | None = None) -> Account: ...
+    def create_account(self, email: str, lang: str | None = None, invitation_id: str | None = None) -> Account: ...
 
     def account(self, account_id: str) -> Account | None: ...
 
@@ -54,6 +66,10 @@ class Tenancy(Protocol):
     def account_for_tenant(self, tenant_id: str) -> Account | None: ...
 
     def suspend_for_deletion(self, account_id: str, approval_id: str) -> None: ...
+
+    def set_first_name(self, account_id: str, first_name: str) -> Account | None: ...
+
+    def set_lang(self, account_id: str, lang: str | None) -> Account | None: ...
 
 
 @dataclass
@@ -71,7 +87,7 @@ class MemoryTenancy:
             self.accounts[account_id] = dataclasses.replace(acc, status="suspended")
             self.deletions.setdefault(account_id, approval_id)
 
-    def create_account(self, email: str, lang: str = "fr", invitation_id: str | None = None) -> Account:
+    def create_account(self, email: str, lang: str | None = None, invitation_id: str | None = None) -> Account:
         email = _norm_email(email)
         if not email or "@" not in email:
             raise ValueError("e-mail invalide")
@@ -79,13 +95,40 @@ class MemoryTenancy:
             if any(a.email == email for a in self.accounts.values()):
                 raise IdentityTaken(f"compte existant pour {email}")
             acc = Account(tenant_id=_new_id("tn"), account_id=_new_id("us"), email=email,
-                          lang="en" if lang == "en" else "fr", created_at=datetime.now(timezone.utc))
+                          lang=lang if lang in ("en", "de", "it") else None, created_at=datetime.now(timezone.utc),
+                          invitation_id=invitation_id)
             self.accounts[acc.account_id] = acc
             self.identities[("email", email)] = acc.account_id
             return acc
 
     def account(self, account_id: str) -> Account | None:
         return self.accounts.get(account_id)
+
+    def set_first_name(self, account_id: str, first_name: str) -> Account | None:
+        """Prénom déjà nettoyé (`nokker/tenancy/names.py::clean_first_name`) ; vide l'efface."""
+        import dataclasses
+
+        with self._lock:
+            acc = self.accounts.get(account_id)
+            if acc is None:
+                return None
+            acc = dataclasses.replace(acc, first_name=first_name)
+            self.accounts[account_id] = acc
+            return acc
+
+    def set_lang(self, account_id: str, lang: str | None) -> Account | None:
+        """Langue de la personne (fr/en/de/it ; None l'efface = « pas posée » ; autre valeur : ValueError). `fr` posé ici est
+        un choix : il se distingue de NULL (migration 089)."""
+        import dataclasses
+
+        lang = _clean_lang(lang)
+        with self._lock:
+            acc = self.accounts.get(account_id)
+            if acc is None:
+                return None
+            acc = dataclasses.replace(acc, lang=lang)
+            self.accounts[account_id] = acc
+            return acc
 
     def account_by_email(self, email: str) -> Account | None:
         return self.account_for_identity("email", _norm_email(email))
@@ -138,9 +181,10 @@ class PgTenancy:
         if row is None:
             return None
         return Account(tenant_id=row["tenant_id"], account_id=row["id"], email=row["email"], lang=row["lang"],
-                       status=row["status"], created_at=row["created_at"])
+                       status=row["status"], created_at=row["created_at"], first_name=row.get("first_name") or "",
+                       invitation_id=row.get("invitation_id"))
 
-    def create_account(self, email: str, lang: str = "fr", invitation_id: str | None = None) -> Account:
+    def create_account(self, email: str, lang: str | None = None, invitation_id: str | None = None) -> Account:
         import psycopg
 
         email = _norm_email(email)
@@ -152,7 +196,7 @@ class PgTenancy:
                 cur.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))  # RLS : le nouveau locataire
                 cur.execute("INSERT INTO tenants (id) VALUES (%s)", (tenant_id,))
                 cur.execute("INSERT INTO accounts (id, tenant_id, email, lang, invitation_id) VALUES (%s,%s,%s,%s,%s) "
-                            "RETURNING *", (account_id, tenant_id, email, "en" if lang == "en" else "fr", invitation_id))
+                            "RETURNING *", (account_id, tenant_id, email, lang if lang in ("en", "de", "it") else None, invitation_id))
                 row = cur.fetchone()
                 cur.execute("INSERT INTO account_identities (kind, value, account_id) VALUES ('email', %s, %s)",
                             (email, account_id))
@@ -163,6 +207,20 @@ class PgTenancy:
     def account(self, account_id: str) -> Account | None:
         with self._key(account_id) as conn:
             return self._acc(conn.execute("SELECT * FROM accounts WHERE id=%s", (account_id,)).fetchone())
+
+    def set_first_name(self, account_id: str, first_name: str) -> Account | None:
+        """Prénom déjà nettoyé (`nokker/tenancy/names.py::clean_first_name`) ; vide l'efface. Écrit par la clé du compte
+        (politique `key_lookup` de 058, SELECT et UPDATE)."""
+        with self._key(account_id) as conn:
+            return self._acc(conn.execute("UPDATE accounts SET first_name = %s WHERE id = %s RETURNING *",
+                                          (first_name, account_id)).fetchone())
+
+    def set_lang(self, account_id: str, lang: str | None) -> Account | None:
+        """Langue de la personne (fr/en/de/it, None l'efface ; autre valeur : ValueError), par la clé du compte."""
+        lang = _clean_lang(lang)
+        with self._key(account_id) as conn:
+            return self._acc(conn.execute("UPDATE accounts SET lang = %s WHERE id = %s RETURNING *",
+                                          (lang, account_id)).fetchone())
 
     def suspend_for_deletion(self, account_id: str, approval_id: str) -> None:
         """Compte et locataire suspendus (plus aucune requête), ligne dans la file d'effacement (migration 017) : une

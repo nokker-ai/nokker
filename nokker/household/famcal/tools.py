@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.household.famcal.review import MAX_SHOWN, Line
@@ -61,8 +62,8 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
     ("family_calendar_propose",
      ("Calendrier familial : prépare un BROUILLON d'événements lus dans un planning (école, club, convocation, horaires "
      "de déchetterie) ou dans un papier (une seule date d'un courrier aussi), en photo jointe, en PDF importé dans les "
-     "Papiers ou en pièce jointe texte (l'échéance d'une facture QR : paper_bill_due). Le noyau relit chaque "
-     "ligne (dates ambiguës, année absente, jour sans date, doublons avec l'agenda) ; rien n'est écrit dans l'agenda. "
+     "Papiers ou en pièce jointe texte (l'échéance d'une facture QR : paper_bill_due). Chaque "
+     "ligne est relue (dates ambiguës, année absente, jour sans date, doublons avec l'agenda) ; rien n'est écrit dans l'agenda. "
      "Une série (« tous les mardis ») porte sa récurrence et sa date de fin écrite."), Effect.WRITE,
      {"type": "object", "required": ["events"], "properties": {
          "document_id": {"type": "string", "description": "papier importé (absent : image ou pièce jointe du message)"},
@@ -158,7 +159,7 @@ class FamilyCalendarTools:
                 return out(not_written(lines) + json.dumps(res, ensure_ascii=False))
         except FamcalError as e:
             return out(str(e), True)
-        return out(f"outil inconnu : {name}", True)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
 
 __all__ = ["CARD_TOOL", "FAMCAL_TOOLS", "SOURCE", "UNTRUSTED_NOTICE", "FamilyCalendarTools", "draft_view",

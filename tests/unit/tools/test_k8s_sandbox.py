@@ -170,6 +170,36 @@ def test_reap_ne_vise_que_cette_instance():
     assert delete[1:3] == ["pod/nokker-sbx-1", "pod/nokker-sbx-2"]
 
 
+class SelectorKubectl(FakeKubectl):
+    """Un cluster minimal : des pods (nom, étiquettes) dans le MÊME namespace ; `get -l a=b,c=d` filtre par égalité
+    exacte de valeur (sémantique du sélecteur Kubernetes), `delete` retire et journalise."""
+
+    def __init__(self, pods: dict[str, dict[str, str]]) -> None:
+        super().__init__()
+        self.cluster = pods
+        self.deleted: list[str] = []
+
+    def run(self, args, stdin=None, timeout=60):
+        self.calls.append((list(args), stdin))
+        if args[0] == "get":
+            want = dict(t.split("=", 1) for t in args[args.index("-l") + 1].split(","))
+            return 0, "".join(f"pod/{n}\n" for n, lab in self.cluster.items()
+                              if all(lab.get(k) == v for k, v in want.items())), ""
+        if args[0] == "delete":
+            self.deleted += [a.removeprefix("pod/") for a in args[1:] if a.startswith("pod/")]
+        return 0, "", ""
+
+
+def test_reap_ne_touche_jamais_une_autre_instance_du_meme_namespace():
+    app = {"app.kubernetes.io/name": "nokker-sandbox"}
+    k = SelectorKubectl({"a1": {**app, "nokker.instance": "nokker-beta"},
+                         "b1": {**app, "nokker.instance": "nokker-beta2"},  # préfixe de la valeur : écarté
+                         "c1": {**app, "nokker.instance": "autre-noyau"},
+                         "d1": {"nokker.instance": "nokker-beta"}})  # pas un bac à sable (autre application)
+    assert ks.reap_k8s_sandboxes("nokker-beta", k) == 1 and k.deleted == ["a1"]
+    assert ks.reap_k8s_sandboxes("nokker-bet", k) == 0 and k.deleted == ["a1"]  # sous-chaîne : rien
+
+
 def test_reap_sans_instance_ni_kubectl():
     assert ks.reap_k8s_sandboxes("", FakeKubectl(pods=["x"])) == 0
     assert ks.reap_k8s_sandboxes("core-0", FakeKubectl(fail={"get": 1})) == 0

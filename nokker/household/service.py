@@ -37,6 +37,7 @@ from nokker.household.model import Consent, HouseholdMember, Policy, Settings, T
 from nokker.team import model as tm
 from nokker.team.model import Invite, Member, Project, TeamError
 from nokker.team.service import Team, household_access, note_json
+from nokker.tenancy.names import FIRST_NAME_MAX, clean_first_name, member_name
 
 logger = logging.getLogger("nokker.household")
 
@@ -55,7 +56,7 @@ def payer_only() -> TeamError:
 
 def minors_not_enabled() -> TeamError:
     return TeamError(403, "minors_not_enabled",
-                     "Le mode parent/mineur n'est pas encore ouvert pour votre foyer (bêta : foyers autorisés un par "
+                     "Le mode parent/mineur n'est pas encore ouvert pour ton foyer (bêta : foyers autorisés un par "
                      "un). / Parent/minor mode is not enabled for your household yet (beta: households are enabled "
                      "one by one).")
 
@@ -67,7 +68,7 @@ def suspended() -> TeamError:
 
 # Vue du payeur d'un foyer suspendu (`notice`) : ce qui se passe et comment le réactiver, FR puis EN.
 SUSPENDED_NOTICE = (
-    "Ton foyer est suspendu : ton abonnement actuel ne comprend pas de foyer (palier Famille ou Large). Chaque membre "
+    "Ton foyer est suspendu : ton abonnement actuel ne comprend pas de foyer (formule Famille ou Large). Chaque membre "
     "utilise ses propres plafonds de compte, rien n'est effacé (membres, notes, réglages), et aucune invitation ne part "
     "tant que le foyer est suspendu. Reprends un abonnement Famille ou Large depuis « Mon compte » pour le réactiver.\n\n"
     "Your household is suspended: your current subscription does not include a household (Family or Large plan). Each "
@@ -95,6 +96,9 @@ class Household:
     # Locataire d'un membre dont le registre, le préfixe ou les règles changent (profil, attestation, liste blanche,
     # entrée, sortie) : le serveur y branche `TenantRegistry.forget`.
     on_change: Callable[[str], None] | None = None
+    # Un membre sort du foyer (départ, retrait, suppression du foyer) : (foyer, compte sorti, membres restants). Le
+    # serveur y branche `Connectors.member_gone` (partages de connecteurs, docs/CONNECTORS-MULTI.md). Après la sortie.
+    on_member_gone: Callable[[str, str, list[HouseholdMember]], None] | None = None
     # Facturation (train) : locataire du payeur → palier actif ; None = facturation éteinte, aucun contrôle de plus.
     payer_plan: Callable[[str], str | None] | None = None
     # Palier → ses plafonds (`turns_per_day`, `turns_per_week`, `household_members`) ; posé avec `payer_plan`.
@@ -198,17 +202,38 @@ class Household:
 
     def delete(self, actor: Any) -> dict[str, Any]:
         p, _ = self._payer(actor)
-        others = [r.account_id for r in self.store.hh_members(actor, p.id) if not r.payer]
+        rows = self.store.hh_members(actor, p.id)
+        others = [r.account_id for r in rows if not r.payer]
         self.store.delete_project(actor, p)
         self._changed(actor.account_id, *others)
+        for r in rows:
+            self._gone(p.id, r.account_id, rows)
         return {"deleted": True}
+
+    def _gone(self, household_id: str, account_id: str, members: list[HouseholdMember]) -> None:
+        if self.on_member_gone is None:
+            return
+        try:
+            self.on_member_gone(household_id, account_id, [m for m in members if m.account_id != account_id])
+        except Exception:  # noqa: BLE001 — la sortie est faite ; un nettoyage raté se refait (la RLS ferme déjà l'accès)
+            logger.warning("foyer : nettoyage après la sortie de %s en échec", account_id, exc_info=True)
+
+    def _first_name(self, account_id: str) -> str:
+        """Prénom du profil (vide s'il n'y en a pas ou si le compte est illisible : le nom retombe sur l'adresse)."""
+        tenancy = self.team.tenancy
+        try:
+            acc = tenancy.account(account_id) if tenancy is not None else None
+        except Exception:  # noqa: BLE001
+            return ""
+        return getattr(acc, "first_name", "") if acc is not None else ""
 
     def _line(self, r: HouseholdMember, me: str, usage: dict[str, Any] | None,
               settings: Settings | None = None) -> dict[str, Any]:
         cap, source = r.cap(settings or self.settings)
         used = (usage or {}).get("by_account", {}).get(r.account_id, {"today": 0, "week": 0})
-        return {"account_id": r.account_id, "email": r.email, "payer": r.payer, "profile": r.profile,
-                "status": r.status, "joined_at": _iso(r.added_at), "you": r.account_id == me,
+        first = self._first_name(r.account_id)
+        return {"account_id": r.account_id, "email": r.email, "first_name": first, "name": member_name(first, r.email),
+                "payer": r.payer, "profile": r.profile, "status": r.status, "joined_at": _iso(r.added_at), "you": r.account_id == me,
                 "turns": {"today": used["today"], "week": used["week"]},
                 "cap": {"turns_per_day": cap, "source": source}}
 
@@ -265,7 +290,7 @@ class Household:
     # ── invitations ──
     @staticmethod
     def _invite_json(i: Invite) -> dict[str, Any]:
-        return {"id": i.id, "email": i.email, "profile": i.profile, "state": i.state,
+        return {"id": i.id, "email": i.email, "first_name": i.first_name, "profile": i.profile, "state": i.state,
                 "created_at": _iso(i.created_at), "expires_at": _iso(i.expires_at), "decided_at": _iso(i.decided_at)}
 
     def invite(self, actor: Any, body: dict[str, Any], *, ip: str | None = None) -> dict[str, Any]:
@@ -274,6 +299,11 @@ class Household:
         if not tier.active:
             raise suspended()
         email = tm.clean_email(body.get("email"))
+        try:
+            first_name = clean_first_name(body.get("first_name"))
+        except ValueError:
+            raise TeamError(400, "bad_first_name", "prénom invalide : lettres, espaces, trait d'union, apostrophe et "
+                            f"point seulement, {FIRST_NAME_MAX} caractères au plus") from None
         profile = hm.clean_profile(body.get("profile"), minors=self.settings.minors)
         if profile in hm.MINOR_PROFILES and not self.minors_open(actor.account_id):
             raise minors_not_enabled()
@@ -291,7 +321,8 @@ class Household:
         acc = self.team.tenancy.account_by_email(email) if self.team.tenancy is not None else None
         inv = Invite(id=tm.new_invite_id(), project_id=p.id, tenant_id=p.tenant_id, project_name=p.name, email=email,
                      role="member", invited_by=actor.account_id, invitee_account=acc.account_id if acc else "",
-                     created_at=now, expires_at=now + tm.INVITE_TTL_S, kind=hm.KIND, profile=profile)
+                     created_at=now, expires_at=now + tm.INVITE_TTL_S, kind=hm.KIND, profile=profile,
+                     first_name=first_name)
         self.store.create_invite(actor, inv)
         if attestation is not None:
             version, lang = attestation
@@ -340,10 +371,24 @@ class Household:
         mem = Member(project_id=inv.project_id, tenant_id=inv.tenant_id, account_id=actor.account_id, role="member",
                      email=actor.email, added_by=inv.invited_by, added_at=now)
         self.store.accept(actor, inv, mem, now)
+        self._adopt_first_name(actor.account_id, inv.first_name)
         if inv.profile in hm.MINOR_PROFILES:
             self._no_training(actor.account_id)
         self._changed(actor.account_id)
         return self.view(actor)
+
+    def _adopt_first_name(self, account_id: str, first_name: str) -> None:
+        """Prénom saisi à l'invitation, recopié dans le compte de l'invité s'il n'en a pas encore (il le change dans Mon
+        compte). Jamais bloquant : l'adhésion est déjà écrite."""
+        tenancy = self.team.tenancy
+        if not first_name or tenancy is None or not hasattr(tenancy, "set_first_name"):
+            return
+        try:
+            acc = tenancy.account(account_id)
+            if acc is not None and not getattr(acc, "first_name", ""):
+                tenancy.set_first_name(account_id, first_name)
+        except Exception:  # noqa: BLE001
+            logger.warning("foyer : prénom de l'invitation non recopié pour %s", account_id, exc_info=True)
 
     def decline(self, actor: Any, invite_id: str) -> dict[str, Any]:
         with household_access():
@@ -370,10 +415,12 @@ class Household:
             target = self._target(actor, p, account_id)
             if target.payer:
                 raise TeamError(409, "payer_fixed", "le payeur ne se retire pas")
+        rows = self.store.hh_members(actor, p.id)
         self.store.remove_member(actor, p, account_id)
         if target.minor and mine.payer:
             self.store.revoke_consents(actor, p.id, target.email, actor.account_id, self.clock())
         self._changed(account_id)
+        self._gone(p.id, account_id, rows)
         return {"removed": True}
 
     def set_cap(self, actor: Any, account_id: str, body: Any) -> dict[str, Any]:

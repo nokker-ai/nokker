@@ -47,7 +47,8 @@ class PgOverview:
     def accounts(self, limit: int = 500) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT a.id, a.tenant_id, a.email, a.lang, a.status, a.created_at, t.status AS tenant_status "
+                "SELECT a.id, a.tenant_id, a.email, a.lang, a.status, a.created_at, a.invitation_id, "
+                "t.status AS tenant_status "
                 "FROM accounts a JOIN tenants t ON t.id = a.tenant_id ORDER BY a.created_at DESC, a.id LIMIT %s",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]

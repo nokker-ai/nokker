@@ -50,10 +50,12 @@ from nokker.cloud import placement as pl
 
 logger = logging.getLogger("nokker.cloud.crew")
 
-MAX_DECK_BYTES = 64 * 1024
+MAX_DECK_BYTES = 128 * 1024  # v2 : + 100 fils (docs/LOKKAL-PHONE.md §1.2 point 2)
 MAX_SESSIONS = 100
 MAX_AGENTS = 200
+MAX_THREADS = 100
 SESSION_STATES = ("idle", "working", "awaiting_approval")
+THREAD_CHANNELS = ("api", "telegram", "code", "agent")
 _THREAD = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
 _AGENT = re.compile(r"^ag_[0-9a-f]{12}$")
 _RUN = re.compile(r"^ar_[0-9a-f]{16}$")
@@ -127,8 +129,22 @@ def clean_deck(raw: Any, *, titles: bool) -> dict[str, Any] | None:
                        "next_run_at": _num(a.get("next_run_at")),
                        "last_run": {"status": lr.get("status") if lr.get("status") in RUN_STATUSES else None,
                                     "ended_at": _num(lr.get("ended_at"))} if lr else None})
+    # v2 (docs/LOKKAL-PHONE.md §1.2 point 2) : TOUS les fils de la machine, les 100 plus récents ; titre sous la même
+    # règle que les sessions (miroir), pour la liste unique quand la machine est hors ligne
+    threads = []
+    for t in (raw.get("threads") if isinstance(raw.get("threads"), list) else [])[:MAX_THREADS]:
+        if not isinstance(t, dict) or not _THREAD.match(str(t.get("thread_id") or "")):
+            continue
+        title = t.get("title") if titles and isinstance(t.get("title"), str) else None
+        threads.append({"thread_id": str(t["thread_id"]),
+                        "state": t.get("state") if t.get("state") in SESSION_STATES else "idle",
+                        "updated_at": _num(t.get("updated_at")),
+                        "channel": t.get("channel") if t.get("channel") in THREAD_CHANNELS else "api",
+                        "title": " ".join(title.split())[:120] or None if title else None})
+    threads.sort(key=lambda x: x["updated_at"] or 0, reverse=True)
     pending = _num(raw.get("pending_approvals"))
-    return {"v": 1, "sessions": sessions, "agents": agents,
+    return {"v": 2 if raw.get("v") == 2 else 1, "sessions": sessions, "agents": agents, "threads": threads,
+            "mirror": raw.get("mirror") is True,  # v2 : la machine dit que ses fils sont en miroir
             "pending_approvals": int(pending) if pending is not None and pending < 1e5 else 0}
 
 
@@ -471,6 +487,7 @@ class CloudCrew:
                 web.append(card)
         out_machines = []
         strong = self._strong_of(tenant)
+        mirror_ok = bool(self.titles_allowed and self.titles_allowed(account))  # le compte a droit au miroir
         for m in sorted(machines, key=lambda x: (x.name, x.id)):
             deck, at = decks.get(m.id, (None, None))
             remote_cards = [{**c, "placement": m.id, "defined_at": "machine", "live_run": None}
@@ -480,7 +497,11 @@ class CloudCrew:
                 "load_age_s": None if m.load_at is None else max(0, int(now - m.load_at)),
                 "load": _load_view(m.load), "deck_at": at,
                 "deck_age_s": None if at is None else max(0, int(now - at)),
+                "deck_v": int((deck or {}).get("v") or 1) if deck else None,
                 "sessions": list((deck or {}).get("sessions") or []),
+                "threads": list((deck or {}).get("threads") or []),  # v2 ; [] pour une machine en v1
+                # contrat C5 : miroir allumé (la machine le dit ET le compte y a droit) → « Continuer dans le cloud »
+                "mirror": bool((deck or {}).get("mirror")) and mirror_ok,
                 "agents": by_machine.get(m.id, []) + remote_cards,
                 "pending_approvals": int((deck or {}).get("pending_approvals") or 0),
                 "strong_approvals": strong(m.id)})

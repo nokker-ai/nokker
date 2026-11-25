@@ -55,6 +55,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from nokker.code_sessions import forge
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.tenancy.context import current_tenant, tenant_scope
@@ -711,7 +712,7 @@ class ForgePushTools:
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if name != PUSH_TOOL:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         if arguments:
             return ToolResult(call_id="", name=name, content="forge_push ne prend aucun argument (la branche est "
                                                               "celle de la PR)", is_error=True)

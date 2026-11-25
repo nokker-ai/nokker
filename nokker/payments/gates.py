@@ -22,7 +22,7 @@ CARD_RULE = "payments:card_field"
 CHECKOUT_RULE = "payments:checkout"
 INVALID_RULE = "payments:invalid"
 
-# Textes vus par le modèle (dans « REFUSÉ par le noyau (<règle>: <raison>). Ne pas réessayer autrement. »).
+# Textes vus par le modèle (dans « Refusé : <règle>: <raison>. Ne le réessaie pas et ne cherche pas à le contourner. »).
 CARD_REASON = ("champ de carte (« {term} ») : Nokker ne saisit jamais un numéro de carte, un code de sécurité ni un "
                "code 3-D Secure. Arrête-toi ici et appelle pay_request : la personne paiera elle-même.")
 CHECKOUT_REASON = ("étape de paiement (« {label} ») : l'agent s'arrête avant de payer. Appelle pay_request avec le "
@@ -127,13 +127,17 @@ class PaymentGates:
         reason = TO_PAY_REASON.format(amount=format_minor(cart.amount_minor, cart.currency),
                                       merchant=inline(cart.merchant, 120))
         if self.payments.agent is not None:  # drapeau `pay_agent` : sinon rien ne change
-            from nokker.payments.agent import DUPLICATE_REASON, DUPLICATE_RULE, MERCHANT_MAX, TO_PAY_AGENT_REASON
+            from nokker.payments.agent import (DUPLICATE_REASON, DUPLICATE_RULE, MERCHANT_MAX, TO_PAY_AGENT_REASON,
+                                               TO_PAY_CARD_REASON, TO_PAY_OWN_REASON)
 
             dup = self.payments.active_duplicate(sender, cart)
             if dup is not None:
                 return [_deny(DUPLICATE_RULE, DUPLICATE_REASON.format(mid=dup), call)]
-            if self.payments._agent_pay_for(cart, approver) is not None:
-                reason = TO_PAY_AGENT_REASON.format(amount=format_minor(cart.amount_minor, cart.currency),
+            block = self.payments._agent_pay_for(cart, approver)
+            if block is not None:
+                text = {"issuer_card": TO_PAY_CARD_REASON, "own_card": TO_PAY_OWN_REASON}.get(
+                    str(block.get("via")), TO_PAY_AGENT_REASON)
+                reason = text.format(amount=format_minor(cart.amount_minor, cart.currency),
                                                     merchant=inline(cart.merchant, MERCHANT_MAX))
         return [Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=GUARDIAN_RULE if guardian else PAY_RULE,
                         reason=reason, subject=call.id, strength="strong")]

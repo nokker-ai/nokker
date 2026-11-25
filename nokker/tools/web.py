@@ -48,7 +48,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from nokker.core import model_texts as mt
+from nokker.tenancy.context import submit_in_context
 from nokker.core.ports import ToolContext, ToolSpec
+from nokker.tools.web_fence import fence_web_result
 from nokker.core.turn import Effect, ToolResult
 
 logger = logging.getLogger("nokker.tools.web")
@@ -86,6 +89,10 @@ _PHONE_CH_RE = re.compile(
     r"|\b0[1-9](?:[ .\-]?\d){8}\b"
 )
 
+# Téléphone international E.164 (`+` puis 8 à 15 chiffres, séparateurs espace/point/tiret) : publié dans les règles de
+# masquage de l'appareil (`nokker/redact/rules.py`, P9b) ; la garde de la recherche web ne s'en sert pas.
+_PHONE_E164_RE = re.compile(r"(?<![0-9A-Za-z+])\+[1-9](?:[ .\-]?\d){7,14}(?!\d)")
+
 # AVS suisse : 756.XXXX.XXXX.XX (13 chiffres), avec ou sans points.
 _AVS_RE = re.compile(r"\b756\.\d{4}\.\d{4}\.\d{2}\b|\b756\d{10}\b")
 
@@ -109,18 +116,18 @@ def pii_violation(text: str, blocked_terms: list[str] | None = None) -> str | No
     """Renvoie une étiquette courte si *text* porte une donnée personnelle ou un terme bloqué par
     config, sinon `None`. Ordre de détection fixe (pas de signification au-delà du premier trouvé)."""
     if _EMAIL_RE.search(text):
-        return "adresse e-mail"
+        return mt.pick(mt.WEB_PII_EMAIL)
     if _PHONE_CH_RE.search(text):
-        return "numéro de téléphone"
+        return mt.pick(mt.WEB_PII_PHONE)
     if _has_ch_iban(text):
         return "IBAN"
     if _AVS_RE.search(text):
-        return "numéro AVS"
+        return mt.pick(mt.WEB_PII_AVS)
     lowered = text.lower()
     for term in blocked_terms or []:
         term_l = term.strip().lower()
         if term_l and term_l in lowered:
-            return f"terme bloqué : {term.strip()}"
+            return mt.pick(mt.WEB_PII_BLOCKED).format(term=term.strip())
     return None
 
 
@@ -162,7 +169,7 @@ def _mcp_call(client: httpx.Client, url: str, tool: str, arguments: dict[str, An
     try:
         response = client.post(url, json=payload, headers=headers, timeout=timeout_s)
     except httpx.HTTPError as exc:
-        raise WebEngineError(f"requête échouée : {exc}") from exc
+        raise WebEngineError(mt.pick(mt.WEB_FAILED).format(error=exc)) from exc
     if response.status_code >= 400:
         raise WebEngineError(f"HTTP {response.status_code}: {response.text.strip()[:300]}")
     return _parse_mcp_text(response.text)
@@ -210,11 +217,20 @@ def _after(line: str, prefix: str) -> str:
 _EXA_LABELS = ("Title:", "URL:", "Highlights:", "Published:", "Author:")
 
 
+def _pub_date(value: str) -> str:
+    """Date de publication d'un moteur : la partie jour d'un horodatage ISO (« 2026-09-04T…Z » → « 2026-09-04 »),
+    sinon la valeur telle quelle ; « N/A » et vide → rien."""
+    value = value.strip()
+    if not value or value.upper() in ("N/A", "NONE", "NULL", "UNKNOWN"):
+        return ""
+    return value[:10] if re.match(r"\d{4}-\d{2}-\d{2}T", value) else value[:40]
+
+
 def _parse_exa_search_text(text: str, limit: int) -> list[dict[str, Any]]:
     """Blocs `---`-séparés `Title:/URL:/Highlights:/...` renvoyés par `web_search_exa`."""
     rows: list[dict[str, Any]] = []
     for block in text.split("\n---\n"):
-        title = url = ""
+        title = url = date = ""
         highlight_lines: list[str] = []
         in_highlights = False
         for stripped in map(str.strip, block.splitlines()):
@@ -222,12 +238,17 @@ def _parse_exa_search_text(text: str, limit: int) -> list[dict[str, Any]]:
                 title = _after(stripped, "Title:")
             elif stripped.startswith("URL:"):
                 url = _after(stripped, "URL:")
+            elif stripped.startswith("Published:"):
+                date = _pub_date(_after(stripped, "Published:"))
             elif in_highlights and stripped and not stripped.startswith(_EXA_LABELS):
                 highlight_lines.append(stripped)
             if stripped.startswith(_EXA_LABELS):
                 in_highlights = stripped.startswith("Highlights:")
         if url:
-            rows.append({"url": url, "title": title, "snippet": " ".join(highlight_lines)})
+            row = {"url": url, "title": title, "snippet": " ".join(highlight_lines)}
+            if date:
+                row["date"] = date  # date de publication fournie par le moteur : hors clôture (« · <date> »)
+            rows.append(row)
         if limit and len(rows) >= limit:
             break
     return rows
@@ -256,7 +277,7 @@ def _firecrawl_search(client: httpx.Client, query: str, limit: int, timeout_s: f
         response = client.post(f"{FIRECRAWL_API_URL}/v2/search", json={"query": query, "limit": limit},
                                headers={"Content-Type": "application/json"}, timeout=timeout_s)
     except httpx.HTTPError as exc:
-        raise WebEngineError(f"requête échouée : {exc}") from exc
+        raise WebEngineError(mt.pick(mt.WEB_FAILED).format(error=exc)) from exc
     if response.status_code >= 400:
         raise WebEngineError(f"HTTP {response.status_code}: {response.text.strip()[:300]}")
     data = response.json()
@@ -276,7 +297,7 @@ def _keenable_request(client: httpx.Client, method: str, path: str, timeout_s: f
     try:
         response = getattr(client, method)(f"{KEENABLE_API_URL}{path}", headers=headers, timeout=timeout_s, **kwargs)
     except httpx.HTTPError as exc:
-        raise WebEngineError(f"requête échouée : {exc}") from exc
+        raise WebEngineError(mt.pick(mt.WEB_FAILED).format(error=exc)) from exc
     if response.status_code >= 400:
         raise WebEngineError(f"HTTP {response.status_code}: {response.text.strip()[:300]}")
     return response.json()
@@ -330,7 +351,7 @@ def _firecrawl_extract(client: httpx.Client, url: str, timeout_s: float) -> dict
         response = client.post(f"{FIRECRAWL_API_URL}/v2/scrape", json={"url": url, "formats": ["markdown"]},
                                headers={"Content-Type": "application/json"}, timeout=timeout_s)
     except httpx.HTTPError as exc:
-        raise WebEngineError(f"requête échouée : {exc}") from exc
+        raise WebEngineError(mt.pick(mt.WEB_FAILED).format(error=exc)) from exc
     if response.status_code >= 400:
         raise WebEngineError(f"HTTP {response.status_code}: {response.text.strip()[:300]}")
     data = response.json()
@@ -495,6 +516,8 @@ def merge_results(engine_rows: dict[str, list[dict[str, Any]]], limit: int) -> l
                 bucket["title"] = row["title"]
             if not bucket["snippet"] and row.get("snippet"):
                 bucket["snippet"] = row["snippet"]
+            if not bucket.get("date") and row.get("date"):
+                bucket["date"] = row["date"]
 
     scored = []
     for bucket in buckets.values():
@@ -514,8 +537,8 @@ def merge_results(engine_rows: dict[str, list[dict[str, Any]]], limit: int) -> l
 
 def _format_search_text(results: list[dict[str, Any]], engines_queried: list[str]) -> str:
     if not results:
-        used = ", ".join(engines_queried) if engines_queried else "aucun"
-        return f"Aucun résultat (moteurs interrogés : {used})."
+        used = ", ".join(engines_queried) if engines_queried else mt.pick(mt.WEB_NO_ENGINE)
+        return mt.pick(mt.WEB_NO_RESULT).format(engines=used)
     lines = []
     for r in results:
         head = f"{r['rank']}. {r['title'] or r['url']} — {r['domain']} [{', '.join(r['engines'])}]"
@@ -563,6 +586,9 @@ class WebToolSource:
     blocked_terms: list[str] = field(default_factory=list)
     breaker: _CircuitBreaker = field(default_factory=_CircuitBreaker)
     cache: _QueryCache = field(default_factory=_QueryCache)
+    # Sites connectés (docs/CONNECTED-SITES.md §8.4) : `connected_site(url)` → libellé du site connecté de l'appelant
+    # dont l'URL est une page, ou None. Un seul chemin par hôte : ces pages se lisent par `sites_read`, jamais en anonyme.
+    connected_site: Callable[[str], str | None] | None = None
     _client: httpx.Client = field(init=False, repr=False)
     _executor: ThreadPoolExecutor = field(init=False, repr=False)
 
@@ -591,18 +617,18 @@ class WebToolSource:
         if name == "web_search":
             return self._call_search(arguments)
         if name == "web_fetch":
-            return self._call_fetch(arguments)
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return self._call_fetch(arguments, ctx)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
 
     # --- web_search ---
     def _call_search(self, arguments: dict[str, Any]) -> ToolResult:
         query = str(arguments.get("query", "")).strip()
         if not query:
-            return ToolResult(call_id="", name="web_search", content="requête vide.", is_error=True)
+            return ToolResult(call_id="", name="web_search", content=mt.pick(mt.WEB_EMPTY_QUERY), is_error=True)
         violation = pii_violation(query, self.blocked_terms)
         if violation:
             return ToolResult(call_id="", name="web_search", is_error=True,
-                              content=f"requête refusée : donnée personnelle ({violation}) — reformule sans elle.")
+                              content=mt.pick(mt.WEB_PERSONAL).format(kind=violation))
         try:
             limit = max(1, min(20, int(arguments.get("limit", 8) or 8)))
         except (TypeError, ValueError):
@@ -618,9 +644,12 @@ class WebToolSource:
 
         text = _format_search_text(results, engines_queried)
         payload = {"query": query, "limit": limit, "engines_queried": engines_queried, "results": results}
-        content = (f"{text}\n\n<!-- nokker:web_search:data -->\n"
-                   f"{json.dumps(payload, ensure_ascii=False)}\n<!-- /nokker:web_search:data -->")
-        return ToolResult(call_id="", name="web_search", content=content)
+        old = (f"{text}\n\n<!-- nokker:web_search:data -->\n"
+               f"{json.dumps(payload, ensure_ascii=False)}\n<!-- /nokker:web_search:data -->")
+        # r44 : le modèle reçoit la forme clôturée (même fonction que le portage des anciens résultats) ; le bloc data
+        # part aux clients et à la provenance par `ToolResult.data`, jamais au modèle.
+        return ToolResult(call_id="", name="web_search", content=fence_web_result("web_search", arguments, old),
+                          data=payload)
 
     def _fan_out_search(self, query: str, limit: int) -> tuple[list[dict[str, Any]], list[str]]:
         futures: dict[Future, str] = {}
@@ -630,7 +659,8 @@ class WebToolSource:
                 logger.info("moteur %s en pause (disjoncteur ouvert) : ignoré pour cette requête", engine)
                 continue
             fn = searchers[engine]
-            futures[self._executor.submit(_run_search_engine, engine, fn, self._client, query, limit, self.budget_s)] = engine
+            futures[submit_in_context(self._executor, _run_search_engine, engine, fn, self._client, query, limit,
+                                      self.budget_s)] = engine
 
         if not futures:
             return [], []
@@ -654,7 +684,7 @@ class WebToolSource:
         return merged, sorted(collected.keys())
 
     # --- web_fetch ---
-    def _call_fetch(self, arguments: dict[str, Any]) -> ToolResult:
+    def _call_fetch(self, arguments: dict[str, Any], ctx: ToolContext | None = None) -> ToolResult:
         raw = arguments.get("urls") or arguments.get("url") or []
         if isinstance(raw, str):
             # Vu en réel 19.10 : le modèle passe parfois la liste ENCODÉE en chaîne JSON (« ["https://a", …] ») —
@@ -674,30 +704,67 @@ class WebToolSource:
             found = re.findall(r"https?://[^\s\"'<>\],]+", json.dumps(arguments, ensure_ascii=False))
             urls = list(dict.fromkeys(u.rstrip(".);") for u in found))
         if not urls:
-            return ToolResult(call_id="", name="web_fetch", content="aucune URL fournie (paramètre `urls`).",
+            return ToolResult(call_id="", name="web_fetch", content=mt.pick(mt.WEB_NO_URLS),
                               is_error=True)
 
-        futures = {self._executor.submit(self._fetch_one, u): u for u in urls}
-        done, pending = wait(futures.keys(), timeout=max(self.budget_s * 4, 10.0))
-        docs_by_url = {}
+        if self.connected_site is not None:
+            refused = []
+            for u in urls:
+                try:
+                    label = self.connected_site(u)
+                except Exception:  # noqa: BLE001 — sites injoignables : web_fetch inchangé
+                    label = None
+                if label:
+                    refused.append(mt.pick(mt.WEB_SITE_CONNECTED).format(label=label))
+            if refused and len(refused) == len(urls):
+                return ToolResult(call_id="", name="web_fetch", content="\n".join(dict.fromkeys(refused)),
+                                  is_error=True, reason="site_connected")
+            if refused:
+                urls = [u for u in urls if not self.connected_site(u)]
+        # P11 (nokker/cloud/egress.py) : pendant un tour OUVERT PAR LA PERSONNE, un hôte de SA liste passe par son
+        # téléphone (`egress` allumé), jamais par le cloud ; le modèle ne choisit rien (aucun champ du schéma).
+        from nokker.cloud import egress as egress_mod
+
+        phone = egress_mod.service()
+        docs_by_url: dict[str, dict[str, Any]] = {}
+        if phone is not None:
+            for u in list(urls):
+                try:
+                    doc = phone.allowlist_doc(ctx, u)
+                except Exception:  # noqa: BLE001 — le téléphone en panne : document en erreur, pas de repli cloud
+                    doc = {"url": u, "title": "", "content": "", "engine": egress_mod.ENGINE,
+                           "error": egress_mod.reason_text("phone_timeout")}
+                if doc is not None:
+                    docs_by_url[u] = doc
+        cloud_urls = [u for u in urls if u not in docs_by_url]
+        futures = {submit_in_context(self._executor, self._fetch_one, u): u for u in cloud_urls}
+        done, pending = wait(futures.keys(), timeout=max(self.budget_s * 4, 10.0)) if futures else (set(), set())
         for fut in done:
             docs_by_url[futures[fut]] = fut.result()
         for fut in pending:
             docs_by_url[futures[fut]] = {"url": futures[fut], "title": "", "content": "",
-                                         "error": "délai dépassé"}
+                                         "error": mt.pick(mt.WEB_TIMEOUT)}
         docs = [docs_by_url[u] for u in urls]
+        if phone is not None:  # un refus du cloud (403, 451, CAPTCHA, blocage) : une OFFRE sur le message, rien d'autre
+            for d in docs:
+                if d.get("error") and d.get("engine") != egress_mod.ENGINE:
+                    try:
+                        phone.offer(ctx, d["url"], str(d["error"]))
+                    except Exception:  # noqa: BLE001 — sans offre, le refus reste tel quel
+                        pass
 
         parts = []
         for i, d in enumerate(docs, start=1):
             if d.get("error"):
-                parts.append(f"{i}. {d['url']} — échec : {d['error']}")
+                parts.append(mt.pick(mt.WEB_FETCH_FAILED).format(i=i, url=d["url"], error=d["error"]))
             else:
-                parts.append(f"{i}. {d['url']} — {d['title'] or '(sans titre)'}\n{d['content']}")
+                parts.append(f"{i}. {d['url']} — {d['title'] or mt.pick(mt.WEB_UNTITLED)}\n{d['content']}")
         payload = {"documents": docs}
-        content = ("\n\n".join(parts) + f"\n\n<!-- nokker:web_fetch:data -->\n"
-                   f"{json.dumps(payload, ensure_ascii=False)}\n<!-- /nokker:web_fetch:data -->")
+        old = ("\n\n".join(parts) + f"\n\n<!-- nokker:web_fetch:data -->\n"
+               f"{json.dumps(payload, ensure_ascii=False)}\n<!-- /nokker:web_fetch:data -->")
         any_ok = any(not d.get("error") for d in docs)
-        return ToolResult(call_id="", name="web_fetch", content=content, is_error=not any_ok)
+        return ToolResult(call_id="", name="web_fetch", content=fence_web_result("web_fetch", arguments, old),
+                          is_error=not any_ok, data=payload)
 
     def _fetch_one(self, url: str) -> dict[str, Any]:
         try:

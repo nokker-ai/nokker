@@ -8,10 +8,16 @@ Règles (les mêmes partout) :
   - coût dans la devise de l'entrée du catalogue (`nokker/ledger/prices.py`, `PriceEntry.currency`) : jamais de taux de
     change inventé, donc un total est un dictionnaire `{devise: montant}` ; un `usage.cost` rendu par le Router
     (`LLMCall.chf`) est pris tel quel, en CHF ;
-  - modèle absent du catalogue : jetons seulement (`cost: None`, nom dans `unpriced_models`), jamais un prix inventé.
+  - modèle absent du catalogue : jetons seulement (`cost: None`, nom dans `unpriced_models`), jamais un prix inventé ;
+  - montant en CHF à côté (`cost_chf`, champ AJOUTÉ le 05.11.2026, décision produit « tout en CHF » ; `cost` ne change
+    pas) : les montants CHF tels quels plus les montants USD au taux `billing_usd_chf` de la config (défaut 0,80, posé
+    au démarrage par `set_usd_chf`, jamais lu sur le réseau) ; `None` si une devise sans taux connu (EUR) est en jeu ou
+    si des appels existent sans aucun prix. Le taux appliqué est rendu dans `usd_chf`.
 """
 from __future__ import annotations
 
+import logging
+import math
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -23,6 +29,46 @@ from nokker.ledger.prices import PriceCatalog
 
 AMOUNT_DIGITS = 6
 SUBAGENT_MARK = "/sa-"
+# Taux USD → CHF du montant `cost_chf` (1 USD = 0,80 CHF, l'inverse du 1 CHF = 1,25 USD du catalogue Router).
+# Remplacé au démarrage par `billing_usd_chf` de la config (`set_usd_chf`).
+DEFAULT_USD_CHF = 0.80
+_usd_chf = DEFAULT_USD_CHF
+
+logger = logging.getLogger("nokker.ledger.turn_cost")
+
+
+def set_usd_chf(rate: float | None) -> float:
+    """Pose le taux USD → CHF de `cost_chf` (valeur de la config). Invalide (non positif, non fini) : le défaut, avec
+    un avis. Rend le taux retenu."""
+    global _usd_chf
+    try:
+        r = float(rate) if rate is not None else DEFAULT_USD_CHF
+    except (TypeError, ValueError):
+        r = float("nan")
+    if not math.isfinite(r) or r <= 0:
+        logger.warning("billing_usd_chf invalide (%r) : défaut %s", rate, DEFAULT_USD_CHF)
+        r = DEFAULT_USD_CHF
+    _usd_chf = r
+    return r
+
+
+def usd_chf() -> float:
+    return _usd_chf
+
+
+def to_chf(costs: dict[str, float], rate: float | None = None) -> float | None:
+    """Somme en CHF d'un coût `{devise: montant}` : CHF tel quel, USD au taux ; None si une autre devise est en jeu
+    (jamais un taux inventé)."""
+    r = _usd_chf if rate is None else rate
+    total = 0.0
+    for cur, amount in costs.items():
+        if cur == "CHF":
+            total += amount
+        elif cur == "USD":
+            total += amount * r
+        else:
+            return None
+    return round(total, AMOUNT_DIGITS)
 
 
 @dataclass(frozen=True)
@@ -38,6 +84,8 @@ class UsageRow:
     reasoning: int
     reasoning_reported: bool
     router_chf: float | None = None  # `usage.cost` du Router, en CHF ; None = coût calculé par le catalogue
+    cache_ttl: str = "5m"  # durée du cache des écritures : choisit le prix 5 min ou 1 h
+    cache_write: int = 0  # jetons écrits en cache (compris dans `prompt`) : prix d'écriture du catalogue s'il existe
 
 
 def row_from_call(call: LLMCall) -> UsageRow:
@@ -45,7 +93,7 @@ def row_from_call(call: LLMCall) -> UsageRow:
     return UsageRow(model=call.model, tier=call.tier.value, prompt=u.prompt, cached=u.cached,
                     cached_reported=u.cached_reported, completion=u.completion, reasoning=u.reasoning,
                     reasoning_reported=getattr(u, "reasoning_reported", False) or u.reasoning > 0,
-                    router_chf=call.chf)
+                    router_chf=call.chf, cache_write=getattr(u, "cache_write", 0), cache_ttl=getattr(u, "cache_ttl", "5m"))
 
 
 def row_from_record(rec: Any) -> UsageRow:
@@ -54,7 +102,8 @@ def row_from_record(rec: Any) -> UsageRow:
     return UsageRow(model=rec.model, tier=rec.tier, prompt=rec.prompt_tokens, cached=rec.cached_tokens,
                     cached_reported=rec.cached_reported, completion=rec.completion_tokens,
                     reasoning=rec.reasoning_tokens, reasoning_reported=rec.reasoning_tokens > 0,
-                    router_chf=rec.chf if rec.cost_source == "router" else None)
+                    router_chf=rec.chf if rec.cost_source == "router" else None,
+                    cache_write=getattr(rec, "cache_write_tokens", 0), cache_ttl=getattr(rec, "cache_ttl", "5m"))
 
 
 def _row_cost(row: UsageRow, prices: PriceCatalog | None) -> tuple[float, str, str] | None:
@@ -63,7 +112,7 @@ def _row_cost(row: UsageRow, prices: PriceCatalog | None) -> tuple[float, str, s
         return row.router_chf, "CHF", "router"
     if prices is None:
         return None
-    got = prices.cost(row.model, max(row.prompt - row.cached, 0), row.cached, row.completion)
+    got = prices.cost(row.model, max(row.prompt - row.cached, 0), row.cached, row.completion, row.cache_write, row.cache_ttl)
     return None if got is None else (got[0], got[1], "catalog")
 
 
@@ -71,8 +120,10 @@ def _round(costs: dict[str, float]) -> dict[str, float]:
     return {cur: round(v, AMOUNT_DIGITS) for cur, v in sorted(costs.items())}
 
 
-def summarize(rows: Iterable[UsageRow], prices: PriceCatalog | None) -> dict[str, Any]:
-    """Jetons et coût, par modèle et au total (forme du contrat, docs/LOKKAL.md §7.8)."""
+def summarize(rows: Iterable[UsageRow], prices: PriceCatalog | None, *, usd_chf: float | None = None) -> dict[str, Any]:
+    """Jetons et coût, par modèle et au total (forme du contrat, docs/LOKKAL.md §7.8). `usd_chf` : taux de `cost_chf`
+    (défaut : celui posé par `set_usd_chf`)."""
+    rate = _usd_chf if usd_chf is None else usd_chf
     by_model: dict[str, dict[str, Any]] = {}
     total_cost: dict[str, float] = defaultdict(float)
     n = 0
@@ -107,6 +158,7 @@ def summarize(rows: Iterable[UsageRow], prices: PriceCatalog | None) -> dict[str
         m = by_model[name]
         cost, priced, sources = m.pop("_cost"), m.pop("_priced"), m.pop("_sources")
         m["cost"] = _round(cost) if priced else None
+        m["cost_chf"] = to_chf(m["cost"], rate) if priced else None
         # « partial » : certains appels du modèle sans prix (un `usage.cost` du Router sur une partie seulement).
         m["price_source"] = (None if not priced else
                              ("+".join(sorted(sources)) + ("+partial" if priced < m["calls"] else "")))
@@ -126,6 +178,9 @@ def summarize(rows: Iterable[UsageRow], prices: PriceCatalog | None) -> dict[str
         "reasoning_tokens": _sum("reasoning_tokens"),
         "total_tokens": sum(m["total_tokens"] for m in models),
         "cost": _round(total_cost),
+        # Rien n'a de prix alors qu'il y a des appels : inconnu (None), pas zéro. Aucun appel : 0.
+        "cost_chf": None if (n and not total_cost) else to_chf(dict(total_cost), rate),
+        "usd_chf": rate,
         "unpriced_models": unpriced,
         "models": models,
     }
@@ -165,5 +220,5 @@ def ledger_totals(ledger: Any, prices: PriceCatalog | None, *, thread_id: str | 
     return out
 
 
-__all__ = ["UsageRow", "is_subagent_thread", "ledger_totals", "root_thread", "row_from_call", "row_from_record",
-           "summarize", "turn_cost"]
+__all__ = ["DEFAULT_USD_CHF", "UsageRow", "is_subagent_thread", "ledger_totals", "root_thread", "row_from_call", "row_from_record",
+           "set_usd_chf", "summarize", "to_chf", "turn_cost", "usd_chf"]

@@ -1,6 +1,6 @@
 # Nokker — Conditions de la bêta privée
 
-**Version 2 — 28 octobre 2026**
+**Version 3 — 5 novembre 2026**
 
 ## 1. Qui nous sommes
 La bêta est proposée par **Ninabot Sàrl**, c/o Openest coworking SA, Chemin de Riantbosson 19, 1217 Meyrin, Suisse
@@ -30,7 +30,9 @@ l'acceptez :
   **jamais vendues** ;
 - le **contenu provenant de vos connecteurs** (vos e-mails, votre agenda, vos fichiers, les pages consultées par le
   navigateur) n'est **jamais** utilisé pour l'entraînement ; il sert uniquement à exécuter vos demandes ;
-- vous pouvez **exclure une conversation** précise de cette utilisation.
+- vous pouvez **exclure une conversation** précise de cette utilisation ;
+- cela vaut aussi pour les conversations dont les réponses viennent du fournisseur d'inférence que vous avez choisi
+  (§ 5 bis) : nous gardons la conversation chez nous ; ce que votre fournisseur en fait relève de ses propres conditions.
 
 Vous pouvez **retirer** ce consentement à tout moment dans « Mon compte » : nous cessons alors d'utiliser vos données
 à partir de ce moment, et l'avantage du § 9 s'arrête s'il n'est pas encore acquis.
@@ -41,8 +43,32 @@ L'effacement de vos données (§ 7) supprime vos données brutes ; il ne modifie
 ## 5. Où vos données sont traitées
 - Pendant la bêta, la plateforme est hébergée **en France**, chez un hébergeur européen (OVHcloud) : votre compte, vos
   conversations, vos connecteurs et les calculs des modèles d'IA. Les paiements éventuels passent par **Stripe**, prestataire de paiement. Les données sont chiffrées en transit et au repos.
+- **Lecture à voix haute** (si vous l'utilisez) : quand vous demandez d'écouter une réponse, ou quand l'agent vous
+  répond par une note vocale sur Telegram, le texte de cette réponse seulement, jamais l'historique de la conversation
+  ni vos pièces jointes, est transmis à **ElevenLabs** (synthèse vocale), qui le stocke **aux États-Unis**. Ce transfert
+  est encadré par les clauses contractuelles types de la Commission européenne, adaptées au droit suisse, et par le Data
+  Privacy Framework Suisse–États-Unis auquel ElevenLabs déclare adhérer.
 - Votre candidature à la bêta reste stockée **en Suisse**.
 - Un hébergement entièrement suisse sera proposé ensuite aux clients qui en ont besoin.
+
+## 5 bis. Inférence choisie par vous (BYOK)
+- Avec l'offre **BYOK**, et aussi avec **Solo**, **Famille** et **Large**, vous pouvez brancher **votre propre fournisseur
+  d'inférence** (une API compatible OpenAI : son adresse, le modèle et votre clé). Pour produire les réponses, Nokker lui
+  transmet **vos messages et le contexte nécessaire au tour** (extraits de mémoire, résultats d'outils, contenu de
+  connecteurs utilisé pour répondre).
+- Les fonctions annexes (rappel de mémoire, relectures, guide, correcteur d'objectifs) restent traitées par **nos
+  modèles**, dans les conditions du § 5, et sont comprises dans votre offre.
+- Ce fournisseur est **un sous-traitant que vous choisissez vous-même**, sous **ses** conditions et dans **son** pays
+  d'hébergement. Ninabot Sàrl ne le choisit pas, ne le contrôle pas et ne répond pas de son traitement ni de sa
+  disponibilité. Vérifiez ses conditions, notamment sur la conservation et l'entraînement, avant de le brancher.
+- Votre clé est conservée **chiffrée** dans notre coffre, n'est jamais affichée après saisie et sert uniquement à
+  appeler l'adresse où vous l'avez donnée : si vous changez cette adresse, la clé est retirée. Vous pouvez la retirer à
+  tout moment.
+- L'offre BYOK n'inclut **aucune inférence de Nokker** pour les réponses : sans fournisseur configuré, Nokker vous
+  invite à en configurer un et ne répond pas. Avec Solo, Famille ou Large, l'inférence incluse reste disponible.
+- Si votre offre ne comprend plus le BYOK (fin d'abonnement), Nokker repasse sur **son propre modèle**, dans les
+  limites de l'offre qui s'applique alors (§ 8).
+- Le coût de l'inférence est **facturé par votre fournisseur**, directement à vous.
 
 ## 6. Connecteurs et actions
 - Vous choisissez les services que vous connectez (messagerie, agenda, Telegram…) et vous pouvez les déconnecter à
@@ -66,6 +92,12 @@ L'usage est mesuré en **messages** (un message = un tour de conversation avec N
 **40 messages par jour et 200 par semaine**, sur des fenêtres à heure fixe affichées dans « Mon compte » (avec l'heure
 de remise à zéro, heure de Zurich). Pendant la bêta, **nous vous prévenons quand vous dépassez, sans vous couper**,
 le temps de calibrer ces limites ; un plafond de sécurité de 150 messages par jour reste appliqué contre les abus.
+
+**Prix.** Les prix sont en **francs suisses (CHF)**, par mois, et sont finaux : Ninabot Sàrl n'est pas assujettie à
+la TVA. Le paiement est traité par Stripe.
+
+**BYOK.** Les tours dont la réponse vient de votre propre fournisseur (§ 5 bis) **ne sont pas décomptés** des quotas
+ci-dessus ; le plafond de sécurité contre les abus (150 messages par jour) leur reste appliqué.
 
 ## 9. Avantage « Solo offert 6 mois »
 À la fin des 30 jours, les participants qui ont **joué le jeu** passent en **offre Solo gratuite pendant 6 mois**.

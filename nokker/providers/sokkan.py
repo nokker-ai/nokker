@@ -49,6 +49,14 @@ délai de lecture n'est donc plus rejoué (le tour se dégrade proprement) ; un 
 `arguments` d'un appel d'outil est aussi remis dès réception (le noyau en lit le JSON partiel, `core/live_input.py`).
 Un morceau d'arguments remis compte comme un morceau émis : même règle de réessai que pour `on_delta`.
 
+Réflexion (API hôte, docs/NOKKAN-HOST-API.md §3) : la réflexion que l'amont renvoie à côté de la réponse — champ
+`reasoning` (vLLM 0.32, capture réelle du 11.11.2026 : tests/fixtures/providers/vllm-0.32-reasoning-stream.sse) ou
+`reasoning_content` (amonts OpenAI-compatibles plus anciens) du message ou du delta — était jetée. Elle est maintenant
+rendue dans `Completion.reasoning`, HORS du message (donc hors du contexte, du store et de la mémoire) et hors de
+`raw` en flux ; avec `on_reasoning_delta`, chaque morceau brut est aussi remis dès réception. Un morceau de réflexion
+remis compte comme un morceau émis (même règle de réessai que `on_delta`). Sans `on_reasoning_delta` et sans lecteur
+de `Completion.reasoning` (drapeau `host_reasoning_stream` éteint) : rien ne change.
+
 Connexion (e2e du 1.11, D5) : trois appels sont tombés après 180 s sur « _ssl.c:1064: The handshake operation timed
 out », sans nouvel essai, alors que le journal annonçait « tentative 1/3 » — le délai de connexion (poignée de main TLS
 comprise) était celui de lecture (180 s), qui épuisait à lui seul le budget de l'appel. Désormais : délai de connexion
@@ -67,25 +75,80 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 
+from nokker.core.model_served import clean_served, is_router_url, served_from_headers
 from nokker.core.ports import Completion, StreamInterrupted
-from nokker.core.turn import Message, ToolCall, Usage
+from nokker.core.quota_error import QUOTA_STATUSES, quota_body, tag_error
+from nokker.core.turn import Message, ToolCall, Usage, new_call_id, strip_thinking
+from nokker.providers.gate import headers_for as gate_headers
 
 logger = logging.getLogger("nokker.providers.sokkan")
 
+CALL_ID_HEADER = "X-Nokker-Call-Id"
+CLIENT_HEADER = "X-Nokker-Client"
+_client_tag = "nokker"  # `route.client_tag` (config.py::client_tag_of), posé au chargement de la config
+_client_tag_fixed = False
+
+
+def set_client_tag(tag: str) -> None:
+    """Étiquette de déploiement envoyée au Router (déjà validée par `config.client_tag_of`). Posée UNE SEULE FOIS : le
+    premier `load_config` la fixe ; un chargement suivant avec une valeur DIFFÉRENTE journalise un WARNING et garde la
+    valeur d'origine (jamais de dérive en cours de processus) ; avec la même valeur, rien."""
+    global _client_tag, _client_tag_fixed
+    if _client_tag_fixed:
+        if tag != _client_tag:
+            logger.warning("route.client_tag : %r ignoré, l'étiquette %r est déjà posée pour ce processus", tag,
+                           _client_tag)
+        return
+    _client_tag, _client_tag_fixed = tag, True
+
+
+def reset_client_tag(tag: str = "nokker") -> None:
+    """Pour les tests seulement : remet l'étiquette et lève le verrou « posée une fois »."""
+    global _client_tag, _client_tag_fixed
+    _client_tag, _client_tag_fixed = tag, False
+
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+RETRY_AFTER_MAX_S = 30.0  # 503 du Router : au-delà, l'attente demandée ne vaut pas le coup, aucun rejeu
+RETRY_AFTER_DEFAULT_S = 1.0  # `Retry-After` absent ou invalide
 MIN_RETRY_S = 15.0  # un essai de plus ne part que s'il reste au moins ce temps dans le budget de l'appel
 CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)  # avant tout octet de réponse (TCP, DNS, TLS)
 
 
+def _retry_after_s(headers: Any) -> float:
+    """Attente demandée par `Retry-After` (secondes entières OU date HTTP, RFC 7231 §7.1.3) ; 1 s si absent ou invalide
+    (texte, négatif, date passée). Non plafonnée ici : l'appelant refuse le rejeu au-delà de `RETRY_AFTER_MAX_S`."""
+    raw = headers.get("retry-after") if headers is not None else None
+    if not isinstance(raw, str) or not raw.strip():
+        return RETRY_AFTER_DEFAULT_S
+    raw = raw.strip()
+    if raw.isascii() and raw.isdigit():
+        return float(int(raw))
+    try:
+        delta = parsedate_to_datetime(raw).timestamp() - time.time()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return RETRY_AFTER_DEFAULT_S
+    return delta if delta > 0 else RETRY_AFTER_DEFAULT_S
+
+
+def _is_quota(text: str) -> bool:
+    """Corps d'un refus de quota d'inférence : lu en entier (≤ 64 Ko), sinon par son préfixe."""
+    probe = tag_error(Exception(), text)
+    code = getattr(probe, "error_code", None)
+    return code == "quota_exceeded" if isinstance(code, str) else quota_body(text) is not None
+
+
 class _UpstreamStatus(Exception):
-    def __init__(self, status: int, text: str) -> None:
+    def __init__(self, status: int, text: str, headers: Any = None) -> None:
         super().__init__(f"HTTP {status}")
         self.status = status
         self.text = text
+        self.headers = headers
+        tag_error(self, text)
 
 
 @dataclass
@@ -112,7 +175,10 @@ class SokkanProvider:
     timeout_retries: int = 1
     # Temps total d'un appel, réessais compris (None = `timeout_s`) : voir la docstring du module.
     call_budget_s: float | None = None
+    # Plafond de sortie quand l'appelant n'en donne pas (`tiers.<nom>.max_tokens`, sinon 2048 comme avant).
     max_tokens_default: int = 2048
+    # Vrai quand ce plafond vient du palier (`tiers.<nom>.max_tokens`) : la boucle du noyau ne lui impose alors pas son défaut.
+    max_tokens_pinned: bool = False
     extra_headers: dict[str, str] = field(default_factory=dict)
     # 429 « trop de requêtes simultanées pour cette clé » (Router, plafond par clé) : une place se libère quand un
     # autre appel finit — on ATTEND (1, 2, 4, 8, 8… s, dans `total_budget_s`) sans consommer les réessais réseau,
@@ -123,10 +189,34 @@ class SokkanProvider:
     vision: bool = False
     # `vision: auto` (nokker/providers/vision_probe.py) : sonde unique au premier tour avec image ; None = pas de sonde.
     vision_probe: Any = None
+    # Échantillonnage fixe du palier (`tiers.<nom>.sampling`, ex. {"temperature": 0.3} pour le palier nina, entraîné et
+    # mesuré à T=0,3) : ajouté à chaque corps AVANT le corps de raisonnement. Vide (défaut) = défaut de l'amont, inchangé.
+    sampling_body: dict[str, Any] = field(default_factory=dict)
+    # Client HTTP construit par l'appelant (`timeout` → `httpx.Client`) : BYOK cloud, client gardé contre le SSRF et
+    # revérifié à chaque connexion (nokker/byok/guard.py). None = client httpx ordinaire (comportement historique).
+    client_factory: Callable[[httpx.Timeout], httpx.Client] | None = None
+    # En-tête `X-Session-Id` (affinité du Router) : coupé vers un amont tiers, qui n'a pas à voir nos identifiants de fil.
+    session_header: bool = True
+    # En-tête `X-Nokker-Call-Id` (identifiant de l'appel, `tiers.<nom>.send_call_id`) : éteint par défaut, jamais vers un
+    # amont tiers (BYOK) sans que la config le demande. L'identifiant est inscrit au ledger dans tous les cas.
+    send_call_id: bool = False
+    # `tiers.<nom>.gate: true` : ce palier reçoit les en-têtes d'amont de la session (`providers/gate.py`), et lui seul.
+    gate: bool = False
+    # Ce palier parle-t-il au Router de Nokker (`tiers.<nom>.router`) ? None = déduit de l'hôte de `base_url`. Un Router
+    # réécrit `model` au nom demandé : sans en-tête `X-Model-Served`, `model_served` reste None (le corps est trompeur).
+    router: bool | None = None
+
+    @property
+    def behind_router(self) -> bool:
+        return is_router_url(self.base_url) if self.router is None else bool(self.router)
 
     def __post_init__(self) -> None:
-        self._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
+        self._client = self._new_client()
         self._closed = False
+
+    def _new_client(self) -> httpx.Client:
+        timeout = self._httpx_timeout(self.timeout_s)
+        return self.client_factory(timeout) if self.client_factory is not None else httpx.Client(timeout=timeout)
 
     def _httpx_timeout(self, t: float) -> httpx.Timeout:
         """Lecture, écriture, pool : `t` ; connexion (TLS compris) : `connect_timeout_s`, jamais plus que `t`."""
@@ -138,7 +228,7 @@ class SokkanProvider:
         côté amont : un `recv` bloqué ne se réveille pas d'un autre thread, et le Router ne libère la place qu'à la
         fin de la réponse."""
         twin = copy.copy(self)
-        twin._client = httpx.Client(timeout=self._httpx_timeout(self.timeout_s))
+        twin._client = self._new_client()
         twin._closed = False
         return twin
 
@@ -157,17 +247,26 @@ class SokkanProvider:
                         ) -> tuple[str | None, float, str]:
         """Que faire après une erreur réseau survenue AVANT tout morceau remis : (genre de réessai, attente, motif).
         Genre None = abandon (le motif dit pourquoi). `n` compte les réessais déjà faits par genre."""
-        normal = n["attempt"] - n["connect"] - n["timeout"]
+        normal = n["attempt"] - n["connect"] - n["timeout"] - n.get("r503", 0)
         wait = self.retry_backoff_s * (n["attempt"] + 1)
+        if n.get("r503"):  # un 503 rejoué une fois et c'est tout : l'essai de rejeu a échoué, on sort
+            return None, 0.0, "rejeu après 503 déjà fait"
         if isinstance(e, CONNECT_ERRORS):
             if n["connect"] >= self.max_retries:
                 return None, 0.0, f"{n['connect'] + 1} échecs de connexion"
             if not self._room(deadline, wait):
                 return None, 0.0, "budget de l'appel épuisé"
             return "connect", wait, ""
+        timed_out = isinstance(e, httpx.TimeoutException)
+        if timed_out and n.get("tmo", 0) >= self.timeout_retries:
+            # Un délai d'attente donne AU PLUS `timeout_retries` rejeu(x) au total : le rejeu « normal » et celui
+            # « délai d'attente » ne s'additionnent pas (avant : 2 « normal » + 1 « timeout » = 3 rejeux).
+            return None, 0.0, "réessais épuisés"
         if normal < self.max_retries and self._budget_left(t_budget0) and self._room(deadline, wait):
+            n["tmo"] = n.get("tmo", 0) + timed_out
             return "retry", wait, ""
-        if isinstance(e, httpx.TimeoutException) and n["timeout"] < self.timeout_retries and self._room(deadline):
+        if timed_out and n["timeout"] < self.timeout_retries and self._room(deadline):
+            n["tmo"] = n.get("tmo", 0) + 1
             return "timeout", 0.0, ""
         if normal >= self.max_retries:
             return None, 0.0, "réessais épuisés"
@@ -185,6 +284,34 @@ class SokkanProvider:
                            "(%.0f s restantes dans le budget de l'appel)", what, nature, attempt + 1, self.model, e,
                            attempt + 2, wait, deadline - time.monotonic())
 
+    def _wait_503(self, status: int, text: str, headers: Any, n: dict[str, int], t_budget0: float,
+                  deadline: float, attempt: int) -> float:
+        """503 du Router (`upstream_timeout` / `no_upstream`, + `Retry-After`) : rejoué UNE fois, quel que soit
+        `max_retries`. Rend l'attente avant ce rejeu, ou lève l'erreur (motif `error.code` dans le message ET le journal)
+        si déjà rejoué, si `Retry-After` dépasse `RETRY_AFTER_MAX_S` ou si l'attente ne tient ni dans `total_budget_s`
+        ni dans le budget de l'appel (`_room`)."""
+        code = getattr(tag_error(Exception(), text), "error_code", None)
+        rid = headers.get("x-request-id") if headers is not None else None
+        wait = _retry_after_s(headers)
+        why = None
+        if n["r503"] >= 1:
+            why = "déjà rejoué une fois"
+        elif wait > RETRY_AFTER_MAX_S:
+            why = f"Retry-After {wait:.0f}s > {RETRY_AFTER_MAX_S:.0f}s"
+        elif time.monotonic() - t_budget0 + wait >= self.total_budget_s:
+            why = f"budget total {self.total_budget_s}s"
+        elif not self._room(deadline, wait):
+            why = "budget de l'appel"
+        motif = f" motif={code}" if code else ""
+        if why is not None:
+            logger.warning("sokkan provider: HTTP 503%s req=%s (tentative %d) %s — abandon (%s)",
+                           motif, rid, attempt + 1, self.model, why)
+            raise tag_error(RuntimeError(f"HTTP 503 de {self.base_url}{' (' + str(code) + ')' if code else ''} après "
+                                         f"{attempt + 1} tentative(s) ({why}): {text[:200]}"), text)
+        logger.warning("sokkan provider: HTTP 503%s req=%s (tentative %d) %s — un rejeu dans %.0fs",
+                       motif, rid, attempt + 1, self.model, wait)
+        return wait
+
     def _busy_wait(self, status: int, busy: int, t_budget0: float, deadline: float | None = None) -> bool:
         """Vrai (après avoir attendu) si un 429 doit être rejoué sans compter comme un réessai."""
         if status != 429 or not self._budget_left(t_budget0):
@@ -197,31 +324,46 @@ class SokkanProvider:
         return True
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, reasoning: bool,
-                 session_key: str, max_tokens: int = 2048,
+                 session_key: str, max_tokens: int | None = None,
                  on_delta: Callable[[str], None] | None = None,
-                 on_tool_delta: Callable[[int, str, str, str], None] | None = None) -> Completion:
+                 on_tool_delta: Callable[[int, str, str, str], None] | None = None,
+                 on_reasoning_delta: Callable[[str], None] | None = None) -> Completion:
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": strip_thinking(messages),  # les blocs de réflexion d'un fournisseur Anthropic ne vont qu'à lui
             "max_tokens": max_tokens or self.max_tokens_default,
         }
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        body.update(self.sampling_body)
         body.update(self.reasoning_on_body if reasoning else self.reasoning_off_body)
 
-        headers = {"Content-Type": "application/json", "X-Session-Id": session_key}
+        headers = {"Content-Type": "application/json"}
+        if self.session_header:
+            headers["X-Session-Id"] = session_key
         if self.api_key:  # un amont sans auth (ex. llama.cpp local) refuse un Bearer vide
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update(self.extra_headers)
+        call_id = new_call_id()  # un par appel du noyau ; les réessais HTTP d'un même appel gardent le leur
+        if self.send_call_id:
+            headers[CALL_ID_HEADER] = call_id
+        headers.update(gate_headers(self.gate, session_key))
+        if self.behind_router and self.client_factory is None:  # le Router de Nokker seulement : jamais un amont tiers/BYOK
+            headers[CLIENT_HEADER] = _client_tag
 
         t0 = time.monotonic()
+        meta: dict[str, Any] = {}  # en-têtes de la réponse retenue (X-Model-Served, X-Sokkan-Upstream)
         if on_delta is not None:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
-            data, attempts = self._stream_with_retry(body, headers, on_delta, on_tool_delta)
+            thought: list[str] = []  # réflexion du flux, gardée hors du corps reconstitué (`raw` inchangé)
+            data, attempts = self._stream_with_retry(body, headers, on_delta, on_tool_delta, on_reasoning_delta,
+                                                     thought, meta)
+            reasoning_text = "".join(thought)
         else:
-            data, attempts = self._post_with_retry(body, headers)
+            data, attempts = self._post_with_retry(body, headers, meta)
+            reasoning_text = _message_reasoning((data.get("choices") or [{}])[0].get("message"))
         latency_s = time.monotonic() - t0
 
         choice = (data.get("choices") or [{}])[0]
@@ -231,17 +373,22 @@ class SokkanProvider:
         tool_calls = [_parse_tool_call(tc) for tc in (msg.get("tool_calls") or [])]
         # Un amont qui retire le bloc de raisonnement laisse ses « \n\n » en tête de réponse (Lokkal, 28.10).
         message = Message(role="assistant", content=(msg.get("content") or "").lstrip("\r\n"), tool_calls=tool_calls)
+        served_h, upstream = served_from_headers(meta.get("headers"))
+        # En-tête du Router d'abord ; sans lui, le corps seulement pour un amont direct (un Router le réécrit).
+        served = served_h or (None if self.behind_router else clean_served(data.get("model")))
         return Completion(message=message, usage=usage, model=data.get("model", self.model),
                            latency_s=latency_s, finish_reason=choice.get("finish_reason"), raw=data,
-                           attempts=attempts)
+                           attempts=attempts, reasoning=reasoning_text, call_id=call_id,
+                           model_served=served, upstream=upstream)
 
-    def _post_with_retry(self, body: dict[str, Any], headers: dict[str, str]) -> tuple[dict[str, Any], int]:
+    def _post_with_retry(self, body: dict[str, Any], headers: dict[str, str],
+                         meta: dict[str, Any] | None = None) -> tuple[dict[str, Any], int]:
         last_exc: Exception | None = None
         t_budget0 = time.monotonic()
         deadline = self._deadline()
         attempt, busy = 0, 0
-        n = {"attempt": 0, "connect": 0, "timeout": 0}
-        while attempt <= self.max_retries + n["timeout"] + n["connect"]:
+        n = {"attempt": 0, "connect": 0, "timeout": 0, "tmo": 0, "r503": 0}
+        while attempt <= self.max_retries + n["timeout"] + n["connect"] + n["r503"]:
             self._check_open()
             try:
                 resp = self._client.post(f"{self.base_url.rstrip('/')}/chat/completions", json=body,
@@ -260,10 +407,18 @@ class SokkanProvider:
                 attempt += 1
                 continue
 
-            if self._busy_wait(resp.status_code, busy, t_budget0, deadline):
+            # Quota d'inférence atteint (429 `quota_exceeded`) : pas une panne, ni attente de clé saturée ni réessai.
+            quota = resp.status_code in QUOTA_STATUSES and _is_quota(resp.text)
+            if not quota and self._busy_wait(resp.status_code, busy, t_budget0, deadline):
                 busy += 1
                 continue
-            if resp.status_code in _RETRYABLE_STATUS and attempt - n["connect"] - n["timeout"] < self.max_retries:
+            if not quota and resp.status_code == 503:
+                time.sleep(self._wait_503(503, resp.text, resp.headers, n, t_budget0, deadline, attempt))
+                n["r503"] += 1
+                attempt += 1
+                continue
+            if (not quota and resp.status_code in _RETRYABLE_STATUS and not n["r503"]
+                    and attempt - n["connect"] - n["timeout"] < self.max_retries):
                 # Un 504 précisément = le broker a déjà attendu tout SON budget (first_token_timeout_s,
                 # 60 s par défaut) sans qu'aucun amont ne réponde (voir docstring du module) : ne réessaie
                 # que s'il reste du budget CÔTÉ NOUS pour un essai de plus, sinon un 2e 504 d'affilée
@@ -281,15 +436,19 @@ class SokkanProvider:
                 attempt += 1
                 continue
             if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code} de {self.base_url}: {resp.text[:500]}")
+                raise tag_error(RuntimeError(f"HTTP {resp.status_code} de {self.base_url}: {resp.text[:500]}"), resp.text)
+            if meta is not None:
+                meta["headers"] = resp.headers
             return resp.json(), attempt + busy + 1  # les rejeux 429 sont des requêtes HTTP : visibles au ledger
         if last_exc:
             raise RuntimeError(f"échec réseau après {self.max_retries + 1} tentatives") from last_exc
         raise RuntimeError("échec sans réponse (ne devrait pas arriver)")
 
     def _stream_with_retry(self, body: dict[str, Any], headers: dict[str, str], on_delta: Callable[[str], None],
-                           on_tool_delta: Callable[[int, str, str, str], None] | None = None
-                           ) -> tuple[dict[str, Any], int]:
+                           on_tool_delta: Callable[[int, str, str, str], None] | None = None,
+                           on_reasoning_delta: Callable[[str], None] | None = None,
+                           thought: list[str] | None = None,
+                           meta: dict[str, Any] | None = None) -> tuple[dict[str, Any], int]:
         """Comme `_post_with_retry`, en SSE. `emitted[0]` passe à True au premier morceau remis : dès lors,
         toute erreur lève `StreamInterrupted` (jamais de réessai, le client a déjà vu du texte)."""
         emitted = [False]
@@ -303,22 +462,38 @@ class SokkanProvider:
             assert on_tool_delta is not None
             on_tool_delta(index, call_id, name, piece)
 
+        def _relay_reasoning(piece: str) -> None:
+            emitted[0] = True  # le client a vu de la réflexion : plus de réessai silencieux
+            assert on_reasoning_delta is not None
+            on_reasoning_delta(piece)
+
         t_budget0 = time.monotonic()
         deadline = self._deadline()
         attempt, busy = 0, 0
-        n = {"attempt": 0, "connect": 0, "timeout": 0}
-        while attempt <= self.max_retries + n["timeout"] + n["connect"]:
+        n = {"attempt": 0, "connect": 0, "timeout": 0, "tmo": 0, "r503": 0}
+        while attempt <= self.max_retries + n["timeout"] + n["connect"] + n["r503"]:
             self._check_open()
             try:
+                if thought is not None:
+                    del thought[:]  # un essai rejoué repart d'une réflexion vide
                 return (self._stream_once(body, headers, _relay, _relay_tool if on_tool_delta is not None else None,
-                                          timeout=self._timeout(deadline)),
+                                          timeout=self._timeout(deadline),
+                                          on_reasoning_delta=_relay_reasoning if on_reasoning_delta is not None
+                                          else None, thought=thought, meta=meta),
                         attempt + busy + 1)
             except _UpstreamStatus as e:
                 # Statut connu avant le moindre octet de corps : rien n'a pu être émis.
-                if self._busy_wait(e.status, busy, t_budget0, deadline):
+                quota = e.status in QUOTA_STATUSES and _is_quota(e.text)  # pas une panne : aucun rejeu
+                if not quota and self._busy_wait(e.status, busy, t_budget0, deadline):
                     busy += 1
                     continue
-                if e.status in _RETRYABLE_STATUS and attempt - n["connect"] - n["timeout"] < self.max_retries:
+                if not quota and e.status == 503:
+                    time.sleep(self._wait_503(503, e.text, e.headers, n, t_budget0, deadline, attempt))
+                    n["r503"] += 1
+                    attempt += 1
+                    continue
+                if (not quota and e.status in _RETRYABLE_STATUS and not n["r503"]
+                        and attempt - n["connect"] - n["timeout"] < self.max_retries):
                     if not self._budget_left(t_budget0) or not self._room(deadline,
                                                                           self.retry_backoff_s * (attempt + 1)):
                         raise RuntimeError(f"HTTP {e.status} de {self.base_url} après {attempt + 1} tentative(s) "
@@ -329,7 +504,7 @@ class SokkanProvider:
                     time.sleep(self.retry_backoff_s * (attempt + 1))
                     attempt += 1
                     continue
-                raise RuntimeError(f"HTTP {e.status} de {self.base_url}: {e.text[:500]}") from None
+                raise tag_error(RuntimeError(f"HTTP {e.status} de {self.base_url}: {e.text[:500]}"), e.text) from None
             except (httpx.TransportError, _StreamError) as e:
                 if emitted[0]:
                     raise StreamInterrupted(f"flux amont interrompu après le premier morceau : {e}") from e
@@ -348,7 +523,9 @@ class SokkanProvider:
 
     def _stream_once(self, body: dict[str, Any], headers: dict[str, str], on_delta: Callable[[str], None],
                      on_tool_delta: Callable[[int, str, str, str], None] | None = None,
-                     timeout: float | None = None) -> dict[str, Any]:
+                     timeout: float | None = None,
+                     on_reasoning_delta: Callable[[str], None] | None = None,
+                     thought: list[str] | None = None, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         """Un appel SSE, reconstitué en corps non-streamé (`{"model", "choices": [{"message",
         "finish_reason"}], "usage"}`) pour passer par le même analyseur que `_post_with_retry`."""
         acc = _StreamAccumulator(model=self.model)
@@ -356,7 +533,9 @@ class SokkanProvider:
                                  headers=headers, timeout=timeout if timeout is not None else self.timeout_s) as resp:
             if resp.status_code >= 400:
                 resp.read()
-                raise _UpstreamStatus(resp.status_code, resp.text)
+                raise _UpstreamStatus(resp.status_code, resp.text, resp.headers)
+            if meta is not None:
+                meta["headers"] = resp.headers  # arrivent avec la réponse, avant le premier morceau
             for line in resp.iter_lines():
                 line = line.strip()
                 if not line.startswith("data:"):
@@ -374,6 +553,12 @@ class SokkanProvider:
                 if chunk.get("error"):
                     raise _StreamError(f"erreur amont dans le flux : {str(chunk['error'])[:300]}")
                 piece = acc.add(chunk, on_tool_delta)
+                think = _delta_reasoning(chunk)
+                if think:
+                    if thought is not None:
+                        thought.append(think)
+                    if on_reasoning_delta is not None:
+                        on_reasoning_delta(think)
                 if piece:
                     on_delta(piece)
         if not acc.done and acc.finish_reason is None:
@@ -406,10 +591,12 @@ class _StreamAccumulator:
     usage: dict[str, Any] | None = None
     done: bool = False
     tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
+    model_seen: bool = False  # un chunk a porté `model` : sinon le corps reconstitué n'en porte pas (jamais le défaut)
 
     def add(self, chunk: dict[str, Any], on_tool: Callable[[int, str, str, str], None] | None = None) -> str:
         if chunk.get("model"):
             self.model = chunk["model"]
+            self.model_seen = True
         if chunk.get("usage"):
             self.usage = chunk["usage"]
         piece = ""
@@ -454,11 +641,35 @@ class _StreamAccumulator:
         message: dict[str, Any] = {"role": "assistant", "content": self.content}
         if self.tool_calls:
             message["tool_calls"] = [self.tool_calls[i] for i in sorted(self.tool_calls)]
-        data: dict[str, Any] = {"model": self.model,
-                                "choices": [{"index": 0, "message": message, "finish_reason": self.finish_reason}]}
+        data: dict[str, Any] = {"choices": [{"index": 0, "message": message, "finish_reason": self.finish_reason}]}
+        if self.model_seen:  # absent du flux : absent du corps (`complete` retombe alors sur le modèle du palier)
+            data = {"model": self.model, **data}
         if self.usage is not None:
             data["usage"] = self.usage
         return data
+
+
+REASONING_KEYS = ("reasoning", "reasoning_content")  # vLLM récent, puis amonts OpenAI-compatibles plus anciens
+
+
+def _message_reasoning(obj: Any) -> str:
+    """Réflexion d'un message ou d'un delta : la première clé connue qui porte du texte (jamais les deux à la suite,
+    un amont de transition envoie le même texte sous les deux noms)."""
+    if not isinstance(obj, dict):
+        return ""
+    for key in REASONING_KEYS:
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _delta_reasoning(chunk: dict[str, Any]) -> str:
+    out = ""
+    for choice in chunk.get("choices") or []:
+        if isinstance(choice, dict) and choice.get("index", 0) == 0:
+            out += _message_reasoning(choice.get("delta"))
+    return out
 
 
 def _parse_usage(raw: dict[str, Any]) -> Usage:

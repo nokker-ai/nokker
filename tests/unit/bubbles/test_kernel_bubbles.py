@@ -201,3 +201,26 @@ def test_broken_observer_never_breaks_turn(tmp_path):
     k.observer = Boom()
     turn = k.run_turn(TurnInput("fil", "salut", sender="alice"))
     assert turn.reply == "voilà" and turn.error is None
+
+
+def test_hub_publishes_mcp_server_unavailable_with_a_scrubbed_reason(hub, rec):
+    from nokker.core.turn import InputCheck, Turn
+
+    hub.mcp_server_unavailable(Turn(thread_id="th_1", index=2, input=InputCheck(text="x")),
+                               {"server": "docs", "reason": "ConnectionError: refus"})
+    event = [e for e in rec.events if e[0] == "mcp.server_unavailable"]
+    assert len(event) == 1 and event[0][1]["server"] == "docs" and event[0][1]["reason"] == "ConnectionError: refus"
+    assert event[0][1]["thread_id"] == "th_1"
+
+
+def test_hub_publishes_route_model_mismatch_with_bounded_fields(hub, rec):
+    from nokker.core.turn import InputCheck, Turn
+
+    hub.route_model_mismatch(Turn(thread_id="th_1", index=2, input=InputCheck(text="x")),
+                             {"tier": "ship", "model_expected": "qwen3.8-27b", "model_served": "v/" + "z" * 400,
+                              "call_id": "nc_00112233445566aa"})
+    event = [e for e in rec.events if e[0] == "route.model_mismatch"]
+    assert len(event) == 1 and event[0][1]["thread_id"] == "th_1"
+    d = event[0][1]
+    assert (d["tier"], d["model_expected"], d["call_id"]) == ("ship", "qwen3.8-27b", "nc_00112233445566aa")
+    assert len(d["model_served"]) == 200

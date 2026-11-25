@@ -23,6 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import ToolResult
 from nokker.tenancy.context import NoTenant
@@ -163,7 +164,7 @@ class CodeSessionSkills:
         from nokker.code_sessions.service import NO_SESSION
 
         if name not in TOOLS:
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         try:
             found = self.sessions.skills_for_thread(ctx.thread_id)
         except NoTenant:
@@ -173,15 +174,14 @@ class CodeSessionSkills:
             return fb.call(name, arguments, ctx) if fb is not None else out(NO_SESSION, True)
         s, project, catalog = found
         if ctx.sender is not None and is_account(ctx.sender) and ctx.sender != s.user_id:
-            return out("REFUSÉ : cette session de code appartient à un autre utilisateur", True)
+            return out(mt.pick(mt.CODE_SESSION_OTHER_USER), True)
         a = arguments or {}
         tid = ctx.thread_id
         try:
             if name == "skill_list":
                 listed = catalog.list_skills(a.get("category"), tid) if project is not None else {"skills": []}
                 if project is not None and listed["skills"] and project.visible_dir(tid) is None:
-                    return out("REFUSÉ : les skills du dépôt ont changé pendant la lecture ; ils sont de nouveau "
-                               "ignorés jusqu'à une nouvelle confiance", True)
+                    return out(mt.pick(mt.CODE_SESSION_SKILLS_CHANGED), True)
                 if fb is not None:
                     r = fb.call(name, arguments, ctx)
                     if not r.is_error:
@@ -193,11 +193,11 @@ class CodeSessionSkills:
                             listed["note"] = " ".join(filter(None, (listed.get("note"), extra["note"])))
                 return out(listed)
             if "name" not in a:
-                return out("argument manquant : name", True)
+                return out(mt.pick(mt.MISSING_ARG).format(name="name"), True)
             entry = catalog._find(str(a["name"]), tid)[0] if catalog is not None else None
             if entry is None:  # pas un skill du dépôt (visible) : ceux du compte
                 return fb.call(name, arguments, ctx) if fb is not None else \
-                    out(f"compétence introuvable : {a['name']!r} (skill_list pour voir les noms)", True)
+                    out(mt.pick(mt.SKILL_NOT_FOUND).format(name=repr(a["name"])), True)
             payload, err = catalog.view(str(a["name"]), a.get("file"), tid)
             return out(payload, err)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue

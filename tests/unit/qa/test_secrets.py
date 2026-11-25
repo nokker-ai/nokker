@@ -321,3 +321,13 @@ def test_paths_with_versioned_words_are_not_secrets():
     # un vrai secret à barres obliques reste caviardé
     aws = "wJalrXUtnFEMI" + "/K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
     assert aws not in redact(f"key {aws}").text
+
+
+def test_ssh_host_fingerprint_is_not_redacted():
+    from nokker.qa.secrets import redact
+
+    fp = "SHA256:jTTg5VQEA5S6w9f4FOkwPDdpx8P//u654ehyNukaaiY"
+    text = f"labo-a présente la clé ED25519 {fp} : compare-la avant d'approuver."
+    assert fp in redact(text).text
+    # le même motif sans le préfixe SHA256: reste un candidat d'entropie
+    assert "jTTg5VQEA5S6w9f4FOkwPDdpx8P//u654ehyNukaaiY" not in redact("clé jTTg5VQEA5S6w9f4FOkwPDdpx8P//u654ehyNukaaiY").text

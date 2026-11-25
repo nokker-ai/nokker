@@ -13,7 +13,7 @@ from nokker.context.types import ContextBudgets
 from nokker.core.ports import Completion
 from nokker.core.turn import InputCheck, Message, Turn, Usage
 
-from .harness import make_session
+from .harness import make_session, context_text
 
 DECISION_A = "La comptable a un nouveau logiciel : passe le séparateur du CSV en virgule, en-tête compris."
 REVOKE_A = ("Ah non, je viens de l'avoir au téléphone : elle ouvre toujours les fichiers dans Excel. Reviens au "
@@ -99,7 +99,7 @@ def test_cancelled_decision_does_not_come_back_as_current(tmp_path):
     s = _scene(tmp_path)
     s.say(QUESTION)
     prompt = _prompt(s)
-    system = s.provider.seen[-1][0]["content"]
+    system = context_text(s.provider.seen[-1])
     head = s.provider.seen[-1][-1]["content"]
 
     # 1. l'annulation est dans le contexte, avec la conclusion du modèle qui nomme ce qu'elle annule
@@ -145,11 +145,11 @@ def test_no_revocation_no_section(tmp_path):
 
 
 def test_revocations_stay_under_the_session_memory_budget(tmp_path):
-    b = ContextBudgets(current_budget=10 ** 6, episodes_budget=300)
+    b = ContextBudgets(current_budget=10 ** 6, episodes_budget=500)  # jetons réels : 500 × 2,9 = 1 450 caractères
     s = make_session(b, tmp_path=tmp_path, provider=CannedProvider())
     for i in range(12):
         s.say(f"Finalement, annule la règle numéro {i} et reviens à l'ancienne version du module m{i}. " * 4)
         s.manager.new_episode(s.thread)
     block = s.manager.memory_block(s.thread)
-    assert len(block) <= b.episodes_budget * 4 + 200
+    assert len(block) <= b.episodes_budget * 2.9 + 200
     assert "T11" in block  # les plus récents d'abord gardés

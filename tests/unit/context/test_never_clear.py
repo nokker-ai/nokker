@@ -5,7 +5,7 @@ from nokker.context.manager import ContextManager
 from nokker.context.types import ContextBudgets
 from nokker.core.turn import InputCheck, Message, Turn
 
-from .harness import BIG_MARK, chars_of, make_session
+from .harness import BIG_MARK, chars_of, make_session, context_text
 
 FILLER = "On parle de la migration du disque et des sauvegardes nocturnes du serveur, avec beaucoup de détails. " * 3
 
@@ -60,7 +60,7 @@ def test_big_result_goes_to_reservoir_and_can_be_recalled(tmp_path):
 
 def test_compaction_sheds_old_results_keeps_recent(tmp_path):
     b = ContextBudgets(episodes_budget=500, current_budget=3000, compaction_step=300, shed_min_tokens=200,
-                       reservoir_min_tokens=10 ** 6, keep_last_turns_raw=2)
+                       reservoir_min_tokens=10 ** 6, keep_last_turns_raw=2, retroactive_shed=True)
     s = make_session(b, tmp_path=tmp_path, tool_size=3000)  # 750 tokens par résultat, jamais admis au réservoir
     for i in range(6):
         s.say(f"logs {i} {BIG_MARK}")
@@ -87,8 +87,9 @@ def test_watermark_closes_episode_with_summary_and_bubble(tmp_path):
     assert len(s.closed) == len(eps) and all(e.bubble_id == f"bu_{e.id}" for e in eps)
     ep = eps[0]
     assert ep.turn_ids_sha256 and ep.raw_tokens > 0 and ep.day
-    system = s.provider.seen[-1][0]["content"]
-    assert "[Mémoire de la session]" in system and eps[-1].id in system
+    system = context_text(s.provider.seen[-1])
+    # l'épisode clos par le tout dernier tour n'était pas encore clos au dernier appel : on vérifie l'avant-dernier
+    assert "[Mémoire de la session]" in system and eps[-2].id in system
 
 
 def test_silence_closes_episode(tmp_path):
@@ -200,7 +201,44 @@ def test_turn_heads_replayed_while_recent_and_shed_only_at_compaction(tmp_path):
     window = s.manager.history_window(s.thread)
     assert floor > 0
     s.say("fin")
-    users = [m["content"] for m in s.provider.seen[-1] if m["role"] == "user"]
+    users = [m["content"] for m in s.provider.seen[-1] if m["role"] == "user"
+             and not m["content"].startswith("[Mémoire de la session]")]  # (le résumé de session est un message à part)
     assert users[-1].startswith("[Date et heure actuelles]")  # tour courant
     for t, content in zip(window, users[:-1]):
         assert content.startswith("[Date et heure actuelles]") == (t.index >= floor)
+
+
+def test_recall_context_result_never_returns_to_the_reservoir(tmp_path):
+    """Boucle S01 : relire un élément rangeait la relecture au réservoir sous un nouvel identifiant, relu à son tour."""
+    from nokker.core.turn import ToolResult
+
+    s = make_session(tmp_path=tmp_path)
+    s.say(f"montre les logs {BIG_MARK}")
+    item_id = next(m for m in s.store.history(s.thread)[-1].messages if m.role == "tool").content.split('recall_context("')[1].split('"')[0]
+    before = len(s.manager.reservoir.list(s.thread, limit=1000))
+    texts = []
+    for i in range(2):  # deux relectures de suite
+        page = s.manager.recall(s.thread, ref=item_id, max_chars=8000)
+        out = s.manager.admit_result_in(s.thread, 90 + i, ToolResult(call_id=f"c{i}", name="recall_context", content=page))
+        assert out.content == page and out.reservoir_id is None  # en clair, entier, sans extrait ni nouvel identifiant
+        texts.append(out.content)
+    assert texts[0] == texts[1] and len(texts[0]) > 4000  # assez long pour avoir été rangé avant la correction
+    assert len(s.manager.reservoir.list(s.thread, limit=1000)) == before
+    other = s.manager.admit_result_in(s.thread, 95, ToolResult(call_id="c9", name="big_tool", content=page))
+    assert other.reservoir_id is not None  # tout autre gros résultat est rangé comme avant
+
+
+def test_recall_context_results_are_not_shed_at_compaction(tmp_path):
+    b = ContextBudgets(episodes_budget=10 ** 6, current_budget=10 ** 6, compaction_step=10 ** 6,
+                       shed_min_tokens=200, reservoir_min_tokens=10 ** 6, keep_last_turns_raw=2)
+    s = make_session(b, tmp_path=tmp_path, tool_size=3000)
+    for i in range(6):
+        s.say(f"logs {i} {BIG_MARK}")
+    for t in s.store.history(s.thread):
+        for m in t.messages:
+            if m.role == "tool" and t.index % 2 == 0:
+                m.name = "recall_context"
+    assert not s.manager.state(s.thread).shed  # rien délesté avant le délestage explicite
+    s.manager.compact(s.thread)
+    shed_turns = {int(k.split(":")[0]) for k in s.manager.state(s.thread).shed}
+    assert shed_turns and all(i % 2 == 1 for i in shed_turns)  # seuls les tours dont l'outil n'est pas recall_context

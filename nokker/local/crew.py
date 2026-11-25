@@ -82,6 +82,9 @@ class LocalCrew:
     approvals: Any = None
     title_of: Callable[[str], str | None] | None = None
     mirrored: Callable[[], bool] = field(default=lambda: False)
+    # Deck v2 (docs/LOKKAL-PHONE.md §1.2 point 2) : tous les fils de la machine (objets `Thread` du hub), pour la
+    # liste unique quand la machine est hors ligne ; vide = seulement les sessions de code (v1).
+    threads: Callable[[], list[Any]] = field(default=list)
     _q: Any = field(default=None, init=False, repr=False)
     _worker: threading.Thread | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -262,7 +265,29 @@ class LocalCrew:
                 agents.append({"id": a.id, "name": a.name, "status": a.status,
                                "trigger": (a.trigger or {}).get("kind") or "manual", "next_run_at": a.next_run_at,
                                "last_run": {"status": lr.get("status"), "ended_at": lr.get("ended_at")} if lr else None})
-        return {"v": 1, "sessions": sessions[:100], "agents": agents[:200], "pending_approvals": pending}
+            code = {s["thread_id"] for s in sessions}
+            threads = []
+            try:
+                listed = list(self.threads() or [])
+            except Exception:  # noqa: BLE001 — un deck sans fils vaut mieux que pas de deck
+                listed = []
+            for t in sorted(listed, key=lambda x: getattr(x, "updated_at", 0) or 0, reverse=True)[:100]:
+                tid = str(getattr(t, "id", "") or "")
+                if not tid:
+                    continue
+                state = "awaiting_approval" if waiting.get(tid) else "working" if tid in active else "idle"
+                threads.append({"thread_id": tid, "state": state, "updated_at": getattr(t, "updated_at", None),
+                                "channel": _channel(t, code),
+                                "title": (getattr(t, "title", None) or None) if titles else None})
+        return {"v": 2, "sessions": sessions[:100], "agents": agents[:200], "threads": threads, "mirror": titles,
+                "pending_approvals": pending}
+
+
+def _channel(t: Any, code: set[str]) -> str:
+    """Canal d'un fil pour le deck v2 : la règle de la recherche (`nokker/threads/search.py::thread_channel`)."""
+    from nokker.threads.search import thread_channel
+
+    return thread_channel(str(getattr(t, "id", "") or ""), getattr(t, "origin", None), code)
 
 
 __all__ = ["LocalCrew", "allows"]

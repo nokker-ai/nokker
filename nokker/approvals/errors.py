@@ -21,6 +21,11 @@ class ApprovalExpired(ApprovalError):
     pass
 
 
+class NotLocalApproval(ApprovalError):
+    """Carte qui ne se signe PAS avec une passkey locale (Lokkal) : seule une carte `payments:to_pay` dont le mandat est
+    own_card le peut (docs/PAY-AGENT.md §11) ; toute autre carte forte se signe chez nokker.ai."""
+
+
 class ProofInvalid(ApprovalError):
     """Signature, TOTP, nonce ou `initData` Telegram invalide — ou niveau de preuve insuffisant
     (ex. TOTP présenté pour une approbation `strong`)."""

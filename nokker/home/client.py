@@ -56,6 +56,30 @@ class BridgeSession:
         _op(self.bridge, "ha.call_service", {"domain": domain, "service": service, "entity_ids": list(entity_ids),
                                              "data": dict(data or {})})
 
+    def tracker_see(self, dev_id: str, location_name: str) -> None:
+        """Présence d'un membre dans HA (zones de l'app) : `device_tracker.see` d'un traceur `nokker_*`, sans coordonnées."""
+        _op(self.bridge, "ha.tracker_see", {"dev_id": dev_id, "location_name": location_name})
+
+    def query(self, domain: str, service: str, entity_ids: list[str], data: dict[str, Any]) -> dict[str, Any]:
+        """Service à réponse (liste fermée de la passerelle : météo, agenda, liste, recherche de média)."""
+        got = _op(self.bridge, "ha.query", {"domain": domain, "service": service, "entity_ids": list(entity_ids),
+                                            "data": dict(data or {})})
+        return dict(got.get("response") or {})
+
+    def history(self, entity_ids: list[str], hours: float) -> dict[str, list[dict[str, Any]]]:
+        return dict(_op(self.bridge, "ha.history", {"entity_ids": list(entity_ids), "hours": hours}).get("history")
+                    or {})
+
+    def logbook(self, entity_ids: list[str], hours: float) -> list[dict[str, Any]]:
+        return list(_op(self.bridge, "ha.logbook", {"entity_ids": list(entity_ids), "hours": hours}).get("entries")
+                    or [])
+
+    def camera_show(self, camera: str, media_player: str, mode: str = "image") -> dict[str, Any]:
+        return _op(self.bridge, "ha.camera_show", {"camera": camera, "media_player": media_player, "mode": mode})
+
+    def notify(self, target: str, message: str, title: str = "") -> None:
+        _op(self.bridge, "ha.notify", {"target": target, "message": message, "title": title})
+
     def subscribe_state_changed(self) -> int:
         self._cursor = int(_op(self.bridge, "ha.events", {"after": -1, "timeout": 0}).get("cursor") or 0)
         return self._cursor
@@ -88,6 +112,9 @@ class BridgeHome:
 
     def write_config(self, kind: str, config_id: str, config: dict[str, Any]) -> None:
         _op(self.bridge, "ha.write_config", {"type": kind, "id": config_id, "config": config})
+
+    def delete_config(self, kind: str, config_id: str) -> None:
+        _op(self.bridge, "ha.delete_config", {"type": kind, "id": config_id})
 
 
 __all__ = ["BridgeHome", "BridgeSession", "HomeError"]

@@ -7,6 +7,7 @@ Essai réel : docs/LOKKAL.md §7.31, « Essayer en vrai »."""
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 import pytest
@@ -39,6 +40,7 @@ from nokker.tools.execute_code import (
     format_block,
 )
 from nokker.tools.registry import Registry, StaticToolSource
+from nokker.tools.result_fence import fence_code_result
 from tests.unit.test_loop_approvals import (
     Ctx,
     Esc,
@@ -77,6 +79,12 @@ class AskWrites:
 
     def switch(self, reply, turn, tier):
         return self.inner.switch(reply, turn, tier)
+
+
+def plain(block: str) -> str:
+    """Le bloc sans les balises de clôture (r44) : pour relire les sections."""
+    return re.sub(r'<untrusted-data kind="[^"]*" id="\w+"(?: suspect="consigne")?>\n|\n</untrusted-data id="\w+">', "",
+                  block)
 
 
 def _tools(calls):
@@ -135,16 +143,39 @@ def test_three_reads_in_one_call_give_one_fixed_block():
             "{'notes': len(m), 'premiere': m[0]['text']}\n")
     block, calls, _, turn = run_code(code)
     assert [c[0] for c in calls] == ["read_file", "read_file", "memory_search"]
-    assert block == ("[execute_code]\nstdout:\ncontenu de a.py\ncontenu de b.py\n"
-                     'return:\n{"notes": 1, "premiere": "note sur disque"}\n'
-                     f"error:\n{EMPTY}\n[/execute_code]")
+    old = ("[execute_code]\nstdout:\ncontenu de a.py\ncontenu de b.py\n"
+           'return:\n{"notes": 1, "premiere": "note sur disque"}\n'
+           f"error:\n{EMPTY}\n[/execute_code]")
+    assert block == fence_code_result(old) and plain(block) == old  # r44 : sections clôturées
     tool_msgs = [m for m in turn.messages if m.role == "tool"]
     assert len(tool_msgs) == 1  # un seul résultat pour le modèle
     assert {v.subject for v in turn.verdicts if v.subject} >= {"x1"}  # l'appel externe ET les internes passent les portes
     assert len([v for v in turn.verdicts if v.gate is Gate.ACTION]) == 4
 
 
-def test_write_tool_from_script_poses_the_same_card_and_is_not_executed():
+def _same_id(shown: str, real: str) -> bool:
+    """Un id vu dans le bloc : le masque des numéros de carte (nokker/payments/cardmask.py) peut remplacer des chiffres
+    d'un UUID par « • » quand la suite passe le test de Luhn ; l'id est le même si tout ce qui reste lisible concorde."""
+    return len(shown) == len(real) and all(a in (b, "•") for a, b in zip(shown, real))
+
+
+# deux couples forcés : le premier est masqué par le filtre de cartes (vérifié plus bas), le second ne l'est pas
+_FORCED = [("5841c219-7678-4627-8399-5238092e87c8", "c6d35f30-6355-4116-9941-5e3bb34e4d5d"),
+           ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "f0e1d2c3-b4a5-4968-87a6-b5c4d3e2f1a0")]
+
+
+@pytest.mark.parametrize("forced", [*_FORCED, *([None] * 50)])
+def test_write_tool_from_script_poses_the_same_card_and_is_not_executed(forced, monkeypatch):
+    if forced:
+        import types
+        import uuid as _uuid
+
+        import nokker.approvals.base as approvals_base
+
+        ids = iter(_uuid.UUID(u) for u in forced)
+        monkeypatch.setattr(approvals_base, "uuid", types.SimpleNamespace(
+            **{k: getattr(_uuid, k) for k in dir(_uuid) if not k.startswith("__") and k != "uuid4"},
+            uuid4=lambda: next(ids)))
     backend = InMemoryApprovals()
     code = ("try:\n    tools.write_file(path='x.txt', content='y')\n"
             "except ApprovalPending as e:\n    print('attente', e.approval_id)\n"
@@ -163,13 +194,33 @@ def test_write_tool_from_script_poses_the_same_card_and_is_not_executed():
     assert calls == []  # jamais exécuté sans décision
     pending = backend.pending()
     assert [p.tool_name for p in pending] == ["write_file", "write_file"]
+    assert [p.status for p in pending] == ["pending", "pending"]  # approval_pending : posées, pas décidées
     assert pending[0].rule == "ask:write" and pending[0].thread_id == "th_1"
+    assert pending[1].rule == "ask:write" and pending[1].thread_id == "th_1"
     assert pending[0].arguments == {"path": "x.txt", "content": "y"}
-    assert f"attente {pending[0].id}" in block
+    assert pending[1].arguments == {"path": "z.txt", "content": "w"}
+    if forced:
+        assert [p.id for p in pending] == list(forced)  # le générateur forcé est bien celui des cartes
+    # les ids sont comparés champ à champ, pas en texte brut : le bloc peut les montrer partiellement masqués
+    shown = re.search(r"attente (\S+)", block)
+    assert shown and _same_id(shown.group(1), pending[0].id)
     # non rattrapée : l'erreur du bloc porte la carte, comme le résultat « en attente » de la boucle
-    assert "ApprovalPending: EN ATTENTE D'APPROBATION HUMAINE (ask:write: écriture : demander) " \
-           f"[approval:{pending[1].id}]. L'action n'a pas été exécutée." in block
+    err = re.search(r"ApprovalPending: EN ATTENTE D'APPROBATION HUMAINE \(ask:write: écriture : demander\) "
+                    r"\[approval:(\S+?)\]\. L'action n'a pas été exécutée\.", block)
+    assert err and _same_id(err.group(1), pending[1].id)
     assert "  ligne 5, dans <module>" in block
+
+
+def test_forced_uuid_pair_is_left_readable_by_the_card_filter():
+    """Les deux couples forcés (dont le premier passait le test de Luhn et était défiguré en « 5841c•••-… ») restent
+    lisibles : un UUID complet n'est pas un numéro de carte. La comparaison tolérante reste, par prudence."""
+    from nokker.payments.cardmask import mask_card_text as mask_tool_text
+
+    for forced in _FORCED:
+        for u in forced:
+            assert mask_tool_text(u) == u
+    assert _same_id(mask_tool_text(_FORCED[0][0]), _FORCED[0][0])
+    assert not _same_id(mask_tool_text(_FORCED[0][0]), _FORCED[1][0])
 
 
 def test_destructive_tool_from_script_gets_the_strong_card_of_the_invariants():
@@ -255,9 +306,9 @@ def test_secret_never_in_output():
 
 def test_return_value_is_canonical_json_and_errors_point_at_the_line():
     block, _, _, _ = run_code("x = {'b': 2, 'a': {3, 1, 2}}\nx")
-    assert 'return:\n{"a": [1, 2, 3], "b": 2}\n' in block
+    assert 'return:\n{"a": [1, 2, 3], "b": 2}\n' in plain(block)
     block, _, _, _ = run_code("x = 1\ny = x / 0\n")
-    assert block.endswith("error:\nTraceback (dernier appel en dernier) :\n  ligne 2, dans <module>\n"
+    assert plain(block).endswith("error:\nTraceback (dernier appel en dernier) :\n  ligne 2, dans <module>\n"
                           "    y = x / 0\nZeroDivisionError: division by zero\n[/execute_code]")
     block, _, _, _ = run_code("def (:\n")
     assert "SyntaxError" in block and "stdout:\n(vide)" in block
@@ -265,13 +316,14 @@ def test_return_value_is_canonical_json_and_errors_point_at_the_line():
 
 def test_timeout_keeps_what_was_printed():
     block, _, _, _ = run_code("import time\nprint('avant')\ntime.sleep(30)\n", timeout_s=1)
-    assert "stdout:\navant\n" in block and "TimeoutError: délai dépassé (1 s), script arrêté" in block
+    assert "stdout:\navant\n" in plain(block)
+    assert block.startswith("[execute_code] délai dépassé (1 s) ; sortie partielle ci-dessous.\n")  # note du noyau
 
 
 def test_child_processes_cannot_write_on_the_channel():
     code = "import os\nos.system('echo depuis-un-enfant')\nos.system('echo {\\\"t\\\": \\\"done\\\"} >&2')\n'ok'\n"
     block, _, _, _ = run_code(code)
-    assert "depuis-un-enfant" in block and 'return:\n"ok"' in block
+    assert "depuis-un-enfant" in block and 'return:\n"ok"' in plain(block)
 
 
 def test_no_sandbox_and_local_backend_are_refused(tmp_path):
@@ -279,14 +331,14 @@ def test_no_sandbox_and_local_backend_are_refused(tmp_path):
     src = ExecuteCodeSource(resolve=lambda ctx: None)
     ctx = ToolContext(thread_id="t", turn_index=0, channel="api", kernel=k)
     r = src.call(TOOL, {"code": "1"}, ctx)
-    assert r.is_error and "pas de session de code sur ce fil" in r.content and r.content.startswith("[execute_code]")
+    assert r.is_error and r.content.startswith("[execute_code] pas de session de code sur ce fil")
     from nokker.tools.code import CodeToolSource
 
     local = CodeToolSource(root=str(tmp_path), backend="local")
     r = ExecuteCodeSource(resolve=lambda ctx: local).call(TOOL, {"code": "1"}, ctx)
-    assert "REFUSÉ : execute_code tourne dans un bac à sable" in r.content
+    assert r.content.startswith("[execute_code] Refusé : execute_code tourne dans un bac à sable")
     r = src.call(TOOL, {"code": "1"}, ToolContext(thread_id="t", turn_index=0, channel="api"))
-    assert "n'est appelable que dans un tour du noyau" in r.content
+    assert "n'est appelable que pendant que tu réponds à la personne" in r.content and "noyau" not in r.content
 
 
 def test_format_block_rule_all_sections_always_present():
@@ -330,3 +382,33 @@ def test_code_script_command(tmp_path, backend):
     else:
         assert argv == ["kubectl", "exec", "-i", "nokker-sbx-1", "--", "sh", "-c", 'cd "$1" && shift && exec "$@"',
                         "sh", "/workspace/sub", "python3", "-c", "x"] and Env.started == 1
+
+
+def test_execute_code_on_a_thread_without_code_session_is_refused_before_any_card():
+    """Un script sur un fil sans session de code : refus tout de suite par les portes (aucune carte à approuver pour
+    apprendre ensuite qu'il n'y a pas de session). Avec une session : la règle habituelle (carte), pas ce refus."""
+    from nokker.core.ports import ToolSpec
+    from nokker.core.turn import Decision, Effect, InputCheck, ToolCall, Turn
+    from nokker.qa.gates import GatesV0
+    from nokker.qa.invariants import DeterministicInvariants
+    from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates
+    from nokker.tools.code import CODE_TOOLS
+    from nokker.tools.execute_code import TOOL, session_only_tools
+
+    assert session_only_tools(False) == frozenset(CODE_TOOLS) and TOOL in session_only_tools(True)
+    spec = ToolSpec(TOOL, "script", {}, Effect.WRITE)
+    call = ToolCall(id="c1", name=TOOL, arguments={"code": "print(1)"})
+    gates = PermissionGates(inner=GatesV0(invariants=DeterministicInvariants()),
+                            permissions=LocalPermissions(mode=Mode.DEFAULT),
+                            code_session=lambda tid: tid == "th_session",
+                            session_tools=session_only_tools(True))
+    chat = gates.action(call, spec, Turn(thread_id="th_chat", index=1, input=InputCheck(text="lance un script")))
+    assert [(v.decision, v.rule) for v in chat] == [(Decision.DENY, "permissions:no_code_session")]
+    assert "pas de session de code" in chat[0].reason
+    sess = gates.action(call, spec, Turn(thread_id="th_session", index=1, input=InputCheck(text="lance un script")))
+    assert all(v.rule != "permissions:no_code_session" for v in sess)
+    off = PermissionGates(inner=GatesV0(invariants=DeterministicInvariants()),
+                          permissions=LocalPermissions(mode=Mode.DEFAULT), code_session=lambda tid: False,
+                          session_tools=session_only_tools(False))
+    assert all(v.rule != "permissions:no_code_session"
+               for v in off.action(call, spec, Turn(thread_id="th_chat", index=1, input=InputCheck(text="x"))))

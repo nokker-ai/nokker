@@ -11,6 +11,9 @@ force ESCALATE — "escalade humaine" de l'invariant 5 du préfixe, appliquée p
 par la bonne volonté du modèle.
 Restriction rc.7 (docs/INVARIANTS.md §1.2) : un domaine seulement MENTIONNÉ (arnaque, lecture d'un document reçu,
 rappel ou relance) sans aucune demande de décider ou d'engager garde la réponse (`qa/invariants.py::domain_mention`).
+Carte « à payer » du tour (03.11, `pay_card_hands_over`) : une carte `payments:to_pay` posée dans le tour EST la remise
+de la décision à la personne ; elle satisfait le drapeau `montant` (lui seul), si la réponse n'annonce pas d'autre
+montant que ceux de la carte et ne dit pas que c'est payé.
 """
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
+from nokker.core import model_texts as mt
+from nokker.core.model_texts import judge_language_line
 from nokker.core.ports import Judge, JudgeAnswer, ToolSpec, call_effect
 from nokker.core.turn import Decision, Effect, Gate, Tier, ToolCall, Turn, Verdict
 from nokker.qa.calibrate import DEFAULT_THRESHOLDS, Thresholds
@@ -42,8 +47,73 @@ _ADVICE_QUESTION = re.compile(
     r"is it (?:legal|deductible|allowed)|should i (?:pay|declare|sign|charge)|muss ich|darf ich|ist es (?:legal|erlaubt))")
 
 
+PAY_CARD_RULE = "payments:to_pay"  # = nokker.payments.service.PAY_RULE (sans dépendre des paiements)
+_MONEY = re.compile(
+    r"(?i)(?:(?:CHF|EUR|USD|GBP|€|\$|£|Fr\.?)\s*(?P<a>\d{1,3}(?:['’ ]\d{3})+|\d+)(?:[.,](?P<ac>\d{1,2}))?)"
+    r"|(?:(?P<b>\d{1,3}(?:['’ ]\d{3})+|\d+)(?:[.,](?P<bc>\d{1,2}))?\s*(?:CHF|EUR|USD|GBP|€|\$|£|Fr\.|francs?\b))"
+    r"|(?:(?<![\d.,])(?P<c>\d+)[.,](?P<cc>\d{2})(?![\d.,]))")
+_PAID_CLAIM = re.compile(
+    r"(?i)(?:\b(?:c['’]est|est|a été|ont été|j['’]ai|ai|as|avons)\s+(?:bien\s+|déjà\s+|maintenant\s+)?"
+    r"(?:pay[ée]e?s?|r[ée]gl[ée]e?s?)\b"
+    r"|\bpaiement\s+(?:est\s+)?(?:bien\s+)?(?:effectu[ée]|r[ée]ussi|confirm[ée]|accept[ée]|valid[ée]|pass[ée])"
+    r"|\b(?:is|was|has been|have been|are)\s+(?:now\s+|already\s+)?paid\b"
+    r"|\bpayment\s+(?:is\s+|was\s+)?(?:done|completed?|successful|confirmed|accepted)"
+    r"|\bbezahlt\b|\bpagat[oaie]\b)")
+_NEGATED = re.compile(r"(?i)(?:n['’]|\bne\b|\brien\b|\bpas\b|\bnot\b|\bnicht\b|\bkein\w*|\bnon\b|\bnothing\b|\bnoch\b)")
+
+
+def _minor(units: str, cents: str | None) -> int:
+    return int(re.sub(r"['’ ]", "", units)) * 100 + int((cents or "0").ljust(2, "0")[:2])
+
+
+def _amount_minor(raw: object) -> int | None:
+    m = re.fullmatch(r"\s*(\d{1,3}(?:['’ ]\d{3})+|\d+)(?:[.,](\d{1,2}))?\s*", str(raw if raw is not None else ""))
+    return _minor(m.group(1), m.group(2)) if m else None
+
+
+def _reply_amounts(reply: str) -> set[int]:
+    out = set()
+    for m in _MONEY.finditer(reply or ""):
+        units, cents = next(((m.group(k), m.group(k + "c")) for k in ("a", "b", "c") if m.group(k)), (None, None))
+        if units is not None:
+            out.add(_minor(units, cents))
+    return out
+
+
+def _claims_paid(reply: str) -> bool:
+    for m in _PAID_CLAIM.finditer(reply or ""):
+        if not _NEGATED.search((reply or "")[max(0, m.start() - 14):m.start()]):
+            return True
+    return False
+
+
+def pay_card_hands_over(turn: Turn, reply: str | None) -> bool:
+    """Le tour a posé une carte « à payer » (pay_request → carte `payments:to_pay` en attente des humains) et la réponse
+    s'en tient à elle : aucun montant autre que le total ou un prix unitaire de la carte, aucune affirmation que c'est
+    payé. Alors le drapeau `montant` est satisfait pour ce tour : la carte EST la remise de la décision à la personne."""
+    if reply is None or not getattr(turn, "approval_ids", None):
+        return False
+    if not any(v.gate is Gate.ACTION and v.decision is Decision.HITL and v.rule == PAY_CARD_RULE
+               for v in turn.verdicts):
+        return False
+    cards = [tc for tc in turn.pending_approvals if tc.name == "pay_request"]
+    if not cards:
+        return False
+    allowed: set[int] = set()
+    for tc in cards:
+        args = tc.arguments or {}
+        allowed.add(_amount_minor(args.get("amount")) or -1)
+        for it in args.get("items") or []:
+            if isinstance(it, dict):
+                allowed.add(_amount_minor(it.get("unit_price")) or -1)
+    allowed.discard(-1)
+    if not allowed or not _reply_amounts(reply) <= allowed:
+        return False
+    return not _claims_paid(reply)
+
+
 def domain_verdict(turn: Turn, allowed: frozenset[str] = DEFAULT_DOMAIN_FLAGS,
-                   code_session: Callable[[str], bool] | None = None) -> Verdict | None:
+                   code_session: Callable[[str], bool] | None = None, reply: str | None = None) -> Verdict | None:
     """Porte bascule, couche 1 : ESCALATE sur un drapeau de domaine (« escalade humaine » de l'invariant 5) ; None
     sans drapeau (ou tour déjà escaladé).
 
@@ -54,7 +124,19 @@ def domain_verdict(turn: Turn, allowed: frozenset[str] = DEFAULT_DOMAIN_FLAGS,
     flags = turn.input.domain_flags & allowed
     if not flags or turn.escalated:
         return None
+    if "montant" in flags and pay_card_hands_over(turn, reply):
+        # Carte « à payer » du tour : la décision est remise à la personne, sur la carte (tracé au ledger).
+        flags = flags - {"montant"}
+        if not flags:
+            return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule="domaine:montant:carte-a-payer",
+                           reason=mt.pick(mt.DOMAIN_PAY_CARD))
     rule = f"domaine:{'+'.join(sorted(flags))}"
+    if turn.channel == "subagent":  # CHILD_CHANNEL (tools/delegate.py)
+        # Tour d'un sous-agent (04.11.2026, banc B) : sa réponse ne va qu'au parent, jamais à la personne ; le tour de la
+        # voix, calculé sur le message de la personne, porte l'invariant 5. Escalader ici remplaçait l'analyse d'un
+        # enfant deep (facture, devis, franchise) par un texte d'escalade dès que le but du routeur disait « juger ».
+        return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:sous-agent",
+                       reason=mt.pick(mt.DOMAIN_CHILD))
     try:
         in_session = bool(code_session(turn.thread_id)) if code_session is not None else False
     except Exception:  # noqa: BLE001 — un registre de sessions illisible : la règle générale s'applique
@@ -63,16 +145,15 @@ def domain_verdict(turn: Turn, allowed: frozenset[str] = DEFAULT_DOMAIN_FLAGS,
     if in_session:
         advice = bool(_ADVICE_QUESTION.search(turn.input.text or ""))
         return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:session-code",
-                       reason="session de code locale : drapeau consultatif, réponse gardée"
-                              + (" (demande de conseil fiscal ou juridique : à faire vérifier)" if advice else ""))
+                       reason=mt.pick(mt.DOMAIN_SESSION) + (mt.pick(mt.DOMAIN_SESSION_ADVICE) if advice else ""))
     # Restriction rc.7 (docs/INVARIANTS.md §1.2) : domaine seulement MENTIONNÉ (arnaque, lecture d'un document reçu,
     # rappel ou relance), sans aucun marqueur d'engagement — la réponse reste, le modèle garde `escalate_to_human`.
     family = domain_mention(turn.input.text or "", flags)
     if family is not None:
         return Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=1, rule=f"{rule}:mention:{family}",
-                       reason=f"domaine seulement mentionné ({family}), aucune demande de décider ou d'engager")
+                       reason=mt.pick(mt.DOMAIN_MENTION).format(family=family))
     return Verdict(gate=Gate.SWITCH, decision=Decision.ESCALATE, layer=1, rule=rule,
-                   reason="drapeau de domaine sans escalade explicite du modèle")
+                   reason=mt.pick(mt.DOMAIN_ESCALATE))
 
 
 @dataclass
@@ -98,7 +179,7 @@ class GatesV0:
         return [self.invariants.check_action(call, spec, turn)]
 
     def switch(self, reply: str, turn: Turn, tier: Tier) -> list[Verdict]:
-        domain = domain_verdict(turn, self.domain_flags, self.code_session)
+        domain = domain_verdict(turn, self.domain_flags, self.code_session, reply)
         if domain is not None and domain.decision is Decision.ESCALATE:
             return [domain]
         # Couche 2 : juge nul en attendant B-2 — toujours ALLOW, mais le port Judge est bien exercé.
@@ -189,16 +270,16 @@ class GatesV1:
         if p_alert is None:
             # Pas de logprobs exploitables : repli sur le choix brut (pas de zone grise mesurable).
             decision = Decision.HITL if q.alerts(answer.choice) else Decision.ALLOW
-            reason = f"juge {answer.model} (sans logprobs) : {answer.choice}"
+            reason = mt.pick(mt.JUDGE_NO_LOGPROBS).format(model=answer.model, choice=answer.choice)
         elif p_alert >= t.high:
             decision = Decision.HITL
-            reason = f"juge {answer.model} : effet non autorisé probable (p={p_alert:.2f} ≥ {t.high})"
+            reason = mt.pick(mt.JUDGE_UNAUTHORIZED).format(model=answer.model, p=f"{p_alert:.2f}", high=t.high)
         elif p_alert > t.low:
             decision = Decision.HITL  # pas de REDO_DEEP côté action (PLAN §2.3 étape 5 : doute -> HITL)
-            reason = f"juge {answer.model} : zone grise (p={p_alert:.2f}), vérification humaine demandée"
+            reason = mt.pick(mt.JUDGE_GREY).format(model=answer.model, p=f"{p_alert:.2f}")
         else:
             decision = Decision.ALLOW
-            reason = f"juge {answer.model} : effet jugé autorisé (p={p_alert:.2f} ≤ {t.low})"
+            reason = mt.pick(mt.JUDGE_ALLOWED).format(model=answer.model, p=f"{p_alert:.2f}", low=t.low)
         if decision is Decision.HITL:
             reason = self._with_advice(reason, turn, context, call_desc=f"{call.name}({call.arguments})")
         return Verdict(gate=Gate.ACTION, decision=decision, layer=2, rule=f"judge:{q.question_id}",
@@ -207,7 +288,7 @@ class GatesV1:
 
     # ── porte bascule (PLAN §2.3 étape 7) ──
     def switch(self, reply: str, turn: Turn, tier: Tier) -> list[Verdict]:
-        domain = domain_verdict(turn, self.domain_flags, self.code_session)
+        domain = domain_verdict(turn, self.domain_flags, self.code_session, reply)
         if domain is not None and domain.decision is Decision.ESCALATE:
             return [domain]
         head = [domain] if domain is not None else []
@@ -215,7 +296,7 @@ class GatesV1:
         necessary = domain is not None or _tool_effect_used_this_turn(turn) or _looks_assertive(reply)
         if not necessary:
             return head + [Verdict(gate=Gate.SWITCH, decision=Decision.ALLOW, layer=2, rule="judge:non-necessaire",
-                                   reason="aucun outil à effet, drapeau ou affirmation détectée ce tour")]
+                                   reason=mt.pick(mt.JUDGE_NOT_NEEDED))]
         return head + [self._ask_switch(q_id, reply, turn, tier) for q_id in ("R.humain", "R.invention", "R.secret")]
 
     def _ask_switch(self, question_id: str, reply: str, turn: Turn, tier: Tier) -> Verdict:
@@ -227,7 +308,7 @@ class GatesV1:
         p_alert = _p_alert(q, answer)
         if p_alert is None:
             decision = Decision.ESCALATE if q.alerts(answer.choice) else Decision.ALLOW
-            reason = f"juge {answer.model} (sans logprobs) : {answer.choice}"
+            reason = mt.pick(mt.JUDGE_NO_LOGPROBS).format(model=answer.model, choice=answer.choice)
         elif p_alert >= t.high:
             decision = Decision.ESCALATE
             reason = f"juge {answer.model} : {question_id} probable (p={p_alert:.2f} ≥ {t.high})"
@@ -250,11 +331,11 @@ class GatesV1:
             avis = advise(f"Demande humaine : {turn.input.text}\nContexte : {context}\n"
                           f"Action suspendue en attente d'approbation : {call_desc}\n"
                           "Donne un avis COURT (2-3 phrases) : risque principal, sauvegarde ou "
-                          "précaution utile, comment revenir en arrière si besoin.")
+                          "précaution utile, comment revenir en arrière si besoin." + judge_language_line())
         except Exception as e:  # noqa: BLE001 — un avis qui échoue ne doit jamais bloquer le tour
             logger.warning("gates: avis HITL indisponible: %s", e)
             return reason
-        return f"{reason}\nAvis : {avis}" if avis else reason
+        return mt.pick(mt.JUDGE_ADVICE).format(reason=reason, advice=avis) if avis else reason
 
     def _context(self, turn: Turn) -> str:
         if self.context_builder is not None:

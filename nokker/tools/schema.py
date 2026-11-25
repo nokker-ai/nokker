@@ -7,7 +7,13 @@ caractères des paramètres.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger("nokker.tools.schema")
+
+# Plafond par défaut de la description d'un outil MCP (caractères), réglable par serveur (`description_max_chars`).
+DESCRIPTION_MAX_CHARS = 4000
 
 
 def compact_schema(node: Any) -> Any:
@@ -37,4 +43,23 @@ def compact_schema(node: Any) -> Any:
     return out
 
 
-__all__ = ["compact_schema"]
+def description_cap(value: Any) -> int:
+    """Plafond posé par la config d'un serveur (`description_max_chars`) ; absent ou illisible : le défaut."""
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return DESCRIPTION_MAX_CHARS
+    return cap if cap > 0 else DESCRIPTION_MAX_CHARS
+
+
+def clip_description(text: Any, cap: int, server: str, tool: str) -> str:
+    """Description d'outil ENTIÈRE (les règles d'usage vivent après la première ligne) ; seul un dépassement du plafond
+    coupe, et il est journalisé (serveur, outil, longueurs)."""
+    desc = str(text or "").strip()
+    if len(desc) > cap:
+        logger.warning("mcp(%s): description de l'outil %s coupée à %d caractères (%d reçus)", server, tool, cap, len(desc))
+        return desc[:cap]
+    return desc
+
+
+__all__ = ["DESCRIPTION_MAX_CHARS", "clip_description", "compact_schema", "description_cap"]

@@ -13,9 +13,12 @@ from nokker.store.conn import TenantConn, migrate
 
 MIGRATION_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "002_context.sql").read_text(
     encoding="utf-8")
+# Colonne `provenance` des épisodes (080) : lue et écrite ici, posée avec la table même sans `apply_migrations`.
+PROVENANCE_SQL = (Path(__file__).parent.parent / "store" / "migrations" / "080_memory_provenance.sql").read_text(
+    encoding="utf-8")
 
 _EP_COLS = ("id, thread_id, seq, first_turn, last_turn, title, summary, keywords, raw_tokens, summary_tokens, "
-            "opened_at, closed_at, closed_reason, day, turn_ids_sha256, refined, bubble_id, version")
+            "opened_at, closed_at, closed_reason, day, turn_ids_sha256, refined, bubble_id, provenance, version")
 _DAY_COLS = "id, thread_id, day, summary, episode_ids, tokens, created_at"
 _ST_COLS = ("thread_id, episode_id, base_turn, last_turn_at, last_turn_index, tokens_since_compaction, "
             "compaction_version, shed, pinned_episodes, updated_at, heads_shed_before")
@@ -24,12 +27,12 @@ _RS_COLS = "id, thread_id, kind, name, content, preview, tokens, turn_index, cal
 
 def _episode(r: tuple) -> Episode:
     (eid, thread_id, seq, first_turn, last_turn, title, summary, keywords, raw_tokens, summary_tokens, opened_at,
-     closed_at, closed_reason, day, sha, refined, bubble_id, version) = r
+     closed_at, closed_reason, day, sha, refined, bubble_id, provenance, version) = r
     return Episode(id=eid, thread_id=thread_id, seq=seq, first_turn=first_turn, last_turn=last_turn, title=title,
                    summary=summary, keywords=list(keywords or []), raw_tokens=raw_tokens,
                    summary_tokens=summary_tokens, opened_at=opened_at, closed_at=closed_at,
                    closed_reason=closed_reason, day=day, turn_ids_sha256=sha, refined=refined,
-                   bubble_id=bubble_id, version=version)
+                   bubble_id=bubble_id, provenance=provenance or "unknown_legacy", version=version)
 
 
 def _day(r: tuple) -> DaySummary:
@@ -59,7 +62,7 @@ class _PgBase:
         if not dsn:
             raise ValueError(f"{type(self).__name__} requiert un DSN Postgres")
         self.dsn = dsn
-        migrate(dsn, MIGRATION_SQL)  # en propriétaire sous verrou consultatif, puis la RLS (nokker/store/conn.py)
+        migrate(dsn, MIGRATION_SQL, PROVENANCE_SQL)  # en propriétaire sous verrou consultatif, puis la RLS (nokker/store/conn.py)
         self._db = TenantConn(dsn)
         self._lock = threading.Lock()
 
@@ -101,10 +104,10 @@ class PgEpisodeStore(_PgBase):
         vals = (episode.id, episode.thread_id, episode.seq, episode.first_turn, episode.last_turn, episode.title,
                 episode.summary, Jsonb(list(episode.keywords)), episode.raw_tokens, episode.summary_tokens,
                 episode.opened_at, episode.closed_at, episode.closed_reason, episode.day,
-                episode.turn_ids_sha256, episode.refined, episode.bubble_id, episode.version)
+                episode.turn_ids_sha256, episode.refined, episode.bubble_id, episode.provenance, episode.version)
         sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in _EP_COLS.split(", ")[1:-1])
         # insert : version telle que fournie ; update : version de la ligne + 1 (reportée sur l'objet, comme en mémoire)
-        r = self._one(f"INSERT INTO nokker_episodes ({_EP_COLS}) VALUES ({', '.join(['%s'] * 18)}) "
+        r = self._one(f"INSERT INTO nokker_episodes ({_EP_COLS}) VALUES ({', '.join(['%s'] * 19)}) "
                       f"ON CONFLICT (id) DO UPDATE SET {sets}, version = nokker_episodes.version + 1 "
                       "RETURNING version", vals)
         if r:

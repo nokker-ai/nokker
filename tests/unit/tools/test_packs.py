@@ -34,7 +34,7 @@ from nokker.tools.skills import SkillToolSource
 
 UPSTREAM = importlib.util.find_spec("tools") is not None and importlib.util.find_spec("tools.skills_guard") is not None
 needs_upstream = pytest.mark.skipif(not UPSTREAM, reason="amont (tools.skills_guard) non importable")
-EXPECTED = {"mail", "social", "jobs", "brand", "video", "mcp-builder", "ops"}
+EXPECTED = {"mail", "social", "jobs", "brand", "video", "mcp-builder", "ops", "design"}
 DOC = Path(__file__).resolve().parents[3] / "docs" / "en" / "packs.md"
 CTX = ToolContext(thread_id="t-packs", turn_index=0, channel="api", sender="alice")
 

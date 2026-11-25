@@ -69,7 +69,7 @@ def _b64(text: str, label: str) -> bytes:
 
 def _from_data_url(url: str, label: str) -> bytes:
     if not url.startswith("data:"):
-        raise ImageError(f"{label} : seules les data URL sont acceptées (le noyau ne télécharge pas d'image)")
+        raise ImageError(f"{label} : seules les data URL sont acceptées (aucune image n'est téléchargée)")
     head, sep, payload = url.partition(",")
     if not sep or not head.endswith(";base64"):
         raise ImageError(f"{label} : data URL sans base64")

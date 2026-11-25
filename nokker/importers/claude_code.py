@@ -14,7 +14,9 @@ nokker/tools/mcp_config.py, mémoire nokker/context/project_memory.py) :
   - permissions : `deny` et `ask` repris (ils ne font que restreindre) ; un `allow` élargit les droits : à reprendre
     à la main, jamais en silence ;
   - MCP : serveurs http/sse proposés (entrée validée comme `mcp_server_add`, valeurs d'en-têtes remplacées par des
-    références `secret:NOM`) ; un serveur stdio (commande lancée sur l'hôte) n'a pas d'équivalent ;
+    références `secret:NOM`) ; un serveur stdio (commande lancée sur l'hôte) n'a pas d'équivalent — sauf drapeau
+    `mcp_stdio.enabled` (docs/NOKKAN-MCP-STDIO.md) : il est alors repris « à approuver » (inactif tant que la carte
+    forte de `mcp_server_add` n'est pas signée), ses variables d'environnement par NOM seulement ;
   - `env` : NOMS seulement, la valeur n'est jamais copiée.
 """
 from __future__ import annotations
@@ -183,11 +185,37 @@ def mcp_entry(name: str, cfg: dict) -> tuple[dict, list[str]]:
     return check_entry(raw), secrets
 
 
-def _scan_mcp(report: Report, path: Path, servers: dict) -> None:
+def mcp_stdio_entry(name: str, cfg: dict) -> tuple[dict, list[str]]:
+    """Déclaration stdio proposée, « à approuver » (`approved: false`), validée comme `mcp_server_add`. Commande et
+    arguments repris tels quels (un argument qui ressemble à une clé fait refuser l'entrée) ; variables par NOM
+    seulement : chaque valeur devient une référence `secret:NOM` du coffre, à poser par la personne."""
+    from nokker.tools.mcp_stdio import check_stdio_entry
+
+    clean = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:40] or "serveur"
+    secrets = [_secret_name(clean, key) for key in (cfg.get("env") or {}) if isinstance(cfg.get("env"), dict)]
+    env = {str(key): f"secret:{ref}" for key, ref in zip(cfg.get("env") or {}, secrets)} if secrets else {}
+    entry = check_stdio_entry({"name": clean, "command": cfg.get("command"), "args": cfg.get("args") or [],
+                               "env": env, "purpose": f"importé ({name})", "approved": False})
+    return entry, secrets
+
+
+def _scan_mcp(report: Report, path: Path, servers: dict, mcp_stdio: bool = False) -> None:
     for name, cfg in sorted(servers.items()):
         src = f"{path}#mcpServers.{name}"
         if not isinstance(cfg, dict):
             report.add("mcp", src, None, "error", "entrée illisible")
+        elif mcp_stdio and cfg.get("command") and not cfg.get("url"):
+            try:
+                entry, secrets = mcp_stdio_entry(name, cfg)
+            except ValueError as e:  # McpStdioError : jamais de valeur dans le message
+                report.add("mcp-stdio", src, None, "unsupported", f"refusé par Nokker : {e}")
+                continue
+            reason = ("déclaré « à approuver » : inactif tant que vous n'avez pas signé sa carte forte dans une "
+                      "session (mcp_server_add) ; il tournera dans le bac à sable de la session, pas sur l'hôte")
+            if secrets:
+                reason += " ; à poser ensuite : " + ", ".join(f"nokker secret set {n}" for n in secrets)
+            report.add("mcp-stdio", src, "mcp-stdio-servers", "planned", reason, name=entry["name"], entry=entry,
+                       secret_names=secrets)
         elif cfg.get("type") in ("http", "sse") or (cfg.get("url") and not cfg.get("command")):
             try:
                 entry, secrets = mcp_entry(name, cfg)
@@ -232,8 +260,9 @@ def _scan_user_instructions(report: Report, path: Path) -> None:
         report.add("user-instructions", path, None, "skipped", "fichier vide")
 
 
-def scan(home: Path, project: Path | None = None, nokker_home: Path | None = None) -> Report:
-    """Rapport à blanc : rien n'est écrit. `home` = dossier personnel, `project` = racine d'un dépôt (facultatif)."""
+def scan(home: Path, project: Path | None = None, nokker_home: Path | None = None, mcp_stdio: bool = False) -> Report:
+    """Rapport à blanc : rien n'est écrit. `home` = dossier personnel, `project` = racine d'un dépôt (facultatif).
+    `mcp_stdio` (drapeau `mcp_stdio.enabled`, Lokkal) : les serveurs stdio sont proposés « à approuver »."""
     report = Report(ORIGIN)
     claude = home / ".claude"
     user_skills_dst = (nokker_home or home / ".nokker") / "skills"
@@ -249,7 +278,7 @@ def scan(home: Path, project: Path | None = None, nokker_home: Path | None = Non
             report.add("runtime", claude / d, None, "skipped", "données de fonctionnement de Claude Code (historique, caches)")
     user_json = _read_json(home / ".claude.json")
     if user_json and isinstance(user_json.get("mcpServers"), dict):
-        _scan_mcp(report, home / ".claude.json", user_json["mcpServers"])
+        _scan_mcp(report, home / ".claude.json", user_json["mcpServers"], mcp_stdio)
 
     roots = [claude]
     if project is not None:
@@ -262,7 +291,7 @@ def scan(home: Path, project: Path | None = None, nokker_home: Path | None = Non
         _scan_subagents(report, pc / "agents", project / ".nokker" / "skills", "project")
         mcp = _read_json(project / ".mcp.json")
         if mcp and isinstance(mcp.get("mcpServers"), dict):
-            _scan_mcp(report, project / ".mcp.json", mcp["mcpServers"])
+            _scan_mcp(report, project / ".mcp.json", mcp["mcpServers"], mcp_stdio)
         roots.append(pc)
 
     # Les sources lues par clé (`fichier#clé`) couvrent leur fichier pour la réconciliation.

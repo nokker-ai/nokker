@@ -20,6 +20,7 @@ from typing import Any
 
 from nokker.context.index import query_terms
 from nokker.context.text import content_words, distinctive_words
+from nokker.core import model_texts as mt
 from nokker.core.ports import Recall, ToolContext, ToolSpec
 from nokker.core.turn import ToolResult
 
@@ -126,14 +127,14 @@ class _MemberMemory:
     def recall_for(self, thread_id: str, query: str, k: int = 5) -> list[Recall]:
         return self.recall(query, k)
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         return None
 
     def specs(self) -> list[ToolSpec]:
         return []
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
 
 
 __all__ = ["HouseholdRecall"]

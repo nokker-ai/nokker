@@ -126,6 +126,6 @@ def test_pg_usage_connection_goes_through_store_conn_connect(monkeypatch):
     monkeypatch.setattr("nokker.store.conn.psycopg.connect", fake_connect)
     assert current_tenant_or_none() is None
     PgUsage("postgresql://x/y")._conn(TESTER)
-    assert seen[0] == ("connect", "postgresql://x/y", {"autocommit": True})
+    assert seen[0] == ("connect", "postgresql://x/y", {"autocommit": True, "connect_timeout": 10})
     assert seen[1] == ("SELECT set_config('app.tenant_id', %s, false)", (TESTER,))
     assert current_tenant_or_none() is None  # le scope temporaire est rendu

@@ -103,11 +103,12 @@ def test_flag_off_ignores_a_tier_argument():
 def test_flag_on_adds_only_the_tier_parameter_and_keeps_the_description():
     src, *_ = setup()
     spec = src.specs()[0]
-    assert spec.description == DESC
+    # Sans session de code (conversation, `delegate_tenants`) : texte sans git et sans `isolate` (relecture, Run6).
+    assert spec.description == dg.CONV_DESCRIPTION
     assert spec.parameters["properties"]["tier"] == {"type": "string", "enum": ["ship", "deep"],
                                                      "description": TIER_DESC}
     assert {k: v for k, v in spec.parameters["properties"].items() if k not in ("tier", "readonly")} \
-        == dg._SPECS_PARAMS["properties"]
+        == {k: v for k, v in dg._SPECS_PARAMS["properties"].items() if k != "isolate"}
     assert "tier" not in spec.parameters["required"]
 
 

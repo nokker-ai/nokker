@@ -11,14 +11,18 @@ Ordre du tour concerné (PLAN §2.3) :
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import RELAY_CHANNEL, Decision, Effect, Gate, InputCheck, ToolCall, ToolResult, Turn, Verdict
+from nokker.payments.cardmask import mask_card_text, mask_tool_text
 from nokker.qa.secrets import KnownSecrets, _type_name, redact, redact_messages
+from nokker.qa.untrusted import APPROVAL_TAG, DATE_TAG, neutralize_approval, neutralize_date, neutralize_env
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none
 
 # ─────────────────────────────── drapeaux de domaine ───────────────────────────────
@@ -353,69 +357,98 @@ class DeterministicInvariants:
                 and self.account_tenant(sender) == tid)
 
     def check_input(self, text: str) -> InputCheck:
-        red = redact(text, self.known)
-        return InputCheck(text=red.text, redacted=red.names, domain_flags=domain_flags(text))
+        red = redact(neutralize_date(neutralize_approval(neutralize_env(text))), self.known)
+        # Numéro de carte collé dans le chat : chiffres masqués avant le modèle et le store (PAYMENTS §2 bis).
+        return InputCheck(text=mask_card_text(red.text), redacted=red.names, domain_flags=domain_flags(text))
+
+    def check_kernel_input(self, text: str) -> InputCheck:
+        """Entrée écrite par le NOYAU (bloc `[Approbation]` d'une suite de carte, `control=APPROVAL_CONTINUE`), jamais
+        tapée par une personne : son « Résultat : » est un résultat d'outil déjà passé par `redact_result`
+        (`weak=False`). On le caviarde pareil (valeurs connues + motifs FORTS) ; le repli faible (entropie, hexa,
+        mot de passe sans coffre) mangeait des ids du noyau (`/t/mc_…/fil`) que la lecture directe garde (S3, 06.11)."""
+        red = redact(text, self.known, weak=False)
+        return InputCheck(text=mask_card_text(red.text), redacted=red.names, domain_flags=domain_flags(text))
 
     def check_action(self, call: ToolCall, spec: ToolSpec | None, turn: Turn) -> Verdict:
         # Outil sans spec déclarée → traité comme WRITE (PLAN §2.3 étape 5, ports.py docstring).
         effect = call_effect(spec, call.arguments)
         subject = call.id
 
+        # Données de carte (PAYMENTS §2 bis), drapeau `payments` allumé ou non : un outil `browser_*` du modèle ne
+        # tape jamais un numéro de carte ni dans un champ de carte — le remplissage appartient à l'agent de paiement.
+        # Même règle et même texte que les portes de paiement (`payments:card_field`).
+        if call.name.startswith("browser_"):
+            from nokker.payments.detect import looks_like_pan
+            from nokker.payments.gates import CARD_REASON, CARD_RULE, browser_verdict
+
+            v = None
+            if call.name in ("browser_type", "browser_fill", "browser_fill_form", "browser_select_option"):
+                v = browser_verdict(None, call, turn.thread_id)
+            elif call.name == "browser_evaluate" and looks_like_pan(str((call.arguments or {}).get("function") or "")):
+                v = Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule=CARD_RULE,
+                            reason=CARD_REASON.format(term="numéro de carte"), subject=subject)
+            if v is not None:
+                return v
+
         if effect is Effect.SEND_BULK:
             return Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="effect:send_bulk",
-                           reason="envoi de masse toujours refusé, même sur demande humaine explicite "
-                                  "(règle du service)", subject=subject)
+                           reason=mt.pick(mt.INV_SEND_BULK), subject=subject)
 
         if effect in (Effect.DESTRUCTIVE, Effect.SEND_EXTERNAL, Effect.SPEND) and turn.channel == RELAY_CHANNEL:
             # Tour venu du web (relais, X10) : un GO textuel ne lève jamais la carte forte, même d'un expéditeur
             # autorisé, et l'allowlist n'y change rien : signature au téléphone.
             return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=f"effect:{effect.value}:relayed",
-                           reason="action demandée depuis le web : carte forte signée au téléphone, aucun GO "
-                                  "textuel n'y supplée", subject=subject, strength="strong")
+                           reason=mt.pick(mt.INV_RELAYED), subject=subject, strength="strong")
 
         if effect is Effect.DESTRUCTIVE:
             text_go = has_explicit_go(turn.input.text, call, spec)
             sender_ok = self.go_authorized(turn.sender)
             if text_go and sender_ok:
                 return Verdict(gate=Gate.ACTION, decision=Decision.ALLOW, layer=1, rule="effect:destructive:go",
-                               reason=f"GO explicite de {turn.sender} dans le tour courant "
-                                      "(cible et paramètres nommés)", subject=subject)
+                               reason=mt.pick(mt.INV_GO).format(sender=turn.sender), subject=subject)
             if text_go and not sender_ok:
                 return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1,
                                rule="effect:destructive:unauthorized_sender",
-                               reason=f"GO textuel détecté mais expéditeur non autorisé à le donner "
-                                      f"({turn.sender!r})", subject=subject, strength="strong")
+                               reason=mt.pick(mt.INV_GO_UNAUTHORIZED).format(sender=repr(turn.sender)),
+                               subject=subject, strength="strong")
             return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule="effect:destructive",
-                           reason="action destructive/irréversible sans GO explicite nommant la cible exacte "
-                                  "et ses paramètres", subject=subject, strength="strong")
+                           reason=mt.pick(mt.INV_DESTRUCTIVE), subject=subject, strength="strong")
 
         if effect is Effect.SEND_EXTERNAL:
             recipients = _extract_recipients(call.arguments)
             if recipients and all(self.allowlist.allows(r) for r in recipients):
                 return Verdict(gate=Gate.ACTION, decision=Decision.ALLOW, layer=1,
-                               rule="effect:send_external:allowlist", reason="destinataire(s) dans l'allowlist",
+                               rule="effect:send_external:allowlist", reason=mt.pick(mt.INV_ALLOWLIST),
                                subject=subject)
-            bad = [r for r in recipients if not self.allowlist.allows(r)] or ["destinataire non identifiable"]
+            bad = [r for r in recipients if not self.allowlist.allows(r)] or [mt.pick(mt.INV_RECIPIENT_UNKNOWN)]
             return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule="effect:send_external",
-                           reason=f"hors allowlist, brouillon + escalade : {', '.join(bad)}", subject=subject,
+                           reason=mt.pick(mt.INV_OUTSIDE_ALLOWLIST).format(bad=", ".join(bad)), subject=subject,
                            strength="standard")
 
         if effect is Effect.SPEND:
             return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule="effect:spend",
-                           reason="dépense sans GO explicite", subject=subject, strength="standard")
+                           reason=mt.pick(mt.INV_SPEND), subject=subject, strength="standard")
 
         if effect is Effect.SECRET:
             # ALLOW : le caviardage du RÉSULTAT n'est plus décidé ici — `core/loop.py` appelle
             # `redact_result` (ci-dessous) sur CHAQUE résultat d'outil, avant le contexte et le
             # store (contrat `main` e076d54). `check_action` ne fait que laisser passer l'appel.
             return Verdict(gate=Gate.ACTION, decision=Decision.ALLOW, layer=1, rule="effect:secret",
-                           reason="résultat transformé en poignée [secret:NOM] par redact_result "
-                                  "avant stockage/contexte", subject=subject)
+                           reason=mt.pick(mt.INV_SECRET), subject=subject)
 
         return Verdict(gate=Gate.ACTION, decision=Decision.ALLOW, layer=1, rule=f"effect:{effect.value}",
                        subject=subject)
 
     def redact_result(self, result: ToolResult, spec: ToolSpec | None) -> ToolResult:
+        """Résultat caviardé, dont les balises du bloc de suite d'une carte sont neutralisées (`neutralize_approval`)."""
+        out = self._redact_result(result, spec)
+        if out.content and APPROVAL_TAG.search(out.content):
+            out = dataclasses.replace(out, content=neutralize_approval(out.content))
+        if out.content and DATE_TAG.search(out.content):  # pas de faux bloc de date venu d'un outil
+            out = dataclasses.replace(out, content=neutralize_date(out.content))
+        return out
+
+    def _redact_result(self, result: ToolResult, spec: ToolSpec | None) -> ToolResult:
         """Appelée par `core/loop.py` sur CHAQUE résultat d'outil, avant le contexte et le store
         (PLAN §2.3 étape 6, contrat `main` e076d54) — la garantie ne dépend plus de la source
         d'outils qui a exécuté l'appel.
@@ -432,12 +465,56 @@ class DeterministicInvariants:
         effect = spec.effect if spec is not None else Effect.WRITE
         if effect is Effect.SECRET:
             return self._seal_secret_result(result)
+        if "nvironnement" in (result.content or "").lower():  # pas de faux bloc `[Environnement]` venu d'un outil
+            result = dataclasses.replace(result, content=neutralize_env(result.content))
+        result = self._mask_cards(result)
+        result = self._mask_avs(result)  # numéro AVS/AHV (`redact/avs.py`) : poignée `[secret:avs-…]`, comme un IBAN
         red = redact(result.content, self.known, weak=False)
         if not red.names:
             return result
         handles = list(dict.fromkeys([*result.secret_handles, *red.names]))
         return ToolResult(call_id=result.call_id, name=result.name, content=red.text, is_error=result.is_error,
-                          reservoir_id=result.reservoir_id, secret_handles=handles, app=result.app)
+                          reservoir_id=result.reservoir_id, secret_handles=handles, app=result.app,
+                          data=self._redact_data(result.data), images=list(result.images),
+                          exit_code=result.exit_code)
+
+    def _redact_data(self, data: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Le bloc data d'un outil passe par le même caviardage que le texte (il part aux clients)."""
+        if data is None:
+            return None
+        import json as _json
+
+        try:
+            return _json.loads(redact(_json.dumps(data, ensure_ascii=False), self.known, weak=False).text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _mask_avs(result: ToolResult) -> ToolResult:
+        """Numéros AVS du texte ET du bloc data (qui part aux clients) remplacés par une poignée ; rien si aucun."""
+        from nokker.redact.avs import mask_avs, mask_avs_obj
+
+        text, names = mask_avs(result.content) if isinstance(result.content, str) else (result.content, [])
+        data, dnames = mask_avs_obj(result.data) if result.data is not None else (None, [])
+        names = list(dict.fromkeys([*names, *dnames]))
+        if not names:
+            return result
+        return dataclasses.replace(result, content=text, data=data if result.data is not None else None,
+                                   secret_handles=list(dict.fromkeys([*result.secret_handles, *names])))
+
+    @staticmethod
+    def _mask_cards(result: ToolResult) -> ToolResult:
+        """Numéros de carte et valeurs des champs de carte masqués (PAYMENTS §2 bis), pour TOUT résultat d'outil :
+        instantané, texte de page, résultat d'un script… Rien d'ajouté au texte, seulement des « • »."""
+        if not isinstance(result.content, str):
+            return result
+        masked = mask_tool_text(result.content)  # + repère « [Masque] » en fin, drapeau `card_mask_notice`
+        if masked == result.content:
+            return result
+        return ToolResult(call_id=result.call_id, name=result.name, content=masked, is_error=result.is_error,
+                          reservoir_id=result.reservoir_id, secret_handles=list(result.secret_handles),
+                          reason=result.reason, app=result.app, data=result.data, images=list(result.images),
+                          exit_code=result.exit_code)
 
     def _seal_secret_result(self, result: ToolResult) -> ToolResult:
         """Résultat d'un outil d'effet `SECRET` (01.11.2026, banc credentiels-pas-de-fuite) : le modèle n'en reçoit
@@ -466,17 +543,16 @@ class DeterministicInvariants:
         if len((result.content or "").strip()) >= 16:  # bloc entier recopié tel quel ; jamais un « ok » court
             self.known.add(whole, result.content.strip())
         items = sorted({m for m in _VAULT_ITEM_RE.findall(red.text)})
-        where = f" Élément du coffre : {', '.join(items)}." if items else ""
+        where = mt.pick(mt.SECRET_WHERE).format(items=", ".join(items)) if items else ""
         caught = "".join(f" {_secret_handle(n)}" for n in red.names)
-        notice = (f"{_secret_handle(whole)}{caught} Résultat de l'outil secret « {result.name} » retiré par le noyau : la valeur "
-                  f"reste dans le coffre et ne passe jamais par le modèle.{where} Ne la recopie pas et ne "
-                  "l'invente pas : indique à l'utilisateur où la récupérer lui-même.")
+        notice = (f"{_secret_handle(whole)}{caught} "
+                  + mt.pick(mt.SECRET_NOTICE).format(name=result.name, where=where))
         handles = list(dict.fromkeys([*result.secret_handles, *red.names, whole]))
         return ToolResult(call_id=result.call_id, name=result.name, content=notice, is_error=False,
                           reservoir_id=result.reservoir_id, secret_handles=handles)
 
     def scrub_output(self, text: str) -> str:
-        return redact(text, self.known).text
+        return mask_card_text(redact(text, self.known).text)
 
     def redact_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Filet du fil (`core/loop.py::_wire_messages`, juste avant chaque appel modèle) : coffre + motifs forts sur
@@ -493,7 +569,7 @@ class DeterministicInvariants:
         def scrub(text: str) -> str:
             got = cache.get(text)
             if got is None:
-                got = redact(text, known, weak=False, wire=True).text  # le fil : rien de ce que refuse le Router
+                got = mask_card_text(redact(text, known, weak=False, wire=True).text)  # le fil : rien de ce que refuse le Router ; aucune carte
                 cache[text] = got
             return got
 

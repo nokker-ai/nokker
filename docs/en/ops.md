@@ -92,6 +92,25 @@ ignored, no agent, no forwarding, no password prompts, no connection sharing, an
 it touches. The key never appears in a tool argument, a result or the model's context; if a server sends it back, it
 is replaced by `[secret:NAME]`.
 
+## How the sandbox reaches your hosts (Lokkal)
+
+In the Lokkal install, the sandbox has no direct route out: everything leaves through the `egress` proxy, and the ssh
+client goes through it too (an HTTP `CONNECT`). The rule is the same for a server on the Internet, on your local
+network or on a VPN such as Tailscale:
+
+- `egress` opens a connection **only to an address and a port declared in `hosts.yaml`**, written exactly as in the
+  file (the same name or IP, the same `port`). Another port of the same host, or another machine of the same network,
+  is refused;
+- port 22 to a host that is not declared is refused, even on the Internet: the sandbox cannot ssh anywhere else;
+- never reachable, even if declared: loopback, link-local (including the cloud metadata address `169.254.169.254`),
+  multicast, and Lokkal's own docker networks (core, database, docker proxy);
+- a host behind a `jump` is reached by the jump, so only the jump has to be reachable from the sandbox.
+
+The core hands `egress` the list (`~/.nokker/state/egress/ssh-hosts.json`: addresses and ports only, no names, users
+or keys), from the inventory it validated, each time a session opens. After editing `hosts.yaml`, open a new session.
+A refusal comes back with a hint ("declare the address and the port in hosts.yaml"). With the `local` backend the
+client connects directly, like your own ssh.
+
 ## The audit journal
 
 Every executed call whose effect is not a read (files, commands, sub-agents, approved cards) and every `ssh_run` or
@@ -130,9 +149,11 @@ the steps, and you run them in a session, where the rules above apply.
 
 ## Limits
 
-- The Lokkal compose puts sandboxes on a network that reaches the Internet only: hosts on your local network are not
-  reachable from the docker sandbox yet. The `local` backend reaches them.
-- The ssh client refuses to run under a user id the sandbox image does not know: today's image knows uid 1000.
+- From the Lokkal sandbox, only declared hosts are reachable over ssh (see above); a host whose address changes (DHCP)
+  must be declared by a stable name or IP.
+- The sandbox runs under your user id; when the image does not know it, the ssh client gets a passwd entry for the
+  duration of the command (`nss_wrapper`). An image without `nss_wrapper` still refuses ids other than 1000, with a
+  clear hint.
 - Approving a `prod` card from your phone arrives with the gateway: **rolling out** ([security.md](security.md)).
   Meanwhile, use a device enrolled on this machine.
 - One jump only; no port forwarding, no interactive sessions, no file upload.

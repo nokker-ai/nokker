@@ -34,6 +34,7 @@ import httpx
 
 from nokker.connectors.errors import ConnectorError, scrub
 from nokker.connectors.net import https_client
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.qa.untrusted import fence
@@ -160,6 +161,7 @@ class Event:
     rrule: dict[str, str] | None = None
     unsupported_rrule: bool = False
     exdates: set[tuple[str, str]] = field(default_factory=set)
+    rdates: list[date | datetime] = field(default_factory=list)
     recurrence_id: tuple[str, str] | None = None
     cancelled: bool = False
     notes: list[str] = field(default_factory=list)
@@ -171,7 +173,7 @@ def _tz(name: str | None, default: ZoneInfo, notes: list[str]) -> ZoneInfo:
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError, OSError):
-        notes.append(f"fuseau {name} inconnu, fuseau du compte utilisé")
+        notes.append(mt.pick(mt.CAL_TZ_UNKNOWN_NOTE).format(name=name))
         return default
 
 
@@ -202,6 +204,27 @@ def _key(v: date | datetime) -> tuple[str, str]:
     return "d", v.isoformat()
 
 
+_BYDAY_RE = re.compile(r"^([+-]?\d{1,2})?(MO|TU|WE|TH|FR|SA|SU)$")
+
+
+def _byday(value: str) -> list[tuple[int | None, int]]:
+    """« 2MO,-1FR,TU » → [(2, 0), (-1, 4), (None, 1)] ; ValueError si illisible."""
+    out: list[tuple[int | None, int]] = []
+    for item in value.split(","):
+        m = _BYDAY_RE.match(item.strip().upper())
+        if not m or (m.group(1) is not None and int(m.group(1)) == 0):
+            raise ValueError("BYDAY illisible")
+        out.append((int(m.group(1)) if m.group(1) else None, _DAYS[m.group(2)]))
+    return out
+
+
+def _ints(value: str, lo: int, hi: int, *, neg: bool = False) -> list[int]:
+    out = [int(x) for x in value.split(",")]
+    if any(x == 0 or not (-hi <= x <= hi if neg else lo <= x <= hi) for x in out):
+        raise ValueError("valeur hors bornes")
+    return out
+
+
 def _parse_rrule(value: str) -> tuple[dict[str, str], bool]:
     parts = {}
     for item in value.split(";"):
@@ -209,9 +232,26 @@ def _parse_rrule(value: str) -> tuple[dict[str, str], bool]:
         parts[k.upper()] = v
     freq = parts.get("FREQ", "")
     ok = freq in {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
-    ok = ok and all(k in {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "WKST"} for k in parts)
-    if "BYDAY" in parts:
-        ok = ok and freq == "WEEKLY" and all(d in _DAYS for d in parts["BYDAY"].split(","))
+    ok = ok and all(k in {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "WKST"} for k in parts)
+    try:
+        if "BYDAY" in parts:
+            days = _byday(parts["BYDAY"])
+            positional = any(n is not None for n, _ in days)
+            # une position (2MO, -1FR) n'a de sens qu'en MONTHLY, ou en YEARLY borné par BYMONTH
+            ok = ok and (not positional or freq == "MONTHLY" or (freq == "YEARLY" and "BYMONTH" in parts))
+            ok = ok and not (positional and "BYMONTHDAY" in parts)
+            ok = ok and not (freq == "YEARLY" and "BYMONTH" not in parts)
+        if "BYMONTHDAY" in parts:
+            _ints(parts["BYMONTHDAY"], 1, 31, neg=True)
+            ok = ok and freq in {"DAILY", "MONTHLY", "YEARLY"}
+            ok = ok and not (freq == "YEARLY" and "BYMONTH" not in parts)
+        if "BYMONTH" in parts:
+            _ints(parts["BYMONTH"], 1, 12)
+            ok = ok and freq in {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
+        if "WKST" in parts and parts["WKST"].upper() not in _DAYS:
+            ok = False
+    except ValueError:
+        ok = False
     for k in ("INTERVAL", "COUNT"):
         if k in parts and not parts[k].isdigit():
             ok = False
@@ -257,7 +297,7 @@ def parse_ics(text: str, tz: ZoneInfo) -> Parsed:
         try:
             ev = _event(props, tz)
         except (ValueError, KeyError, OverflowError):
-            warnings.append("un événement illisible a été ignoré")
+            warnings.append(mt.pick(mt.CAL_UNREADABLE_IGNORED))
             continue
         if ev is not None:
             events.append(ev)
@@ -293,6 +333,11 @@ def _event(props: list[tuple[str, dict[str, str], str]], tz: ZoneInfo) -> Event 
             for item in value.split(","):
                 if item.strip():
                     ev.exdates.add(_key(_parse_dt(item, params, tz, notes)))
+        elif name == "RDATE":
+            if params.get("VALUE", "").upper() == "PERIOD" or "/" in value:
+                ev.unsupported_rrule = True
+            else:
+                ev.rdates += [_parse_dt(i, params, tz, notes) for i in value.split(",") if i.strip()]
         elif name == "RECURRENCE-ID":
             ev.recurrence_id = _key(_parse_dt(value, params, tz, notes))
     if ev.start is None:
@@ -308,8 +353,11 @@ def _event(props: list[tuple[str, dict[str, str], str]], tz: ZoneInfo) -> Event 
     ev.uid = ev.uid or "anon-" + hashlib.sha1(f"{ev.summary}{_key(ev.start)}".encode()).hexdigest()[:16]
     ev.notes = notes
     if ev.unsupported_rrule:
-        ev.notes.append("récurrence non gérée : seule la première occurrence est affichée")
+        ev.notes.append(mt.pick(mt.CAL_RECURRENCE_UNSUPPORTED))
     return ev
+
+
+_TRUNCATED_NOTE = mt.CAL_TRUNCATED_NOTE["fr"]  # texte gelé (relecture, 15.11.2026)
 
 
 def _as_dt(v: date | datetime, tz: ZoneInfo) -> datetime:
@@ -323,54 +371,116 @@ def _until(v: str, tz: ZoneInfo) -> datetime:
     return d.replace(tzinfo=UTC if v.endswith(("Z", "z")) else tz)
 
 
-def _candidates(ev: Event):
-    """Débuts successifs d'une série (heure murale conservée d'une occurrence à l'autre), sans filtrer ni compter."""
+MAX_OCC = 1000   # occurrences émises par série et par requête
+MAX_SCAN = 20000   # périodes parcourues au plus (garde-fou d'une série sans fin ni COUNT)
+MAX_SPAN = timedelta(days=1100)   # plage interrogée au plus ~3 ans (l outil plafonne déjà à 366 jours)
+
+
+def _month_days(y: int, m: int, rule: dict[str, str], d0: date) -> list[date]:
+    """Jours d'un mois (y, m) selon BYDAY (avec position éventuelle) / BYMONTHDAY, sinon le quantième de DTSTART."""
+    last = (date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).day
+    days: set[int] = set()
+    if "BYDAY" in rule:
+        for n, wd in _byday(rule["BYDAY"]):
+            same = [d for d in range(1, last + 1) if date(y, m, d).weekday() == wd]
+            if n is None:
+                days.update(same)
+            elif -len(same) <= n <= len(same):
+                days.add(same[n - 1] if n > 0 else same[n])
+        if "BYMONTHDAY" in rule:
+            days &= {x if x > 0 else last + 1 + x for x in _ints(rule["BYMONTHDAY"], 1, 31, neg=True)}
+    elif "BYMONTHDAY" in rule:
+        days = {x if x > 0 else last + 1 + x for x in _ints(rule["BYMONTHDAY"], 1, 31, neg=True)}
+    else:
+        days = {d0.day}
+    return [date(y, m, d) for d in sorted(days) if 1 <= d <= last]
+
+
+def _periods(ev: Event, i0: int):
+    """Jours candidats période par période (période = jour, semaine WKST, mois ou année × INTERVAL), triés."""
     s = ev.start
     assert s is not None and ev.rrule is not None
-    freq, interval = ev.rrule["FREQ"], int(ev.rrule.get("INTERVAL", "1"))
+    r = ev.rrule
+    freq, interval = r["FREQ"], int(r.get("INTERVAL", "1"))
     d0 = s.date() if isinstance(s, datetime) else s
-
-    def at(d: date) -> date | datetime:
-        return d if not isinstance(s, datetime) else datetime.combine(d, s.time()).replace(tzinfo=s.tzinfo)
-
-    if freq == "DAILY":
-        for i in itertools.count():
-            yield at(d0 + timedelta(days=i * interval))
-    elif freq == "WEEKLY":
-        days = sorted(_DAYS[d] for d in ev.rrule["BYDAY"].split(",")) if "BYDAY" in ev.rrule else [d0.weekday()]
-        monday = d0 - timedelta(days=d0.weekday())
-        for i in itertools.count():
-            for wd in days:
-                d = monday + timedelta(weeks=i * interval, days=wd)
-                if d >= d0:
-                    yield at(d)
-    elif freq == "MONTHLY":
-        for i in itertools.count():
+    months = set(_ints(r["BYMONTH"], 1, 12)) if "BYMONTH" in r else None
+    for i in itertools.count(i0):
+        if freq == "DAILY":
+            d = d0 + timedelta(days=i * interval)
+            ok = months is None or d.month in months
+            if ok and "BYDAY" in r:
+                ok = d.weekday() in {wd for _, wd in _byday(r["BYDAY"])}
+            if ok and "BYMONTHDAY" in r:
+                last = (date(d.year + (d.month == 12), d.month % 12 + 1, 1) - timedelta(days=1)).day
+                ok = d.day in {x if x > 0 else last + 1 + x for x in _ints(r["BYMONTHDAY"], 1, 31, neg=True)}
+            yield [d] if ok else []
+        elif freq == "WEEKLY":
+            wkst = _DAYS[r.get("WKST", "MO").upper()]
+            ws = d0 - timedelta(days=(d0.weekday() - wkst) % 7) + timedelta(weeks=i * interval)
+            wds = sorted({wd for _, wd in _byday(r["BYDAY"])}, key=lambda w: (w - wkst) % 7) if "BYDAY" in r else [d0.weekday()]
+            ds = [ws + timedelta(days=(wd - wkst) % 7) for wd in wds]
+            yield [d for d in ds if months is None or d.month in months]
+        elif freq == "MONTHLY":
             y, m = divmod(d0.year * 12 + d0.month - 1 + i * interval, 12)
-            try:
-                yield at(date(y, m + 1, d0.day))
-            except ValueError:
-                continue
-    else:
-        for i in itertools.count():
-            try:
-                yield at(date(d0.year + i * interval, d0.month, d0.day))
-            except ValueError:
-                continue
+            yield [d for d in _month_days(y, m + 1, r, d0) if months is None or d.month in months]
+        else:
+            y = d0.year + i * interval
+            out: list[date] = []
+            for m in sorted(months or {d0.month}):
+                out += _month_days(y, m, r, d0)
+            yield out
 
 
-def _occurrences(ev: Event, t1: datetime, tz: ZoneInfo):
+def _first_period(ev: Event, lo: date) -> int:
+    """Indice de période où commencer (sans COUNT : on saute les périodes antérieures à la plage, avec une marge)."""
+    assert ev.start is not None and ev.rrule is not None
+    d0 = ev.start.date() if isinstance(ev.start, datetime) else ev.start
+    freq, interval = ev.rrule["FREQ"], int(ev.rrule.get("INTERVAL", "1"))
+    if "COUNT" in ev.rrule or lo <= d0:
+        return 0
+    n = {"DAILY": (lo - d0).days, "WEEKLY": (lo - d0).days // 7,
+         "MONTHLY": (lo.year - d0.year) * 12 + lo.month - d0.month, "YEARLY": lo.year - d0.year}[freq]
+    return max(0, n // interval - 2)
+
+
+def _occurrences(ev: Event, t0: datetime, t1: datetime, tz: ZoneInfo, dur: timedelta = timedelta(0)):
+    """Débuts des occurrences (RRULE puis RDATE) dont le début est avant t1, heure murale conservée d'une occurrence
+    à l'autre (DST). Séries bornées : MAX_OCC occurrences, MAX_SCAN périodes ; au-delà, note « tronquée »."""
     assert ev.start is not None
-    if ev.rrule is None or ev.unsupported_rrule:
-        yield ev.start
+    s = ev.start
+    yield s
+    if ev.unsupported_rrule:
+        return
+    for r in ev.rdates:
+        if _key(r) != _key(s):
+            yield r
+    if ev.rrule is None:
         return
     count = int(ev.rrule["COUNT"]) if "COUNT" in ev.rrule else None
     until = _until(ev.rrule["UNTIL"], tz) if "UNTIL" in ev.rrule else None
-    for n, occ in enumerate(itertools.islice(_candidates(ev), MAX_ITER), 1):
-        at = _as_dt(occ, tz)
-        if (count and n > count) or (until and at > until) or at >= t1:
-            return
-        yield occ
+    d0 = s.date() if isinstance(s, datetime) else s
+    lo = ((t0 - dur).astimezone(s.tzinfo) if isinstance(s, datetime) else t0 - dur).date() - timedelta(days=1)
+    n, emitted = 1, 0   # DTSTART compte comme première occurrence (RFC 5545 §3.8.5.3)
+    try:
+        for p, days in enumerate(_periods(ev, _first_period(ev, lo))):
+            if p >= MAX_SCAN or emitted >= MAX_OCC:
+                ev.notes.append(mt.pick(mt.CAL_TRUNCATED_NOTE))
+                return
+            for d in days:
+                if d < d0:
+                    continue
+                occ = d if not isinstance(s, datetime) else datetime.combine(d, s.time()).replace(tzinfo=s.tzinfo)
+                if _key(occ) == _key(s):
+                    continue
+                at = _as_dt(occ, tz)
+                n += 1
+                if (count and n > count) or (until and at > until) or at >= t1:
+                    return
+                if at + dur > t0:
+                    emitted += 1
+                yield occ
+    except (OverflowError, ValueError):
+        ev.notes.append(mt.pick(mt.CAL_TRUNCATED_NOTE))
 
 
 def events_between(events: list[Event], t0: datetime, t1: datetime, tz: ZoneInfo) -> list[dict[str, Any]]:
@@ -382,14 +492,14 @@ def events_between(events: list[Event], t0: datetime, t1: datetime, tz: ZoneInfo
             continue
         dur = ev.end - ev.start
         try:
-            for occ in _occurrences(ev, t1, tz):
-                if ev.recurrence_id is None and (ev.uid, _key(occ)) in overridden:
-                    continue
-                if ev.recurrence_id is None and _key(occ) in ev.exdates:
+            hits: list[tuple[datetime, date | datetime]] = []
+            for occ in _occurrences(ev, t0, min(t1, t0 + MAX_SPAN), tz, dur) if ev.recurrence_id is None else [ev.start]:
+                if ev.recurrence_id is None and ((ev.uid, _key(occ)) in overridden or _key(occ) in ev.exdates):
                     continue
                 start, end = _as_dt(occ, tz), _as_dt(occ + dur, tz)
                 if (start < t1 and end > t0) or (start == end and t0 <= start < t1):
-                    found.append((start, _render(ev, occ, dur, tz)))
+                    hits.append((start, occ))
+            found += [(start, _render(ev, occ, dur, tz)) for start, occ in hits]   # après le parcours : notes complètes
         except (OverflowError, ValueError):
             continue
     found.sort(key=lambda t: (t[0], t[1]["summary"]))
@@ -422,7 +532,7 @@ def parse_input_time(value: str, tz: ZoneInfo) -> tuple[date | datetime, bool]:
             return date.fromisoformat(s), True
         d = datetime.fromisoformat(s)
     except ValueError:
-        raise ValueError(f"date/heure invalide : {s!r} — attendu ISO 8601, ex. 2026-10-27T14:00 (ou 2026-10-27 pour une journée entière)") from None
+        raise ValueError(mt.pick(mt.CAL_BAD_DATETIME).format(value=repr(s))) from None
     return (d if d.tzinfo else d.replace(tzinfo=tz)), False
 
 
@@ -437,7 +547,7 @@ def _attendee_lines(attendees: list[str]) -> list[str]:
     for a in attendees:
         a = str(a).strip()
         if not _EMAIL_RE.match(a):
-            raise ValueError(f"adresse d'invité invalide : {a!r}")
+            raise ValueError(mt.pick(mt.CAL_BAD_GUEST).format(value=repr(a)))
         lines.append(f"ATTENDEE:mailto:{a}")
     return lines
 
@@ -485,7 +595,7 @@ def edit_ics(text: str, drop: set[str], add: list[str], sequence_bump: bool = Tr
                 else:
                     depth -= 1
     if start < 0 or end < 0:
-        raise ValueError("événement maître introuvable")
+        raise ValueError(mt.pick(mt.CAL_MASTER_NOT_FOUND))
     seq = 0
     kept, depth = [], 0
     for line in lines[start + 1:end]:
@@ -549,12 +659,12 @@ class CalendarConnector:
         self._now = now or (lambda: datetime.now(UTC))
         mode = settings.get("mode")
         if mode not in ("ical", "caldav"):
-            raise ConnectorError("bad_settings", "mode agenda inconnu (ical ou caldav)")
+            raise ConnectorError("bad_settings", mt.pick(mt.CAL_UNKNOWN_MODE))
         self.mode = mode
         try:
             self.tz = ZoneInfo(settings.get("tz") or DEFAULT_TZ)
         except (ZoneInfoNotFoundError, ValueError, OSError):
-            raise ConnectorError("bad_settings", "fuseau horaire inconnu") from None
+            raise ConnectorError("bad_settings", mt.pick(mt.CAL_UNKNOWN_TZ)) from None
         if not secret:
             raise ConnectorError("bad_settings", "secret manquant")
         self._calendars: list[Cal] | None = None
@@ -623,7 +733,7 @@ class CalendarConnector:
             handlers |= {"calendar_create": self._create, "calendar_update": self._update, "calendar_delete": self._delete}
         fn = handlers.get(name)
         if fn is None:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         try:
             out = fn(arguments or {})
             return ToolResult(call_id="", name=name,
@@ -633,7 +743,7 @@ class CalendarConnector:
         except ValueError as e:
             msg = scrub(str(e), self._secret)
         except Exception:
-            msg = "erreur interne du connecteur agenda"
+            msg = mt.pick(mt.CAL_INTERNAL_ERROR)
         return ToolResult(call_id="", name=name, content=msg, is_error=True)
 
     def test(self) -> str:
@@ -712,7 +822,7 @@ class CalendarConnector:
         if r.status == 404:
             raise ConnectorError("protocol_error", "ressource introuvable sur le serveur d'agenda")
         if r.status == 412:
-            raise ConnectorError("protocol_error", "événement modifié entre-temps : relire puis réessayer")
+            raise ConnectorError("protocol_error", mt.pick(mt.CAL_CHANGED_MEANWHILE))
         raise ConnectorError("protocol_error", f"réponse inattendue du serveur d'agenda (HTTP {r.status})")
 
     @staticmethod
@@ -813,7 +923,7 @@ class CalendarConnector:
         for cal in cals:
             if c.lower() in (cal.name.lower(), cal.url.lower()):
                 return [cal]
-        raise ValueError(f"agenda inconnu : {c!r} (disponibles : {', '.join(x.name for x in cals)})")
+        raise ValueError(mt.pick(mt.CAL_UNKNOWN_CALENDAR).format(name=repr(c), available=", ".join(x.name for x in cals)))
 
     # — lecture —
 
@@ -839,9 +949,9 @@ class CalendarConnector:
         try:
             days = int(args.get("days", 7))
         except (TypeError, ValueError):
-            raise ValueError("`days` doit être un entier") from None
+            raise ValueError(mt.pick(mt.CAL_DAYS_INT)) from None
         if not 1 <= days <= 366:
-            raise ValueError("`days` doit être compris entre 1 et 366")
+            raise ValueError(mt.pick(mt.CAL_DAYS_RANGE))
         now = self._now()
         cals = self._select(args.get("calendar")) if self.mode == "caldav" else None
         evs = self._window(now, now + timedelta(days=days), cals)
@@ -871,7 +981,7 @@ class CalendarConnector:
                 if "BEGIN:VCALENDAR" in data.upper() and any(e.uid == uid for e in parse_ics(data, self.tz).events):
                     etag = (resp.findtext(f".//{DAV}getetag") or "").strip()
                     return cal, urljoin(cal.url, (resp.findtext(f"{DAV}href") or "").strip()), etag, data
-        raise ValueError("événement introuvable (id inconnu de cet agenda)")
+        raise ValueError(mt.pick(mt.CAL_EVENT_NOT_FOUND))
 
     def _put(self, url: str, ics: str, *, etag: str = "", create: bool = False) -> Resp:
         h = {"Content-Type": "text/calendar; charset=utf-8"}
@@ -884,15 +994,15 @@ class CalendarConnector:
     def _create(self, a: dict[str, Any]) -> dict[str, Any]:
         summary = str(a.get("summary") or "").strip()
         if not summary:
-            raise ValueError("`summary` requis")
+            raise ValueError(mt.pick(mt.CAL_SUMMARY_REQUIRED))
         start, all_day = parse_input_time(a.get("start") or "", self.tz)
         end, end_all = parse_input_time(a.get("end") or "", self.tz)
         if all_day != end_all:
-            raise ValueError("`start` et `end` doivent être tous deux des dates ou tous deux des heures")
+            raise ValueError(mt.pick(mt.CAL_START_END_KIND))
         if all_day:
             end = end + timedelta(days=1)  # type: ignore[operator]
         if end <= start:  # type: ignore[operator]
-            raise ValueError("`end` doit être postérieur à `start`")
+            raise ValueError(mt.pick(mt.CAL_END_AFTER_START))
         attendees = [str(x) for x in (a.get("attendees") or [])]
         uid = uuid.uuid4().hex
         lines = _event_lines(uid, summary, start, end, a.get("description"), a.get("location"), attendees, self._now())
@@ -900,7 +1010,7 @@ class CalendarConnector:
         self._put(urljoin(cal.url, uid + ".ics"), build_ics(lines), create=True)
         out: dict[str, Any] = {"created": True, "id": uid, "calendar": cal.name}
         if attendees:
-            out["note"] = "invités inscrits dans l'événement ; aucune invitation envoyée"
+            out["note"] = mt.pick(mt.CAL_GUESTS_NO_INVITE)
         return out
 
     def put_new_event(self, uid: str, ics: str, calendar: str | None = None) -> dict[str, Any]:
@@ -908,9 +1018,9 @@ class CalendarConnector:
         sous `<agenda>/<uid>.ics`, sans écraser (If-None-Match). Méthode Python seulement, jamais un outil du modèle :
         l'appelant passe par une carte approuvée. CalDAV seulement ; mêmes garde-fous réseau que `calendar_create`."""
         if self.mode != "caldav":
-            raise ValueError("agenda en lecture seule (iCal) : écriture impossible")
+            raise ValueError(mt.pick(mt.CAL_READ_ONLY))
         if not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", uid or "") or f"UID:{uid}" not in ics:
-            raise ValueError("uid invalide")
+            raise ValueError(mt.pick(mt.CAL_BAD_UID))
         cal = self._select(calendar)[0]
         self._put(urljoin(cal.url, uid + ".ics"), ics, create=True)
         return {"created": True, "id": uid, "calendar": cal.name}
@@ -918,23 +1028,23 @@ class CalendarConnector:
     def _update(self, a: dict[str, Any]) -> dict[str, Any]:
         uid = str(a.get("event_id") or "").strip()
         if not uid:
-            raise ValueError("`event_id` requis")
+            raise ValueError(mt.pick(mt.CAL_EVENT_ID_REQUIRED))
         cal, href, etag, text = self._find(uid, a.get("calendar"))
         master = next((e for e in parse_ics(text, self.tz).events if e.uid == uid and e.recurrence_id is None), None)
         if master is None or master.start is None or master.end is None:
-            raise ValueError("événement illisible")
+            raise ValueError(mt.pick(mt.CAL_UNREADABLE_EVENT))
         drop: set[str] = set()
         add: list[str] = []
         if "start" in a or "end" in a:
             if master.rrule:
-                raise ValueError("série récurrente : la modification des horaires n'est pas prise en charge ici")
+                raise ValueError(mt.pick(mt.CAL_SERIES_TIMES))
             s_in = parse_input_time(a["start"], self.tz) if a.get("start") else None
             e_in = parse_input_time(a["end"], self.tz) if a.get("end") else None
             all_day = (s_in or e_in)[1]  # type: ignore[index]
             if (s_in and s_in[1] != all_day) or (e_in and e_in[1] != all_day):
-                raise ValueError("`start` et `end` doivent être tous deux des dates ou tous deux des heures")
+                raise ValueError(mt.pick(mt.CAL_START_END_KIND))
             if master.all_day != all_day and not (s_in and e_in):
-                raise ValueError("changer entre journée entière et heures impose de donner `start` et `end`")
+                raise ValueError(mt.pick(mt.CAL_ALLDAY_SWITCH))
             dur = master.end - master.start
             start = s_in[0] if s_in else master.start
             if e_in:
@@ -942,7 +1052,7 @@ class CalendarConnector:
             else:
                 end = start + dur
             if end <= start:  # type: ignore[operator]
-                raise ValueError("`end` doit être postérieur à `start`")
+                raise ValueError(mt.pick(mt.CAL_END_AFTER_START))
             drop |= {"DTSTART", "DTEND", "DURATION"}
             add += [_ics_time("DTSTART", start), _ics_time("DTEND", end)]
         for key, prop in (("summary", "SUMMARY"), ("description", "DESCRIPTION"), ("location", "LOCATION")):
@@ -954,19 +1064,19 @@ class CalendarConnector:
             drop.add("ATTENDEE")
             add += _attendee_lines([str(x) for x in (a["attendees"] or [])])
         if not drop:
-            raise ValueError("rien à modifier : donner au moins un champ")
+            raise ValueError(mt.pick(mt.CAL_NOTHING_TO_CHANGE))
         self._put(href, edit_ics(text, drop, add), etag=etag)
         out: dict[str, Any] = {"updated": True, "id": uid}
         if master.rrule:
-            out["note"] = "événement récurrent : la modification vaut pour toute la série"
+            out["note"] = mt.pick(mt.CAL_SERIES_WHOLE)
         if "attendees" in a:
-            out["note"] = (out.get("note", "") + "; " if out.get("note") else "") + "aucune invitation envoyée"
+            out["note"] = (out.get("note", "") + "; " if out.get("note") else "") + mt.pick(mt.CAL_NO_INVITE_SENT)
         return out
 
     def _delete(self, a: dict[str, Any]) -> dict[str, Any]:
         uid = str(a.get("event_id") or "").strip()
         if not uid:
-            raise ValueError("`event_id` requis")
+            raise ValueError(mt.pick(mt.CAL_EVENT_ID_REQUIRED))
         _cal, href, etag, _text = self._find(uid, a.get("calendar"))
         h = {"If-Match": etag} if etag else {}
         self._check(self._req("DELETE", href, headers=h), (200, 202, 204))

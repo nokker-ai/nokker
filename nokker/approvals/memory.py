@@ -39,6 +39,15 @@ class InMemoryApprovals(BaseApprovals):
             items = [copy.deepcopy(a) for a in self._approvals.values() if a.status == "pending"]
         return items
 
+    def _interrupt_stale_rows(self, cutoff: float, exclude: frozenset[str] = frozenset()) -> list[Approval]:
+        with self._lock:
+            hit = [a for a in self._approvals.values()
+                   if a.status == "executing" and a.id not in exclude and self.visible(a)
+                   and (a.executing_at or a.decided_at or a.created_at) < cutoff]
+            for a in hit:
+                a.status = "interrupted"
+            return [copy.deepcopy(a) for a in hit]
+
     def _list_history(self, since: float) -> list[Approval]:
         with self._lock:
             return [copy.deepcopy(a) for a in self._approvals.values() if a.created_at >= since]
@@ -58,6 +67,10 @@ class InMemoryApprovals(BaseApprovals):
     def _append_event(self, approval_id: str, event_type: str, data: dict) -> None:
         with self._lock:
             self._events.append((approval_id, event_type, dict(data)))
+
+    def _load_events(self, approval_id: str) -> list[tuple[str, dict]]:
+        with self._lock:
+            return [(t, dict(d)) for a, t, d in self._events if a == approval_id]
 
     def _reserve_nonce(self, nonce: str, scope_id: str, exp: float) -> None:
         with self._lock:

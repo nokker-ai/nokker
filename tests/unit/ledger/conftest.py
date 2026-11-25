@@ -45,6 +45,12 @@ def pg_ledger(pg_dsn):
     from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
 
     # Le ledger Postgres lit et écrit dans le locataire courant (RLS, docs/TENANCY.md §4).
+    from nokker.store.pg import apply_migrations
+
+    # Le schéma d'abord, dans l'ordre de la production (`migration_files()` : piliers, puis 001… du store) : `migrate()` du
+    # ledger rejoue les fichiers 037/039/090 en entier, qui supposent les tables du store (consentements, équipes…).
+    # Sur une base nue, il échouait sur `data_consents` (`'data_consents'::regclass` évalué malgré `to_regclass`).
+    apply_migrations(pg_dsn, strict=True)
     with tenant_scope(INTERNAL_TENANT):
         ledger = PostgresLedger(pg_dsn, prices=load_from_yaml())
         # Isolation : chaque test travaille sous un thread_id unique plutôt que de TRUNCATE une table

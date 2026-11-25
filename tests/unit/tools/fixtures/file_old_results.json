@@ -1,0 +1,446 @@
+[
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "liste.*documents|documents.*list|pagination",
+   "target": "files",
+   "path": ".",
+   "limit": 10
+  },
+  "content": "[\"src/components/DocumentsList.tsx\", \"src/pages/DocumentsPage.tsx\", \"src/api/documents.ts\", \"src/types/document.ts\"]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/components/DocumentsList.tsx",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "Ligne 1-50 : import React, { useState, useEffect } from 'react';\nimport { fetchDocuments } from '../api/documents';\nimport { Document } from '../types/document';\n\nexport function DocumentsList() {\n  const [documents, setDocuments] = useState<Document[]>([]);\n  const [loading, setLoading] = useState(true);\n\n  useEffect(() => {\n    fetchDocuments().then(data => {\n      setDocuments(data);\n      setLoading(false);\n    });\n  }, []);\n\n  // TODO: ajouter pagination\n  // Actuellement : affiche tous les documents sans limite\n\n  return (\n    <div className=\"documents-list\">\n      {loading ? <p>Chargement...</p> : (\n        <table>\n          <thead>...</thead>\n          <tbody>\n            {documents.map(doc => <DocumentRow key={doc.id} doc={doc} />)}\n          </tbody>\n        </table>\n      )}\n    </div>\n  );\n}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "tests/test_percentages.py",
+   "offset": 1,
+   "limit": 50
+  },
+  "content": "\"Line 1: import pytest\\nLine 2: from src.calculator import apply_percentage\\nLine 3: \\nLine 4: def test_apply_percentage():\\nLine 5:     assert apply_percentage(100, 20) == 120\\nLine 6:     assert apply_percentage(200, 15) == 230\\nLine 7:     # Fallisce: assert apply_percentage(500, 10) == 550\\nLine 8:     # Errore: ottiene 545 invece di 550\"",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "import requests|from requests",
+   "target": "content",
+   "path": ".",
+   "file_glob": "*.py",
+   "context": 2,
+   "limit": 20
+  },
+  "content": "3 fichiers trouvés :\n- app/api/external.py (lignes 3-8): import requests\\nfrom requests.exceptions import Timeout, ConnectionError\\n... def fetch_weather(city): ... def fetch_exchange_rate(): ...\n- app/services/notification.py (lignes 5-7): import requests\\n... def send_webhook(url, payload): ...\n- tests/test_external.py (lignes 1-4): from unittest.mock import patch\\nimport requests\\n... @patch('requests.get') ...",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "export.*csv|csv.*export",
+   "target": "content",
+   "path": ".",
+   "limit": 10
+  },
+  "content": "{\"matches\": [{\"file\": \"src/exporters/data_exporter.py\", \"line\": 45, \"context\": \"def export_to_csv(data, path):\\\\n    with open(path, 'w', newline='') as f:\\\\n        writer = csv.DictWriter(f, fieldnames=data[0].keys())\\\\n        writer.writeheader()\\\\n        writer.writerows(data)\"}, {\"file\": \"src/exporters/__init__.py\", \"line\": 3, \"context\": \"from .data_exporter import export_to_csv\\\\nfrom .data_exporter import export_to_json\"}]}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/exporters/data_exporter.py",
+   "offset": 1,
+   "limit": 80
+  },
+  "content": "{\"content\": \"1  import csv\\n2  import json\\n3  from pathlib import Path\\n4  \\n5  class DataExporter:\\n6      def __init__(self, output_dir):\\n7          self.output_dir = Path(output_dir)\\n8          self.output_dir.mkdir(parents=True, exist_ok=True)\\n9  \\n10     def export_to_csv(self, data, filename):\\n11         if not data:\\n12             raise ValueError(\\\"Aucune donnée à exporter\\\")\\n13         path = self.output_dir / filename\\n14         with open(path, 'w', newline='', encoding='utf-8') as f:\\n15             writer = csv.DictWriter(f, fieldnames=data[0].keys())\\n16             writer.writeheader()\\n17             writer.writerows(data)\\n18         return str(path)\\n19  \\n20     def export_to_json(self, data, filename):\\n21         # TODO: à implémenter\\n22         pass\\n23  \\n24     def get_export_formats(self):\\n25         return ['csv']\\n\", \"lines\": 80}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.kanzlei-auer.de"
+  },
+  "content": "Site Status: UP\nUptime: 99.9% (last 30 days)\nLatest Incident: None\nSSL Certificate: Valid until 2027-02-10\nNote: Monitoring agent reports 'ACME Challenge Failed' on 2027-02-05.",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/main.py",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\"lines\": [{\"num\": 1, \"text\": \"from fastapi import FastAPI\"}, {\"num\": 2, \"text\": \"\"}, {\"num\": 3, \"text\": \"app = FastAPI()\"}, {\"num\": 4, \"text\": \"\"}, {\"num\": 5, \"text\": \"@app.get('/users')\"}, {\"num\": 6, \"text\": \"async def get_users():\"}, {\"num\": 7, \"text\": \"    return {'users': []}\"}, {\"num\": 8, \"text\": \"\"}, {\"num\": 9, \"text\": \"@app.get('/items')\"}, {\"num\": 10, \"text\": \"async def get_items():\"}, {\"num\": 11, \"text\": \"    return {'items': []}\"}], \"total_lines\": 45, \"path\": \"src/main.py\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "def test_.*",
+   "target": "content",
+   "file_glob": "*_test.py",
+   "limit": 10
+  },
+  "content": "{\"matches\": [{\"file\": \"tests/test_api.py\", \"line\": 12, \"text\": \"def test_get_users():\"}, {\"file\": \"tests/test_api.py\", \"line\": 28, \"text\": \"def test_get_items():\"}], \"total\": 2}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "package.json",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\n  \"name\": \"api-client\",\n  \"version\": \"2.3.1\",\n  \"dependencies\": {\n    \"axios\": \"^1.4.0\",\n    \"lodash\": \"^4.17.21\",\n    \"dotenv\": \"^16.3.1\"\n  },\n  \"devDependencies\": {\n    \"jest\": \"^29.5.0\",\n    \"typescript\": \"^5.0.4\"\n  },\n  \"scripts\": {\n    \"test\": \"jest\",\n    \"build\": \"tsc\"\n  }\n}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "from ['\"]axios['\"]|require\\(['\"]axios['\"]\\)",
+   "target": "content",
+   "limit": 10
+  },
+  "content": "[{\"file\": \"src/api/client.ts\", \"line\": 3, \"match\": \"import axios from 'axios';\"}, {\"file\": \"src/api/client.ts\", \"line\": 45, \"match\": \"import axios from 'axios';\"}, {\"file\": \"src/utils/request.ts\", \"line\": 2, \"match\": \"const axios = require('axios');\"}, {\"file\": \"tests/api.test.ts\", \"line\": 5, \"match\": \"import axios from 'axios';\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "routes|app\\.py|main\\.py",
+   "target": "files",
+   "limit": 10
+  },
+  "content": "[{\"path\": \"app.py\", \"match\": \"routes\"}, {\"path\": \"tests/test_app.py\", \"match\": \"test_\"}, {\"path\": \"requirements.txt\", \"match\": \"requirements\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "app.py",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\"lines\": [{\"num\": 1, \"text\": \"from flask import Flask, jsonify\"}, {\"num\": 2, \"text\": \"\"}, {\"num\": 3, \"text\": \"app = Flask(__name__)\"}, {\"num\": 4, \"text\": \"\"}, {\"num\": 5, \"text\": \"@app.route('/')\"}, {\"num\": 6, \"text\": \"def index():\"}, {\"num\": 7, \"text\": \"    return jsonify({'status': 'ok'})\"}, {\"num\": 8, \"text\": \"\"}, {\"num\": 9, \"text\": \"@app.route('/api/users')\"}, {\"num\": 10, \"text\": \"def get_users():\"}, {\"num\": 11, \"text\": \"    return jsonify([])\"}, {\"num\": 12, \"text\": \"\"}, {\"num\": 13, \"text\": \"if __name__ == '__main__':\"}, {\"num\": 14, \"text\": \"    app.run(debug=True)\"}], \"total_lines\": 14}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "version\\.txt",
+   "target": "files",
+   "limit": 5
+  },
+  "content": "[]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "PORT",
+   "target": "content",
+   "path": ".",
+   "limit": 5
+  },
+  "content": "[{\"file\":\"src/config.py\",\"line\":42,\"preview\":\"PORT = 8080\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "export_csv",
+   "target": "content",
+   "path": ".",
+   "limit": 20
+  },
+  "content": "[{\"file\":\"tests/test_export.py\",\"line\":12,\"snippet\":\"def test_export_csv():\"},{\"file\":\"tests/test_csv_export.py\",\"line\":8,\"snippet\":\"def test_export_csv():\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/export.py",
+   "offset": 40,
+   "limit": 20
+  },
+  "content": "{\"content\": \"40\\n41 def export_data(data, format_type, path):\\n42     if format_type == 'csv':\\n43         return csv_export(data, path)\\n44     # TODO: add json support\\n45     raise ValueError('Unsupported format')\\n46\\n47 def csv_export(data, path):...\", \"lines_read\": 20}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/utils.py",
+   "offset": 1,
+   "limit": 50
+  },
+  "content": "{\"lines\": [{\"n\": 10, \"text\": \"def calculate_total(items):\"}, {\"n\": 11, \"text\": \"    return sum(i.price for i in items)\"}], \"path\": \"src/utils.py\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "calculateTotal",
+   "target": "content",
+   "limit": 20
+  },
+  "content": "{\"matches\": [{\"file\": \"src/utils/calculator.js\", \"line\": 45, \"content\": \"function calculateTotal(items) {\"}, {\"file\": \"src/utils/calculator.js\", \"line\": 78, \"content\": \"export { calculateTotal };\"}, {\"file\": \"src/components/Cart.jsx\", \"line\": 12, \"content\": \"import { calculateTotal } from '../utils/calculator';\"}, {\"file\": \"src/components/Cart.jsx\", \"line\": 34, \"content\": \"const total = calculateTotal(cartItems);\"}, {\"file\": \"src/components/Checkout.jsx\", \"line\": 8, \"content\": \"import { calculateTotal } from '../utils/calculator';\"}, {\"file\": \"src/components/Checkout.jsx\", \"line\": 22, \"content\": \"setTotal(calculateTotal(items));\"}, {\"file\": \"tests/utils/calculator.test.js\", \"line\": 5, \"content\": \"import { calculateTotal } from '../../src/utils/calculator';\"}, {\"file\": \"tests/utils/calculator.test.js\", \"line\": 10, \"content\": \"describe('calculateTotal', () => {\"}], \"total_found\": 8}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "frontend/package.json",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\n  \"name\": \"frontend-app\",\n  \"version\": \"2.3.1\",\n  \"dependencies\": {\n    \"react\": \"^18.2.0\",\n    \"axios\": \"^1.4.0\",\n    \"@tanstack/react-query\": \"^4.29.0\"\n  },\n  \"devDependencies\": {\n    \"typescript\": \"^5.1.0\",\n    \"vitest\": \"^0.32.0\"\n  }\n}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "axios",
+   "target": "content",
+   "path": "frontend",
+   "file_glob": "*.ts",
+   "context": 2,
+   "limit": 20
+  },
+  "content": "[\n  {\"file\": \"frontend/src/api/client.ts\", \"line\": 15, \"match\": \"import axios from 'axios';\", \"context\": \"// ligne 13-17\\nimport { ApiResponse } from './types';\\nimport axios from 'axios';\\n\\nconst API_BASE = process.env.REACT_APP_API_URL;\"},\n  {\"file\": \"frontend/src/api/client.ts\", \"line\": 42, \"match\": \"return axios.get<ApiResponse<T>>(`${API_BASE}/${endpoint}`);\", \"context\": \"// ligne 40-44\\nexport async function fetchResource<T>(endpoint: string): Promise<T> {\\n  return axios.get<ApiResponse<T>>(`${API_BASE}/${endpoint}`);\\n}\"},\n  {\"file\": \"frontend/src/hooks/useData.ts\", \"line\": 8, \"match\": \"import axios from 'axios';\", \"context\": \"// ligne 6-10\\nimport { useQuery } from '@tanstack/react-query';\\nimport axios from 'axios';\\n\\nexport function useData<T>(key: string)\"}\n]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "pyproject.toml",
+   "offset": 12,
+   "limit": 1
+  },
+  "content": "{\"lines\":[\"requires-python = \\\">=3.8\\\"\"]}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://grafana.ninabot.ch/d/gpu-load"
+  },
+  "content": "{\"error\": \"Timeout after 30 s – la page n’a pas pu être récupérée\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "export.*csv|csv.*export",
+   "target": "content",
+   "limit": 10
+  },
+  "content": "[{\"path\": \"src/exports/csv_export.py\", \"line\": 12, \"content\": \"def export_to_csv(data, filepath):\"}, {\"path\": \"src/exports/__init__.py\", \"line\": 3, \"content\": \"from .csv_export import export_to_csv\"}, {\"path\": \"tests/test_exports.py\", \"line\": 45, \"content\": \"def test_csv_export_format():\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "TOKEN_TTL",
+   "target": "content",
+   "path": ".",
+   "limit": 5
+  },
+  "content": "[{\"path\":\"src/auth/token.py\",\"line\":42,\"text\":\"TOKEN_TTL = 3600  # seconds\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.hotel-alpenrose.ch/certificates"
+  },
+  "content": "{\"url\":\"https://status.hotel-alpenrose.ch/certificates\",\"content\":\"Certificate status page shows hotel-alpenrose.ch – expires 2026-08-05. No renewal scheduled. Last renewal was on 2025-08-07.\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.fidu-rhone.ch/dns"
+  },
+  "content": "{\"text\": \"Dashboard-Widget: dns_query_latency – avg 340 ms, max 480 ms (letztes Update 10:10). Status: Degraded.\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "calculateTotal",
+   "target": "content",
+   "limit": 20
+  },
+  "content": "[{\"path\": \"src/orders/calculator.py\", \"line\": 45, \"match\": \"def calculateTotal(items, tax_rate):\"}, {\"path\": \"src/orders/calculator.py\", \"line\": 89, \"match\": \"total = calculateTotal(cart.items, cart.tax)\"}, {\"path\": \"src/api/handlers.py\", \"line\": 23, \"match\": \"from .calculator import calculateTotal\"}, {\"path\": \"tests/test_calculator.py\", \"line\": 12, \"match\": \"def test_calculateTotal_with_tax():\"}, {\"path\": \"tests/test_calculator.py\", \"line\": 34, \"match\": \"result = calculateTotal(test_items, 0.08)\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://cabinet-vautier.fr/status/tls"
+  },
+  "content": "{\"domain\": \"cabinet-vautier.fr\", \"issuer\": \"Let's Encrypt\", \"expires_at\": \"2026-05-10T14:00:00Z\", \"days_remaining\": 8, \"status\": \"valid_but_expiring_soon\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "PORT",
+   "target": "content",
+   "path": ".",
+   "limit": 5
+  },
+  "content": "[{\"path\": \"src/config.py\", \"line\": 12, \"snippet\": \"PORT = 8080\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "src/config.py",
+   "offset": 10,
+   "limit": 5
+  },
+  "content": "[\"12: PORT = 8080\"]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "tests/test_export.py",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\"path\": \"tests/test_export.py\", \"content\": \"...\\n12: def test_export_to_csv_basic():\\n    # assertions for basic CSV export\\n    ...\\n45: def test_export_to_csv_edge_cases():\\n    # assertions for edge cases in CSV export\\n    ...\\n\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "python_requires",
+   "target": "content",
+   "path": "."
+  },
+  "content": "[{\"file\":\"pyproject.toml\",\"line\":12,\"text\":\"python = \\\"^3.9\\\"\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://cabinet-vautier.fr/monitoring/backup-disk"
+  },
+  "content": "{\"content\":\"\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "export_csv",
+   "target": "content",
+   "path": ".",
+   "file_glob": "*test*.py",
+   "context": 0,
+   "limit": 20
+  },
+  "content": "[{\"file\":\"tests/test_export_csv.py\",\"line\":12},{\"file\":\"tests/integration/test_data_export.py\",\"line\":45}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "TOKEN_TTL",
+   "target": "content",
+   "path": ".",
+   "limit": 5
+  },
+  "content": "[{\"path\":\"src/auth/token_manager.py\",\"line\":42,\"excerpt\":\"TOKEN_TTL = 3600  # durée de vie du jeton en secondes\"}]",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.studio-brume.ch/tls"
+  },
+  "content": "{\"page_text\":\"Dashboard-Übersicht: TLS-Zertifikat für studio-brume.ch gültig bis 2027-11-01 23:59 UTC (12 Tage verbleibend). Keine kritischen Fehlermeldungen.\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://grafana.ninabot.ch/d/gpu-overview"
+  },
+  "content": "{\"error\":\"timeout\",\"message\":\"Impossible de charger la page dans le délai imparti\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://monitoring.fidu-rhone.ch/dashboard/tls"
+  },
+  "content": "{\"title\":\"TLS Dashboard\",\"text\":\"Certificato fidu-rhone.ch: scadenza 2026-10-30 23:59 UTC. Stato: OK. Nessun avviso critico.\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "package.json",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\n  \"name\": \"menuiserie-app\",\n  \"version\": \"2.4.1\",\n  \"dependencies\": {\n    \"react\": \"^18.2.0\",\n    \"react-dom\": \"^18.2.0\",\n    \"@types/react\": \"^18.2.0\",\n    \"typescript\": \"^5.3.0\"\n  },\n  \"scripts\": {\n    \"test\": \"vitest run\",\n    \"build\": \"tsc && vite build\"\n  }\n}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.atelier-morel.ch"
+  },
+  "content": "{\"status\": \"ok\", \"title\": \"Stato Servizi - Atelier Morel\", \"content\": \"Web: UP. TLS: WARN. Ultimo check: 17:22 UTC. Certificato: scade 17/04/2027. Rinnovo automatico: FAILED (ultimo tentativo 14/04/2027 02:00).\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "search_files",
+  "args": {
+   "pattern": "csv|export",
+   "target": "files",
+   "path": ".",
+   "limit": 10
+  },
+  "content": "{\"files\": [\"src/data/exporter.py\", \"src/data/formats/csv_handler.py\", \"tests/test_exporter.py\"]}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://status.kanzlei-auer.de"
+  },
+  "content": "{\"title\": \"Kanzlei Auer Status Page\", \"content\": \"Service Status: Degraded\\nUptime (30d): 99.98%\\nCurrent Incidents: 1\\n- [OPEN] TLS Certificate Renewal Failure (Since 2027-06-08 03:00)\\nImpact: Potential browser warnings for clients after 2027-06-14. No current service outage.\\nLast Updated: 2027-06-08 18:50\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "browser_navigate",
+  "args": {
+   "url": "https://monitoring.praxis-keller.ch/d/backup-volume"
+  },
+  "content": "{\"usage_percent\":68,\"used_tb\":13.6,\"total_tb\":20,\"timestamp\":\"2026-02-15T14:00:00+01:00\"}",
+  "origin": "mélange d'entraînement"
+ },
+ {
+  "name": "read_file",
+  "args": {
+   "path": "package.json",
+   "offset": 1,
+   "limit": 100
+  },
+  "content": "{\n  \"name\": \"medical-portal\",\n  \"version\": \"2.3.1\",\n  \"dependencies\": {\n    \"react\": \"^17.0.2\",\n    \"react-dom\": \"^17.0.2\",\n    \"@types/react\": \"^17.0.50\",\n    \"@types/react-dom\": \"^17.0.17\",\n    \"typescript\": \"^4.9.5\"\n  }\n}",
+  "origin": "mélange d'entraînement"
+ }
+]

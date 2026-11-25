@@ -8,7 +8,7 @@ from nokker.learning.store import JournalEntry, LearningConflict, PendingNote, S
 
 _SK = "name, version, content, sha256, op, active, reverted_to, thread_id, turn_index, actor, approval_id, at"
 _PN = ("id, source, kind, title, body, scope, derived_from, project, links, thread_id, turn_index, at, status, "
-       "decided_at, decided_by, result")
+       "decided_at, decided_by, result, provenance")
 _JR = "id, kind, subject, at, actor, version, thread_id, turn_index, detail"
 
 
@@ -21,10 +21,11 @@ def _sk(r: tuple) -> SkillVersion:
 
 def _pn(r: tuple) -> PendingNote:
     (nid, source, kind, title, body, scope, derived, project, links, thread_id, turn_index, at, status, decided_at,
-     decided_by, result) = r
+     decided_by, result, provenance) = r
     return PendingNote(id=nid, source=source, kind=kind, title=title, text=body, scope=scope, derived_from=derived,
                        project=project, links=list(links or []), thread_id=thread_id, turn_index=turn_index, at=at,
-                       status=status, decided_at=decided_at, decided_by=decided_by, result=result)
+                       status=status, decided_at=decided_at, decided_by=decided_by, result=result,
+                       provenance=provenance or "")
 
 
 class PgLearningStore:
@@ -62,10 +63,10 @@ class PgLearningStore:
     # ── notes en attente ──
     def put_pending(self, account: str, n: PendingNote) -> None:
         self._q(f"INSERT INTO nokker_memory_pending (account_id, {_PN}) VALUES "
-                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 (account, n.id, n.source, n.kind, n.title, n.text, n.scope, n.derived_from, n.project,
                  Jsonb(list(n.links)), n.thread_id, n.turn_index, n.at, n.status, n.decided_at, n.decided_by,
-                 n.result))
+                 n.result, n.provenance))
 
     def get_pending(self, account: str, note_id: str) -> PendingNote | None:
         rows = self._q(f"SELECT {_PN} FROM nokker_memory_pending WHERE account_id = %s AND id = %s", (account, note_id))

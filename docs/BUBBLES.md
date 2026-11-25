@@ -67,7 +67,7 @@ EXISTANT, une identité qui n'en est pas membre reçoit 403 (serveur ouvert sans
 | `media` | `{url, mime, poster?, preview?}` |
 | `notify` | `{from_thread, from_title, text, approval_id?, actions}` — action implicite `goto` (« Aller à la session ») |
 | `agent_draft` | `{name, role, model, tools: [..], fill: 0..1}` — à l'activation : `bubble.closed` + `agent.created` (Crew) |
-| `approval` | `{approval_id}` — la carte elle-même se lit par `/v1/approvals/{id}` |
+| `approval` | `{approval_id}` — la carte elle-même se lit par `/v1/approvals/{id}`. Posée par le noyau quand le relecteur automatique approuve une carte (docs/APPROVALS.md §8) : `{approval_id, tool_name, status, decision, decided_via: "auto-review", reason, revoked, rollback_applied?}`, mise à jour (`bubble.updated`) à la révocation et à la restauration ; pas de notification push, rien de vu par le modèle. **Drapeau `approval_bubbles` (03.11, éteint par défaut)** : le noyau pose aussi une bulle à CHAQUE carte qui revient aux humains (`Approvals.notify_pending` : à la pose, ou à l'escalade du relecteur), dans le fil de la carte, `{approval_id, tool_name, status}`, titre = `tool_name`, statut `working` ; puis `bubble.updated` à la décision (`status` de la carte + `decided_via` réel), à l'exécution, à l'échec et à l'expiration (`done` si approuvée, exécutée ou refusée ; `failed` si expirée ou en échec) ; elle reste ouverte. Une carte approuvée ensuite par le relecteur met à jour SA bulle (pas de seconde). Filet (`reconcile_cards`, à la lecture des bulles du fil) : une bulle encore `working` dont la carte n'est plus en attente (expiration que personne n'a lue, mise à jour perdue) est recalée ; idempotent, jamais bloquant. Fil sans bulles (crew, sous-agent) : rien. Visible des membres du fil, dans le locataire de la carte. **Sans condition (drapeau ou non)** : `approval` est un kind du noyau (création par un client : 400) et, pour le modèle, une bulle `approval` n'existe pas (`bubble_update` → `BubbleNotFound`, texte existant) ; il n'en voit jamais l'id |
 | `artifact` | `{page_id, path, title, mime, version, size, public, updated_at}` — page créée en session (§10) ; jamais le contenu de la page ; jamais créable par un client (400) |
 | `handoff` | `{handoff_id, state, need: {kind, name}, machine_id, machine_name, online, task, lokkal_thread, reply, error, pending_approvals, created_at, updated_at}` — relais d'une session web vers une machine Lokkal (docs/LOKKAL.md §7.16, X21) ; actions `accept`/`refuse` = décision de l'utilisateur, jamais un tour ; jamais créable par un client (400) |
 | `home` | `{entity_id, name, domain, area, state, unit, attributes, last_changed, live}` — état d'une entité Home Assistant (docs/HOME-ASSISTANT.md §6), tenu à jour par `bubble.updated` tant qu'elle est ouverte ; jamais créable par un client (400) ; aucune action en P2 |
@@ -167,7 +167,7 @@ l'implémentation, non couverts ci-dessus —
 
 ## 6. Événements ajoutés à `/v1/events`
 
-`turn.started` {thread_id, turn_id} · `turn.delta` {thread_id, turn_id, text} · `tool.input.delta` {thread_id,
+`turn.started` {thread_id, turn_id, user_message?, truncated?} (le message de la personne, borné : docs/CLIENT-API.md) · `turn.delta` {thread_id, turn_id, text} · `tool.input.delta` {thread_id,
 turn_id, call_id, name, seq, text, path?, field?, truncated?, discarded?} (écriture en direct, X22 : ce que le modèle
 écrit dans les arguments de `write_file`/`patch`/`page_create`, AVANT le `tool.call` du même `call_id` ; forme et
 règles : §10.7) · `tool.call` {thread_id, turn_id,
@@ -220,7 +220,7 @@ Tranché au plus simple là où le contrat ci-dessus ne disait rien :
   `POST …/actions/goto` → `{"closed": true, "goto": "<from_thread>"}`. Balayage des expirées toutes les 30 s.
 - **Action d'une autre bulle** (`POST /v1/bubbles/{id}/actions/{action_id}`) : l'action doit figurer dans
   `bubble.actions` (404 sinon) ; elle devient un **tour** du fil de la bulle (`[Action « libellé » demandée sur la
-  bulle …]`, en tâche de fond, identité de l'appelant) → **202** `{"accepted": true, "thread_id"}`. Jamais exécutée en
+  bulle]`, sans titre ni id dans le fil ; le modèle reçoit `[Bulle « titre » (bu_…)]` dans le bloc joint du tour, en tâche de fond, identité de l'appelant) → **202** `{"accepted": true, "thread_id"}`. Jamais exécutée en
   direct : le tour passe par les portes et les approbations comme un message.
 - **Producteurs** : `search` = 10 résultats au plus (`took_ms` = durée de l'appel d'outil) ; `monitor` = aussi tout
   `infra_*_{usage,info,status,stats}` d'effet READ ; une bulle n'est produite que si l'outil a été VRAIMENT exécuté
@@ -767,3 +767,9 @@ tool.input.delta {thread_id, turn_id, call_id, name, seq, text, path?, field?, t
 Kind `cast`, posé par le noyau seulement, une bulle par affichage sur une télé du foyer (`show_on_screen`). Contrat
 complet (état, actions `approve` / `refuse` / `stop` dans `state.actions`, page en `srcdoc` sandboxée) :
 docs/SCREEN-CAST.md §7. Un client qui ne connaît pas ce kind retombe sur la bulle générique (thème de repli).
+
+## 12. Bulle `screen` (écrans du mur, lot V7, derrière `ambient.screens.enabled`)
+
+Kind `screen`, posé par le noyau seulement : une bulle par écran, qu'une retouche met à jour. Elle porte l'aperçu
+statique (`html`, à montrer dans `<iframe sandbox="" srcdoc=…>`) et les actions `publish` (carte forte `wall:publish`)
+et `unpublish`. Le contrat complet est dans docs/SCREENS.md §4.

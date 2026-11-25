@@ -146,9 +146,22 @@ class Notifier:
         self.sent.append(approval.id)
 
 
+class SnapshotsOK:
+    """Magasin de points de retour qui couvre tout fil (pas de point, pas d'approbation automatique d'écriture)."""
+
+    @staticmethod
+    def root_of(_thread_id):
+        return "/"
+
+    @staticmethod
+    def check(_root, _tool, _args):
+        return None
+
+
 def kernel(script, reviewer=None, backend=None):
     backend = backend if backend is not None else InMemoryApprovals(notifier=Notifier())
     k, tools = make_kernel(script, approvals=backend)
+    k.card_snapshots = [SnapshotsOK()]
     tools.specs["patch"] = ToolSpec("patch", "patch", {}, Effect.WRITE)
     tools.specs["terminal"] = ToolSpec("terminal", "terminal", {}, Effect.WRITE)
     tools.specs["secret_get"] = ToolSpec("secret_get", "secret", {}, Effect.SECRET)
@@ -484,3 +497,39 @@ def test_script_and_payment_preparation_are_never_reviewed():
 def test_commands_are_always_decided_by_the_human():
     for tool in ("terminal", "process_start", "ssh_run"):
         assert excluded(card(rule="permissions:default", tool_name=tool, arguments={"command": "pytest -q"}), "write")
+
+
+# ─────────────────────────── texte tronqué : le relecteur ne juge pas ce qu'il ne voit pas ───────────────────────────
+
+def test_text_cut_for_the_reviewer_escalates_without_model_call():
+    t = Transport("DÉCISION: APPROUVER\nRAISON: x")
+    rev = AutoReviewer(transport=t)
+    long_card = card(tool_name="kanban_create_task", arguments={"title": "t", "body": "x" * 1600})
+    d = rev.review_text("crée la tâche", long_card, [])
+    assert d.decision == "escalate" and d.by_rule and "le contenu de cette carte" in d.reason
+    past = [{"name": "note_write", "arguments": {"text": "y" * 300}, "result": "ok"}]
+    d = rev.review_text("écris", card(tool_name="note_write", arguments={"text": "z"}), past)
+    assert d.decision == "escalate" and "le contenu de l'action précédente : action non nommée" in d.reason
+    assert not t.bodies  # aucun appel au modèle
+
+
+def test_text_fully_seen_still_reviewed():
+    rev = AutoReviewer(transport=Transport("DÉCISION: APPROUVER\nRAISON: demandé."))
+    past = [{"name": "note_write", "arguments": {"text": "y" * 150}, "result": "z" * 900}]  # résultat long : sans effet
+    d = rev.review_text("écris", card(tool_name="note_write", arguments={"text": "ok"}), past)
+    assert d.decision == "approve"
+
+
+def test_cut_text_reason_is_frozen_and_worded_for_a_person():
+    import hashlib
+
+    rev = AutoReviewer(transport=Transport("DÉCISION: APPROUVER\nRAISON: x"))
+    long_card = card(tool_name="kanban_create_task", arguments={"title": "t", "body": "x" * 1600})
+    d = rev.review_text("crée la tâche", long_card, [])
+    assert d.reason == "Ce texte est trop long pour être relu automatiquement (le contenu de cette carte) : à toi de le vérifier."
+    assert hashlib.sha256(d.reason.encode()).hexdigest()[:16] == "d21a17e937c1c693"
+    past = [{"name": "write_file", "arguments": {"text": "y" * 300}, "result": "ok"}]
+    d = rev.review_text("écris", card(tool_name="note_write", arguments={"text": "z"}), past)
+    assert d.reason == ("Ce texte est trop long pour être relu automatiquement (le contenu de l'action précédente : "
+                        "fichier) : à toi de le vérifier.")
+    assert hashlib.sha256(d.reason.encode()).hexdigest()[:16] == "2205e5fe499818f8"

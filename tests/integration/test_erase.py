@@ -7,6 +7,7 @@ interne et une confirmation fausse sont refusés ; le retrait d'un appareil ne t
 session (`context_corthexis` : notes sous `root_dir` et base CortHeXis) part avec le compte, ou rien ne part."""
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -16,6 +17,9 @@ from tests.integration.test_rls import A, B, pg, requires_pg  # noqa: F401  (pg 
 
 ACC = {A: "us_aaaaaaaaaaaa", B: "us_bbbbbbbbbbbb"}
 CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connector_credentials": {"kind": "mail"},
+           # partages de connecteurs (068) : nature et niveau contraints ; journal : événement contraint
+           "connector_grants": {"kind": "mail", "level": "read"}, "connector_grant_events": {"event": "granted"},
+           "oauth_accounts": {"state": "ok"},
            # foyer (039) : une attestation est toujours attestée, pour un profil mineur
            "parental_consents": {"attested": True, "profile": "teen"}, "account_minors": {"profile": "teen"},
            # foyers autorisés aux profils mineurs (043) : l'audit n'accepte que allow | revoke
@@ -32,14 +36,30 @@ CHECKED = {"data_consents": {"scope": "training", "source": "signup"}, "connecto
            "nokker_consolidation_ops": {"kind": "merge"},
            # écrans e-ink (054) : profondeur 1 ou 2 bits
            "ambient_displays": {"depth": 1},
+           # écrans du mur (083) : un brouillon
+           "wall_screens": {"status": "draft"},
            # salle Maison (057) : un message de membre a un auteur ; audience connue
            "house_room_messages": {"kind": "member", "audience": "all"},
            # papiers du foyer (055) : nature et état contraints
            "paper_exports": {"kind": "ics", "status": "ready"},
            # calendrier familial (061) : état contraint
            "family_calendar_drafts": {"status": "open"},
+           # projets du foyer (084) : genre, état et visibilité contraints
+           "household_project_drafts": {"kind": "create", "status": "open"},
+           "household_projects": {"visibility": "household"}, "household_tasks": {"status": "todo"},
            # déclencheurs de forge (052) : fournisseur connu ; une session de PR ouverte ou fermée
-           "forge_hooks": {"provider": "forgejo"}, "forge_pr_sessions": {"status": "open"}}
+           "forge_hooks": {"provider": "forgejo"}, "forge_pr_sessions": {"status": "open"},
+           # pack Emploi (073) : une version retouchée est un CV ou une lettre
+           "jobs_docs": {"kind": "cv"},
+           # zones de l'app (075) : dernière transition et genre d'événement contraints
+           "member_zones": {"state": "inside"}, "zone_events": {"event": "enter"},
+           # appareils de l'app (076) : plateforme contrainte
+           "member_devices": {"platform": "ios"},
+           # nœud téléphone (077) : plateforme et stockage de la clé contraints
+           "phone_nodes": {"platform": "ios", "key_storage": "software"},
+           "phone_registrations": {"platform": "ios", "key_storage": "software", "state": "pending"},
+           # « Ton Nokker » (085, V6) : nom, voix et avatar tirés de catalogues fermés
+           "account_persona": {"name": "Ada", "voice_id": "nina", "avatar_id": "nina", "avatar_version": 1}}
 
 
 def _dummy_row(conn, table: str) -> tuple[list[str], list]:
@@ -117,6 +137,9 @@ def _seed(su: str) -> list[str]:
                     row.update(id=f"dev-{tenant}", code=tenant[-6:])
                 if t == "sessions":
                     row["device_id"] = f"dev-{tenant}"
+                if t == "accord_devices":  # appareils ACCORD (092) : identifiant, clé publique et empreintes contraints
+                    row.update(device_id="acc_" + uuid.uuid4().hex[:12], pubkey=("A" * 42 + tenant[-1]),
+                               key8="0" * 8, host_fp="f" * 64)
                 q = ", ".join(f'"{c}"' for c in row)
                 full = conn.execute(f'INSERT INTO "{t}" ({q}) VALUES ({", ".join(["%s"] * len(row))}) RETURNING *',
                                     list(row.values()))
@@ -260,6 +283,7 @@ def test_deletion_granted_by_the_person_suspends_then_erase_pending_clears_it(pg
     assert acc.account_id not in pending_deletions(pg["app"]) and tenancy.account(acc.account_id) is None
 
 
+@requires_pg
 def test_active_subscription_blocks_erasure(pg, seeded):  # noqa: F811
     import psycopg
 
@@ -556,3 +580,294 @@ def test_erase_reaches_its_glance_view_in_another_household_under_rls(pg):  # no
         left = {r[0] for r in su.execute("SELECT id FROM ambient_displays WHERE tenant_id = %s",
                                          (payer.tenant_id,)).fetchall()}
     assert left == {rows[1][0], rows[2][0]}
+
+
+@requires_pg
+def test_erase_deletes_the_sites_registry_robot_or_nothing(pg):  # noqa: F811
+    """Image privée des sites connectés (docs/CONNECTED-SITES.md §3.1.1) : le robot Harbor de lecture du compte
+    (`lokkal-<compte>`) part avec lui, avant la validation ; Harbor injoignable → rien n'est effacé (tout se rejoue)."""
+    import psycopg
+
+    from nokker.admin.erase import SITES_REGISTRY_KEY, EraseError, erase_account
+    from nokker.cloud.sites_registry import SitesRegistry
+    from nokker.tenancy.store import PgTenancy
+    from tests.unit.test_sites_registry import ISSUER_PW, FakeHarbor, _issuer
+
+    acc = PgTenancy(pg["app"]).create_account("robot-sites@recette.test")
+    harbor = FakeHarbor()
+    reg = SitesRegistry(issuer=_issuer(harbor))
+    reg.issuer.issue(acc.account_id)
+    dry = erase_account(pg["app"], account_id=acc.account_id, sites_registry=reg)
+    assert not dry.applied and dry.deleted[SITES_REGISTRY_KEY] == 1 and len(harbor.robots) == 1
+    harbor.down = True
+    with pytest.raises(EraseError) as e:
+        erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id, sites_registry=reg)
+    assert ISSUER_PW not in str(e.value) and acc.account_id not in str(e.value)
+    with psycopg.connect(pg["su"]) as su:
+        assert su.execute("SELECT count(*) FROM accounts WHERE id = %s", (acc.account_id,)).fetchone()[0] == 1
+    harbor.down = False
+    done = erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id,
+                         sites_registry=reg)
+    assert done.applied and done.deleted[SITES_REGISTRY_KEY] == 1 and harbor.robots == {}
+    assert acc.account_id not in " ".join(done.deleted)
+    with psycopg.connect(pg["su"]) as su:
+        assert su.execute("SELECT count(*) FROM accounts WHERE id = %s", (acc.account_id,)).fetchone()[0] == 0
+
+
+@requires_pg
+def test_erase_takes_the_phones_their_queue_registrations_and_hosts_and_kills_the_tokens(pg):  # noqa: F811
+    """Nœud téléphone (077, 078) et hôtes autorisés (079) : l'effacement du compte emporte ses machines `phone`, leurs
+    tâches, ses inscriptions en attente et sa liste d'hôtes ; le jeton du téléphone ne répond plus. Le téléphone d'un
+    autre compte reste et son jeton marche."""
+    import time
+
+    import psycopg
+
+    from nokker.admin.erase import erase_account
+    from nokker.cloud.egress import PgEgressStore
+    from nokker.cloud.link import LinkService
+    from nokker.cloud.pg import PgLinkStore
+    from nokker.cloud.phone import PgPhoneStore, PhoneNode, PhoneTask
+    from nokker.tenancy.context import tenant_scope
+    from nokker.tenancy.store import PgTenancy
+
+    tenancy = PgTenancy(pg["app"])
+    links, phones, hosts = LinkService(store=PgLinkStore(pg["app"])), PgPhoneStore(pg["app"]), PgEgressStore(pg["app"])
+    now = time.time()
+    world = {}
+    for who in ("alice-phone", "bob-phone"):
+        acc = tenancy.create_account(f"{who}@example.org")
+        m, token = links.add_phone(acc.account_id, acc.tenant_id, "iPhone")
+        with tenant_scope(acc.tenant_id):
+            phones.add_node(PhoneNode(machine_id=m.id, account=acc.account_id, platform="ios", attested=False,
+                                      key_storage="secure_enclave", pubkey_spki="AAAA", key_fp="ab" * 32, created_at=now))
+            phones.add_task(PhoneTask(task_id="pt_" + uuid.uuid4().hex[:16], machine_id=m.id, account=acc.account_id,
+                                      op="zone.state", args={}, args_sha256="x", deadline=now + 60, created_at=now))
+            phones.put_reg({"approval_id": "ap_" + uuid.uuid4().hex[:12], "account": acc.account_id, "name": "iPad",
+                            "platform": "ios", "key_storage": "secure_enclave", "pubkey": "AAAA", "enc_key": "BBBB",
+                            "key_fp": "cd" * 32, "state": "pending", "expires_at": now + 600, "created_at": now})
+            hosts.put_hosts(acc.account_id, ["news.example.org"])
+        assert links.machine_for_token(token).id == m.id
+        world[who] = (acc, m, token)
+
+    alice, m_a, tok_a = world["alice-phone"]
+    rep = erase_account(pg["app"], account_id=alice.account_id, apply=True, confirm=alice.account_id)
+    assert rep.applied
+    for t in ("lokkal_machines", "phone_nodes", "phone_tasks", "phone_registrations", "member_egress_hosts"):
+        assert rep.deleted.get(t) == 1, (t, rep.deleted.get(t))
+    assert links.machine_for_token(tok_a) is None  # le jeton du téléphone ne marche plus
+    assert LinkService(store=PgLinkStore(pg["app"])).machine_for_token(tok_a) is None  # ni depuis un autre réplica
+    with psycopg.connect(pg["su"]) as su:
+        for t in ("phone_nodes", "phone_tasks", "phone_registrations", "member_egress_hosts"):
+            assert su.execute(f"SELECT count(*) FROM {t} WHERE account_id = %s", (alice.account_id,)).fetchone()[0] == 0
+        assert su.execute("SELECT count(*) FROM lokkal_machines WHERE id = %s", (m_a.id,)).fetchone()[0] == 0
+    bob, m_b, tok_b = world["bob-phone"]
+    assert links.machine_for_token(tok_b).id == m_b.id
+    with tenant_scope(bob.tenant_id):
+        assert phones.node(m_b.id) is not None and len(phones.regs_of(bob.account_id)) == 1
+        assert hosts.hosts(bob.account_id) == ["news.example.org"]
+
+
+@requires_pg
+def test_erase_scrubs_its_references_from_another_households_projects(pg):  # noqa: F811
+    """Projets du foyer (084) : effacer un membre NON payeur retire ses références dans le foyer du payeur (assigné,
+    relance reçue ou faite, coche, membre, auteur), comme `member_gone` ; les tâches et projets restent, rien d'autre ne
+    bouge ; son propre foyer part entier. Hors effacement, la politique n'ouvre rien ; et même pendant l'effacement, le
+    déclencheur refuse de toucher une autre colonne dans le locataire d'un autre."""
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    from nokker.admin.erase import erase_account
+    from nokker.tenancy.store import PgTenancy
+
+    tenancy = PgTenancy(pg["app"])
+    gone = tenancy.create_account("membre-efface@recette.test")
+    payer = tenancy.create_account("payeur-projets@recette.test")
+    g, p = gone.account_id, payer.account_id
+    tcols = ("task_id", "tenant_id", "household_id", "project_id", "title", "assignee", "due", "created_at",
+             "updated_at", "status", "done_by", "nudged_at", "nudged_by", "nudge_text")
+    tasks = [("ht_assigned", payer.tenant_id, "pj_f", "hp_f", "Cahiers", g, "2026-11-14", 1.0, 1.0, "todo", "", 5.0,
+              p, "rappel"),
+             ("ht_nudger", payer.tenant_id, "pj_f", "hp_f", "Sac", p, "2026-11-12", 1.0, 1.0, "todo", "", 6.0, g,
+              "pense au sac"),
+             ("ht_doneby", payer.tenant_id, "pj_f", "hp_f", "Gâteau", p, "2026-11-10", 1.0, 1.0, "done", g, None, "",
+              ""),
+             ("ht_other", payer.tenant_id, "pj_f", "hp_f", "Ballons", p, "2026-11-11", 1.0, 1.0, "todo", "", None, "",
+              ""),
+             ("ht_own", gone.tenant_id, "pj_g", "hp_g", "À moi", g, "2026-11-11", 1.0, 1.0, "todo", "", None, "", "")]
+    pcols = ("project_id", "tenant_id", "household_id", "created_by", "title", "deadline", "created_at", "updated_at",
+             "members", "visibility")
+    projects = [("hp_f", payer.tenant_id, "pj_f", g, "Rentrée", "2026-12-20", 1.0, 1.0, Jsonb([p, g]), "household"),
+                ("hp_g", gone.tenant_id, "pj_g", g, "Le mien", "2026-12-20", 1.0, 1.0, Jsonb([g]), "household")]
+    with psycopg.connect(pg["su"], autocommit=True) as su:
+        for r in tasks:
+            su.execute(f"INSERT INTO household_tasks ({', '.join(tcols)}) VALUES ({', '.join(['%s'] * len(tcols))})", r)
+        for r in projects:
+            su.execute(f"INSERT INTO household_projects ({', '.join(pcols)}) VALUES "
+                       f"({', '.join(['%s'] * len(pcols))})", r)
+    # Hors effacement : le compte ne voit ni ne modifie rien chez le payeur.
+    with psycopg.connect(pg["app"]) as conn:
+        conn.execute("SELECT set_config('app.tenant_id', %s, false), set_config('app.account_id', %s, false)",
+                     (gone.tenant_id, g))
+        assert conn.execute("SELECT count(*) FROM household_tasks WHERE tenant_id = %s",
+                            (payer.tenant_id,)).fetchone()[0] == 0
+    # Pendant l'effacement : seule la colonne de référence peut bouger.
+    with psycopg.connect(pg["app"]) as conn:
+        conn.execute("SELECT set_config('app.tenant_id', %s, false), set_config('app.account_id', %s, false), "
+                     "set_config('nokker.erasing_tenant', %s, false)", (gone.tenant_id, g, gone.tenant_id))
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute("UPDATE household_tasks SET title = 'piraté', assignee = '' WHERE task_id = 'ht_assigned'")
+    dry = erase_account(pg["app"], account_id=g)
+    assert not dry.applied and dry.deleted["household_tasks:scrubbed"] == 3
+    assert dry.deleted["household_projects:scrubbed"] == 1
+    rep = erase_account(pg["app"], account_id=g, apply=True, confirm=g)
+    assert rep.applied and rep.deleted["household_tasks:scrubbed"] == 3 and rep.deleted["household_tasks"] == 1
+    with psycopg.connect(pg["su"]) as su:
+        rows = {r[0]: r[1:] for r in su.execute(
+            "SELECT task_id, title, assignee, status, done_by, nudged_at, nudged_by, nudge_text FROM household_tasks "
+            "ORDER BY task_id").fetchall()}
+        prj = su.execute("SELECT project_id, members, created_by, title FROM household_projects").fetchall()
+    assert set(rows) == {"ht_assigned", "ht_nudger", "ht_doneby", "ht_other"}  # son foyer à lui est parti
+    assert rows["ht_assigned"] == ("Cahiers", "", "todo", "", None, "", "")
+    assert rows["ht_nudger"] == ("Sac", p, "todo", "", None, "", "")
+    assert rows["ht_doneby"] == ("Gâteau", p, "done", "", None, "", "")
+    assert rows["ht_other"] == ("Ballons", p, "todo", "", None, "", "")
+    assert prj == [("hp_f", [p], "", "Rentrée")]
+    assert g not in json.dumps([rows, prj])
+
+
+@requires_pg
+def test_erase_takes_its_beta_coupon_grants_and_nobody_elses(pg):  # noqa: F811
+    """Coupon bêta par compte (088, hors RLS, sans colonne de rattachement) : l'effacement connaît la table (rien de
+    « non concerné ») et supprime les attributions du compte, quel que soit leur état (consommée comprise) : celle de
+    son invitation front1 (`accounts.invitation_id`) et celle posée après coup (`account:<id>`). Celles d'un autre
+    compte, et celle d'une invitation pas encore rachetée, restent."""
+    from datetime import datetime, timezone
+
+    import psycopg
+
+    from nokker.admin.erase import erase_account
+    from nokker.billing.beta_coupon import PgGrants, account_key
+    from nokker.tenancy.store import PgTenancy
+
+    tenancy = PgTenancy(pg["app"])
+    gone = tenancy.create_account("coupon-efface@recette.test", invitation_id="inv_efface_0001")
+    other = tenancy.create_account("coupon-reste@recette.test", invitation_id="inv_reste_0001")
+    grants, now = PgGrants(pg["su"]), datetime.now(timezone.utc)
+    for key in ("inv_efface_0001", account_key(gone.account_id), "inv_reste_0001", account_key(other.account_id),
+                "inv_pas_rachetee"):
+        assert grants.grant(key, "op@recette.test", now)
+    assert grants.claim("inv_efface_0001", now, now)[0]
+    grants.attach("inv_efface_0001", "cs_test_efface")
+    assert grants.consume("inv_efface_0001", "cs_test_efface", "evt_test_efface", now) == "consumed"
+
+    dry = erase_account(pg["app"], account_id=gone.account_id)
+    assert not dry.applied and dry.deleted["beta_coupon_grants"] == 2 and "beta_coupon_grants" not in dry.unscoped
+    assert grants.get("inv_efface_0001") is not None
+    rep = erase_account(pg["app"], account_id=gone.account_id, apply=True, confirm=gone.account_id)
+    assert rep.applied and rep.deleted["beta_coupon_grants"] == 2 and not rep.unscoped
+    assert grants.get("inv_efface_0001") is None and grants.get(account_key(gone.account_id)) is None
+    for key in ("inv_reste_0001", account_key(other.account_id), "inv_pas_rachetee"):
+        assert grants.get(key) is not None, key
+    with psycopg.connect(pg["su"]) as su:
+        assert su.execute("SELECT count(*) FROM beta_coupon_grants WHERE checkout_session = 'cs_test_efface'"
+                          ).fetchone()[0] == 0
+
+
+class _FakeStripe:
+    """Faux Stripe de l'effacement : `expire_checkout` (et `checkout_status` si l'expiration est refusée)."""
+
+    def __init__(self, *, expire_error=None, status="expired", status_error=None):
+        self.expired, self.asked = [], []
+        self.expire_error, self.status, self.status_error = expire_error, status, status_error
+
+    def expire_checkout(self, session_id):
+        if self.expire_error is not None:
+            raise self.expire_error
+        self.expired.append(session_id)
+
+    def checkout_status(self, session_id):
+        self.asked.append(session_id)
+        if self.status_error is not None:
+            raise self.status_error
+        return self.status
+
+
+def _reserved_account(pg, email, inv, session):  # noqa: F811
+    """Un compte né de l'invitation `inv`, son attribution réservée par une session Checkout Solo (ou sans session)."""
+    from datetime import datetime, timedelta, timezone
+
+    from nokker.billing.beta_coupon import PgGrants
+    from nokker.tenancy.store import PgTenancy
+
+    acc = PgTenancy(pg["app"]).create_account(email, invitation_id=inv)
+    grants, now = PgGrants(pg["su"]), datetime.now(timezone.utc)
+    assert grants.grant(inv, "op@recette.test", now)
+    assert grants.claim(inv, now + timedelta(minutes=30), now)[0]
+    if session:
+        grants.attach(inv, session)
+    return acc, grants
+
+
+@requires_pg
+def test_erase_expires_the_open_beta_checkout_before_the_commit(pg):  # noqa: F811
+    """Checkout Solo ouvert (attribution `reserved`) : à blanc, compté et Stripe n'est pas appelé ; validé, la session
+    est expirée chez Stripe, puis tout part. Pas d'abonnement orphelin possible."""
+    from nokker.admin.erase import BETA_CHECKOUT_KEY, erase_account
+
+    acc, grants = _reserved_account(pg, "checkout-ouvert@recette.test", "inv_ouvert_0001", "cs_test_ouvert")
+    stripe = _FakeStripe()
+    dry = erase_account(pg["app"], account_id=acc.account_id, beta_stripe=stripe)
+    assert dry.deleted[BETA_CHECKOUT_KEY] == 1 and stripe.expired == [] and not dry.applied
+    rep = erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id, beta_stripe=stripe)
+    assert rep.applied and stripe.expired == ["cs_test_ouvert"] and rep.deleted["beta_coupon_grants"] == 1
+    assert grants.get("inv_ouvert_0001") is None
+
+
+@requires_pg
+@pytest.mark.parametrize("case", ["unavailable", "no_stripe", "paid", "status_unknown", "creating"])
+def test_erase_refuses_cleanly_when_the_open_checkout_cannot_be_closed(pg, case):  # noqa: F811
+    """Stripe injoignable, facturation absente, session déjà payée, état illisible, ou Checkout encore en création :
+    `EraseError` au message clair, RIEN n'est effacé (compte et attribution restent), et l'effacement se rejoue."""
+    import psycopg
+
+    from nokker.admin.erase import EraseError, erase_account
+    from nokker.billing.stripe import StripeError
+
+    refused = StripeError("checkout_session_not_open", 400)
+    stripe = {"unavailable": _FakeStripe(expire_error=StripeError("unavailable")), "no_stripe": None,
+              "paid": _FakeStripe(expire_error=refused, status="complete"),
+              "status_unknown": _FakeStripe(expire_error=refused, status_error=StripeError("unavailable")),
+              "creating": _FakeStripe()}[case]
+    inv = f"inv_refus_{case}"
+    acc, grants = _reserved_account(pg, f"refus-{case}@recette.test".replace("_", "-"), inv,
+                                    None if case == "creating" else f"cs_test_{case}")
+    with pytest.raises(EraseError) as e:
+        erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id, beta_stripe=stripe)
+    msg = str(e.value)
+    assert {"unavailable": "Stripe injoignable", "no_stripe": "facturation n'est pas configurée",
+            "paid": "résilier d'abord", "status_unknown": "état de la session",
+            "creating": "en cours de création"}[case] in msg
+    assert case == "paid" or "rien n'est effacé" in msg
+    assert f"cs_test_{case}" not in msg and acc.account_id not in msg
+    with psycopg.connect(pg["su"]) as su:
+        assert su.execute("SELECT count(*) FROM accounts WHERE id = %s", (acc.account_id,)).fetchone()[0] == 1
+    assert grants.get(inv)["state"] == "reserved"
+    if case == "unavailable":  # Stripe revenu : l'effacement rejoué passe
+        stripe.expire_error = None
+        rep = erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id,
+                            beta_stripe=stripe)
+        assert rep.applied and stripe.expired == [f"cs_test_{case}"] and grants.get(inv) is None
+
+
+@requires_pg
+def test_erase_goes_on_when_stripe_says_the_session_already_expired(pg):  # noqa: F811
+    """Expiration refusée parce que la session a déjà expiré (le webhook n'est pas encore passé) : l'état lu chez
+    Stripe est `expired`, rien à payer, l'effacement passe."""
+    from nokker.admin.erase import erase_account
+    from nokker.billing.stripe import StripeError
+
+    acc, grants = _reserved_account(pg, "deja-expiree@recette.test", "inv_expiree_0001", "cs_test_expiree")
+    stripe = _FakeStripe(expire_error=StripeError("checkout_session_not_open", 400), status="expired")
+    rep = erase_account(pg["app"], account_id=acc.account_id, apply=True, confirm=acc.account_id, beta_stripe=stripe)
+    assert rep.applied and stripe.asked == ["cs_test_expiree"] and grants.get("inv_expiree_0001") is None

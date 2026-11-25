@@ -109,7 +109,8 @@ Commands do not run on your host. Each session gets a disposable container:
   (and their lint) and commands stay in the sandbox.
 
 Running commands on the host (`--backend local` of `nokker code`) exists for tests and for people who choose it
-explicitly; it is not what the installer sets up.
+explicitly: it also needs `--unsafe-local` and prints a warning on stderr (the model can read your local token and
+approve its own cards); it is not what the installer sets up, which also sets `require_sandbox: true`.
 
 ## The local API
 

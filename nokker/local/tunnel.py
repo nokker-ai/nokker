@@ -33,6 +33,13 @@ CHUNK = 256 * 1024  # corps découpé en trames de 256 Kio (base64 < 1 Mio)
 MAX_IN_FLIGHT = 64
 MAX_BODY = 50 * 1024 * 1024  # même plafond que le relais (413 au-delà) : un relais fautif ne remplit pas la RAM
 PING_S = 25.0
+# Écran de passation d'un site connecté depuis le téléphone (docs/CONNECTED-SITES.md §4.3) : le SEUL WebSocket que le
+# tunnel ouvre côté machine, vers le web de Lokkal (qui relaie à `sites-chrome`, où le ticket décide). Même règle que
+# le relais (chemin exact, ticket dans l'URL).
+import re as _re  # noqa: E402
+
+SCREEN_WS_RE = _re.compile(r"^/sites/screen/st_[a-z0-9]{10}/websockify\?ticket=[A-Za-z0-9_-]{20,64}$")
+SCREEN_CHUNK = 256 * 1024
 _HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "set-cookie"}
 
 
@@ -101,6 +108,7 @@ class Tunnel:
     _tasks: dict[int, asyncio.Task] = field(default_factory=dict, init=False, repr=False)
     _loop: Any = field(default=None, init=False, repr=False)
     _ws: Any = field(default=None, init=False, repr=False)
+    _wsq: dict[int, asyncio.Queue] = field(default_factory=dict, init=False, repr=False)  # flux d'écran ouverts
 
     # ── cycle de vie ──
     def start(self) -> None:
@@ -190,6 +198,19 @@ class Tunnel:
                         if task is not None:
                             task.cancel()
                         inbound.cancel(rid)  # annulée pendant l'arrivée de son corps
+                    elif kind == "wsopen":
+                        rid = int(msg["id"])
+                        if len(self._tasks) >= MAX_IN_FLIGHT or not self.web_base \
+                                or not SCREEN_WS_RE.match(str(msg.get("path") or "")):
+                            await ws.send(json.dumps({"t": "wsclose", "id": rid}))
+                            continue
+                        q: asyncio.Queue = asyncio.Queue()
+                        self._wsq[rid] = q
+                        self._tasks[rid] = asyncio.create_task(self._screen(ws, rid, msg, q))
+                    elif kind in ("ws", "wsclose"):
+                        q2 = self._wsq.get(int(msg["id"]))
+                        if q2 is not None:
+                            q2.put_nowait(msg)
                     elif kind in ("req", "body"):
                         rid = int(msg["id"])
                         got = inbound.feed(msg)
@@ -207,6 +228,47 @@ class Tunnel:
             for t in self._tasks.values():
                 t.cancel()
             self._tasks.clear()
+
+    async def _screen(self, ws: Any, rid: int, msg: dict[str, Any], q: asyncio.Queue) -> None:
+        """Flux noVNC : WebSocket local vers le web de Lokkal (`/sites/screen/…/websockify?ticket=…`), relayé trame
+        par trame. Ticket refusé ou écran fermé : `wsclose`, le relais répond 403 au navigateur."""
+        import websockets
+
+        url = _re.sub(r"^http", "ws", str(self.web_base).rstrip("/")) + str(msg["path"])
+        protos = [p for p in (msg.get("protocols") or []) if isinstance(p, str)][:2] or None
+        try:
+            async with websockets.connect(url, subprotocols=protos, max_size=4 * SCREEN_CHUNK,
+                                          additional_headers={"X-Nokker-Tunnel": self.secret}, proxy=None) as lws:
+                await ws.send(json.dumps({"t": "wsok", "id": rid}))
+
+                async def down() -> None:  # écran → relais
+                    async for data in lws:
+                        raw = data if isinstance(data, bytes) else data.encode()
+                        for i in range(0, len(raw), SCREEN_CHUNK):
+                            await ws.send(json.dumps({"t": "ws", "id": rid, "data": _b64(raw[i:i + SCREEN_CHUNK])}))
+
+                async def up() -> None:  # relais → écran
+                    while True:
+                        m = await q.get()
+                        if m.get("t") != "ws":
+                            return
+                        await lws.send(base64.b64decode(m.get("data") or ""))
+
+                tasks = [asyncio.create_task(down()), asyncio.create_task(up())]
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in tasks:
+                    task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — ticket refusé (403), écran arrêté : le relais ferme le flux
+            logger.info("écran relayé refusé ou fermé : %s", type(e).__name__)
+        finally:
+            self._wsq.pop(rid, None)
+            self._tasks.pop(rid, None)
+            try:
+                await ws.send(json.dumps({"t": "wsclose", "id": rid}))
+            except Exception:  # noqa: BLE001 — tunnel déjà fermé
+                pass
 
     async def _forward(self, ws: Any, client: httpx.AsyncClient, rid: int, req: dict[str, Any], body: bytes) -> None:
         path = str(req.get("path") or "/")
@@ -234,7 +296,7 @@ class Tunnel:
         except Exception as e:  # noqa: BLE001 — le relais reçoit une réponse, jamais un silence
             logger.warning("requête relayée %s en échec : %s", path, e)
             await ws.send(json.dumps(_res(rid, 502, [["content-type", "application/json"]],
-                                          json.dumps({"error": {"message": "noyau local injoignable"}}).encode())))
+                                          json.dumps({"error": {"message": "Nokker est injoignable sur ta machine"}}).encode())))
         finally:
             self._tasks.pop(rid, None)
 

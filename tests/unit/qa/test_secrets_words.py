@@ -78,6 +78,9 @@ def test_a_known_legal_identifier_in_a_public_url_is_not_a_secret(url):
 
 
 def tokens():
+    # Tirage reproductible quel que soit l'ordre des tests (xdist, -k) : RNG remise à sa graine à chaque appel. Avant, la
+    # RNG du module avançait d'un test à l'autre et le jeton hex-24 changeait selon l'ordre (échec intermittent du 07.11).
+    RNG.seed(20261025)
     header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
     body = base64.urlsafe_b64encode(json.dumps({"sub": "1234567890"}).encode()).decode().rstrip("=")
     sig = base64.urlsafe_b64encode(bytes(RNG.randrange(256) for _ in range(32))).decode().rstrip("=")
@@ -94,6 +97,7 @@ def tokens():
     }
 
 
+# hex-24 : trou fermé le 07.11 (règle de l'hexadécimal pur, nokker/qa/secrets.py) ; mesure dans test_secrets_hex.py.
 @pytest.mark.parametrize("kind", sorted(tokens()))
 def test_real_tokens_are_still_redacted(kind):
     token = tokens()[kind]

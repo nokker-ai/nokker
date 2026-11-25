@@ -31,6 +31,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, Message, Tier, ToolResult
 from nokker.tenancy.context import current_tenant_or_none
@@ -157,7 +158,7 @@ class AdviseToolSource:
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
         if name != TOOL:
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         if _ADVISING.get():
             return out(REFUSED_NESTED, True)
         c = self.config

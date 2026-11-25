@@ -21,6 +21,7 @@ import fnmatch
 import json
 import logging
 import queue
+import re
 import ssl
 import threading
 import time
@@ -29,9 +30,34 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from nokker import bg_stop
+
 logger = logging.getLogger("nokker.homebridge.ha")
 EVENT_BUFFER = 1000
 MAX_POLL_S = 30.0
+# Services d'intégration dont la cible est une entité d'un AUTRE domaine (Music Assistant pilote des media_player).
+TARGET_DOMAIN: dict[str, str] = {"music_assistant": "media_player"}
+# Clés de `data` qui désignent d'autres entités (grouper des enceintes, parler sur une enceinte) : chacune doit être
+# dans la liste blanche et du domaine indiqué.
+ENTITY_REF_KEYS: dict[str, str] = {"group_members": "media_player", "media_player_entity_id": "media_player",
+                                   "source_player": "media_player"}
+TARGET_KEYS = frozenset({"entity_id", "area_id", "device_id", "floor_id", "label_id"})
+# Services à réponse (lecture) servis par `ha.query` : liste fermée.
+QUERY_SERVICES = frozenset({("weather", "get_forecasts"), ("calendar", "get_events"), ("todo", "get_items"),
+                            ("media_player", "search_media"), ("music_assistant", "search"),
+                            ("music_assistant", "get_queue")})
+MAX_HISTORY_H = 24 * 7
+SNAPSHOT_TTL_S = 300.0
+MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
+
+
+TRACKER_ID = re.compile(r"nokker_[a-z0-9_]{1,48}")  # traceurs posés par les zones de l'app (fullmatch : pas de \n final)
+
+
+def tracker_id(member: str) -> str:
+    """`dev_id` du traceur HA d'un membre : `nokker_<membre>` (minuscules, [a-z0-9_]). Même règle côté noyau
+    (nokker/zones/scenarios.py) et côté passerelle (liste des traceurs permis)."""
+    return "nokker_" + (re.sub(r"[^a-z0-9_]+", "_", str(member).lower()).strip("_")[:48] or "membre")
 
 
 class HaError(RuntimeError):
@@ -73,6 +99,7 @@ class WebSocketTransport:
         try:
             self._ws = connect(url, sock=sock, open_timeout=timeout_s, close_timeout=2, max_size=32 * 1024 * 1024,
                                **kw)
+            self._ws.__enter__()  # ≥ 17.1 : sans `with`, DeprecationWarning ; renvoie self
         except Exception as e:  # noqa: BLE001
             sock.close()
             raise HaError(f"Home Assistant injoignable ({type(e).__name__})", "unreachable") from None
@@ -245,11 +272,49 @@ class HomeAssistant:
         return self._with(get)
 
     def call_service(self, domain: str, service: str, data: dict[str, Any] | None = None,
-                     entity_ids: list[str] | None = None) -> Any:
+                     entity_ids: list[str] | None = None, return_response: bool = False) -> Any:
         payload: dict[str, Any] = {"domain": domain, "service": service, "service_data": dict(data or {})}
         if entity_ids is not None:
             payload["target"] = {"entity_id": list(entity_ids)}
+        if return_response:
+            payload["return_response"] = True
         return self._with(lambda s: s.command("call_service", **payload))
+
+    def history(self, entity_ids: list[str], start: str, end: str | None = None) -> Any:
+        """WebSocket `history/history_during_period` (compte non administrateur suffisant, vérifié sur 2026.11)."""
+        payload: dict[str, Any] = {"start_time": start, "entity_ids": list(entity_ids), "minimal_response": True,
+                                   "no_attributes": True, "significant_changes_only": False}
+        if end:
+            payload["end_time"] = end
+        return self._with(lambda s: s.command("history/history_during_period", **payload))
+
+    def logbook(self, entity_ids: list[str], start: str, end: str | None = None) -> Any:
+        payload: dict[str, Any] = {"start_time": start, "entity_ids": list(entity_ids)}
+        if end:
+            payload["end_time"] = end
+        return self._with(lambda s: s.command("logbook/get_events", **payload))
+
+    def delete_config(self, kind: str, config_id: str) -> None:
+        token = (self.admin_token or self.token).get()
+        status, _ = self.lan.http("DELETE", f"{self.url}/api/config/{kind}/config/{config_id}", None,
+                                  {"Authorization": f"Bearer {token}"})
+        if status in (401, 403):
+            raise HaError("Home Assistant refuse la suppression (compte administrateur requis : admin_token_file)",
+                          "auth_invalid")
+        if status not in (200, 404):
+            raise HaError(f"Home Assistant a refusé la suppression (HTTP {status})", "ha_config")
+
+    def camera_image(self, camera: str) -> tuple[bytes, str]:
+        """Image instantanée d'une caméra (`GET /api/camera_proxy/<entité>`, compte non administrateur) ; jamais un
+        flux."""
+        status, body = self.lan.http("GET", f"{self.url}/api/camera_proxy/{camera}", None,
+                                     {"Authorization": f"Bearer {self.token.get()}"})
+        if status != 200 or not body:
+            raise HaError(f"image de caméra indisponible (HTTP {status})", "camera")
+        if len(body) > MAX_SNAPSHOT_BYTES:
+            raise HaError("image de caméra trop grosse", "camera")
+        ctype = "image/png" if body[:4] == b"\x89PNG" else "image/jpeg"
+        return body, ctype
 
     def write_config(self, kind: str, config_id: str, config: dict[str, Any]) -> None:
         token = (self.admin_token or self.token).get()
@@ -295,11 +360,23 @@ class HaOps:
 
     ha: HomeAssistant
     entities: tuple[str, ...] = ()
+    # Services notify déclarés (home.yaml `notify_services`, ex. `mobile_app_pixel`) en plus des entités `notify.*`.
+    notify_services: tuple[str, ...] = ()
+    # Base de l'écoute du foyer (`lan.url` de home.yaml, ex. http://192.168.1.5:8801) : URL des images de caméra
+    # affichées sur un écran (`ha.camera_show`).
+    lan_url: str = ""
+    # Traceurs permis à `ha.tracker_see` : ceux des membres DÉCLARÉS du foyer (home.yaml `home_assistant.zone_members`,
+    # sinon les membres de `members` de la présence par pièce). Vide = refusé : le jeton du noyau ne peut pas créer
+    # d'entrées sans fin dans HA.
+    trackers: frozenset[str] = frozenset()
+    clock: Callable[[], float] = time.monotonic
+    _snaps: dict[str, tuple[str, float]] = field(default_factory=dict, init=False)
     _events: collections.deque = field(default_factory=lambda: collections.deque(maxlen=EVENT_BUFFER), init=False)
     _seq: int = field(default=0, init=False)
     _cond: threading.Condition = field(default_factory=threading.Condition, init=False)
     _sub: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
+    _sub_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def allowed(self, entity_id: str) -> bool:
         return any(fnmatch.fnmatchcase(entity_id, p) for p in self.entities)
@@ -311,21 +388,150 @@ class HaOps:
         reg = self.ha.registry()
         return {"areas": [{"area_id": a.get("area_id"), "name": a.get("name")} for a in reg["areas"]],
                 "devices": [{"id": d.get("id"), "area_id": d.get("area_id")} for d in reg["devices"]],
-                "entities": [{k: e.get(k) for k in ("entity_id", "area_id", "device_id", "hidden_by", "disabled_by")}
+                "entities": [{k: e.get(k) for k in ("entity_id", "area_id", "device_id", "hidden_by", "disabled_by",
+                                                     "platform")}
                              for e in reg["entities"] if self.allowed(str(e.get("entity_id") or ""))]}
 
-    def call(self, p: dict[str, Any]) -> dict[str, Any]:
+    def _targets(self, p: dict[str, Any]) -> tuple[str, str, list[str], dict[str, Any]]:
         domain, service = str(p.get("domain") or ""), str(p.get("service") or "")
         ids, data = p.get("entity_ids"), p.get("data") or {}
-        if not isinstance(ids, list) or not ids or not isinstance(data, dict):
-            raise ValueError("entity_ids (liste non vide) et data (objet)")
-        if {"entity_id", "area_id", "device_id", "floor_id", "label_id"} & set(data):
+        if not isinstance(ids, list) or not ids or not isinstance(data, dict) or len(ids) > 10:
+            raise ValueError("entity_ids (liste non vide, 10 au plus) et data (objet)")
+        if TARGET_KEYS & set(data):
             raise PermissionError("cible dans data refusée")
-        bad = [str(e) for e in ids if not self.allowed(str(e)) or str(e).split(".", 1)[0] != domain]
+        tdom = TARGET_DOMAIN.get(domain, domain)
+        bad = [str(e) for e in ids if not self.allowed(str(e)) or str(e).split(".", 1)[0] != tdom]
+        for key, ref_domain in ENTITY_REF_KEYS.items():
+            if key in data:
+                refs = data[key] if isinstance(data[key], list) else [data[key]]
+                bad += [str(r) for r in refs if not self.allowed(str(r)) or str(r).split(".", 1)[0] != ref_domain]
         if bad:
             raise PermissionError(f"entité hors liste ou d'un autre domaine : {', '.join(bad)[:200]}")
-        self.ha.call_service(domain, service, data, [str(e) for e in ids])
+        return domain, service, [str(e) for e in ids], data
+
+    def tracker_see(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Présence d'un membre dans HA, venue d'une zone de l'app (docs/LOKKAL-PHONE.md §4.2) : `device_tracker.see`
+        d'un traceur NOKKER seulement (`dev_id` = `nokker_<membre>`), un nom de lieu borné. Jamais de coordonnées : ni
+        `gps`, ni `gps_accuracy`, ni rien d'autre que ces deux clés."""
+        if set(p) - {"dev_id", "location_name"}:
+            raise PermissionError("ha.tracker_see : dev_id et location_name seulement (jamais de coordonnées)")
+        dev_id, where = p.get("dev_id"), p.get("location_name")
+        if not isinstance(dev_id, str) or not isinstance(where, str):
+            raise ValueError("ha.tracker_see : dev_id et location_name sont des textes")
+        if not TRACKER_ID.fullmatch(dev_id) or not where or len(where) > 40 or any(not c.isprintable() for c in where):
+            raise ValueError("ha.tracker_see : dev_id nokker_<membre>, location_name de 1 à 40 caractères")
+        if dev_id not in self.trackers:
+            raise PermissionError("ha.tracker_see : traceur d'un membre non déclaré du foyer (home_assistant.zone_members)")
+        self.ha.call_service("device_tracker", "see", {"dev_id": dev_id, "location_name": where})
         return {"ok": True}
+
+    def call(self, p: dict[str, Any]) -> dict[str, Any]:
+        domain, service, ids, data = self._targets(p)
+        if (domain, service) in QUERY_SERVICES:
+            raise PermissionError("service à réponse : ha.query")
+        self.ha.call_service(domain, service, data, ids)
+        return {"ok": True}
+
+    def delete_config(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Suppression d'une automatisation ou d'un script : seulement un identifiant `nokker_…` (créé par Nokker) — la
+        passerelle ne supprime jamais une automatisation de l'utilisateur."""
+        kind, cid = str(p.get("type") or ""), str(p.get("id") or "")
+        if kind not in ("automation", "script") or not cid:
+            raise ValueError("type (automation|script) et id")
+        if not cid.startswith("nokker_") or "/" in cid:
+            raise PermissionError("seuls les identifiants nokker_… se suppriment")
+        self.ha.delete_config(kind, cid)
+        return {"ok": True}
+
+    def query(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Service à réponse de la liste fermée QUERY_SERVICES (météo, agenda, liste, recherche de média)."""
+        domain, service, ids, data = self._targets(p)
+        if (domain, service) not in QUERY_SERVICES:
+            raise PermissionError(f"service à réponse non permis : {domain}.{service}")
+        got = self.ha.call_service(domain, service, data, ids, return_response=True) or {}
+        resp = got.get("response") if isinstance(got, dict) else None
+        return {"response": {k: v for k, v in (resp or {}).items() if self.allowed(str(k))}}
+
+    def notify(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Notification : entité `notify.*` de la liste blanche (notify.send_message) ou service notify déclaré."""
+        target, message = str(p.get("target") or ""), str(p.get("message") or "")
+        title = str(p.get("title") or "")
+        if not message or len(message) > 1000 or len(title) > 200:
+            raise ValueError("message (1 000 caractères au plus) et title (200)")
+        data = {"message": message, **({"title": title} if title else {})}
+        if target.startswith("notify.") and self.allowed(target):
+            self.ha.call_service("notify", "send_message", data, [target])
+        elif target.removeprefix("notify.") in self.notify_services:
+            self.ha.call_service("notify", target.removeprefix("notify."), data, None)
+        else:
+            raise PermissionError("destinataire de notification non déclaré")
+        return {"ok": True}
+
+    def camera_show(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Affiche une caméra sur un écran (sortie choisie, docs/HOME-ASSISTANT.md §12) — le noyau ne l'appelle qu'après
+        une carte forte. `image` : URL à capacité (≥ 192 bits, 5 min) sur l'écoute du foyer, jouée par le
+        media_player ; `flux` : `camera.play_stream` de Home Assistant (HLS servi par HA lui-même). L'image ne passe
+        jamais par le noyau."""
+        camera, player = str(p.get("camera") or ""), str(p.get("media_player") or "")
+        mode = str(p.get("mode") or "image")
+        if not camera.startswith("camera.") or not self.allowed(camera):
+            raise PermissionError("caméra hors liste")
+        if not player.startswith("media_player.") or not self.allowed(player):
+            raise PermissionError("écran hors liste")
+        if mode == "flux":
+            self.ha.call_service("camera", "play_stream", {"media_player": player, "format": "hls"}, [camera])
+            return {"ok": True, "mode": "flux"}
+        if mode != "image":
+            raise ValueError("mode : image ou flux")
+        if not self.lan_url:
+            raise ValueError("lan.url absent de home.yaml : l'écran ne saurait pas où lire l'image")
+        import secrets as _secrets
+
+        now = self.clock()
+        self._snaps = {k: v for k, v in self._snaps.items() if v[1] > now}
+        token = _secrets.token_urlsafe(24)
+        self._snaps[token] = (camera, now + SNAPSHOT_TTL_S)
+        url = f"{self.lan_url}/media/v1/hasnap/{token}.jpg"
+        self.ha.call_service("media_player", "play_media", {"media_content_id": url,
+                                                            "media_content_type": "image/jpeg"}, [player])
+        return {"ok": True, "mode": "image", "expires_in": int(SNAPSHOT_TTL_S)}
+
+    def snapshot(self, token: str) -> tuple[bytes, str] | None:
+        """Image servie à l'écran par l'écoute du foyer (GET, jeton à capacité encore valide) ; None sinon."""
+        got = self._snaps.get(token)
+        if got is None or got[1] <= self.clock():
+            return None
+        return self.ha.camera_image(got[0])
+
+    def _period(self, p: dict[str, Any]) -> tuple[list[str], str, str | None]:
+        import datetime as _dt
+
+        ids = p.get("entity_ids")
+        if not isinstance(ids, list) or not ids or len(ids) > 10:
+            raise ValueError("entity_ids (liste non vide, 10 au plus)")
+        bad = [str(e) for e in ids if not self.allowed(str(e))]
+        if bad:
+            raise PermissionError(f"entité hors liste : {', '.join(bad)[:200]}")
+        try:
+            hours = float(p.get("hours", 24))
+        except (TypeError, ValueError):
+            raise ValueError("hours numérique") from None
+        hours = max(0.1, min(hours, MAX_HISTORY_H))
+        start = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).isoformat()
+        return [str(e) for e in ids], start, None
+
+    def history(self, p: dict[str, Any]) -> dict[str, Any]:
+        ids, start, end = self._period(p)
+        got = self.ha.history(ids, start, end) or {}
+        return {"history": {k: [{"s": r.get("s"), "lu": r.get("lu") or r.get("lc")} for r in v][-200:]
+                            for k, v in got.items() if self.allowed(str(k)) and isinstance(v, list)}}
+
+    def logbook(self, p: dict[str, Any]) -> dict[str, Any]:
+        ids, start, end = self._period(p)
+        got = self.ha.logbook(ids, start, end) or []
+        keep = ("when", "entity_id", "state", "name", "message")
+        return {"entries": [{k: e.get(k) for k in keep if k in e} for e in got
+                            if isinstance(e, dict) and self.allowed(str(e.get("entity_id") or ""))][-200:]}
 
     def write_config(self, p: dict[str, Any]) -> dict[str, Any]:
         kind, cid, cfg = str(p.get("type") or ""), str(p.get("id") or ""), p.get("config")
@@ -352,9 +558,14 @@ class HaOps:
                 self._cond.wait(left)
 
     def _ensure_subscriber(self) -> None:
-        if self._sub is None or not self._sub.is_alive():
-            self._sub = threading.Thread(target=self._subscribe, name="home-bridge-ha-events", daemon=True)
-            self._sub.start()
+        # Deux sondages simultanés (un fil HTTP chacun) ne doivent pas lancer deux abonnés : verrou.
+        with self._sub_lock:
+            if self._stop.is_set():
+                return
+            if self._sub is None or not self._sub.is_alive():
+                self._sub = threading.Thread(target=self._subscribe, name="home-bridge-ha-events", daemon=True)
+                self._sub.start()
+                bg_stop.track(self, "stop")
 
     def _subscribe(self) -> None:
         delay = 2.0
@@ -382,8 +593,13 @@ class HaOps:
                 delay = min(60.0, delay * 2)
 
     def stop(self) -> None:
+        """Arrête l'abonné (idempotent) ; il sort au plus tard à la fin de l'attente en cours (30 s max)."""
         self._stop.set()
+        with self._sub_lock:
+            sub = self._sub
+        if sub is not None and sub is not threading.current_thread():
+            sub.join(1.0)
 
 
-__all__ = ["HaError", "HaOps", "HaSession", "HomeAssistant", "TokenSource", "Transport", "WebSocketTransport",
+__all__ = ["ENTITY_REF_KEYS", "QUERY_SERVICES", "TARGET_DOMAIN", "HaError", "HaOps", "HaSession", "HomeAssistant", "TokenSource", "Transport", "WebSocketTransport",
            "from_config", "oauth_exchange", "ws_url"]

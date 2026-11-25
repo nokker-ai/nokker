@@ -32,6 +32,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, ToolResult, Verdict
 
@@ -48,6 +49,16 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 _TOOL = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_READ_TOOLS = 64
 READ_RULE = "mcp:read_tools_write_names"
+STDIO_RULE = "mcp:stdio_server"
+# Paramètres de `mcp_server_add` en plus quand les serveurs stdio sont permis (drapeau `mcp_stdio.enabled`, Lokkal ;
+# docs/NOKKAN-MCP-STDIO.md). Éteint : le schéma de l'outil est celui de `_SPECS`, au caractère près.
+STDIO_PARAMS: dict[str, dict[str, Any]] = {
+    "command": {"type": "string", "description": "serveur stdio, à la place de url : programme lancé dans le bac à "
+                                                 "sable de chaque session de code"},
+    "args": {"type": "array", "items": {"type": "string"}, "description": "arguments du programme"},
+    "env": {"type": "object", "description": "variables du programme, PAR NOM : secret:NOM, session ou thread, jamais "
+                                             "une valeur"},
+}
 
 # Verbes d'écriture évidente : un outil dont le nom ou la description en porte un n'est jamais déclaré en lecture sans
 # confirmation explicite sous carte forte. Liste volontairement large (un faux positif coûte une carte, un faux
@@ -92,7 +103,7 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
     ("mcp_server_list", "Liste les serveurs MCP ajoutés dans Lokkal (nom, adresse, NOMS des secrets, manquants).",
      Effect.READ, {"type": "object", "properties": {}}),
     ("mcp_server_add", "Ajoute un serveur MCP (HTTP) à la config de Lokkal, identifiants PAR NOM du coffre "
-     "(token: secret:NOM). Carte d'approbation ; actif au prochain redémarrage du noyau.", Effect.DESTRUCTIVE, {
+     "(token: secret:NOM). Carte d'approbation ; actif au prochain redémarrage de Nokker.", Effect.DESTRUCTIVE, {
          "type": "object", "required": ["name", "url"], "properties": {
              "name": {"type": "string", "description": "nom court du serveur : minuscules, chiffres, tirets"},
              "url": {"type": "string", "description": "adresse MCP streamable-HTTP (https://…/mcp, ou http:// en "
@@ -107,7 +118,7 @@ _SPECS: tuple[tuple[str, str, Effect, dict[str, Any]], ...] = (
                                 "description": "outils de read_tools au nom d'écriture (send, delete, post…) que "
                                                "l'utilisateur confirme en lecture (carte forte)"}}}),
     ("mcp_server_read_tools", "Déclare les outils en LECTURE d'un serveur MCP ajouté (remplace la liste ; vide = "
-     "tout redevient écriture). Carte ; actif au prochain redémarrage du noyau.", Effect.DESTRUCTIVE, {
+     "tout redevient écriture). Carte ; actif au prochain redémarrage de Nokker.", Effect.DESTRUCTIVE, {
          "type": "object", "required": ["name", "read_tools"], "properties": {
              "name": {"type": "string"},
              "read_tools": {"type": "array", "items": {"type": "string"}},
@@ -225,6 +236,26 @@ def check_read_tools(read_tools: Any, confirm_writes: Any = None) -> tuple[list[
     return reads, [t for t in writes if t in confirm]
 
 
+def config_read_tools(server: str, read_tools: list[str], known: set[str] | None) -> list[str]:
+    """`read_tools` d'un serveur de la CONFIG, ramenés aux noms que porte son catalogue (docs/HOST-EMBED.md §8). Nom
+    d'un outil MCP : `<serveur>__<outil>` (le préfixe de ce serveur est accepté, le nom nu aussi). `known` : les outils que le
+    serveur déclare ; un nom qui n'y figure pas est refusé (`McpConfigError`, démarrage). `known` None (serveur injoignable ou
+    catalogue inconnu au démarrage) : rien ne peut être vérifié, les noms sont gardés sans préfixe."""
+    prefix = f"{server}__"
+    out: list[str] = []
+    unknown: list[str] = []
+    for name in read_tools:
+        bare = name[len(prefix):] if name.startswith(prefix) and not (known and name in known) else name
+        if known is not None and bare not in known:
+            unknown.append(name)
+        out.append(bare)
+    if unknown:
+        raise McpConfigError(
+            f"mcp_tool_servers.{server}.read_tools : outil inconnu de ce serveur : {', '.join(unknown)} "
+            f"(outils déclarés : {', '.join(sorted(known or [])) or 'aucun'} ; forme `<serveur>__<outil>` ou nom nu)")
+    return out
+
+
 def load_user_servers(path: Path) -> list[dict[str, Any]]:
     """Entrées valides de `mcp-servers.yaml` ; une entrée illisible est sautée (journalisée), jamais devinée."""
     try:
@@ -298,10 +329,24 @@ class McpConfigToolSource:
     known_secrets: Callable[[], list[str]] | None = None
     configured: Callable[[], list[str]] | None = None  # noms des serveurs de config.yaml
     core: bool = False
+    # Serveurs stdio (docs/NOKKAN-MCP-STDIO.md) : le fichier de leurs déclarations, ou None = interdits ou éteints —
+    # `command` est alors un paramètre inconnu, refusé comme avant (« adresse refusée »).
+    stdio_path: Path | None = None
+    # Serveurs stdio de config.yaml (`origin: config`) et leurs accords (`mcp_stdio.Approvals`) : signer la carte de
+    # `mcp_server_add` pour la déclaration EXACTE de la config enregistre son empreinte ; `on_stdio_approved(nom, fil)`
+    # prévient la source (premier lancement dans le fil de la carte).
+    stdio_config: Callable[[], list[dict[str, Any]]] | None = None
+    stdio_approvals: Any = None
+    on_stdio_approved: Callable[[str, str], None] | None = None
 
     def specs(self) -> list[ToolSpec]:
-        return [ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core, source="builtin:mcp_config")
-                for n, d, e, p in _SPECS]
+        out = []
+        for n, d, e, p in _SPECS:
+            if n == "mcp_server_add" and self.stdio_path is not None:
+                p = {**p, "required": ["name"], "properties": {**p["properties"], **STDIO_PARAMS}}
+            out.append(ToolSpec(name=n, description=d, parameters=p, effect=e, core=self.core,
+                                source="builtin:mcp_config"))
+        return out
 
     def _missing(self, names: list[str]) -> list[str] | None:
         if self.known_secrets is None:
@@ -319,6 +364,24 @@ class McpConfigToolSource:
         if call.name not in ("mcp_server_add", "mcp_server_read_tools"):
             return None
         a = call.arguments or {}
+        if call.name == "mcp_server_add" and self.stdio_path is not None and a.get("command"):
+            # Un serveur stdio est un programme lancé à chaque session : toujours une carte FORTE, quel que soit le
+            # mode ; une déclaration refusée l'est tout de suite (pas de carte vouée à l'échec).
+            from nokker.tools.mcp_stdio import McpStdioError, check_stdio_entry
+
+            try:
+                entry = check_stdio_entry(a)
+            except McpStdioError as e:
+                return Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule=STDIO_RULE, subject=call.id,
+                               reason=str(e))
+            import shlex
+
+            line = shlex.join([entry["command"], *entry.get("args", [])])[:300]
+            names = ", ".join(sorted(entry.get("env") or {})) or "aucune"
+            return Verdict(gate=Gate.ACTION, decision=Decision.HITL, layer=1, rule=STDIO_RULE, subject=call.id,
+                           strength="strong",
+                           reason=f"serveur MCP stdio {entry['name']} : lancer « {line} » dans le bac à sable de "
+                                  f"chaque session de code (variables : {names}).")
         reads = a.get("read_tools")
         if not isinstance(reads, list):
             return None
@@ -358,12 +421,20 @@ class McpConfigToolSource:
                     if missing:
                         item["missing_secrets"] = missing
                     items.append(item)
-                return out({"servers": items, "configured": sorted(self.configured()) if self.configured else [],
-                            "note": "les serveurs ajoutés sont actifs après un redémarrage du noyau ; leurs outils "
+                listing: dict[str, Any] = {}
+                if self.stdio_path is not None:
+                    listing["stdio"] = self._stdio_list()
+                return out({"servers": items, **listing,
+                            "configured": sorted(self.configured()) if self.configured else [],
+                            "note": "les serveurs ajoutés sont actifs après un redémarrage de Nokker ; leurs outils "
                                     "sont des écritures (ils demandent), sauf ceux de read_tools dont la description "
                                     "n'annonce pas d'écriture"})
+            if name == "mcp_server_add" and self.stdio_path is not None and a.get("command"):
+                return out(*self._stdio_add(a, servers, ctx.thread_id))
             if name == "mcp_server_add":
                 entry = check_entry(a)
+                if self.stdio_path is not None and any(s["name"] == entry["name"] for s in self._stdio_servers()):
+                    return out(f"refusé : un serveur MCP s'appelle déjà {entry['name']!r} (retire-le d'abord)", True)
                 taken = set(self.configured()) if self.configured else set()
                 if entry["name"] in taken or any(s["name"] == entry["name"] for s in servers):
                     return out(f"refusé : un serveur MCP s'appelle déjà {entry['name']!r} (retire-le d'abord)", True)
@@ -372,7 +443,7 @@ class McpConfigToolSource:
                 _write(self.path, [*servers, entry])
                 names = secret_names(entry)
                 result: dict[str, Any] = {"added": entry["name"], "url": entry["url"], "secrets": names,
-                                          "active": "au prochain redémarrage du noyau"}
+                                          "active": "au prochain redémarrage de Nokker"}
                 for key in ("read_tools", "confirmed_writes"):
                     if entry.get(key):
                         result[key] = list(entry[key])
@@ -391,20 +462,108 @@ class McpConfigToolSource:
                 entry = set_read_tools(self.path, target, a.get("read_tools"), a.get("confirm_writes"))
                 return out({"server": target, "read_tools": list(entry.get("read_tools") or []),
                             "confirmed_writes": list(entry.get("confirmed_writes") or []),
-                            "active": "au prochain redémarrage du noyau"})
+                            "active": "au prochain redémarrage de Nokker"})
             if name == "mcp_server_remove":
                 target = str(a.get("name") or "").strip()
                 kept = [s for s in servers if s["name"] != target]
+                if len(kept) == len(servers) and self.stdio_path is not None \
+                        and any(s["name"] == target for s in self._stdio_servers()):
+                    from nokker.tools.mcp_stdio import write_stdio_servers
+
+                    write_stdio_servers(self.stdio_path, [s for s in self._stdio_servers() if s["name"] != target])
+                    return out({"removed": target, "active": "au prochain redémarrage de Nokker"})
                 if len(kept) == len(servers):
                     return out(f"rien à retirer : {target!r} n'est pas un serveur ajouté (config.yaml ne se modifie "
                                "pas d'ici)", True)
                 _write(self.path, kept)
-                return out({"removed": target, "active": "au prochain redémarrage du noyau"})
+                return out({"removed": target, "active": "au prochain redémarrage de Nokker"})
         except McpConfigError as e:
-            return out(f"refusé : {e}", True)
+            return out(mt.pick(mt.TOOL_REFUSED).format(error=e), True)
         except OSError as e:
             return out(f"écriture impossible : {type(e).__name__}", True)
-        return out(f"outil inconnu : {name}", True)
+        except ValueError as e:
+            if type(e).__name__ != "McpStdioError":  # toute autre erreur : comme avant
+                raise
+            return out(mt.pick(mt.TOOL_REFUSED).format(error=e), True)  # déclaration stdio refusée (jamais de valeur dans le message)
+        return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
+
+    # ── serveurs stdio (seulement si `stdio_path`) ──
+    def _stdio_servers(self) -> list[dict[str, Any]]:
+        from nokker.tools.mcp_stdio import load_stdio_servers
+
+        return load_stdio_servers(self.stdio_path) if self.stdio_path is not None else []
+
+    def _stdio_list(self) -> list[dict[str, Any]]:
+        from nokker.tools.mcp_stdio import secret_names as stdio_secret_names
+
+        items = []
+        for s in [*self._stdio_configured(), *self._stdio_servers()]:
+            approved = bool(s.get("approved")) or (
+                s.get("origin") == "config" and self.stdio_approvals is not None and self.stdio_approvals.granted(s))
+            item: dict[str, Any] = {"name": s["name"], "command": [s["command"], *s.get("args", [])],
+                                    "env": dict(s.get("env") or {}), "approved": approved}
+            if s.get("origin") == "config":
+                item["origin"] = "config"
+            for key in ("purpose", "read_tools", "confirmed_writes"):
+                if s.get(key):
+                    item[key] = s[key]
+            missing = self._missing(stdio_secret_names(s))
+            if missing:
+                item["missing_secrets"] = missing
+            items.append(item)
+        return items
+
+    def _stdio_configured(self) -> list[dict[str, Any]]:
+        return list(self.stdio_config()) if self.stdio_config is not None else []
+
+    def _stdio_add(self, a: dict[str, Any], http_servers: list[dict[str, Any]], thread_id: str = "") -> tuple[Any, bool]:
+        """Déclare un serveur stdio, ou approuve une déclaration en attente (import, ou serveur de config.yaml à son
+        premier lancement) si elle est IDENTIQUE (commande, arguments, variables). L'appel n'arrive ici qu'après la
+        carte forte (`floor`)."""
+        from nokker.tools.mcp_stdio import (
+            MAX_SERVERS as MAX_STDIO, check_stdio_entry, same_declaration, secret_names as stdio_secret_names,
+            write_stdio_servers,
+        )
+
+        if a.get("url"):
+            return "refusé : url (serveur HTTP) ou command (serveur stdio), pas les deux", True
+        entry = {**check_stdio_entry(a), "approved": True}
+        conf = next((s for s in self._stdio_configured() if s["name"] == entry["name"]), None)
+        if conf is not None and not conf.get("approved") and self.stdio_approvals is not None \
+                and same_declaration(conf, entry):
+            # Serveur de config.yaml : rien n'est recopié, seul l'accord (empreinte de SA déclaration) est gardé.
+            self.stdio_approvals.grant(conf)
+            if self.on_stdio_approved is not None:
+                try:
+                    self.on_stdio_approved(entry["name"], thread_id)
+                except Exception:  # noqa: BLE001 — l'accord est gardé ; le serveur partira au prochain tour
+                    log.warning("serveur MCP stdio %s : suite de l'accord en échec", entry["name"])
+            return {"approved": entry["name"], "command": [entry["command"], *entry.get("args", [])],
+                    "env": sorted(entry.get("env") or {})}, False
+        stdio = self._stdio_servers()
+        taken = set(self.configured()) if self.configured else set()
+        pending = next((s for s in stdio if s["name"] == entry["name"]), None)
+        if pending is not None and not pending.get("approved") and same_declaration(pending, entry):
+            entry = {**pending, **{k: v for k, v in entry.items() if k in ("read_tools", "confirmed_writes")},
+                     "approved": True}
+            stdio = [s for s in stdio if s["name"] != entry["name"]]
+        elif pending is not None or entry["name"] in taken or any(s["name"] == entry["name"] for s in http_servers):
+            return f"refusé : un serveur MCP s'appelle déjà {entry['name']!r} (retire-le d'abord)", True
+        if len(stdio) >= MAX_STDIO:
+            return f"refusé : {MAX_STDIO} serveurs ajoutés au plus", True
+        write_stdio_servers(self.stdio_path, [*stdio, entry])
+        names = stdio_secret_names(entry)
+        result: dict[str, Any] = {"added": entry["name"], "command": [entry["command"], *entry.get("args", [])],
+                                  "env": sorted(entry.get("env") or {}), "secrets": names,
+                                  "active": "au prochain redémarrage de Nokker"}
+        for key in ("read_tools", "confirmed_writes"):
+            if entry.get(key):
+                result[key] = list(entry[key])
+        missing = self._missing(names)
+        if missing:
+            result["missing_secrets"] = missing
+            result["next"] = "pose chaque valeur toi-même : nokker secret set " + " ; nokker secret set ".join(missing)
+        return result, False
 
 
 @dataclass
@@ -463,5 +622,5 @@ class ReadDeclaredSource:
 
 
 __all__ = ["FILE_NAME", "MCP_CONFIG_TOOLS", "McpConfigError", "McpConfigToolSource", "READ_RULE", "ReadDeclaredSource",
-           "WRITE_VERBS", "check_entry", "check_read_tools", "check_url", "load_user_servers", "merge_servers",
+           "STDIO_PARAMS", "STDIO_RULE", "WRITE_VERBS", "check_entry", "check_read_tools", "check_url", "load_user_servers", "merge_servers",
            "secret_names", "set_read_tools", "write_words"]

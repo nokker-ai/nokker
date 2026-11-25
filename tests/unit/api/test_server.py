@@ -126,6 +126,7 @@ class _Server:
 
     def stop(self) -> None:
         self.httpd.shutdown()
+        self.httpd.server_close()  # libère la prise d'écoute (sinon ResourceWarning)
         self.thread.join(timeout=5)
 
 

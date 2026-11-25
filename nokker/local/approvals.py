@@ -18,6 +18,7 @@ import posixpath
 from pathlib import Path
 from typing import Any
 
+UNASKED_CARD_RULE = "home:unasked"  # nokker.home.source.UNASKED_RULE (pas d'import : source.py est lourd)
 FILE_TOOLS = ("write_file", "patch", "read_file", "search_files")
 
 
@@ -27,6 +28,8 @@ def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None, 
     from nokker.qa.permissions import RELAY_CARD_RULE
 
     if strength == "strong" or rule == RELAY_CARD_RULE:
+        return []
+    if rule == UNASKED_CARD_RULE:  # action que PERSONNE n'a demandée : une règle durable annulerait le juge
         return []
     if tool == "ssh_trust":  # premier contact (lot X11) : une carte par clé d'hôte, jamais de règle
         return []
@@ -51,6 +54,13 @@ def suggested_rules(tool: str, arguments: dict[str, Any], strength: str | None, 
         if len(words) > 2:
             out.append(f"{tool}({' '.join(words[:2])}*)")
         return out
+    if tool in ("desktop_act", "desktop_open"):
+        # Bureau (docs/DESKTOP.md §3.1) : « pour cette tâche dans <appli> » = une règle par appli, ÉCRITURES
+        # seulement ; envoyer et supprimer n'ont jamais de règle (une carte par action).
+        from nokker.desktop.policy import desktop_subject
+
+        subject = desktop_subject(tool, arguments)
+        return [f"{tool}({subject})"] if subject and subject.endswith(":write") else []
     if tool == "delegate":
         # Déléguer n'a ni fichier ni commande : seule une règle par outil a un sens (e2e du 1.11 : la carte proposait
         # une règle que le client affichait « toujours ce fichier »). `rule_kind` le dit au client.

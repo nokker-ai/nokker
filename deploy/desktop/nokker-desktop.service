@@ -1,0 +1,21 @@
+# Nœud Bureau en mode `session` (docs/DESKTOP.md §1.1) : unité systemd --USER, dans la session graphique (X11) de la
+# personne. Posée par l'installeur seulement si `local.desktop.mode: session` est choisi explicitement.
+# Le nœud tourne dans l'image `desktop` ; `session-run.sh` (posé par l'installeur dans ~/.nokker/bin) lui donne l'écran X
+# et le socket du bus d'ACCESSIBILITÉ, jamais le bus de session de la personne (le conteneur a son bus privé, où seul
+# org.a11y.Bus existe). Réseau : `desktopnet` du compose seulement. Mode physique : interdit jusqu'à B2.
+[Unit]
+Description=Nokker — Bureau (mode session)
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=DISPLAY
+
+[Service]
+Type=simple
+Environment=NOKKER_DESKTOP_IMAGE=nokker-desktop:local NOKKER_DESKTOP_NETWORK=nokker_desktopnet
+ExecStart=%h/.nokker/bin/nokker-desktop-session-run
+ExecStop=/usr/bin/docker stop nokker-desktop-session-%U
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=graphical-session.target

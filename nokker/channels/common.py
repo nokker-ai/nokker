@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
+from nokker.approvals.rule_labels import norm_lang
 from nokker.core.turn import Turn, TurnInput
 from nokker.telegram.pairing import TTL, MemoryPairing, PairingStore, _sha, new_code
 from nokker.tenancy.context import scoped_thread_id, tenant_of_thread, tenant_scope
@@ -76,6 +77,46 @@ TEXTS = {
         "open": "Open the card",
         "decide_in_app": "Cards aren't decided here: open it in the web app.",
     },
+    "de": {
+        "unpaired": ("Dieses {name}-Konto ist mit keinem Nokker-Konto verknüpft. Öffne in der Nokker-Web-App «{name}», "
+                     "um einen Code zu erhalten, und sende ihn mir dann als Direktnachricht: pair CODE"),
+        "paired": "Erledigt: Dieses {name}-Konto ist mit deinem Nokker-Konto verknüpft. Du kannst mir hier schreiben.",
+        "bad_code": "Dieser Code ist nicht gültig (bereits verwendet oder abgelaufen). Fordere in der Web-App einen "
+                    "neuen an.",
+        "taken": "Dieses {name}-Konto ist bereits mit einem anderen Nokker-Konto verknüpft.",
+        "pair_private": "Die Verknüpfung erfolgt in einer Direktnachricht, nie in einem Kanal.",
+        "text_only": "Im Moment lese ich hier nur Textnachrichten und Sprachnachrichten.",
+        "voice_off": "Sprachnachrichten sind in diesem Kanal nicht aktiviert: Schreibe mir deine Nachricht.",
+        "voice_empty": "Ich habe in dieser Sprachnachricht nichts verstanden. Versuche es noch einmal oder schreibe mir.",
+        "voice_big": "Diese Sprachnachricht ist mir zu lang. Kürze sie oder schreibe mir.",
+        "rate": "Langsam: Zu viele Nachrichten auf einmal. Ich mache in einer Minute weiter.",
+        "error": "Ein Fehler hat mich an der Antwort gehindert. Versuche es gleich noch einmal.",
+        "card": "Aktion wartet auf deine Freigabe: {tool}",
+        "card_strong": "STARKE Karte: Diese Karte wird nur in der Web-App (Passkey) oder in der Telegram Mini App entschieden, "
+                       "nie hier.",
+        "card_standard": "Diese Karte wird in der Web-App entschieden, nicht hier.",
+        "open": "Karte öffnen",
+        "decide_in_app": "Karten werden hier nicht entschieden: Öffne sie in der Web-App.",
+    },
+    "it": {
+        "unpaired": ("Questo account {name} non è collegato ad alcun account Nokker. Nell'app web di Nokker apri "
+                     "«{name}» per ottenere un codice, poi inviamelo in un messaggio privato: pair CODE"),
+        "paired": "Fatto: questo account {name} è collegato al tuo account Nokker. Puoi scrivermi qui.",
+        "bad_code": "Questo codice non è valido (già usato o scaduto). Chiedine uno nuovo nell'app web.",
+        "taken": "Questo account {name} è già collegato a un altro account Nokker.",
+        "pair_private": "Il collegamento si fa in un messaggio privato, mai in un canale.",
+        "text_only": "Per ora qui leggo solo messaggi di testo e note vocali.",
+        "voice_off": "Le note vocali non sono attive su questo canale: scrivimi il tuo messaggio.",
+        "voice_empty": "Non ho capito nulla di questa nota vocale. Riprova, oppure scrivimi.",
+        "voice_big": "Questa nota vocale è troppo lunga per me. Dividila, oppure scrivimi.",
+        "rate": "Con calma: troppi messaggi tutti insieme. Riprendo tra un minuto.",
+        "error": "Un errore mi ha impedito di rispondere. Riprova tra un momento.",
+        "card": "Azione in attesa della tua approvazione: {tool}",
+        "card_strong": "Scheda FORTE: si decide solo nell'app web (passkey) o nella Mini App di Telegram, mai qui.",
+        "card_standard": "Si decide nell'app web, non qui.",
+        "open": "Apri la scheda",
+        "decide_in_app": "Le schede non si decidono qui: aprile nell'app web.",
+    },
 }
 
 _PAIR = re.compile(r"^\s*(?:/start|pair|appairer|link)\s+([A-Za-z0-9]{6,12})\s*$", re.IGNORECASE)
@@ -88,7 +129,8 @@ def parse_pair_command(text: str) -> str | None:
 
 
 def texts(lang: str | None) -> dict[str, str]:
-    return TEXTS["en" if lang == "en" else "fr"]
+    """Textes du canal dans la langue (`fr`/`en`/`de`/`it`, deux premières lettres) ; toute autre : français."""
+    return TEXTS[norm_lang(lang) or "fr"]
 
 
 def mask(identity: str) -> str:
@@ -394,8 +436,10 @@ class ChannelCore:
                         msg.typing()
                     except Exception:  # noqa: BLE001 — confort seulement
                         pass
+                msg_lang = norm_lang(msg.lang)  # langue annoncée par le canal pour ce message, sinon le noyau résout
                 inp = TurnInput(thread_id=scoped_thread_id(account.tenant_id, msg.thread_key), user_text=text,
-                                channel=self.channel, sender=account.account_id)
+                                channel=self.channel, sender=account.account_id, lang=msg_lang,
+                                lang_recognized=msg_lang is not None)
                 turn = self.run_turn(inp)
                 self._say(msg, turn.reply)
         except Exception:  # noqa: BLE001 — un tour raté ne tue pas le pool

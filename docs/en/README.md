@@ -40,6 +40,7 @@ Status: private beta / early access. What a page describes is in the Lokkal inst
 | [secrets.md](secrets.md) | The local vault: `secret:NAME` references, redaction, `file` and OpenBao providers |
 | [agents.md](agents.md) | Scheduled agents: triggers, arming, runs, budget; placement on several machines and the deck (rolling out) |
 | [packs.md](packs.md) | Agent packs (mail, social, jobs, brand, video, MCP builder, ops): skills plus agent templates proposed as cards; adding MCP servers |
+| [design.md](design.md) | Design guard-rails: `design_check` (a design floor checked without a browser) and the `design` pack |
 | [incidents.md](incidents.md) | Alerts, incidents, the plan and the morning brief (beta) |
 | [teams.md](teams.md) | Shared projects: roles, what is shared and what is not (beta) |
 | [code-server.md](code-server.md) | Code sessions on a shared server: one folder and one sandbox per user, forge credentials by name (beta) |

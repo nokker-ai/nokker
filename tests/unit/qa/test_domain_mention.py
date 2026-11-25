@@ -157,3 +157,17 @@ def test_in_the_kernel_a_scam_question_keeps_the_alert_and_a_transfer_is_escalat
     assert not scam.escalated and scam.reply == alert
     transfer = run(ENGAGE["fr-virement"], "Virement de 3 000 CHF effectué.")
     assert transfer.escalated and transfer.reply.startswith("Je transmets") and "effectué" not in transfer.reply
+
+
+def test_a_subagent_turn_keeps_its_analysis_the_parent_gate_decides():
+    """Banc B (04.11.2026) : un but du routeur qui dit « juger » une facture engage au sens de rc.7 ; sur un tour de
+    sous-agent, la réponse ne va qu'au parent — le drapeau est consultatif (ALLOW tracé), la voix escalade toujours."""
+    text = ENGAGE["montant"] if "montant" in ENGAGE else next(iter(ENGAGE.values()))
+    flags = INV.check_input(text).domain_flags
+    assert flags, text
+    child = Turn(thread_id="t/sa-1", index=0, input=INV.check_input(text), channel="subagent")
+    v = domain_verdict(child)
+    assert v is not None and v.decision is Decision.ALLOW and v.rule.endswith(":sous-agent")
+    for gates in gates_all():
+        assert not any(x.decision is Decision.ESCALATE for x in gates.switch("Analyse.", child, Tier.SHIP))
+        assert escalates(gates, text)  # le même texte, sur le tour de la voix : escalade inchangée

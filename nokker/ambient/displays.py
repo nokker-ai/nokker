@@ -75,6 +75,8 @@ class Display:
     revoked_at: float | None = None
     last_seen_at: float | None = None
     kind: str = "eink"  # eink | glance
+    surface: str = "glasses"  # glance : glasses | wall (écran mural, P10b, 082), fixée à l'appairage
+    show_brief: bool = True  # glance mural : brief et titre du prochain événement montrés (choix du titulaire)
 
     @property
     def active(self) -> bool:
@@ -85,7 +87,8 @@ class Display:
                 "depth": self.depth, "refresh_s": self.refresh_s, "created_at": self.created_at,
                 "revoked": self.revoked_at is not None, "paired": self.token_sha256 is not None,
                 "trmnl": self.kind == "eink" and self.pair_sha256 is not None, "last_seen_at": self.last_seen_at,
-                "kind": self.kind, "account_id": self.account_id}
+                "kind": self.kind, "account_id": self.account_id,
+                **({"surface": self.surface, "show_brief": self.show_brief} if self.kind == "glance" else {})}
 
 
 class DisplayStore(Protocol):
@@ -104,6 +107,8 @@ class DisplayStore(Protocol):
     def of_account(self, account_id: str, kind: str) -> list[Display]: ...
 
     def revoke_owned(self, account_id: str, display_id: str, now: float) -> bool: ...
+
+    def set_show_brief(self, account_id: str, display_id: str, value: bool) -> Display | None: ...
 
     def touch(self, display_id: str, now: float) -> None: ...
 
@@ -162,6 +167,14 @@ class MemoryDisplayStore:
             d.revoked_at, d.token_sha256, d.setup_until = now, None, None
             return True
 
+    def set_show_brief(self, account_id: str, display_id: str, value: bool) -> Display | None:
+        with self._lock:
+            d = self.rows.get(display_id)
+            if d is None or d.account_id != account_id or d.kind != "glance" or d.revoked_at is not None:
+                return None
+            d.show_brief = bool(value)
+            return copy.copy(d)
+
     def of_household(self, tenant_id: str, household_id: str) -> list[Display]:
         with self._lock:
             return sorted((copy.copy(d) for d in self.rows.values()
@@ -203,7 +216,8 @@ class MemoryDisplayStore:
 
 
 _COLS = ("id", "tenant_id", "household_id", "account_id", "name", "model", "width", "height", "depth", "refresh_s",
-         "token_sha256", "created_at", "pair_sha256", "setup_until", "revoked_at", "last_seen_at", "kind")
+         "token_sha256", "created_at", "pair_sha256", "setup_until", "revoked_at", "last_seen_at", "kind", "surface",
+         "show_brief")
 
 
 class PgDisplayStore:
@@ -270,6 +284,13 @@ class PgDisplayStore:
             cur = conn.execute("UPDATE ambient_displays SET revoked_at=%s, token_sha256=NULL, setup_until=NULL "
                                "WHERE id=%s AND account_id=%s AND revoked_at IS NULL", (now, display_id, account_id))
             return cur.rowcount == 1
+
+    def set_show_brief(self, account_id: str, display_id: str, value: bool) -> Display | None:
+        with self._key(account_id) as conn:
+            return self._row(conn.execute(f"UPDATE ambient_displays SET show_brief=%s WHERE id=%s AND account_id=%s "
+                                          "AND kind='glance' AND revoked_at IS NULL "
+                                          f"RETURNING {', '.join(_COLS)}", (bool(value), display_id, account_id)
+                                          ).fetchone())
 
     def of_household(self, tenant_id: str, household_id: str) -> list[Display]:
         with self._for(tenant_id) as conn:

@@ -23,6 +23,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core.model_texts import NOT_DONE_MARKS as _NOT_DONE_MARKS
+from nokker.core.model_texts import judge_language_line
+from nokker.core.refusal import is_refusal
 from nokker.core.turn import Turn
 from nokker.qa.review import last_commands, turn_diff
 
@@ -208,7 +211,7 @@ def _tool_results(turn: Turn, n: int = 3, max_chars: int = 2000) -> str:
         if m.role != "tool" or names.get(m.tool_call_id) in ("write_file", "patch", "terminal"):
             continue
         content = m.content or ""
-        if content.startswith(("REFUSÉ", "EN ATTENTE", "ESCALADÉ")):
+        if is_refusal(content) or content.startswith(_NOT_DONE_MARKS):
             continue
         out.append(f"--- {names.get(m.tool_call_id) or m.name or 'outil'}\n{content[-max_chars:]}")
     return "\n".join(out[-n:])
@@ -253,7 +256,7 @@ class OutcomeGrader:
         from nokker.qa.untrusted import fence
 
         return GRADER_PROMPT.format(rubric=rubric.render(), deliverable=fence("livrable", d),
-                                    evidence=fence("preuves", evidence or NO_EVIDENCE))
+                                    evidence=fence("preuves", evidence or NO_EVIDENCE)) + judge_language_line()
 
     def grade(self, rubric: Rubric, deliverable: str, evidence: str) -> Grade | None:
         """None : correcteur indisponible ou réponse illisible (pas de note, le tour continue)."""

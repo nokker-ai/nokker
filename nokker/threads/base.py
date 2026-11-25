@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from nokker.redact.markers import unmark
 from nokker.threads.types import Thread, ThreadNotFound
 
 TITLE_FROM_TEXT_CHARS = 48
@@ -22,7 +23,7 @@ def new_thread_id() -> str:
 
 
 def provisional_title(text: str) -> str:
-    t = " ".join((text or "").split())
+    t = " ".join(unmark(text or "").split())
     return t[:TITLE_FROM_TEXT_CHARS] or "Nouvelle session"
 
 
@@ -62,7 +63,8 @@ class BaseThreads:
     def create(self, title: str, owner: str | None, *, thread_id: str | None = None,
                members: list[str] | None = None, origin: dict | None = None) -> Thread:
         now = self.clock()
-        t = Thread(id=thread_id or new_thread_id(), title=(title or "").strip()[:200] or "Nouvelle session",
+        # Titre et extrait s'affichent HORS du fil (listes, notifications) : jamais de marqueur de l'appareil (P9b).
+        t = Thread(id=thread_id or new_thread_id(), title=unmark(title or "").strip()[:200] or "Nouvelle session",
                    owner=owner, members=[m for m in (members or []) if m and m != owner],
                    created_at=now, updated_at=now, origin=dict(origin) if origin else None)
         self._store(t)
@@ -84,13 +86,13 @@ class BaseThreads:
                working: bool | None = None, last_snippet: str | None = None, touch: bool = True) -> Thread:
         t = self.require(thread_id)
         if title is not None:
-            t.title = title.strip()[:200] or t.title
+            t.title = unmark(title).strip()[:200] or t.title
         if members is not None:
             t.members = [m for m in dict.fromkeys(members) if m and m != t.owner]
         if working is not None:
             t.working = working
         if last_snippet is not None:
-            t.last_snippet = " ".join(last_snippet.split())[:140]
+            t.last_snippet = " ".join(unmark(last_snippet).split())[:140]
         if touch:
             t.updated_at = self.clock()
         self._store(t)

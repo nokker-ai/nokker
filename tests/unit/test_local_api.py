@@ -15,6 +15,7 @@ import pytest
 from nokker.api.server import make_handler
 from nokker.core.ports import ToolContext
 from nokker.local.api import LOCAL_OWNER, LocalApi, SessionCodeTools, ensure_token
+from nokker.tools.checkpoints import NO_WORKSPACE
 from tests.unit.api.test_server import make_kernel
 
 
@@ -57,7 +58,7 @@ def test_session_tools_route_by_thread(tmp_path):
     tools = SessionCodeTools(backend="local")
     assert {s.name for s in tools.specs()} >= {"read_file", "terminal", "patch"}
     r = tools.call("read_file", {"path": "a"}, ToolContext(thread_id="th_x", turn_index=0, channel="api"))
-    assert r.is_error and "pas de session" in r.content
+    assert r.is_error and r.content == NO_WORKSPACE
 
 
 @pytest.fixture
@@ -382,7 +383,7 @@ def test_local_decision_routes(tmp_path):
         b = _card(approvals, "th_1", "npm run build --prod")
         status, body = _req(port, f"/v1/local/approvals/{b.id}/decide", token=api.token,
                             body={"decision": "reject", "scope": "always", "rule": "terminal(npm run*)"})
-        assert status == 200 and approvals.get(b.id).status == "rejected"
+        assert status == 202 and approvals.get(b.id).status == "rejected"
         assert not api.settings_path.exists()  # un refus n'écrit aucune règle
         c = _card(approvals, "th_1", "rm -rf dist", strength="strong")
         assert _req(port, f"/v1/local/approvals/{c.id}/decide", token=api.token,
@@ -395,9 +396,9 @@ def test_sandboxes_carry_the_instance_and_reaping_is_scoped(tmp_path, monkeypatc
     from nokker.tools import code
 
     api = _api(tmp_path)
-    assert api.code.instance and len(api.code.instance) == 12
+    assert api.code.instance and len(api.code.instance) == 16  # id aléatoire persisté dans l'état
     again = LocalApi.from_config({"token_path": str(tmp_path / "tok")}, port=8742)
-    assert again.code.instance == api.code.instance  # stable pour un même dossier d'état
+    assert again.code.instance == api.code.instance  # stable pour un même dossier d'état (le fichier instance-id)
     (tmp_path / "projets" / "app2").mkdir()
     api.code.open("th_i", str(tmp_path / "projets" / "app2"), str(tmp_path / "projets"))
     assert api.code.for_thread("th_i").instance == api.code.instance
@@ -405,7 +406,7 @@ def test_sandboxes_carry_the_instance_and_reaping_is_scoped(tmp_path, monkeypatc
     monkeypatch.setattr("subprocess.run", lambda argv, **kw: calls.append(argv) or type("R", (), {"stdout": ""})())
     assert code.reap_sandboxes("") == 0 and calls == []  # sans instance : rien n'est ramassé
     code.reap_sandboxes(api.code.instance)
-    assert calls[0][-1] == f"label=nokker.instance={api.code.instance}"
+    assert f"label=nokker.instance={api.code.instance}" in calls[0]
 
 
 def test_machine_route(tmp_path):
@@ -546,3 +547,257 @@ def test_delegate_card_only_offers_a_tool_wide_rule_and_kinds_label_rules():
     assert rule_kind("delegate") == "tool"
     assert rule_kind("write_file(src/a.py)") == "file" and rule_kind("write_file(src/**)") == "dir"
     assert rule_kind("terminal(npm test*)") == "prefix" and rule_kind("terminal(npm test)") == "exact"
+
+
+def _setup(tmp_path, monkeypatch, tested=None):
+    from cryptography.fernet import Fernet
+
+    from nokker.local.setup import LocalSetup, LocalVault
+
+    monkeypatch.setenv("NOKKER_LOCAL_SECRET_KEY", Fernet.generate_key().decode())
+    api = _api(tmp_path)
+    api.setup = LocalSetup(state_path=tmp_path / "setup.json", vault=LocalVault(tmp_path / "vault.bin"),
+                           detect=lambda: [], test=lambda base, key: tested or {"ok": True, "models": ["m1", "m2"]})
+    return api, f"Bearer {api.token}"
+
+
+def _put(api, auth, body):
+    return api.handle("PUT", "/v1/local/setup/models", auth, body)
+
+
+ENTRY = {"name": "perso", "base_url": "https://ex.test/v1", "api_key": "sk-k"}
+
+
+def test_put_refuses_a_default_without_model_or_missing(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    status, body = _put(api, auth, {"byok": [ENTRY], "default": "byok:perso"})
+    assert status == 400 and "pas de modèle" in body["error"]["message"]
+    status, body = _put(api, auth, {"byok": [ENTRY], "default": "byok:absent"})
+    assert status == 400 and "aucune entrée" in body["error"]["message"]
+    assert api.setup.state["byok"] == [] and api.setup.state["default"] is None  # rien d'écrit
+    assert api.setup.vault.get("byok:perso") is None
+
+
+def test_put_single_tested_entry_takes_its_first_tested_model(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    seen = []
+    api.on_default_model = lambda *a: seen.append(a)
+    status, view = _put(api, auth, {"byok": [ENTRY]})
+    assert status == 200 and view["default"] == "byok:perso"
+    assert view["models"]["byok"][0]["model"] == "m1" and view["models"]["byok"][0]["ok"] is True
+    assert seen == [("https://ex.test/v1", "sk-k", "m1")]
+    # un modèle donné par la personne prime sur le premier testé
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m2"}], "default": "byok:perso"})
+    assert status == 200 and view["models"]["byok"][0]["model"] == "m2"
+
+
+def test_single_byok_entry_does_not_take_over_when_a_config_tier_already_serves(tmp_path, monkeypatch):
+    """Un palier de la config a sa clé (Ship sert déjà) : une entrée byok ajoutée sans `default` ne devient PAS le
+    défaut et ne remplace donc ni Ship ni Deep à chaud. Elle reste choisissable : par fil, ou `default: byok:<nom>`."""
+    api, auth = _setup(tmp_path, monkeypatch)
+    api.setup.tiers_ready = lambda: True
+    seen = []
+    api.on_default_model = lambda *a: seen.append(a)
+    status, view = _put(api, auth, {"byok": [ENTRY]})
+    assert status == 200 and view["default"] is None and seen == []
+    assert view["models"]["byok"][0]["ok"] is True  # l'entrée est gardée et testée, prête à être choisie
+    assert api.setup.model_catalog()["m1"][2] is True  # modèle testé : choisissable pour un fil, sans toucher aux paliers
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m2"}], "default": "byok:perso"})
+    assert status == 200 and view["default"] == "byok:perso" and seen == [("https://ex.test/v1", "sk-k", "m2")]  # choix explicite
+    assert api.setup.model_catalog()["m2"][2] is True  # et le modèle est dans le catalogue par fil
+
+
+def test_explicit_default_swaps_both_tiers_while_a_per_thread_choice_leaves_them(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from nokker.api.server import default_model_applier
+    from nokker.config import NokkerConfig
+    from nokker.core.turn import Tier
+
+    api, auth = _setup(tmp_path, monkeypatch)
+    ship, deep = object(), object()
+    kernel = SimpleNamespace(providers={Tier.SHIP: ship, Tier.DEEP: deep}, reviewer=None, advisor=None)
+    api.on_default_model = default_model_applier(NokkerConfig(), kernel, lambda: None)
+    api.setup.tiers_ready = lambda: True
+    _put(api, auth, {"byok": [ENTRY]})
+    assert kernel.providers == {Tier.SHIP: ship, Tier.DEEP: deep}  # byok seul, sans défaut : les paliers restent
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m2"}], "default": "byok:perso"})
+    assert kernel.providers[Tier.SHIP] is not ship and kernel.providers[Tier.DEEP] is kernel.providers[Tier.SHIP]
+
+
+def test_put_does_not_guess_a_default_when_the_test_fails_or_entries_are_many(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch, tested={"ok": False, "models": [], "error": "HTTP 401"})
+    status, view = _put(api, auth, {"byok": [ENTRY]})
+    assert status == 200 and view["default"] is None and view["models"]["byok"][0]["ok"] is False
+    (tmp_path / "b").mkdir()
+    api, auth = _setup(tmp_path / "b", monkeypatch)
+    status, view = _put(api, auth, {"byok": [ENTRY, {**ENTRY, "name": "autre"}]})
+    assert status == 200 and view["default"] is None
+
+
+def test_removing_the_default_entry_clears_it_and_invalidates_setup(tmp_path, monkeypatch):
+    api, auth = _setup(tmp_path, monkeypatch)
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})
+    api.handle("POST", "/v1/local/setup/done", auth, {})
+    assert api.setup.has_model() is True
+    status, view = _put(api, auth, {"byok": []})
+    assert status == 200 and view["default"] is None and view["done"] is False
+    assert api.setup.vault.get("byok:perso") is None
+    # avec un autre modèle restant, setup reste valide si le défaut est ailleurs
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}, {**ENTRY, "name": "b", "model": "m2"}], "default": "byok:b"})
+    api.handle("POST", "/v1/local/setup/done", auth, {})
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}]})
+    assert view["default"] is None  # le défaut retiré est vidé, pas remplacé en silence
+    status, view = _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})
+    assert view["default"] == "byok:perso"
+
+
+def test_turn_stops_before_the_model_only_when_no_model_is_usable(tmp_path, monkeypatch):
+    from nokker.api.server import setup_guard
+    from nokker.core.turn import TurnInput
+
+    api, auth = _setup(tmp_path, monkeypatch)
+    kernel = make_kernel()
+    calls = []
+
+    def run_turn(inp, *a, **k):
+        calls.append(inp)
+        return "model"
+
+    cfg_key = {"on": False}
+    guarded = setup_guard(kernel, api.setup, "http://127.0.0.1:7420", run_turn, lambda: cfg_key["on"])
+    inp = TurnInput(thread_id="t1", user_text="salut", channel="api", sender=None)
+    turn = guarded(inp)  # rien du tout
+    assert calls == [] and turn.reply == ("Aucun modèle n'est configuré. Termine la configuration : "
+                                          "http://127.0.0.1:7420/setup")
+    cfg_key["on"] = True  # done faux, palier de config avec clé
+    assert guarded(inp) == "model"
+    cfg_key["on"] = False
+    assert api.setup.state["done"] is False
+    api.setup.vault.put("router", "sk-r")  # done faux, compte relié
+    assert guarded(inp) == "model"
+    api.setup.vault.delete("router")
+    assert guarded(inp) != "model"
+    _put(api, auth, {"byok": [{**ENTRY, "model": "m1"}], "default": "byok:perso"})  # byok avec modèle, done faux
+    assert guarded(inp) == "model" and len(calls) == 3
+
+
+
+def test_no_model_guard_links_the_web_setup_with_the_token_and_fails_the_turn(tmp_path, monkeypatch):
+    """rc.9.3 : le lien visait le port API (8742 → 401) et le tour finissait sans erreur (exit 0, error null). Le lien
+    vise la page /setup du WEB, avec le jeton local en fragment pour un tour SUR la machine seulement ; le tour est un
+    échec `no_model` annoncé aux observateurs (turn.done.error), sans rien enregistrer dans le fil."""
+    from nokker.api.server import setup_guard, web_url_of_lokkal
+    from nokker.core.turn import TurnInput
+
+    api, _ = _setup(tmp_path, monkeypatch)
+    kernel = make_kernel()
+    seen = []
+
+    class Obs:
+        def turn_started(self, turn):
+            seen.append(("started", turn.thread_id))
+
+        def turn_done(self, turn):
+            seen.append(("done", turn.failure))
+            seen.append(("reply", turn.reply))  # ce que le bus d'événements publie (turn.delta)
+
+    kernel.observer = Obs()
+    guarded = setup_guard(kernel, api.setup, "http://127.0.0.1:7420", lambda *a, **k: "model", lambda: False,
+                          code=lambda: "codeAbc123-_xyz7890")
+    base = "Aucun modèle n'est configuré. Termine la configuration : http://127.0.0.1:7420/setup"
+    turn = guarded(TurnInput(thread_id="t1", user_text="salut", channel="api", sender=None))
+    assert turn.reply == base + "#code=codeAbc123-_xyz7890" and "#token" not in turn.reply
+    assert turn.failure == {"code": "no_model", "message": base}  # jamais le jeton dans l'erreur
+    assert seen == [("started", "t1"), ("done", {"code": "no_model", "message": base}), ("reply", base)]
+    assert all("codeAbc123" not in str(x) for x in seen)  # le code ne passe jamais par les observateurs (bus)
+    assert kernel.store.history("t1") == []  # rien dans le fil
+    for channel in ("relay", "telegram"):  # hors de la machine : jamais le jeton
+        assert guarded(TurnInput(thread_id="t2", user_text="x", channel=channel, sender=None)).reply == base
+    monkeypatch.delenv("NOKKER_WEB_URL", raising=False)
+    monkeypatch.setenv("NOKKER_PORT", "7520")
+    assert web_url_of_lokkal() == "http://127.0.0.1:7520"
+    monkeypatch.setenv("NOKKER_WEB_URL", "http://127.0.0.1:7420/")
+    assert web_url_of_lokkal() == "http://127.0.0.1:7420"
+
+
+class _TenantStrictApprovals:
+    """Approbations qui, comme le backend Postgres sous RLS, refusent tout accès sans locataire fixé (rc.9.3 : 502)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        from nokker.tenancy.context import current_tenant
+
+        attr = getattr(self.inner, name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*a, **kw):
+            current_tenant()  # NoTenant sans tenant_scope à la frontière
+            return attr(*a, **kw)
+        return guarded
+
+
+def test_local_approvals_set_the_tenant_at_the_boundary(tmp_path):
+    from nokker.approvals.memory import InMemoryApprovals
+    from nokker.qa.permissions import LocalPermissions, Mode, PermissionGates
+    from nokker.tenancy.context import INTERNAL_TENANT, tenant_scope
+    from tests.unit.api.test_approvals_routes import make_kernel_with_approvals
+
+    inner = InMemoryApprovals()
+    approvals = _TenantStrictApprovals(inner)
+    kernel, _ = make_kernel_with_approvals(approvals)
+    kernel.gates = PermissionGates(inner=kernel.gates, permissions=LocalPermissions(mode=Mode.ACCEPT_EDITS))
+    api = _api(tmp_path)
+    api.settings_path = tmp_path / "settings.json"
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, approvals=approvals,
+                                                               local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with tenant_scope(INTERNAL_TENANT):
+            a = _card(inner, "th_t", "npm test")
+        status, body = _req(port, "/v1/local/approvals", token=api.token)
+        assert status == 200 and [x["id"] for x in body["approvals"]] == [a.id]
+        status, body = _req(port, f"/v1/local/approvals/{a.id}/decide", token=api.token,
+                            body={"decision": "approve", "scope": "once"})
+        assert status in (200, 202) and body["approval_id"] == a.id
+    finally:
+        httpd.shutdown()
+
+
+def test_sandbox_image_from_env_unless_config(monkeypatch):
+    from nokker.local.api import _sandbox_image
+    from nokker.tools.code import DEFAULT_SANDBOX_IMAGE
+
+    monkeypatch.delenv("NOKKER_SANDBOX_IMAGE", raising=False)
+    assert _sandbox_image({}) == DEFAULT_SANDBOX_IMAGE
+    monkeypatch.setenv("NOKKER_SANDBOX_IMAGE", "ghcr.io/nokker-ai/sandbox:0.1.0-rc.9.5")
+    assert _sandbox_image({}) == "ghcr.io/nokker-ai/sandbox:0.1.0-rc.9.5"
+    assert _sandbox_image({"image": "mon/image:1"}) == "mon/image:1"
+    monkeypatch.setenv("NOKKER_SANDBOX_IMAGE", "  ")
+    assert _sandbox_image({}) == DEFAULT_SANDBOX_IMAGE
+
+
+def test_local_sites_set_the_tenant_at_the_boundary(tmp_path):
+    """Vrai Lokkal (06.11.2026) : GET /v1/local/sites levait NoTenant (who() → current_tenant()) → 502 par nginx. Le
+    locataire interne se fixe à la frontière de l'API locale, comme pour les approbations (d77ed58)."""
+    from nokker.tenancy.context import INTERNAL_TENANT, current_tenant, current_tenant_or_none
+
+    seen = []
+
+    class _Sites:
+        def handle(self, method, path, body, relayed):
+            seen.append(current_tenant())  # NoTenant si la frontière n'a pas fixé le locataire
+            return 200, {"enabled": True, "sites": []}
+
+    api = _api(tmp_path)
+    api.sites = _Sites()
+    assert current_tenant_or_none() is None
+    assert api.handle("GET", "/v1/local/sites", f"Bearer {api.token}", {}) == (200, {"enabled": True, "sites": []})
+    assert api.handle("POST", "/v1/local/sites/x/pause", f"Bearer {api.token}", {})[0] == 200
+    assert seen == [INTERNAL_TENANT, INTERNAL_TENANT]
+    assert current_tenant_or_none() is None  # rien ne fuit hors de la requête

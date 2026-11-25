@@ -13,6 +13,12 @@ sont égales, sinon le bruit de la mesure déciderait seul), puis charge CPU rel
 petite), puis tours actifs (le moins), puis le nom et l'id (un ordre stable : deux appels identiques choisissent la
 même machine).
 
+**Capacités** (P7b, docs/LOKKAL-PHONE.md §3.4) : `Needs.caps` (noms : `location`, `ocr`, `stt`…). Un Lokkal les déclare
+dans son inventaire (`resources.caps`) ; un téléphone (`kind == "phone"`) par son battement, et seulement celles à
+`on` (`off` ou `denied` : absente). `Needs.secrets` (l'outil prend un secret du coffre) : un téléphone n'est jamais
+éligible. Un Lokkal éligible passe AVANT un téléphone ; entre téléphones : `live` avant `push`, mode `home` avant
+`pocket` pour `lan_home` et `camera`, en charge avant sur batterie, Wi-Fi avant cellulaire, puis nom et id.
+
 **Aucune éligible** : `machine` vaut None et `reason` dit pourquoi, lisible par l'utilisateur ; `fallback` est la
 machine la plus récemment vue parmi celles qui ont les ressources et le GPU (hors ligne) : la demande l'attendra.
 """
@@ -28,6 +34,7 @@ KINDS = ("repos", "hosts", "connectors", "mcp")  # natures de l'inventaire (docs
 NEED_KINDS = {"repo": "repos", "host": "hosts", "connector": "connectors", "mcp": "mcp"}  # X21 : besoin au singulier
 SINGULAR = {v: k for k, v in NEED_KINDS.items()}
 LABEL = {"repos": "dépôt", "hosts": "hôte", "connectors": "connecteur", "mcp": "serveur MCP"}
+HOME_CAPS = frozenset({"lan_home", "camera"})  # un téléphone en mode maison passe avant un téléphone de poche
 MAX_PER_KIND = 20
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,63}$")  # même règle que l'inventaire (`clean_resources`)
 
@@ -45,6 +52,8 @@ class Needs:
     connectors: tuple[str, ...] = ()
     mcp: tuple[str, ...] = ()
     gpu: bool = False
+    caps: tuple[str, ...] = ()  # capacités d'appareil (P7b) : jamais demandées par un agent, posées par l'outil
+    secrets: bool = False  # l'outil prend un secret du coffre : jamais sur un téléphone
 
     @classmethod
     def of(cls, kind: str, name: str) -> Needs:
@@ -57,12 +66,13 @@ class Needs:
 
     def local_only(self) -> bool:
         """Exige une ressource qui n'existe que sur une machine (le web n'a ni dépôt, ni hôte, ni GPU)."""
-        return bool(self.resources()) or self.gpu
+        return bool(self.resources()) or self.gpu or bool(self.caps)
 
     def to_json(self) -> dict[str, Any] | None:
-        if not self.resources() and not self.gpu:
+        if not self.resources() and not self.gpu and not self.caps:
             return None
-        return {**{k: list(getattr(self, k)) for k in KINDS}, "gpu": self.gpu}
+        return {**{k: list(getattr(self, k)) for k in KINDS}, "gpu": self.gpu, **({"caps": list(self.caps)} if self.caps
+                                                                                  else {})}
 
 
 def parse_needs(raw: Any) -> Needs:
@@ -109,10 +119,22 @@ def needs_of(raw: Any) -> Needs:
 # ─────────────────────────────── une machine ───────────────────────────────
 
 
+def is_phone(m: Any) -> bool:
+    return getattr(m, "kind", "lokkal") == "phone"
+
+
+def _beat(m: Any) -> dict[str, Any]:
+    load = getattr(m, "load", None)
+    return load if isinstance(load, dict) else {}
+
+
 def is_online(m: Any, now: float) -> bool:
-    """Charge fraîche (X5), et pas de fermeture de tunnel signalée par le relais depuis cette charge."""
+    """Charge fraîche (X5), et pas de fermeture de tunnel signalée par le relais depuis cette charge. Un téléphone :
+    battement frais ET `reach: live` (un téléphone `push` est réveillable, pas en ligne)."""
     load_at = getattr(m, "load_at", None)
     if load_at is None or now - load_at > FRESH_S:
+        return False
+    if is_phone(m) and _beat(m).get("reach") != "live":
         return False
     offline_at = getattr(m, "offline_at", None)
     return offline_at is None or offline_at < load_at
@@ -129,10 +151,29 @@ def _declared(m: Any, kind: str) -> list[str]:
     return list(res.get(kind) or []) if isinstance(res, dict) else []
 
 
+def caps_of(m: Any) -> list[str]:
+    """Capacités déclarées : celles à `on` dans le battement d'un téléphone, l'inventaire `caps` d'un Lokkal."""
+    if is_phone(m):
+        caps = _beat(m).get("caps")
+        if not isinstance(caps, dict):
+            return []
+        net = _beat(m).get("net") if isinstance(_beat(m).get("net"), dict) else {}
+        # lan_home : seulement sur le Wi-Fi déclaré « maison » (P10a, §3.4) ; ailleurs, le nœud n'atteint pas HA
+        return sorted(k for k, v in caps.items() if v == "on" and (k != "lan_home" or net.get("home_wifi") is True))
+    return _declared(m, "caps")
+
+
 def lacks(m: Any, needs: Needs) -> list[dict[str, Any]]:
-    """Ce qui manque à `m` pour `needs` (ressources par nom, GPU), indépendamment de son état en ligne. Une machine
-    sans inventaire n'a rien ; une machine sans charge connue n'a pas de GPU connu."""
+    """Ce qui manque à `m` pour `needs` (ressources par nom, GPU, capacités ; un secret sur un téléphone),
+    indépendamment de son état en ligne. Une machine sans inventaire n'a rien ; une machine sans charge connue n'a pas
+    de GPU connu."""
     out: list[dict[str, Any]] = []
+    if needs.secrets and is_phone(m):
+        out.append({"kind": "secrets", "message": f"« {m.name} » est un téléphone : jamais de tâche qui demande un secret"})
+    have = caps_of(m) if needs.caps else []
+    for cap in needs.caps:
+        if cap not in have:
+            out.append({"kind": "cap", "name": cap, "message": f"capacité « {cap} » absente de « {m.name} »"})
     for kind, name in needs.resources():
         if name not in _declared(m, kind):
             out.append({"kind": SINGULAR[kind], "name": name,
@@ -154,11 +195,23 @@ def ram_free_mb(m: Any) -> int:
     return int(ram.get("free_mb") or 0)
 
 
-def rank_key(m: Any) -> tuple:
-    """Clé de tri (la plus petite gagne) : RAM libre (par pas de 256 Mio, décroissante), CPU relatif, tours actifs,
-    nom, id."""
+def phone_key(m: Any, needs: Needs) -> tuple:
+    """Entre téléphones : `live` avant `push`, mode `home` avant `pocket` (lan_home, camera), en charge, Wi-Fi, nom, id."""
+    b = _beat(m)
+    power = b.get("power") if isinstance(b.get("power"), dict) else {}
+    net = b.get("net") if isinstance(b.get("net"), dict) else {}
+    home_first = bool(HOME_CAPS & set(needs.caps)) and b.get("mode") != "home"
+    return (b.get("reach") != "live", home_first, not power.get("charging"), net.get("type") != "wifi",
+            str(m.name), str(m.id))
+
+
+def rank_key(m: Any, needs: Needs | None = None) -> tuple:
+    """Clé de tri (la plus petite gagne). Un Lokkal avant un téléphone. Lokkal : RAM libre (par pas de 256 Mio,
+    décroissante), CPU relatif, tours actifs, nom, id. Téléphone : `phone_key`."""
+    if is_phone(m):
+        return (1, phone_key(m, needs or Needs()))
     active = int(((m.load or {}).get("active_turns") or 0) if isinstance(getattr(m, "load", None), dict) else 0)
-    return (-(ram_free_mb(m) // RAM_STEP_MB), round(cpu_rel(m), 3), active, str(m.name), str(m.id))
+    return (0, (-(ram_free_mb(m) // RAM_STEP_MB), round(cpu_rel(m), 3), active, str(m.name), str(m.id)))
 
 
 def _age(m: Any, now: float) -> str:
@@ -196,7 +249,7 @@ def place(machines: list[Any], needs: Needs, now: float, *, only: str | None = N
         return Placement(None, reason=f"machine {only} inconnue ou déliée de ce compte")
     lacking = {m.id: lacks(m, needs) for m in pool}
     have = [m for m in pool if not lacking[m.id]]
-    online = sorted((m for m in have if is_online(m, now)), key=rank_key)
+    online = sorted((m for m in have if is_online(m, now)), key=lambda m: rank_key(m, needs))
     if online:
         return Placement(online[0], ranked=online, lacking=lacking)
     if have:
@@ -216,16 +269,20 @@ __all__ = [
     "KINDS",
     "LABEL",
     "NEED_KINDS",
+    "HOME_CAPS",
     "RAM_STEP_MB",
     "Needs",
     "NeedsError",
     "Placement",
+    "caps_of",
     "cpu_rel",
     "gpu_count",
     "is_online",
+    "is_phone",
     "lacks",
     "needs_of",
     "parse_needs",
+    "phone_key",
     "place",
     "ram_free_mb",
     "rank_key",

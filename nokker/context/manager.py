@@ -22,9 +22,11 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.approvals.rule_labels import current_lang
+from nokker.attachments import fence_head
 from nokker.context import index as episode_index
 from nokker.context.memory import MemoryEpisodeStore, MemoryReservoirStore
-from nokker.context.summarize import ExtractiveSummarizer, message_chars, turn_tokens
+from nokker.context.summarize import ExtractiveSummarizer, message_tokens, turn_tokens
 from nokker.context.text import (
     FUNCTION_WORDS,
     clip,
@@ -40,6 +42,7 @@ from nokker.context.text import (
     revoked_durables,
     sentences,
 )
+from nokker.context.tokens import CALIBRATOR
 from nokker.context.transcript import render_episode
 from nokker.context.types import (
     ContextBudgets,
@@ -53,7 +56,10 @@ from nokker.context.types import (
     new_episode_id,
     new_reservoir_id,
 )
-from nokker.core.turn import ToolResult, Turn
+from nokker.core import model_texts as mt
+from nokker.core.turn import Message, ToolResult, Turn
+from nokker.memory.provenance import of_turns
+from nokker.qa.untrusted import neutralize_date, neutralize_env
 
 logger = logging.getLogger("nokker.context.manager")
 ZURICH = ZoneInfo("Europe/Zurich")
@@ -107,6 +113,14 @@ def stub_text(item_id: str, name: str, tokens: int, preview: str) -> str:
             f"« {clip(preview, STUB_PREVIEW_CHARS)} » — recall_context(\"{item_id}\") pour le relire]")
 
 
+# Outil de relecture du réservoir : son résultat n'y retourne JAMAIS (admission ni délestage), sinon chaque relecture
+# rangerait un nouvel élément dont l'identifiant appellerait une relecture de plus.
+RECALL_TOOL = "recall_context"
+# Caractères par jeton du bloc `[Mémoire de la session]` (français dense, ids, dates : 2,9 mesuré au Router) : le budget
+# `episodes_budget` est en jetons RÉELS (avant : `* 4` caractères, soit ~1,4 fois trop).
+MEMORY_CHARS_PER_TOKEN = 2.9
+
+
 @dataclass
 class ContextManager:
     store: Any  # core.ports.Store (history / history_from)
@@ -128,9 +142,19 @@ class ContextManager:
         self._locks: dict[str, threading.RLock] = {}
         self._guard = threading.Lock()
         self._tidx: dict[str, dict[str, Any]] = {}
+        for attr, val in (("key_items", self.budgets.summary_key_items),
+                          ("key_items_chars", min(600, max(0, int(self.budgets.summary_key_chars))))):
+            if hasattr(self.summarizer, attr):  # le résumeur extractif par défaut (et ceux qui le prolongent)
+                setattr(self.summarizer, attr, val)
+        self._admitted: dict[tuple[str, int], int] = {}  # (fil, tour) -> jetons de résultats moyens gardés en clair
+        self._mem_snap: dict[str, tuple[tuple, str]] = {}  # fil -> (clé d'événement, bloc `[Mémoire de la session]` figé)
         self._rel_cache: dict[tuple[str, str], list] = {}  # une recherche par (fil, requête) : assemble() repasse à chaque appel
 
     # ───────────────────────────── utilitaires ─────────────────────────────
+
+    def _is_rev(self, text: str) -> bool:
+        """`text.is_revocation` avec le réglage `revision_markers` (révisions de valeur incluses ou non)."""
+        return is_revocation(text, self.budgets.revision_markers)
 
     def _lock(self, thread_id: str) -> threading.RLock:
         with self._guard:
@@ -145,20 +169,22 @@ class ContextManager:
             return fn(thread_id, first)
         return [t for t in self.store.history(thread_id) if t.index >= first]
 
-    def _turn_tokens(self, turn: Turn, st: ViewState | None = None) -> int:
+    def _turn_tokens(self, turn: Turn, st: ViewState | None = None, shed: dict[str, str] | None = None) -> int:
         """Tokens estimés d'un tour tel que le modèle le VOIT (les résultats délestés comptent pour leur stub, l'en-tête
-        figé pour sa longueur tant qu'il n'est pas délesté)."""
+        figé pour sa longueur tant qu'il n'est pas délesté). `shed` : stubs supplémentaires à supposer (le report de
+        clôture mesure la forme réduite avant de la décider)."""
         if st is None:
             st = self.state(turn.thread_id)
-        chars = len(turn.input.text or "")
+        n = estimate_tokens(turn.input.text or "")
         if turn.head and turn.index >= st.heads_shed_before:
-            chars += len(turn.head)  # contient déjà le contexte reçu
+            n += estimate_tokens(fence_head(turn.head))  # contient déjà le contexte reçu ; porté comme au rejeu (r46)
         else:
-            chars += sum(len(b) for b in turn.injected)
+            n += sum(estimate_tokens(b) for b in turn.injected)
         for m in turn.messages:
-            stub = st.shed.get(shed_key(turn.index, m.tool_call_id or "")) if m.role == "tool" else None
-            chars += len(stub) if stub is not None else message_chars(m)
-        return max(0, chars // 4)
+            k = shed_key(turn.index, m.tool_call_id or "")
+            stub = ((shed or {}).get(k) or st.shed.get(k)) if m.role == "tool" else None
+            n += estimate_tokens(stub) if stub is not None else message_tokens(m)
+        return n
 
     def replay_head(self, turn: Turn, st: ViewState) -> bool:
         """Vrai si l'historique rejoue l'en-tête figé de ce tour (non délesté)."""
@@ -203,6 +229,11 @@ class ContextManager:
         self.episodes.save(opened)
         st.episode_id, st.base_turn = opened.id, start
         self.episodes.save_state(st)
+        if self.budgets.bootstrap_compact:
+            # Historique importé / fil d'avant ce chantier : l'épisode courant garde ses résultats d'outils EN CLAIR
+            # (`compact` ne tourne qu'en fin de tour). Même règle de délestage, UNE FOIS, avant le tout premier appel :
+            # événement discret et persisté comme les autres (aucun cache à casser : rien n'a encore été envoyé).
+            self._shed(thread_id, st)
         return st
 
     # ───────────────────────────── frontières ─────────────────────────────
@@ -246,7 +277,8 @@ class ContextManager:
             res = self.summarizer.summarize(turns)
         except Exception:
             logger.exception("résumeur en échec — repli extractif")
-            res = ExtractiveSummarizer().summarize(turns)
+            res = ExtractiveSummarizer(key_items=self.budgets.summary_key_items,
+                                       key_items_chars=min(600, max(0, int(self.budgets.summary_key_chars)))).summarize(turns)
         ep.title = self._clean(res.title)[:120]
         ep.summary = self._clean(res.summary)
         ep.keywords = [self._clean(k) for k in res.keywords][:16]
@@ -257,6 +289,8 @@ class ContextManager:
         ep.turn_ids_sha256 = hashlib.sha256(
             "|".join(f"{ep.thread_id}:{t.index}" for t in turns).encode()).hexdigest()
         ep.refined = res.model is not None
+        # Provenance du résumé (et des faits qu'on en tirera) : tiers dès qu'un tour porte un contenu de tiers.
+        ep.provenance = of_turns(turns)
 
     def _close(self, thread_id: str, reason: str) -> str | None:
         ep = self.episodes.current(thread_id)
@@ -278,7 +312,7 @@ class ContextManager:
                 self.episodes.save(ep)
         self._index_semantic(ep, turns)
         st.episode_id = None
-        st.base_turn = max(ep.first_turn, ep.last_turn - self.budgets.carry_turns + 1)
+        st.base_turn = self._carry_from(thread_id, st, ep, turns)
         st.shed = {k: v for k, v in st.shed.items() if int(k.split(":", 1)[0]) >= st.base_turn}
         st.tokens_since_compaction = 0
         st.compaction_version += 1
@@ -286,12 +320,68 @@ class ContextManager:
         self.episodes.save_state(st)
         return ep.id
 
+    def _reduced_stubs(self, t: Turn, st: ViewState, item_id: str | None = None) -> dict[str, tuple[Message, str]]:
+        """Résultats d'outils d'un tour qu'un délestage remplacerait par un stub (≥ `shed_min_tokens`, pas déjà délestés,
+        pas `recall_context`) : clé de délestage → (message, stub). Sans `item_id`, le stub est mesuré avec un
+        identifiant factice de même longueur (rien n'est rangé au réservoir)."""
+        out: dict[str, tuple[Message, str]] = {}
+        for m in t.messages:
+            if m.role != "tool" or not m.tool_call_id or m.name == RECALL_TOOL:
+                continue
+            key = shed_key(t.index, m.tool_call_id)
+            tokens = estimate_tokens(m.content)
+            if key in st.shed or tokens < self.budgets.shed_min_tokens:
+                continue
+            found = self.reservoir.find(t.thread_id, t.index, m.tool_call_id)
+            rid = found.id if found is not None else (item_id or "rs_000000000000")
+            preview = found.preview if found is not None else clip(self._clean(m.content), 500)
+            out[key] = (m, stub_text(rid, m.name or "", (found.tokens if found is not None else 0) or tokens, preview))
+        return out
+
+    def _carry_from(self, thread_id: str, st: ViewState, ep: Episode, turns: list[Turn]) -> int:
+        """Premier tour de la fenêtre qui suit une clôture : les `carry_turns` derniers tours, SOUS UN PLAFOND EN JETONS
+        (`carry_max_ratio × current_budget`, bloc `[Mémoire de la session]` compris : report + bloc ≤ plafond). Sans plafond, des tours lourds reportés remplissent presque tout le budget et
+        la clôture revient tous les 2 tours (mesuré sur un vrai Claude). Au-delà du plafond, les tours reportés passent à
+        leur forme réduite (résultats d'outils en stub + extrait + `rs_…`, sans texte nouveau : le même stub qu'un
+        délestage) puis, si ça dépasse encore, les plus anciens ne sont pas reportés. La fenêtre est réécrite par la
+        clôture de toute façon : ce raccourcissement ne coûte pas un octet de cache de plus. `carry_max_ratio` ≥ 1 = ancien."""
+        b = self.budgets
+        first = max(ep.first_turn, ep.last_turn - b.carry_turns + 1)
+        cand = [t for t in turns if t.index >= first]
+        if b.carry_max_ratio >= 1.0 or not cand:
+            return first
+        # Le bloc `[Mémoire de la session]` (message de tête, écrit au même coup que le report) compte dans le plafond : on
+        # réduit le REPORT, jamais le bloc. L'épisode est déjà clos et enregistré : le bloc est celui qui va être figé.
+        mem = estimate_tokens(self.memory_block(thread_id)) if b.memory_as_message else 0
+        cap = max(0, int(b.carry_max_ratio * b.current_budget) - mem)
+        if sum(self._turn_tokens(t, st) for t in cand) <= cap:
+            return first
+        used, kept = 0, []
+        for t in reversed(cand):  # du plus récent au plus ancien : la suite doit rester contiguë
+            reduced = self._reduced_stubs(t, st)
+            n = self._turn_tokens(t, st, {k: v[1] for k, v in reduced.items()})
+            if used + n > cap:
+                break
+            used += n
+            kept.append(t)
+        for t in kept:
+            for key, (m, _) in self._reduced_stubs(t, st).items():
+                item = self.reservoir.find(thread_id, t.index, m.tool_call_id or "")
+                if item is None:
+                    item = ReservoirItem(id=new_reservoir_id(), thread_id=thread_id, kind="tool_result", name=m.name or "",
+                                         content=self._clean(m.content), preview=clip(self._clean(m.content), 500),
+                                         tokens=estimate_tokens(m.content), turn_index=t.index,
+                                         call_id=m.tool_call_id, created_at=self.clock())
+                    self.reservoir.put(item)
+                st.shed[key] = stub_text(item.id, item.name, item.tokens or estimate_tokens(m.content), item.preview)
+        return kept[-1].index if kept else ep.last_turn + 1
+
     def _semantic_body(self, ep: Episode, turns: list[Turn]) -> str:
         """Corps de la note CortHeXis d'un épisode : résumé + TOUS les messages de l'utilisateur (bornés), UN PAR
         PARAGRAPHE — l'indexeur découpe sur les paragraphes : un message par morceau, pour qu'un fait du milieu d'un
         épisode de bavardage ne soit pas noyé dans l'embedding d'un morceau de remplissage (mesuré, §11)."""
         lines = [f"[T{t.index}] {clip(t.input.text, 320)}"
-                 + (f" → conclusion : {clip(conclusion_of(t), 240)}" if is_revocation(t.input.text) else "")
+                 + (f" → conclusion : {clip(conclusion_of(t), 240)}" if self._is_rev(t.input.text) else "")
                  for t in turns if (t.input.text or "").strip()]
         text = "\n\n".join(lines)
         return self._clean(f"{ep.summary}\n\n## Messages de l'utilisateur\n\n{text[:12000]}")
@@ -359,13 +449,17 @@ class ContextManager:
 
     def window_tokens(self, thread_id: str) -> int:
         st = self.state(thread_id)
-        return sum(self._turn_tokens(t, st) for t in self._history_from(thread_id, st.base_turn))
+        n = sum(self._turn_tokens(t, st) for t in self._history_from(thread_id, st.base_turn))
+        if self.budgets.calibrate_tokens:  # ratio réel/estimé du palier (`tokens.CALIBRATOR`), 1,0 sans observation
+            n = round(n * CALIBRATOR.factor())
+        return n
 
     def _enforce(self, thread_id: str) -> None:
         b = self.budgets
         st = self.state(thread_id)
         wt = self.window_tokens(thread_id)
-        if wt >= b.soft_budget and (st.tokens_since_compaction >= b.compaction_step or wt >= b.current_budget):
+        if b.retroactive_shed and wt >= b.soft_budget and (st.tokens_since_compaction >= b.compaction_step
+                                                            or wt >= b.current_budget):
             self.compact(thread_id)
             wt = self.window_tokens(thread_id)
         if wt >= b.current_budget:
@@ -376,35 +470,38 @@ class ContextManager:
         réservoir et sont remplacés par un stub. Événement discret, persisté : la vue reste append-only entre deux.
         Renvoie le nombre de résultats délestés."""
         with self._lock(thread_id):
-            st = self.state(thread_id)
-            b = self.budgets
-            turns = self._history_from(thread_id, st.base_turn)
-            candidates = turns[: max(0, len(turns) - b.keep_last_turns_raw)]
-            n = 0
-            for t in candidates:
-                for m in t.messages:
-                    if m.role != "tool" or not m.tool_call_id:
-                        continue
-                    key = shed_key(t.index, m.tool_call_id)
-                    tokens = estimate_tokens(m.content)
-                    if key in st.shed or tokens < b.shed_min_tokens:
-                        continue
-                    item = self.reservoir.find(thread_id, t.index, m.tool_call_id)
-                    if item is None:
-                        item = ReservoirItem(id=new_reservoir_id(), thread_id=thread_id, kind="tool_result",
-                                             name=m.name or "", content=self._clean(m.content),
-                                             preview=clip(self._clean(m.content), 500), tokens=tokens,
-                                             turn_index=t.index, call_id=m.tool_call_id, created_at=self.clock())
-                        self.reservoir.put(item)
-                    st.shed[key] = stub_text(item.id, item.name, item.tokens or tokens, item.preview)
-                    n += 1
-            if candidates:  # les en-têtes des mêmes tours anciens partent au même événement
-                st.heads_shed_before = max(st.heads_shed_before, candidates[-1].index + 1)
-            st.compaction_version += 1
-            st.tokens_since_compaction = 0
-            st.updated_at = self.clock()
-            self.episodes.save_state(st)
-            return n
+            return self._shed(thread_id, self.state(thread_id))
+
+    def _shed(self, thread_id: str, st: ViewState) -> int:
+        """Corps de `compact`, sur un état DÉJÀ obtenu (le bootstrap n'a pas encore le sien dans le magasin)."""
+        b = self.budgets
+        turns = self._history_from(thread_id, st.base_turn)
+        candidates = turns[: max(0, len(turns) - b.keep_last_turns_raw)]
+        n = 0
+        for t in candidates:
+            for m in t.messages:
+                if m.role != "tool" or not m.tool_call_id or m.name == RECALL_TOOL:
+                    continue
+                key = shed_key(t.index, m.tool_call_id)
+                tokens = estimate_tokens(m.content)
+                if key in st.shed or tokens < b.shed_min_tokens:
+                    continue
+                item = self.reservoir.find(thread_id, t.index, m.tool_call_id)
+                if item is None:
+                    item = ReservoirItem(id=new_reservoir_id(), thread_id=thread_id, kind="tool_result",
+                                         name=m.name or "", content=self._clean(m.content),
+                                         preview=clip(self._clean(m.content), 500), tokens=tokens,
+                                         turn_index=t.index, call_id=m.tool_call_id, created_at=self.clock())
+                    self.reservoir.put(item)
+                st.shed[key] = stub_text(item.id, item.name, item.tokens or tokens, item.preview)
+                n += 1
+        if candidates and b.shed_heads:  # les en-têtes des mêmes tours anciens partent au même événement
+            st.heads_shed_before = max(st.heads_shed_before, candidates[-1].index + 1)
+        st.compaction_version += 1
+        st.tokens_since_compaction = 0
+        st.updated_at = self.clock()
+        self.episodes.save_state(st)
+        return n
 
     # ───────────────────────────── ce que le modèle voit ─────────────────────────────
 
@@ -420,9 +517,25 @@ class ContextManager:
     def admit_result_in(self, thread_id: str, turn_index: int, result: ToolResult) -> ToolResult:
         """Admission : un résultat de plus de `reservoir_min_tokens` est rangé EN ENTIER au réservoir ; le contexte ne
         garde qu'un extrait et l'identifiant (le résultat est déjà caviardé par l'appelant)."""
-        tokens = estimate_tokens(result.content)
-        if tokens < self.budgets.reservoir_min_tokens:
+        if result.name == RECALL_TOOL:  # déjà borné par `max_chars` : en clair dans la fenêtre, jamais réadmis
             return result
+        b = self.budgets
+        tokens = estimate_tokens(result.content)
+        if tokens < b.reservoir_min_tokens:
+            # Résultat « moyen » : sa forme FINALE est décidée maintenant (jamais réécrite ensuite, `retroactive_shed`
+            # faux) selon un budget par tour ; au-delà, stub + extrait comme un gros résultat. Un extrait qui ne
+            # raccourcit presque rien (< 30 %) n'a pas de sens : le résultat reste en clair.
+            if b.retroactive_shed or tokens < b.shed_min_tokens:
+                return result
+            if len(self._admitted) > 256:
+                self._admitted.clear()
+            key = (thread_id, turn_index)
+            used = self._admitted.get(key, 0)
+            if used + tokens <= b.admit_turn_budget:
+                self._admitted[key] = used + tokens
+                return result
+            if len(result.content) * 0.7 <= b.reservoir_excerpt_chars:  # l'extrait ne raccourcirait presque rien
+                return result
         item = ReservoirItem(id=new_reservoir_id(), thread_id=thread_id, kind="tool_result", name=result.name,
                              content=self._clean(result.content), preview=clip(self._clean(result.content), 500),
                              tokens=tokens, turn_index=turn_index, call_id=result.call_id or None,
@@ -449,9 +562,13 @@ class ContextManager:
         n = (ep.last_turn - ep.first_turn + 1) if ep.last_turn is not None else 0
         return f"- {ep.id} (#{ep.seq + 1}, {ep.day or '?'}, {n} tours) « {ep.title} » — {body}"
 
-    def memory_block(self, thread_id: str) -> str:
+    def memory_block(self, thread_id: str, recall_available: bool = True) -> str:
         """Couche 3 : résumés des derniers épisodes clos + épisodes épinglés + index des plus anciens. Ne change qu'à
-        la clôture d'un épisode ou à un (dés)épinglage : le préfixe de cache reste valide entre-temps."""
+        la clôture d'un épisode ou à un (dés)épinglage : le préfixe de cache reste valide entre-temps.
+
+        `recall_available` : `recall_context` est-il dans le catalogue du fil ? (l'appelant le sait : `deny_tools`, source
+        d'outils absente). Faux : la balise `[Mémoire de la session]` et le contenu restent, SANS la ligne d'invitation
+        (elle nommerait un outil absent)."""
         b = self.budgets
         closed = self.episodes.list(thread_id, closed_only=True)
         if not closed:
@@ -474,9 +591,14 @@ class ContextManager:
                 covered.update(d.episode_ids)
         day_lines.reverse()
         rest = [e for e in older if e.id not in covered]
-        budget_chars = b.episodes_budget * 4
-        header = ("[Mémoire de la session]\n(La fenêtre ne montre que l'épisode courant : pour toute information absente, "
-                  "appelle recall_context(query) AVANT de répondre que tu ne sais pas.)")
+        budget_chars = int(b.episodes_budget * MEMORY_CHARS_PER_TOKEN)
+        if not recall_available:
+            header = "[Mémoire de la session]"
+        elif b.direct_recall_hint:  # invitation directe, dans la langue du tour (`model_texts.SESSION_MEMORY_HINT`)
+            header = "[Mémoire de la session]\n" + mt.pick(mt.SESSION_MEMORY_HINT, current_lang())
+        else:
+            header = ("[Mémoire de la session]\n(La fenêtre ne montre que l'épisode courant : pour toute information absente, "
+                      "appelle recall_context(query) AVANT de répondre que tu ne sais pas.)")
         index_line = self._index_line(rest, thread_id) if rest else ""
         durs = self._durable_lines(thread_id, int(budget_chars * 0.15))  # [] drapeau éteint
         cons = self._constraint_lines(thread_id, int(budget_chars * 0.25))
@@ -488,9 +610,28 @@ class ContextManager:
         lines = [self._fmt(e, cap) for e in chosen]
         # Exigences puis revirements juste après l'en-tête (la coupe de sûreté ci-dessous ne peut pas les emporter),
         # dans cet ordre : un revirement plus récent l'emporte sur une exigence.
-        text = "\n".join([header, *durs, *cons, *revs, *day_lines, *lines, *([index_line] if index_line else []),
-                          "[/Mémoire]"])
+        text = neutralize_date(neutralize_env("\n".join([header, *durs, *cons, *revs, *day_lines, *lines,
+                                                      *([index_line] if index_line else []), "[/Mémoire]"])))
         return text if len(text) <= budget_chars + 200 else text[: budget_chars + 150] + "\n[/Mémoire]"
+
+    def frozen_memory_block(self, thread_id: str, recall_available: bool = True) -> str:
+        """`memory_block` FIGÉ entre deux événements de la mémoire de session (clôture d'un épisode, épinglage) : le texte
+        envoyé au modèle ne change pas quand un résumé est raffiné, qu'un résumé de jour est (re)calculé ou qu'un index
+        bouge, il n'est donc jamais réécrit dans la requête (cache). En mémoire du processus : après un redémarrage il
+        est recalculé une fois (les résumés raffinés entrent alors).
+
+        `recall_available` n'entre PAS dans la clé du figement : sa valeur est prise au figement et le bloc ne change pas
+        si la disponibilité varie ensuite (cache de préfixe intact ; `deny_tools` est posé à l'ouverture de la session,
+        en pratique constant sur la vie du fil)."""
+        with self._lock(thread_id):
+            st = self.state(thread_id)
+            key = (tuple(e.id for e in self.episodes.list(thread_id, closed_only=True)), tuple(st.pinned_episodes))
+            hit = self._mem_snap.get(thread_id)
+            if hit is not None and hit[0] == key:
+                return hit[1]
+            text = self.memory_block(thread_id, recall_available)
+            self._mem_snap[thread_id] = (key, text)
+            return text
 
     def revocations(self, thread_id: str) -> list[tuple[Turn, Episode]]:
         """Les tours de revirement (`text.is_revocation`) des épisodes clos, du plus ancien au plus récent."""
@@ -513,6 +654,18 @@ class ContextManager:
             out.append(line)
             used += len(line) + 1
         return [REVOCATION_HEADER, *reversed(out)] if out else []
+
+    def open_revisions(self, thread_id: str) -> list[tuple[Turn, Episode]]:
+        """Les tours de revirement ou de RÉVISION DE VALEUR (« on passe de 1e-3 à 2e-4 ») de l'épisode OUVERT, du plus ancien
+        au plus récent : lus dans la fenêtre à chaque appel (jamais dans le bloc figé de couche 3). Ils disent que ce qu'un
+        épisode clos affirme a changé depuis. Vide si `revision_markers` est faux."""
+        if not self.budgets.revision_markers:
+            return []
+        ep = self.episodes.current(thread_id)
+        if ep is None or ep.last_turn is None:
+            return []
+        return [(t, ep) for t in self._history_from(thread_id, ep.first_turn)
+                if t.index <= ep.last_turn and self._is_rev(t.input.text or "")]
 
     def constraints(self, thread_id: str) -> list[tuple[Turn, Episode]]:
         """Les tours qui posent une exigence de préservation (`text.is_constraint`, hors revirements) dans les
@@ -628,11 +781,11 @@ class ContextManager:
             span = f"T{e.first_turn}-T{e.last_turn}" if e.last_turn is not None else f"T{e.first_turn}"
             lines.append(f"- {e.id} (#{e.seq + 1}, {span}, {e.day or '?'}, {n} tours) « {clip(e.title, 60)} » — "
                          f"{best or clip(e.summary, 300)} (pertinence {score:.2f})")
-        revs = self.revocations(thread_id)
+        revs = self.revocations(thread_id) + self.open_revisions(thread_id)  # + celles de l'épisode ouvert (dans la fenêtre)
         rev_ids = {t.index for t, _ in revs}
         if found:
             lines.append("Messages retrouvés :")
-            lines.extend(self._fmt_turn_hit(sc, t, ep) + (" — REVIREMENT : remplace ce qui précède sur ce sujet"
+            lines.extend(self._fmt_turn_hit(sc, t, ep) + (f" — {mt.pick(mt.RECALL_REVISION, current_lang())}"
                                                           if t.index in rev_ids else "") for sc, t, ep in found)
         oldest = min([e.first_turn for e, _ in hits] + [t.index for _, t, _ in found])
         shown = {t.index for _, t, _ in found}
@@ -642,7 +795,7 @@ class ContextManager:
                          "sujet et fait foi : " + " ; ".join(
                              f"T{t.index} « {clip(self._clean(revocation_sentences(t.input.text)), 160)} »"
                              for t, _ in later))
-        return "[Épisodes pertinents]\n" + "\n".join(lines) + "\n[/Épisodes]"
+        return neutralize_date(neutralize_env("[Épisodes pertinents]\n" + "\n".join(lines) + "\n[/Épisodes]"))
 
     def _hit_body(self, e: Episode, query: str, hit: Any = None) -> str:
         """Corps d'un épisode retrouvé, commun au bloc `[Épisodes pertinents]` et à `recall_context(query)` : l'extrait
@@ -761,14 +914,50 @@ class ContextManager:
                     ep = self.episodes.get(h.episode_id)
                     if ep is not None and ep.thread_id == thread_id and not any(ep.id in ln for ln in lines):
                         lines.append(f"{self._fmt(ep, 200)} (sémantique {h.score:.2f})")
-            lines += self.search_turns(thread_id, query, k=5)
-            q = set(content_words(query)) - self._qstop
-            for it in self.reservoir.list(thread_id, limit=200):
-                hay = set(content_words(f"{it.name} {it.preview}"))
-                if q and len(q & hay) / len(q) >= 0.5:
-                    lines.append(f"- {it.id} ({it.kind}, {it.tokens} tokens) {it.name} — {clip(it.preview, 160)}")
-            return "\n".join(lines[:8]) if lines else "Rien de pertinent trouvé dans la mémoire de ce fil."
+            if not self.budgets.recall_recent_first:  # ancien ordre : épisodes, messages, réservoir (par pertinence)
+                lines += self.search_turns(thread_id, query, k=5)
+                q = set(content_words(query)) - self._qstop
+                for it in self.reservoir.list(thread_id, limit=200):
+                    hay = set(content_words(f"{it.name} {it.preview}"))
+                    if q and len(q & hay) / len(q) >= 0.5:
+                        lines.append(f"- {it.id} ({it.kind}, {it.tokens} tokens) {it.name} — {clip(it.preview, 160)}")
+                return "\n".join(lines[:8]) if lines else "Rien de pertinent trouvé dans la mémoire de ce fil."
+            return self._recall_recent_first(thread_id, query, lines)
         return "recall_context : donner `ref` (ep_…, rs_…, dy_…) ou `query`."
+
+    def _recall_recent_first(self, thread_id: str, query: str, episode_lines: list[str]) -> str:
+        """`recall_context(query)` rendu du plus RÉCENT au plus ancien : quand une valeur a été révisée, la dernière version
+        est la première lue. Les 8 meilleures lignes (même sélection que l'ancien ordre : épisodes, messages retrouvés,
+        réservoir, puis les révisions de l'épisode ouvert) sont triées par numéro de tour décroissant ; les extraits du
+        réservoir portent leur jour."""
+        keyed: list[tuple[int, str]] = []
+        by_id = {e.id: e for e in self.episodes.list(thread_id, closed_only=True)}
+        for ln in episode_lines:
+            eid = next((i for i in by_id if i in ln), "")
+            ep = by_id.get(eid)
+            keyed.append(((ep.last_turn if ep is not None and ep.last_turn is not None else -1), ln))
+        for sc, t, ep in self._scored_turns(thread_id, query, 5, 0.34):
+            keyed.append((t.index, self._fmt_turn_hit(sc, t, ep)
+                          + (f" — {mt.pick(mt.RECALL_REVISION, current_lang())}" if self._is_rev(t.input.text or "") else "")))
+        q = set(content_words(query)) - self._qstop
+        for it in self.reservoir.list(thread_id, limit=200):
+            hay = set(content_words(f"{it.name} {it.preview}"))
+            if q and len(q & hay) / len(q) >= 0.5:
+                day = day_of(it.created_at) if it.created_at else "?"
+                keyed.append((it.turn_index if it.turn_index is not None else -1,
+                              f"- {it.id} ({it.kind}, {it.tokens} tokens, {day}) {it.name} — {clip(it.preview, 160)}"))
+        terms = set(episode_index.query_terms(query, extra_stop=self._qstop))
+        recent: list[tuple[int, str]] = []
+        for t, ep in self.open_revisions(thread_id)[::-1]:  # l'épisode ouvert est dans la fenêtre : ses révisions seules comptent
+            text = t.input.text or ""
+            if terms & (set(content_words(text)) | set(distinctive_words(text))):
+                recent.append((t.index, f"- T{t.index} ({ep.id}, en cours) « {clip(text, 220)} » — "
+                                        f"{mt.pick(mt.RECALL_REVISION, current_lang())}"))
+        recent = recent[:2]  # jamais coupées par le plafond de 8 lignes
+        top = keyed[:max(0, 8 - len(recent))] + recent
+        if not top:
+            return "Rien de pertinent trouvé dans la mémoire de ce fil."
+        return "\n".join(ln for _, ln in sorted(top, key=lambda p: -p[0]))
 
     def _turn_docs(self, thread_id: str) -> list[tuple[Turn, set[str], Episode]]:
         """Index INCRÉMENTAL (en mémoire du processus) des messages utilisateur des épisodes clos : un tour n'est lu
@@ -800,7 +989,10 @@ class ContextManager:
                         idx["durs"].append((t, ep, self._clean(durable)))
                     elif human and is_durable_revocation(text):
                         idx["drevs"].append((t, ep))
-                    if is_revocation(text):
+                    # « Désormais, … doit rester importable » est une EXIGENCE (puis un marqueur de révision par hasard) :
+                    # elle reste une exigence ; seul un revirement classique, ou une révision sans exigence, est un revirement.
+                    revision_only = not is_revocation(text, False)
+                    if self._is_rev(text) and not (revision_only and is_constraint(text)):
                         # Un revirement s'exprime par référence (« reviens au point-virgule », « annule ce
                         # changement-là ») : la conclusion du modèle, qui nomme ce qui a été annulé, porte le
                         # vocabulaire qui manque au message pour qu'une question sur le sujet le retrouve.

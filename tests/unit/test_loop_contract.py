@@ -509,11 +509,12 @@ def test_max_calls_wrap_up_failure_still_escalates_and_closes_the_turn():
 
 def test_max_calls_wrap_up_refused_by_the_gate_escalates_with_the_gate_reason():
     """Revue 20.10 : un refus de la porte bascule sur la conclusion escaladait avec le motif générique « boucle d'outils
-    non terminée » ; le motif de la porte doit arriver à l'humain, comme dans la boucle."""
+    non terminée » ; c'est la porte qui escalade, comme dans la boucle. C7e : la personne ne lit plus l'identifiant de
+    la règle (`domaine:fiscal`, sans libellé ni motif ici) ; le motif brut reste au registre des verdicts."""
     loop_call = Message("assistant", tool_calls=[tc("calendar_list")])
     k, *_ = kernel([loop_call] * 8 + [Message("assistant", "La TVA due est de 77 CHF.")])
     turn = k.run_turn(TurnInput("t1", "quel montant de TVA sur 1000 CHF ?"))  # drapeau fiscal → GatesFake escalade
-    assert turn.escalated and "domaine:fiscal" in turn.reply
+    assert turn.escalated and "domaine:fiscal" not in turn.reply and turn.reply.startswith("Je transmets à Alice")
     assert "boucle d'outils" not in turn.reply and turn.error is None
 
 

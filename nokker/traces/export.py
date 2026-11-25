@@ -47,8 +47,8 @@ FORMAT = "nokker-traces/1"
 # Fils d'un banc, reconnus même sans `meta.bench` (lignes reconstruites depuis `turns`) : `bench-…`, `improve-…`
 # (préfixe du locataire compris, `tn_…:bench-…`). docs/SELF-IMPROVE.md §5.
 BENCH_THREAD_PREFIXES = ("bench-", "improve-")
-APPROVAL_STATES = {"pending": "created", "expired": "created", "approved": "accepted", "executed": "accepted",
-                   "failed": "accepted", "rejected": "refused"}
+APPROVAL_STATES = {"pending": "created", "expired": "created", "approved": "accepted", "executing": "accepted", "executed": "accepted",
+                   "failed": "accepted", "interrupted": "accepted", "rejected": "refused"}
 
 # Signal de l'utilisateur au tour suivant (règles fixes, sans modèle).
 _NO_RE = re.compile(r"^\s*(?:non|no|nope|nein|pas\s+ça|pas\s+du\s+tout|niet)\b", re.IGNORECASE)
@@ -291,7 +291,8 @@ def _reconstruct(turn: dict[str, Any]) -> list[dict[str, Any]]:
                      "secret_seals": {"count": len(t.input.redacted), "names": sorted(t.input.redacted)}
                      if k == 0 else {"count": 0, "names": []},
                      "judge_verdict_v3": None, "turn_error": t.error, "last_call": k == n - 1,
-                     "tenant_type": None, "channel": t.channel, "alignment": "exact" if exact else "approx"},
+                     "tenant_type": None, "channel": t.channel, "alignment": "exact" if exact else "approx",
+                     "model_served": c.model_served, "upstream": c.upstream},
         })
     return out
 
@@ -395,6 +396,8 @@ def export(source: TraceSource, out_dir: str | Path, opts: ExportOptions, *, kno
                                                "channel", "verdict_scope", "alignment", "shadow", "side",
                                                "advisor_tier", "advisor_model", "grader_tier", "grader_model")
                           if k in meta},
+                "model_served": meta.get("model_served"),  # en fin : l'ordre des clés d'avant ne bouge pas ; avant : null
+                "upstream": meta.get("upstream"),  # id de l'amont (en-tête du Router) ; avant : null
             }
             line = {"prompt": prompt, "tools": tools, "completion": completion, "meta": m}
             blob = json.dumps(line, ensure_ascii=False)

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.qa.outcomes import MAX_CRITERIA, RubricError
@@ -38,12 +39,12 @@ class GoalToolSource:
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if name != RUBRIC_TOOL:
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         try:
             g = self.service.propose(ctx.thread_id, ctx.sender or "", arguments.get("criteria"),
                                      str(arguments.get("objective") or ""))
         except RubricError as e:
-            return ToolResult(call_id="", name=name, content=f"refusé : {e}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.TOOL_REFUSED).format(error=e), is_error=True)
         return ToolResult(call_id="", name=name, content=json.dumps(
             {"proposed": [f"C{i}. {t}" for i, t in enumerate(g.proposed or [], 1)], "note": PROPOSED_NOTE},
             ensure_ascii=False))

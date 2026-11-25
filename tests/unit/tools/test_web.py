@@ -194,11 +194,11 @@ def test_web_search_formats_numbered_text_and_embeds_json_payload(monkeypatch):
     finally:
         src.close()
     assert not result.is_error
-    assert "1. A" in result.content
-    marker_start, marker_end = "<!-- nokker:web_search:data -->\n", "\n<!-- /nokker:web_search:data -->"
-    assert marker_start in result.content
-    json_text = result.content.split(marker_start, 1)[1].split(marker_end, 1)[0]
-    payload = json.loads(json_text)
+    # r44 : le modèle reçoit la forme clôturée ; le bloc data part par `ToolResult.data`, jamais dans le texte
+    assert result.content.startswith("Résultats web pour « requête technique sans PII » : 1.\n- 1. https://example.com/a\n")
+    assert '<untrusted-data kind="web:result"' in result.content and "A — sa" in result.content
+    assert "nokker:web_search:data" not in result.content
+    payload = result.data
     assert payload["results"][0]["url"] == "https://example.com/a"
     assert set(payload["results"][0]["engines"]) == {"exa", "parallel"}
     assert sorted(payload["engines_queried"]) == ["exa", "parallel"]
@@ -383,7 +383,8 @@ def test_web_fetch_reads_the_page_directly_before_any_engine(monkeypatch):
         res = src.call("web_fetch", {"urls": ["https://a.example/1"]}, CTX)
     finally:
         src.close()
-    assert not res.is_error and engines == [] and '"engine": "direct"' in res.content
+    assert not res.is_error and engines == [] and res.data["documents"][0]["engine"] == "direct"
+    assert res.content.startswith("Page https://a.example/1 (600 caractères) :") and '"engine"' not in res.content
 
 
 def test_web_fetch_falls_back_to_engines_when_direct_read_fails(monkeypatch):
@@ -393,7 +394,7 @@ def test_web_fetch_falls_back_to_engines_when_direct_read_fails(monkeypatch):
         res = src.call("web_fetch", {"urls": ["https://js-app.example/"]}, CTX)
     finally:
         src.close()
-    assert not res.is_error and '"engine": "exa"' in res.content
+    assert not res.is_error and res.data["documents"][0]["engine"] == "exa" and "Via exa\n\ntexte" in res.content
 
 
 def test_direct_extract_rejects_short_pages_and_keeps_long_ones(monkeypatch):

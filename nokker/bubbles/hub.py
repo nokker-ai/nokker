@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -32,11 +33,15 @@ from nokker.bubbles.producers import Producers
 from nokker.bubbles.types import (
     KINDS, MODES, Bubble, BubbleError, BubbleForbidden, BubbleNotFound, bubble_to_json,
 )
+from nokker.core import person_texts as ptx
+from nokker.core.internal_tiers import FailureLimiter, is_failure_event
+from nokker.core.loop import failure_person_text
 from nokker.core.ports import ToolSpec, call_effect
+from nokker.ledger.turn_cost import is_subagent_thread
 from nokker.core.turn import Decision, Gate, ToolCall, ToolResult, Turn, TurnInput
 from nokker.core.turn_lock import TurnLock, TurnLocks
 from nokker.ledger.prices import load as load_prices
-from nokker.ledger.turn_cost import is_subagent_thread, root_thread, row_from_call, turn_cost
+from nokker.ledger.turn_cost import root_thread, row_from_call, turn_cost
 from nokker.tenancy.context import (
     INTERNAL_TENANT, current_tenant_or_none, scoped_thread_id, tenant_of_thread, tenant_scope,
 )
@@ -49,9 +54,10 @@ NOTIFY_TTL_S = 600.0
 # Bulles que seul le noyau pose (un client reçoit 400 s'il essaie) : notifications, épisodes, pages, relais, plan (X18).
 # `pack_agents` (pack retiré, ses agents créés : désarmer / supprimer / garder) : ses actions touchent des agents.
 KERNEL_KINDS = frozenset({"notify", "episode", "artifact", "handoff", "plan_split", "brief", "pack_agents", "home",
-                          "home_watch", "cast", "pointer"})
+                          "home_watch", "cast", "pointer", "approval", "screen", "browser"})
 SESSION_CHANNEL = "session"
 ARGS_PREVIEW_CHARS = 200
+STARTED_MESSAGE_BYTES = 16 * 1024  # `turn.started.user_message` : borne en octets UTF-8 (au-delà : `truncated: true`)
 TOOL_ARG_CHARS = 2000  # une valeur d'argument dans tool.call (§7.4.2), caviardée puis bornée
 TOOL_PREVIEW_CHARS = 1200  # début du résultat dans tool.result
 
@@ -126,13 +132,26 @@ class BubbleHub:
     user_tenant: Callable[[str | None], str | None] | None = None
     producers: Producers = field(default_factory=Producers)
     kernel: Any = None  # posé après construction du noyau (dépendance circulaire : outils ↔ hub)
+    # Fil « connu » sans ligne au hub (session de code ouverte, tour rangé) : `(fil, appelant) -> bool`, posé par
+    # `serve` ; vrai seulement pour le propriétaire local. Sert aux seules LECTURES (`read_thread`) ; `None` = seules les lignes du hub existent.
+    session_known: Callable[[str, str | None], bool] | None = None
     # Crew minimal (docs/BUBBLES.md §9.4) : posé après construction (même raison que `kernel` ci-dessus,
     # `nokker/api/server.py::serve`) — `None` = activation d'un `agent_draft` refusée (400).
     agents_hub: AgentsHub | None = None
     # Never clear (docs/NEVER-CLEAR.md §3) : `nokker.context.manager.ContextManager` ; posé par `build_kernel`.
     # `None` = les bulles `episode` ne sont pas créées et leur transfert ne copie pas de transcription.
     context_manager: Any = None
+    # Drapeau `approval_bubbles` (posé par `serve`) : bulle `approval` de chaque carte qui revient aux humains, et
+    # bulles `approval` réservées au noyau (ni créées par un client, ni modifiées par le modèle).
+    approval_bubbles: bool = False
+    # Relecture d'une carte par son id (`Approvals.get`, posée par `serve` avec le drapeau) : une bulle `approval` restée
+    # `working` alors que sa carte n'attend plus (expiration que personne n'a lue, mise à jour de bulle perdue) est
+    # recalée à la lecture des bulles du fil. `None` = pas de recalage.
+    card_lookup: Callable[[str], Any] | None = None
     spawn: Callable[[Callable[[], None]], None] = _spawn_thread
+    # Événements d'échec d'un palier interne (`<module>.failed`, `home.judge_failed`) : au plus un par minute, par module et
+    # par raison ; les répétitions supprimées sont comptées dans le suivant (`repeats`). Horloge injectable.
+    failure_limiter: FailureLimiter = field(default_factory=FailureLimiter)
     notify_ttl_s: float = NOTIFY_TTL_S
     clock: Callable[[], float] = time.time
     _locks: TurnLocks = field(default_factory=TurnLocks)  # sans noyau branché seulement (sinon ceux du noyau)
@@ -149,9 +168,14 @@ class BubbleHub:
     plan: Any = None
     # Écrans du foyer (docs/SCREEN-CAST.md, drapeau `local.cast.enabled`) : nokker.cast.service.CastService ; None ailleurs
     cast: Any = None
+    # Écrans du mur (docs/SCREENS.md, lot V7, `ambient.screens.enabled`) : nokker.screens.service.ScreenService
+    screens: Any = None
     # Mode « montre-moi » (docs/SHOW-ME.md, drapeau `show_me`) : nokker.showme.tool.ShowMeSource ; None = éteint, aucune
     # bulle `pointer`
     show_me: Any = None
+    # Bureau, mode session (B2, docs/DESKTOP.md §12) : nokker.desktop.steps.DesktopSteps ; ses pas ouvrent une bulle
+    # `pointer` à cible `desktop`, dont les réponses (Vas-y, moi-même, Arrête) vont au service, jamais en tour du modèle.
+    desktop_steps: Any = None
     # Écriture en direct (X22, §10.7) : (fil, call_id) → bulles `artifact` passées « en cours d'écriture » par cet appel.
     _live_writes: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     _live_guard: threading.Lock = field(default_factory=threading.Lock)
@@ -181,6 +205,24 @@ class BubbleHub:
             self.publish(event_type, payload)
         except Exception:  # noqa: BLE001
             logger.exception("publication de %s impossible", event_type)
+
+    def host_event(self, event_type: str, data: dict[str, Any], thread_id: str | None = None) -> None:
+        """Événement hôte d'un palier interne (`<module>.failed {reason}`, `home.judge_failed`) : `thread_id` posé = les
+        membres du fil ; sinon tout abonné du locataire (aucun filtre de membre). Les champs sont rendus tels quels :
+        l'appelant n'y met jamais d'adresse, de jeton ni de message brut. Un événement d'échec est limité (`failure_limiter`)."""
+        if is_failure_event(event_type):
+            ok, repeats = self.failure_limiter.allow(event_type, str(data.get("reason", "")))
+            if not ok:
+                return
+            if repeats:
+                data = {**data, "repeats": repeats}
+        if thread_id:
+            self._emit(event_type, {"thread_id": thread_id, **data}, self.thread_audience(thread_id))
+        elif self.publish is not None:
+            try:
+                self.publish(event_type, dict(data))
+            except Exception:  # noqa: BLE001
+                logger.exception("publication de %s impossible", event_type)
 
     def thread_audience(self, thread_id: str | None) -> set[str]:
         if not thread_id:
@@ -222,6 +264,23 @@ class BubbleHub:
         if not t.is_member(user):
             raise ThreadForbidden(thread_id)
         return t
+
+    def read_thread(self, thread_id: str, user: str | None, *, owner_scope: bool = False) -> Thread:
+        """Fil à LIRE : celui du hub (membres seulement, comme `require_member`) ; à défaut, un fil connu du noyau local
+        (session de code ouverte ou tour rangé) mais sans ligne au hub, rendu VIDE et propriétaire inconnu : transitoire,
+        jamais créé ni écrit. Réservé à l'appelant de portée `owner` (`owner_scope`, posé par le serveur d'après le jeton :
+        `present`, `kiosk` ou toute autre portée sont refusés), au locataire interne ET à l'appelant que `session_known` admet (le propriétaire
+        local) ; tout autre cas, fil d'un autre locataire ou autre appelant compris, lève le même `ThreadNotFound`
+        qu'un fil inconnu."""
+        t = self.threads.get(thread_id) if _tenant_ok(thread_id) else None
+        if t is not None:
+            if not t.is_member(user):
+                raise ThreadForbidden(thread_id)
+            return t
+        if (owner_scope and self.session_known is not None and _tenant_ok(thread_id)
+                and tenant_of_thread(str(thread_id)) == INTERNAL_TENANT and self.session_known(thread_id, user)):
+            return Thread(id=thread_id)
+        raise ThreadNotFound(thread_id)
 
     def can_write_bubble(self, user: str | None, b: Bubble) -> bool:
         if b.thread_id is None:  # notify sans fil : ses destinataires seulement
@@ -323,18 +382,39 @@ class BubbleHub:
         for t in turns:
             user = {"index": t.index, "role": "user", "content": t.input.text, "sender": t.sender,
                     "channel": t.channel}
+            if getattr(t.input, "origin", ""):  # « approval » : bloc du noyau (suite d'une carte), pas la personne
+                user["origin"] = t.input.origin
             if t.images:  # X7 : références ; octets par GET /v1/threads/{id}/images/{sha256}
                 user["images"] = [i.to_dict() for i in t.images]
+            if getattr(t, "texts", None):  # P9 : pièces de l'appareil ; texte par GET …/attachments/{att_id}
+                user["attachments"] = [{k: x[k] for k in ("id", "kind", "source", "name", "chars")} for x in t.texts]
             out.append(user)
-            out.append({"index": t.index, "role": "assistant", "content": t.reply})
+            assistant = {"index": t.index, "role": "assistant", "content": t.reply}
+            from nokker.cloud import egress as egress_mod
+
+            ex = egress_mod.service()
+            if ex is not None:  # P11 : offres (phone_fetch_offers) et pages par le téléphone (phone_fetched) du tour
+                assistant.update(ex.message_fields(thread_id, t.index))
+            from nokker.cloud import phone_tools
+
+            fw = phone_tools.follow()
+            if fw is not None:  # P7b : tâches du téléphone au-delà de 20 s (bulle phone_task chez le client)
+                assistant.update(fw.message_fields(thread_id, t.index))
+            from nokker.desktop import steps as desktop_steps_mod
+
+            dfw = desktop_steps_mod.follow()
+            if dfw is not None:  # B2 : pas du bureau au-delà de 20 s (même mécanisme, champ desktop_tasks)
+                assistant.update(dfw.message_fields(thread_id, t.index))
+            out.append(assistant)
         return out
 
     # ─────────────────────────────── bulles ───────────────────────────────
 
-    def list_bubbles(self, thread_id: str, user: str | None, include_closed: bool = False
-                     ) -> list[tuple[Bubble, bool]]:
-        self.require_member(thread_id, user)
+    def list_bubbles(self, thread_id: str, user: str | None, include_closed: bool = False,
+                     owner_scope: bool = False) -> list[tuple[Bubble, bool]]:
+        self.read_thread(thread_id, user, owner_scope=owner_scope)
         self.sweep_expired()
+        self.reconcile_cards(thread_id)
         own = [(b, False) for b in self.bubbles.list_thread(thread_id, include_closed)]
         shared = [(b, True) for b in self.bubbles.list_shared_with_thread(thread_id, include_closed)
                   if b.thread_id != thread_id and _tenant_ok(b.thread_id)]
@@ -377,12 +457,127 @@ class BubbleHub:
         self._emit_bubble("bubble.created", b)
         return b
 
-    def notify_user(self, user: str, *, title: str, text: str, from_thread: str | None = None) -> Bubble:
-        """Notification (`notify`, sans fil, §4) à une identité, venue du noyau (brief du matin, X18)."""
+    # ── bulle `approval` d'une décision du relecteur automatique (docs/APPROVALS.md §8) ──
+
+    @staticmethod
+    def _approval_state(a: Any, rollback_applied: bool | None = None) -> dict[str, Any]:
+        rec = dict(getattr(a, "auto_review", None) or {})
+        state: dict[str, Any] = {"approval_id": a.id, "tool_name": a.tool_name, "status": a.status,
+                                 "decision": rec.get("decision"), "decided_via": a.decided_via,
+                                 "reason": rec.get("reason") or "", "revoked": bool(rec.get("revoked_by"))}
+        if rollback_applied is not None:
+            state["rollback_applied"] = rollback_applied
+        return state
+
+    def auto_review_decided(self, turn: Turn, approval: Any) -> None:
+        """Le relecteur automatique a approuvé une carte (et l'outil a tourné) : bulle `approval` dans le fil, état
+        de la décision (`decided_via: auto-review`, raison) ; on la voit et on la révoque depuis le fil. Pas de
+        notification push ; rien de vu par le modèle (bulle du noyau, aucun texte ajouté au tour)."""
+        if approval is None or (approval.auto_review or {}).get("decision") != "approve":
+            return
+        own = self._card_bubble(approval) if self.approval_bubbles else None  # la bulle de la carte, si elle existe
+        if own is not None:
+            self.update_from_kernel(own.id, status="done", state=self._approval_state(approval))
+            return
+        self.create_kernel_bubble(turn.thread_id, kind="approval", title=str(approval.tool_name)[:200],
+                                  status="done", state=self._approval_state(approval))
+
+    # ── bulle `approval` de chaque carte qui revient aux humains (drapeau `approval_bubbles`) ──
+
+    def _card_bubble(self, approval: Any) -> Bubble | None:
+        return next((b for b in self.bubbles.list_thread(approval.thread_id)
+                     if b.kind == "approval" and (b.state or {}).get("approval_id") == approval.id), None)
+
+    @staticmethod
+    def _card_bubble_status(status: str) -> str:
+        """Carte en attente ou en cours d'exécution : `working` ; décidée (approuvée, exécutée, refusée) : `done` ;
+        expirée, en échec ou interrompue (issue inconnue) : `failed`."""
+        return "working" if status in ("pending", "executing") else \
+            "failed" if status in ("expired", "failed", "interrupted") else "done"
+
+    def approval_pending(self, approval: Any) -> None:
+        """La carte part aux humains (`Approvals.notify_pending`, à la pose ou à l'escalade du relecteur) : bulle
+        `approval` dans SON fil, état minimal `{approval_id, tool_name, status}` (la carte se relit par GET), sans
+        notification push. Fil inconnu des bulles (crew, sous-agent…) : rien. Aucun texte vu par le modèle."""
+        if not self.approval_bubbles:
+            return
+        with tenant_scope(tenant_of_thread(approval.thread_id)):
+            if self.threads.get(approval.thread_id) is None:
+                return
+            state = {"approval_id": approval.id, "tool_name": approval.tool_name, "status": approval.status}
+            own = self._card_bubble(approval)
+            if own is not None:
+                self.update_from_kernel(own.id, state={**(own.state or {}), **state},
+                                        status=self._card_bubble_status(approval.status))
+                return
+            self.create_kernel_bubble(approval.thread_id, kind="approval", title=str(approval.tool_name)[:200],
+                                      status=self._card_bubble_status(approval.status), state=state)
+
+    def approval_card_changed(self, approval: Any) -> None:
+        """Décision, exécution, échec, expiration : `bubble.updated` de la bulle de la carte (statut, moyen de la
+        décision). Pas de bulle (drapeau éteint, carte jamais passée aux humains) : rien."""
+        if not self.approval_bubbles:
+            return
+        with tenant_scope(tenant_of_thread(approval.thread_id)):
+            own = self._card_bubble(approval)
+            if own is None:
+                return
+            state = {**(own.state or {}), "status": approval.status}
+            if getattr(approval, "decided_via", None):
+                state["decided_via"] = approval.decided_via
+            if approval.status == "interrupted":  # texte vu de la personne seulement (langue du contexte, sinon français)
+                state["note"] = ptx.pick(ptx.APPROVAL_INTERRUPTED)
+            self.update_from_kernel(own.id, state=state, status=self._card_bubble_status(approval.status))
+
+    def reconcile_cards(self, thread_id: str) -> int:
+        """Filet de la bulle `approval` : celles encore `working` dont la carte n'est plus `pending` (la relecture fait
+        elle-même expirer une carte périmée) sont recalées sur l'état de la carte. Idempotent (une bulle terminée n'est
+        jamais relue), silencieux si la carte ou la bulle manque, et n'élève jamais : la lecture des bulles passe
+        toujours. Rend le nombre de bulles recalées."""
+        if not self.approval_bubbles or self.card_lookup is None:
+            return 0
+        n = 0
+        try:
+            with tenant_scope(tenant_of_thread(thread_id)):
+                for b in self.bubbles.list_thread(thread_id):
+                    aid = (b.state or {}).get("approval_id")
+                    if b.kind != "approval" or b.status != "working" or not aid:
+                        continue
+                    try:
+                        card = self.card_lookup(str(aid))
+                        if card is None or card.status in ("pending", "executing"):
+                            continue
+                        self.approval_card_changed(card)
+                        n += 1
+                    except Exception:  # noqa: BLE001 — une bulle ratée ne bloque ni les autres ni la lecture
+                        logger.exception("recalage de la bulle de la carte %s en échec", aid)
+        except Exception:  # noqa: BLE001 — le recalage ne bloque jamais la lecture des bulles
+            logger.exception("recalage des bulles de carte du fil %s en échec", thread_id)
+        return n
+
+    def approval_changed(self, approval: Any, *, rollback_applied: bool | None = None) -> int:
+        """Révocation ou restauration : met à jour les bulles `approval` de cette carte dans son fil
+        (`bubble.updated`). Rend le nombre de bulles touchées."""
+        n = 0
+        for b in self.bubbles.list_thread(approval.thread_id):
+            if b.kind == "approval" and (b.state or {}).get("approval_id") == approval.id:
+                prev = (b.state or {}).get("rollback_applied")
+                self.update_from_kernel(b.id, state=self._approval_state(
+                    approval, rollback_applied if rollback_applied is not None else prev))
+                n += 1
+        return n
+
+    def notify_user(self, user: str, *, title: str, text: str, from_thread: str | None = None,
+                    extra: dict[str, Any] | None = None) -> Bubble:
+        """Notification (`notify`, sans fil, §4) à une identité, venue du noyau (brief du matin, X18). `extra` : clés
+        de plus dans l'état (notification d'une machine liée : `event`, `origin`, `origin_thread`, `link`), sans
+        jamais remplacer les clés de base."""
         src = self.threads.get(from_thread) if from_thread else None
+        state = {"from_thread": from_thread, "from_title": src.title if src else title,
+                 "to_thread": None, "text": self._scrub(text)[:280], "actions": []}
+        state = {**{k: v for k, v in (extra or {}).items() if k not in state}, **state}
         b = self.bubbles.create(thread_id=None, kind="notify", title=title[:200], status="done",
-                                state={"from_thread": from_thread, "from_title": src.title if src else title,
-                                       "to_thread": None, "text": self._scrub(text)[:280], "actions": []},
+                                state=state,
                                 created_by="nina", shared_members=[user])
         self._emit_bubble("bubble.created", b)
         return b
@@ -444,6 +639,22 @@ class BubbleHub:
                 return 0
             for b in self.bubbles.list_thread(thread_id):
                 if b.kind == "cast" and b.closed_at is None and (b.state or {}).get("cast_id") == cast_id:
+                    self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
+                    n += 1
+        return n
+
+    def screen_changed(self, screen_id: str, thread_id: str) -> int:
+        """Écran du mur changé hors d'un tour (carte décidée, retrait) : la bulle `screen` suit."""
+        if self.screens is None:
+            return 0
+        n = 0
+        tenant = tenant_of_thread(thread_id)
+        with tenant_scope(tenant):
+            state = self.screens.bubble_state(self.screens.tenant(), screen_id)
+            if state is None:
+                return 0
+            for b in self.bubbles.list_thread(thread_id):
+                if b.kind == "screen" and b.closed_at is None and (b.state or {}).get("screen_id") == screen_id:
                     self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
                     n += 1
         return n
@@ -599,6 +810,24 @@ class BubbleHub:
             if state:
                 self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
             return {"cast": {k: v for k, v in state.items() if k != "html"}}
+        if b.kind == "pointer" and ((b.state or {}).get("target") or {}).get("kind") == "desktop":
+            return self._desktop_step_action(b, user, action_id)
+        if b.kind == "screen":
+            # Écran du mur (docs/SCREENS.md) : « Publier sur le mur » pose une carte forte ; « Retirer du mur ». Geste
+            # de la personne qui a composé l'écran (contrôlé par le service), jamais un tour.
+            if action_id not in ("publish", "unpublish"):
+                raise BubbleNotFound(f"action inconnue : {action_id}")
+            if self.screens is None:
+                raise BubbleError("écrans du mur non configurés")
+            try:
+                state = self.screens.bubble_action(self.screens.tenant(), dict(b.state or {}), action_id, user)
+            except LookupError as e:
+                raise BubbleNotFound(str(e)) from None
+            except PermissionError as e:
+                raise BubbleForbidden(str(e)) from None
+            if state:
+                self.update_from_kernel(b.id, state=state, status=state.get("bubble_status"))
+            return {"screen": {k: v for k, v in state.items() if k != "html"}}
         if b.kind == "pointer":
             return self._pointer_action(b, user, action_id)
         if b.kind == "agent_draft":
@@ -628,9 +857,18 @@ class BubbleHub:
         if action is None:
             raise BubbleNotFound(f"action inconnue : {action_id}")
         # Jamais en direct : l'action devient un tour du fil, soumis aux portes et aux approbations.
-        text = f"[Action « {action.get('label') or action_id} » demandée sur la bulle « {b.title} » ({b.id})]"
-        self._run_background_turn(b.thread_id, text, user)
+        text, meta = self._action_text(b, action, action_id)
+        self._run_background_turn(b.thread_id, text, user, attached=meta)
         return {"accepted": True, "thread_id": b.thread_id}
+
+    @staticmethod
+    def _action_text(b: Bubble, action: dict[str, Any], action_id: str) -> tuple[str, str]:
+        """(texte du fil, bloc du modèle) d'une action de bulle : la personne lit le libellé de SON bouton, sans
+        identifiant ni titre (le titre vient d'un outil, pas de sa langue) ; l'id et le titre vont au modèle dans le bloc
+        joint (`TurnInput.attached`), qu'il lit mais que le fil n'affiche pas."""
+        label = re.sub(r"[«»\[\]]", "", str(action.get('label') or action_id)).strip() or action_id  # ne casse pas le format
+        return (f"[Action « {label} » demandée sur la bulle]",
+                f"[Bulle « {b.title} » ({b.id})]")
 
     def _pointer_action(self, b: Bubble, user: str | None, action_id: str) -> dict[str, Any]:
         """Réponse de la personne à un repère (docs/SHOW-ME.md §3) : « Fait » ou « Je ne trouve pas ». Membre du fil en
@@ -647,9 +885,38 @@ class BubbleHub:
             self._close(b.id)
         else:
             self.update_from_kernel(b.id, state={"waiting": True, "answer": action_id})
-        text = f"[Action « {action.get('label') or action_id} » demandée sur la bulle « {b.title} » ({b.id})]"
-        self._run_background_turn(b.thread_id, text, user)
+        text, meta = self._action_text(b, action, action_id)
+        self._run_background_turn(b.thread_id, text, user, attached=meta)
         return {"accepted": True, "thread_id": b.thread_id, "closed": last}
+
+    def _desktop_step_action(self, b: Bubble, user: str | None, action_id: str) -> dict[str, Any]:
+        """Réponse à un pas du bureau (docs/DESKTOP.md §12.1) : membre du fil en écriture seulement (`_writable`, appelé
+        par `action`) ; la décision va au service des pas — jamais un tour du modèle (le résultat arrive dans le tour
+        en cours, ou dans le tour de suite écrit par le noyau)."""
+        if self.desktop_steps is None:
+            raise BubbleError("bureau en mode session éteint")
+        step_id = str((b.state or {}).get("step_id") or "")
+        try:
+            return self.desktop_steps.answer(step_id, user, action_id)
+        except LookupError as e:
+            raise BubbleNotFound(str(e)) from None
+
+    def desktop_step_opened(self, step: Any, state: dict[str, Any]) -> str:
+        """Le service ouvre un pas : UNE bulle `pointer` par pas (cible `desktop`), créée par le noyau."""
+        from nokker.desktop.steps import ACTIONS
+
+        if self.threads.get(step.thread_id) is None:
+            self.threads.ensure(step.thread_id, step.sender, "")
+        title = str(state.pop("title", "") or "")
+        b = self.bubbles.create(thread_id=step.thread_id, kind="pointer", title=title, state=state, status="idle",
+                                actions=[dict(a) for a in ACTIONS], created_by="nina")
+        self._emit_bubble("bubble.created", b)
+        return b.id
+
+    def desktop_step_update(self, bubble_id: str, state: dict[str, Any], close: bool) -> None:
+        self.update_from_kernel(bubble_id, state=state, status="working" if state.get("waiting") else "idle")
+        if close:
+            self._close(bubble_id)
 
     def _pointer_shown(self, turn: Turn) -> str | None:
         """Repère posé par `point_at` dans ce tour → LA bulle `pointer` du fil (créée, ou mise à jour à chaque étape)."""
@@ -735,7 +1002,7 @@ class BubbleHub:
         return b
 
     def _run_background_turn(self, thread_id: str, text: str, sender: str | None, *,
-                             reply_to: str | None = None) -> None:
+                             reply_to: str | None = None, attached: str = "") -> None:
         """Tour en tâche de fond dans `thread_id` (canal `session`) ; si `reply_to`, la réponse revient à ce
         fil comme un message de session. Un tour lancé ainsi ne peut pas relancer `ask` (pas de ping-pong)."""
         kernel = self.kernel
@@ -746,7 +1013,7 @@ class BubbleHub:
             try:
                 with self.thread_lock(thread_id):
                     turn = kernel.run_turn(TurnInput(thread_id=thread_id, user_text=text, channel=SESSION_CHANNEL,
-                                                     sender=sender))
+                                                     sender=sender, attached=attached))
                 if reply_to:
                     dest = self.threads.get(reply_to)
                     src = self.threads.get(thread_id)
@@ -788,6 +1055,11 @@ class BubbleHub:
     def tool_bubble_update(self, thread_id: str, bubble_id: str, *, title: str | None = None,
                            state: dict[str, Any] | None = None, status: str | None = None) -> Bubble:
         b = self.bubbles.require(bubble_id)
+        if b.kind == "approval":
+            # Bulle d'une carte : tenue par le noyau seul. Pour le modèle, elle n'existe pas, dans son fil comme ailleurs
+            # (classe et texte EXISTANTS, aucun mot nouveau vu par le modèle) ; il n'en voit jamais l'id (les bulles du
+            # fil n'entrent pas dans son contexte, bubble_show ne rend que la bulle qu'il crée).
+            raise BubbleNotFound(bubble_id)
         if b.thread_id != thread_id:
             raise BubbleForbidden("cette bulle n'appartient pas au fil courant")
         return self.update_from_kernel(bubble_id, title=title, state=state, status=status)
@@ -802,13 +1074,51 @@ class BubbleHub:
         if t is None:
             t, _ = self.threads.ensure(turn.thread_id, turn.sender, turn.input.text)
         audience = t.audience()
-        self._emit("turn.started", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn)}, audience)
+        data: dict[str, Any] = {"thread_id": turn.thread_id, "turn_id": _turn_id(turn)}
+        data.update(self._started_message(turn))
+        self._emit("turn.started", data, audience)
         self._emit_thread(self.threads.update(turn.thread_id, working=True))
+
+    def _started_message(self, turn: Turn) -> dict[str, Any]:
+        """Champs `user_message` (et `truncated`) de `turn.started` : le texte de la personne TEL QUE le fil le garde
+        (`turn.input.text`, déjà caviardé à l'entrée par le noyau, puis recaviardé ici comme tout texte publié), borné à
+        `STARTED_MESSAGE_BYTES` octets UTF-8 (coupe sur une frontière de caractère, `truncated: true`). Rien pour un
+        sous-agent (`<fil>/sa-…`, la consigne vient du modèle), pour un tour écrit par le noyau (`input.origin`
+        non vide : carte décidée, page jointe, suite d'une tâche) ni pour un message vide. Jamais le contenu des pièces."""
+        if is_subagent_thread(turn.thread_id) or getattr(turn.input, "origin", ""):
+            return {}
+        text = self._scrub(str(turn.input.text or ""))
+        if not text.strip():
+            return {}
+        raw = text.encode("utf-8")
+        if len(raw) <= STARTED_MESSAGE_BYTES:
+            return {"user_message": text}
+        return {"user_message": raw[:STARTED_MESSAGE_BYTES].decode("utf-8", errors="ignore"), "truncated": True}
 
     def attachment_skipped(self, turn: Turn, count: int, reason: str) -> None:
         """Images jointes non lues par le modèle (X7, docs/LOKKAL.md §7.6) : `reason` = "no_vision"."""
         self._emit("attachment.skipped", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn), "count": count,
                                           "reason": reason}, self.thread_audience(turn.thread_id))
+
+    def turn_reasoning(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Réflexion d'un appel modèle (drapeau `host_reasoning_stream`, docs/NOKKAN-HOST-API.md §3) : `turn.reasoning`
+        `{thread_id, turn_id, call_index, text}`, texte déjà caviardé par le noyau (recaviardé ici, comme tout texte
+        publié). Un champ à part : `turn.delta` ne porte jamais de réflexion. Appelé seulement drapeau allumé."""
+        self._emit("turn.reasoning", {"thread_id": turn.thread_id, "turn_id": _turn_id(turn),
+                                      "call_index": int(data.get("call_index") or 0),
+                                      "text": self._scrub(str(data.get("text") or ""))},
+                   self.thread_audience(turn.thread_id))
+
+    def question_asked(self, turn: Turn, question: dict[str, Any]) -> None:
+        """Question à choix posée par `clarify` (drapeau `host_clarify_options`, docs/NOKKAN-HOST-API.md §1) :
+        `question.asked`, avec ses options et l'option « Autre ». Appelé par le noyau seulement quand le drapeau est
+        allumé ; textes déjà caviardés par le tableau des questions."""
+        self._emit("question.asked", dict(question), self.thread_audience(turn.thread_id))
+
+    def question_closed(self, question: dict[str, Any]) -> None:
+        """Question répondue (route, bouton, ou message de la personne) ou remplacée : `question.answered` porte
+        `status` (`answered` | `superseded`) et la réponse."""
+        self._emit("question.answered", dict(question), self.thread_audience(str(question.get("thread_id") or "")))
 
     def tool_call(self, turn: Turn, call: ToolCall) -> None:
         self._tool_t0[(turn.thread_id, call.id)] = time.monotonic()
@@ -838,6 +1148,51 @@ class BubbleHub:
 
     def turn_steered(self, turn: Turn, data: dict[str, Any]) -> None:
         self._turn_event("turn.steered", turn, data)
+
+    def mcp_server_unavailable(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Un serveur MCP ne répond pas : ses outils sont retirés pour ce tour (`{server, reason}`, raison sans secret)."""
+        self._turn_event("mcp.server_unavailable", turn, {"server": str(data.get("server", "")),
+                                                          "reason": self._scrub(str(data.get("reason", "")))})
+
+    def route_model_mismatch(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Le modèle renvoyé par l'amont n'est pas celui du palier (repli d'un routeur, docs/HOST-EMBED.md §11) :
+        `route.model_mismatch` `{tier, model_expected, model_served, call_id, upstream?}`. Information seulement, le tour continue."""
+        self._turn_event("route.model_mismatch", turn, {
+            "tier": str(data.get("tier", ""))[:40], "model_expected": str(data.get("model_expected", ""))[:200],
+            "model_served": str(data.get("model_served", ""))[:200], "call_id": str(data.get("call_id", ""))[:40],
+            **({"upstream": str(data["upstream"])[:200]} if data.get("upstream") else {})})
+
+    def route_fallback(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Palier demandé indisponible, le noyau a répondu avec un autre (docs/CLIENT-API.md) : `route.fallback`
+        `{from, to, reason}` (`reason` courte, caviardée). Information seulement, le tour continue."""
+        self._turn_event("route.fallback", turn, {
+            "from": str(data.get("from", ""))[:40], "to": str(data.get("to", ""))[:40],
+            "reason": self._scrub(str(data.get("reason", "")))[:200]})
+
+    def mcp_required_unavailable(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Un serveur MCP INDISPENSABLE à la session (`mcp_required`) ne répond pas : le tour échoue avant le modèle
+        (`{servers: [{server, reason}]}`, raisons sans secret). La bulle d'erreur est celle de `turn.done` (même code)."""
+        servers = [{"server": str(s.get("server", "")), "reason": self._scrub(str(s.get("reason", "")))}
+                   for s in (data.get("servers") or []) if isinstance(s, dict)]
+        self._turn_event("mcp.required_unavailable", turn, {"servers": servers})
+
+    def turn_text_toolcall_retry(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Le modèle a écrit un appel d'outil en texte : le noyau relance l'appel UNE fois (`turn.text_toolcall_retry`
+        `{thread_id, turn_id, kind}`, `kind` = `tool_input` | `appel_outil`). Jamais le contenu. Information seulement."""
+        self._turn_event("turn.text_toolcall_retry", turn, {"kind": str(data.get("kind", ""))[:20]})
+
+    def turn_truncated(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Réponse coupée par la limite de longueur, relances épuisées : `turn.truncated` `{thread_id, turn_id, reasoning,
+        retries}` (`reasoning` : la réflexion était active, le tour échoue en `length_truncated` sans afficher le texte).
+        Une fois par tour, information seulement."""
+        self._turn_event("turn.truncated", turn, {"reasoning": bool(data.get("reasoning")),
+                                                  "retries": int(data.get("retries") or 0)})
+
+    def tool_loop_guard(self, turn: Turn, data: dict[str, Any]) -> None:
+        """Garde-fou contre les boucles d'outils de lecture (docs/HOST-EMBED.md §14) : `tool.loop_guard`
+        `{thread_id, turn_id, tool, n, action}` (`action` = `note` | `suspend`) ; jamais d'argument ni de résultat."""
+        self._turn_event("tool.loop_guard", turn, {"tool": str(data.get("tool", ""))[:80], "n": int(data.get("n") or 0),
+                                                   "action": str(data.get("action", ""))})
 
     def turn_steer_dropped(self, turn: Turn, data: dict[str, Any]) -> None:
         self._turn_event("turn.steer_dropped", turn, data)
@@ -911,6 +1266,10 @@ class BubbleHub:
                                 "preview": self._scrub(result.content or "")[:TOOL_PREVIEW_CHARS]}
         if getattr(result, "reason", None):  # refus d'office : motif stable (`plan_mode`…), hors du texte du modèle
             data["reason"] = result.reason
+        if getattr(result, "refused", False):  # refus d'une porte : l'hôte lit `status`, pas `ok` (le modèle garde son résultat)
+            data["status"] = "refused"
+        if getattr(result, "decision_reason", None):  # carte refusée PENDANT le tour, avec le motif de la personne (`reason` = declined)
+            data["decision_reason"] = self._scrub(result.decision_reason)
         self._emit("tool.result", data, self.thread_audience(turn.thread_id))
 
     def direct_result(self, thread_id: str, approval_id: str, name: str, content: str, is_error: bool,
@@ -924,7 +1283,8 @@ class BubbleHub:
                    self.thread_audience(thread_id) or ({owner} if owner else set()))
 
     def approval_result(self, thread_id: str, turn_index: int, call_id: str | None, approval_id: str, name: str,
-                        content: str, is_error: bool, ms: int | None = None, owner: str | None = None) -> None:
+                        content: str, is_error: bool, ms: int | None = None, owner: str | None = None,
+                        refused_reason: str | None = None, decision_reason: str | None = None) -> None:
         """Sortie d'un outil exécuté après sa carte (`ApprovalExecutor`, docs/LOKKAL.md §7.4.9) : `tool.result` du MÊME
         `call_id` que l'appel resté « en attente » dans le tour qui a posé la carte, avec `approval_id` ; le client le
         ferme avec la vraie sortie. `turn_id` = ce tour-là. Caviardé et tronqué comme un `tool.result` de la boucle ;
@@ -937,6 +1297,10 @@ class BubbleHub:
             self._clear_live(thread_id, call_id)
         if ms is not None:
             data["ms"] = ms
+        if refused_reason:  # carte refusée par la personne (n°27 b) : l'hôte lit `status`/`reason`, comme un refus de porte
+            data["status"], data["reason"] = "refused", refused_reason
+            if decision_reason:  # motif donné par la personne avec le refus (champ distinct : `reason` vaut « declined »)
+                data["decision_reason"] = self._scrub(decision_reason)
         self._emit("tool.result", data, self.thread_audience(thread_id) or ({owner} if owner else set()))
 
     def _emit_app(self, turn: Turn, call: ToolCall, app: dict[str, Any]) -> None:
@@ -991,6 +1355,16 @@ class BubbleHub:
                 from nokker.cast.texts import BUBBLE_UPDATED
 
                 return BUBBLE_UPDATED.format(id=b.id)
+        if produced.kind == "screen":  # une bulle par écran : une retouche met la même bulle à jour (docs/SCREENS.md)
+            screen_id = produced.state.get("screen_id")
+            same = next((b for b in self.bubbles.list_thread(turn.thread_id)
+                         if b.kind == "screen" and b.closed_at is None
+                         and (b.state or {}).get("screen_id") == screen_id), None)
+            if same is not None:
+                b = self.update_from_kernel(same.id, state=produced.state, status=produced.status)
+                from nokker.screens.texts import BUBBLE_UPDATED as SCREEN_UPDATED
+
+                return SCREEN_UPDATED.format(id=b.id, version=produced.state.get("version"))
         prev_id = self._turn_search.get(_turn_id(turn)) if produced.kind == "search" else None
         prev = self.bubbles.get(prev_id) if prev_id else None
         if prev is not None and prev.closed_at is None:
@@ -1069,7 +1443,17 @@ class BubbleHub:
             data["cost_chf"] = round(sum(chf), 6)
         if turn.failure:  # le tour a échoué (D7) : code stable + message caviardé
             data["error"] = {"code": str(turn.failure.get("code") or "internal_error"),
-                             "message": self._scrub(str(turn.failure.get("message") or ""))[:500]}
+                             "message": self._scrub(failure_person_text(turn.failure, getattr(turn, "lang", None) or None))[:500]}
+            if turn.failure.get("retry_at"):  # quota d'inférence atteint (`quota_exceeded`) : fin de la période, ISO 8601 UTC
+                data["error"]["retry_at"] = str(turn.failure["retry_at"])
+            if "retry" in turn.failure:  # refus de plafond de session (docs/NOKKAN-HOST-API.md §2) : ne pas réessayer
+                data["error"]["retry"] = bool(turn.failure["retry"])
+                if turn.failure.get("limit"):
+                    data["error"]["limit"] = str(turn.failure["limit"])
+        if turn.fallback:  # repli de palier (Deep -> Ship) : additif, absent sans repli
+            data["fallback"] = {"from": str(turn.fallback.get("from", "")), "to": str(turn.fallback.get("to", ""))}
+        if turn.notice:  # ligne d'état pour la personne, affichée à part par le client ; jamais dans `reply` ni l'historique
+            data["notice"] = turn.notice
         if turn.error == "cancelled":
             data["cancelled"] = True
         if self._refused(turn):

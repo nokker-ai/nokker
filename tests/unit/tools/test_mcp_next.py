@@ -25,12 +25,17 @@ from nokker.threads.memory import InMemoryThreads
 from nokker.tools import mcp_next
 from nokker.tools.mcp import McpToolSource
 from nokker.tools.mcp_apps import APP_CHANNEL, AppRegistry
+from nokker.tools.result_fence import fence_mcp_result
 from nokker.tools.registry import Registry
 from tests.unit.api.test_server import NoEscalator, NullMem
 from tests.unit.bubbles.conftest import Recorder
 from tests.unit.tools.fake_mcp_server import CLOCK_HTML, INLINE_HTML, LEGACY, MODERN, FakeMcpServer
 
 CTX = ToolContext("t1", 0, "api", "alice")
+
+
+def F(tool: str, text: str) -> str:
+    return fence_mcp_result("fake", tool, text)
 
 
 @pytest.fixture
@@ -63,7 +68,8 @@ def test_flags_off_legacy_wire_and_outputs_unchanged(legacy):
     finally:
         src.close()
     assert [(r.content, r.is_error, r.app) for r in outs] == [
-        ("echo: hi", False, None), ("Il est 12:00.", False, None), ("Widget prêt.\n[EmbeddedResource]", False, None)]
+        (F("echo", "echo: hi"), False, None), (F("clock", "Il est 12:00."), False, None),
+        (F("inline_widget", "Widget prêt.\n[EmbeddedResource]"), False, None)]  # r44 : texte du serveur clôturé
     assert legacy.methods() == ["initialize", "notifications/initialized", "tools/list", "tools/call", "tools/call",
                                 "tools/call"]
     assert all(not (r["params"].get("_meta") or {}) and "mcp-method" not in r["headers"] for r in legacy.requests)
@@ -87,7 +93,7 @@ def test_flags_off_old_client_cannot_reach_modern_only_server(modern):
 def test_modern_client_falls_back_to_handshake_on_legacy_server(legacy):
     src = source(legacy, modern=True)
     try:
-        assert src.call("echo", {"text": "hi"}, CTX).content == "echo: hi"
+        assert src.call("echo", {"text": "hi"}, CTX).content == F("echo", "echo: hi")
         assert src._io._session.protocol_version == LEGACY
     finally:
         src.close()
@@ -97,7 +103,7 @@ def test_modern_client_falls_back_to_handshake_on_legacy_server(legacy):
 def test_modern_client_is_stateless_on_modern_server(modern):
     src = source(modern, modern=True)
     try:
-        assert src.call("echo", {"text": "hi"}, CTX).content == "echo: hi"
+        assert src.call("echo", {"text": "hi"}, CTX).content == F("echo", "echo: hi")
         assert src._io._session.protocol_version == MODERN
     finally:
         src.close()
@@ -120,7 +126,7 @@ def test_mrtr_request_state_rounds_are_driven(modern):
         r = src.call("slow_sum", {}, CTX)
     finally:
         src.close()
-    assert (r.content, r.is_error) == ("somme : 3", False)
+    assert (r.content, r.is_error) == (F("slow_sum", "somme : 3"), False)
     states = [q["params"].get("requestState") for q in modern.requests if q["method"] == "tools/call"]
     assert states == [None, "r1", "r2"]
 
@@ -131,7 +137,7 @@ def test_mrtr_elicitation_is_refused_not_invented(modern):
         r = src.call("ask_name", {}, CTX)
     finally:
         src.close()
-    assert r.is_error and r.content.startswith("erreur MCP fake/ask_name:")
+    assert r.is_error and r.content.startswith("erreur MCP fake/ask_name, message du serveur :\n<untrusted-data")
     assert [q["method"] for q in modern.requests].count("tools/call") == 1  # aucune réponse inventée renvoyée
 
 
@@ -141,7 +147,7 @@ def test_task_is_polled_to_completion(modern):
         r = src.call("long_job", {}, CTX)
     finally:
         src.close()
-    assert (r.content, r.is_error) == ("travail fini", False)
+    assert (r.content, r.is_error) == (F("long_job", "travail fini"), False)
     gets = [q for q in modern.requests if q["method"] == "tasks/get"]
     assert len(gets) == 2 and gets[0]["headers"]["mcp-name"] == gets[0]["params"]["taskId"]
 
@@ -219,7 +225,7 @@ def test_app_resource_goes_to_client_never_to_model(era):
         finally:
             src.close()
     assert "clock_refresh" not in names  # visibility ["app"] : hors de la surface du modèle
-    assert r.content == "Il est 12:00.\n" + mcp_next.APP_SUMMARY.format(tool="clock")
+    assert r.content == F("clock", "Il est 12:00.") + "\n" + mcp_next.APP_SUMMARY.format(tool="clock")
     assert CLOCK_HTML not in r.content and "ui://" not in r.content
     app = r.app
     assert app["html"] == CLOCK_HTML and app["server"] == "fake" and app["tool"] == "clock"
@@ -234,7 +240,7 @@ def test_app_resource_goes_to_client_never_to_model(era):
     assert "connect-src 'self' https://api.example.com" in app["csp"] and "object-src 'none'" in app["csp"]
     assert app["permissions_requested"] == ["camera"] and app["prefers_border"] is True
     assert app["tool_result"]["structuredContent"] == {"time": "12:00"}
-    assert inline.content == "Widget prêt.\n" + mcp_next.APP_SUMMARY.format(tool="inline_widget")
+    assert inline.content == F("inline_widget", "Widget prêt.") + "\n" + mcp_next.APP_SUMMARY.format(tool="inline_widget")
     assert inline.app["html"] == INLINE_HTML and inline.app["csp"] == mcp_next.DEFAULT_CSP
     assert all(b.get("type") != "resource" for b in inline.app["tool_result"]["content"])
 
@@ -334,7 +340,7 @@ def test_turn_emits_tool_app_and_model_sees_only_summary(tmp_path, modern):
     seen = json.dumps(ship.seen, ensure_ascii=False)
     assert CLOCK_HTML not in seen and "ui://" not in seen and "allow-scripts" not in seen
     tool_msg = next(m for m in ship.seen[-1] if m.get("role") == "tool")
-    assert tool_msg["content"] == "Il est 12:00.\n" + mcp_next.APP_SUMMARY.format(tool="clock")
+    assert tool_msg["content"] == F("clock", "Il est 12:00.") + "\n" + mcp_next.APP_SUMMARY.format(tool="clock")
     assert "clock_refresh" not in seen  # outil réservé à l'app : jamais dans le catalogue du modèle
     types = [x for x in rec.types() if x.startswith("tool.")]
     assert types == ["tool.call", "tool.app", "tool.result"]

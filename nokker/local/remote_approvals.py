@@ -54,6 +54,8 @@ import httpx
 
 from nokker.approvals.errors import ApprovalExpired, ApprovalNotFound, ApprovalNotPending, ProofInvalid, \
     StrongDeviceRequired
+from nokker.approvals.reasons import MAX_REASON as DECISION_REASON_MAX
+from nokker.approvals.reasons import BadReason, clean_reason, parse_reason
 from nokker.approvals.types import Device
 from nokker.cloud.link import TokenError, verify_attestation
 from nokker.core.ports import Approval, Proof
@@ -70,7 +72,7 @@ SCAN_S = 15.0
 MAX_TITLE, MAX_REASON = 200, 600
 MAX_SIGNED = 256  # signatures vérifiées gardées pour les appels relayés (les plus récentes)
 MAX_JTI = 2048  # attestations vues (jusqu'à leur expiration) ; au-delà, les plus anciennes sortent de la mémoire
-_FINAL = {"approved": "approved", "executed": "approved", "failed": "approved", "rejected": "rejected",
+_FINAL = {"approved": "approved", "executing": "approved", "executed": "approved", "failed": "approved", "interrupted": "approved", "rejected": "rejected",
           "expired": "expired"}
 
 
@@ -103,6 +105,9 @@ class RemoteApprovals:
     client: Any = None  # httpx.Client injectable (tests)
     clock: Callable[[], float] = time.time
     last_status: int | None = None  # statut HTTP de la dernière relève (None : aucune)
+    # Cartes qui se signent avec la passkey LOCALE et ne sont donc jamais déposées (carte « à payer » own_card,
+    # docs/PAY-AGENT.md §11) ; None : toutes les cartes fortes sont déposées, comme avant.
+    local_only: Callable[[Approval], bool] | None = None
     # approval_id → défi déposé (texte exact) : la preuve est vérifiée contre NOTRE défi, pas celui que rend nokker.ai
     _cards: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _skip: set[str] = field(default_factory=set, init=False, repr=False)  # refusées au dépôt (déjà décidées là-bas)
@@ -211,6 +216,10 @@ class RemoteApprovals:
                     known = a.id in self._cards or a.id in self._skip
                 if a.strength != "strong" or known:
                     continue
+                if self.local_only is not None and self.local_only(a):
+                    # carte « à payer » own_card (docs/PAY-AGENT.md §11) : elle se signe avec la passkey LOCALE,
+                    # jamais chez nokker.ai — elle n'est donc pas déposée
+                    continue
                 if self._deposit(token, a):
                     deposited += 1
             with self._lock:
@@ -312,13 +321,21 @@ class RemoteApprovals:
                       webauthn_signature=raw.get("webauthn_signature"))
         origin = (self.origin or self.base_url).rstrip("/")
         attestation = raw.get("attestation")
+        reason = None
+        if str(d.get("decision") or "") != "approve":  # motif du refus donné par la personne ; invalide : ignoré, jamais un refus de la décision
+            try:
+                reason = clean_reason(parse_reason(d.get("reason")))
+            except BadReason:
+                logger.warning("approbation relayée %s : motif du refus ignoré (texte de %d caractères au plus attendu)",
+                               aid, DECISION_REASON_MAX)
         try:
             if attestation:  # Mini App Telegram : nokker.ai a vérifié, la machine vérifie son attestation
-                decided = self._decide_attested(aid, d, str(attestation), proof.challenge or "")
+                decided = self._decide_attested(aid, d, str(attestation), proof.challenge or "", reason)
             else:
                 device = self._device(token, str(raw.get("device_id") or ""))
                 decided = self.approvals.decide_remote(aid, str(d.get("decision") or ""), proof, device, origin=origin,
-                                                       rp_id=urlsplit(origin).hostname, decided_by=self.decided_by)
+                                                       rp_id=urlsplit(origin).hostname, decided_by=self.decided_by,
+                                                       **({"reason": reason} if reason else {}))
         except ProofInvalid as e:
             logger.warning("approbation relayée %s : preuve refusée (%s)", aid, e)
             self._result(token, aid, "pending", error=f"preuve refusée par la machine : {e}")
@@ -344,7 +361,8 @@ class RemoteApprovals:
             self._run(token, decided)
         return decided.status
 
-    def _decide_attested(self, aid: str, d: dict[str, Any], attestation: str, challenge: str) -> Approval:
+    def _decide_attested(self, aid: str, d: dict[str, Any], attestation: str, challenge: str,
+                         reason: str | None = None) -> Approval:
         """Décide la carte `aid` sur la foi d'une attestation de nokker.ai (voir l'en-tête du module). Lève `ProofInvalid`
         (attestation refusée : la carte reste en attente, l'appareil peut signer à nouveau)."""
         if not self.attested:
@@ -361,7 +379,8 @@ class RemoteApprovals:
             raise ProofInvalid("attestation refusée : décision différente de celle relevée")
         self._burn_jti(claims["jti"], float(claims["exp"]))
         return self.approvals.decide_attested(aid, claims["decision"], challenge, decided_by=self.decided_by,
-                                              account=claims["sub"], device_id=claims["device_id"], jti=claims["jti"])
+                                              account=claims["sub"], device_id=claims["device_id"], jti=claims["jti"],
+                                              **({"reason": reason} if reason else {}))
 
     def _burn_jti(self, jti: str, exp: float) -> None:
         """Une attestation ne sert qu'une fois : son `jti` est gardé dans l'état local jusqu'à son expiration (donc

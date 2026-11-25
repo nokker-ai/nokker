@@ -51,10 +51,11 @@ class PgLinkStore:
     @staticmethod
     def _mac(r: tuple) -> Machine:
         return Machine(id=r[0], account=r[1], tenant=r[2], name=r[3], host=r[4], token_sha256=r[5], created_at=r[6],
-                       revoked=r[7] is not None, last_seen_at=r[8] if len(r) > 8 else None)
+                       revoked=r[7] is not None, last_seen_at=r[8] if len(r) > 8 else None,
+                       kind=(r[9] or "lokkal") if len(r) > 9 else "lokkal")
 
     _RCOLS = "device_sha256, user_code, machine_name, expires_at, state, machine_id"
-    _MCOLS = "id, account_id, tenant_id, name, host, token_sha256, created_at, revoked_at, last_seen_at"
+    _MCOLS = "id, account_id, tenant_id, name, host, token_sha256, created_at, revoked_at, last_seen_at, kind"
 
     def add_request(self, r: _Request) -> None:
         self._q(f"INSERT INTO lokkal_link_requests ({self._RCOLS}) VALUES (%s, %s, %s, %s, %s, %s)",
@@ -81,8 +82,8 @@ class PgLinkStore:
         return bool(_kq(self.dsn, host, "SELECT 1 FROM lokkal_machines WHERE host = %s", (host,)))
 
     def add_machine(self, m: Machine) -> None:
-        _nq(self.dsn, m.tenant, f"INSERT INTO lokkal_machines ({self._MCOLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL)",
-                (m.id, m.account, m.tenant, m.name, m.host, m.token_sha256, m.created_at))
+        _nq(self.dsn, m.tenant, f"INSERT INTO lokkal_machines ({self._MCOLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s)",
+                (m.id, m.account, m.tenant, m.name, m.host, m.token_sha256, m.created_at, m.kind))
 
     def machine(self, machine_id: str) -> Machine | None:
         rows = _kq(self.dsn, machine_id, f"SELECT {self._MCOLS} FROM lokkal_machines WHERE id = %s", (machine_id,))
@@ -114,7 +115,7 @@ class PgLinkStore:
 
     def tenant_has_machine(self, tenant: str) -> bool:
         return bool(_nq(self.dsn, tenant, "SELECT 1 FROM lokkal_machines WHERE tenant_id = %s AND revoked_at IS NULL "
-                            "AND token_sha256 <> '' LIMIT 1", (tenant,)))
+                            "AND token_sha256 <> '' AND kind <> 'phone' LIMIT 1", (tenant,)))
 
     def _tq(self, tenant: str, sql: str, params: tuple = ()) -> list[tuple]:
         """Requête sous la RLS de `tenant` (`app.tenant_id` posé par `connect`)."""

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 
@@ -468,7 +469,7 @@ class SkillToolSource:
                                        summary=summary)
                             continue
                         if verdict == "caution":
-                            entry.warning = f"compétence à vérifier avant usage : {summary}"
+                            entry.warning = mt.pick(mt.SKILL_CAUTION).format(summary=summary)
                     entries.append(entry)
             visible: dict[str, _Entry] = {}
             shadowed: dict[str, list[_Entry]] = {}
@@ -486,7 +487,7 @@ class SkillToolSource:
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
         if name not in SKILL_TOOLS:
-            return out(f"outil inconnu : {name}", True)
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         try:
             a = arguments or {}
             tid = getattr(ctx, "thread_id", None)
@@ -501,7 +502,7 @@ class SkillToolSource:
             payload, err = self.remove(str(a["name"]))
             return out(payload, err)
         except KeyError as e:
-            return out(f"argument manquant : {e.args[0]}", True)
+            return out(mt.pick(mt.MISSING_ARG).format(name=e.args[0]), True)
         except Exception as e:  # noqa: BLE001 — l'erreur revient au modèle, la boucle continue
             return out(_clean(f"{type(e).__name__}: {e}"), True)
 
@@ -518,8 +519,7 @@ class SkillToolSource:
             skills.append(item)
         result: dict[str, Any] = {"skills": skills}
         if info["unscannable"]:
-            result["note"] = (f"{info['unscannable']} compétence(s) non fournie(s) masquée(s) : le scanner de "
-                              "sécurité n'est pas disponible, elles ne sont pas affichées par prudence.")
+            result["note"] = mt.pick(mt.SKILL_UNSCANNABLE_NOTE).format(n=info["unscannable"])
         return result
 
     def _find(self, name: str, thread_id: str | None = None) -> tuple[_Entry | None, list[_Entry]]:
@@ -553,9 +553,8 @@ class SkillToolSource:
     def view(self, name: str, file: str | None = None, thread_id: str | None = None) -> tuple[Any, bool]:
         entry, hidden = self._find(name, thread_id)
         if entry is None:
-            return f"compétence introuvable : {name!r} (skill_list pour voir les noms)", True
-        changed = (("REFUSÉ : les skills du dépôt ont changé pendant la lecture ; ils sont de nouveau ignorés "
-                    "jusqu'à une nouvelle confiance de l'utilisateur"), True)
+            return mt.pick(mt.SKILL_NOT_FOUND).format(name=repr(name)), True
+        changed = (mt.pick(mt.SKILL_REPO_CHANGED), True)
         if file:
             payload, err = self._read_linked(entry, str(file))
             return changed if not err and not self._project_ok(entry, thread_id) else (payload, err)
@@ -569,31 +568,31 @@ class SkillToolSource:
         if entry.warning:
             payload["warning"] = entry.warning
         if hidden:
-            payload["note"] = (f"plusieurs compétences portent ce nom ; celle de la racine « {entry.source} » "
-                               f"l'emporte sur : {', '.join(sorted({h.source for h in hidden}))}.")
+            payload["note"] = mt.pick(mt.SKILL_DUPLICATE_NAME).format(
+                source=entry.source, others=", ".join(sorted({h.source for h in hidden})))
         return payload, False
 
     @staticmethod
     def _read_linked(entry: _Entry, file: str) -> tuple[Any, bool]:
         rel = file.replace("\\", "/")
         if rel.startswith("/") or ".." in rel.split("/") or "\x00" in rel:
-            return f"REFUSÉ : chemin hors de la compétence ({file!r})", True
+            return mt.pick(mt.SKILL_PATH_OUTSIDE).format(file=repr(file)), True
         base = os.path.realpath(entry.path)
         real = os.path.realpath(entry.path / rel)
         if not (real == base or real.startswith(base + os.sep)):
-            return f"REFUSÉ : {file!r} sort du dossier de la compétence", True
+            return mt.pick(mt.SKILL_FILE_ESCAPES).format(file=repr(file)), True
         if not os.path.isfile(real):
-            return f"fichier introuvable dans la compétence : {file!r}", True
+            return mt.pick(mt.SKILL_FILE_MISSING).format(file=repr(file)), True
         size = os.path.getsize(real)
         if size > MAX_FILE_BYTES:
-            return f"fichier trop gros ({size} octets, max {MAX_FILE_BYTES})", True
+            return mt.pick(mt.SKILL_FILE_TOO_BIG).format(size=size, max=MAX_FILE_BYTES), True
         data = Path(real).read_bytes()
         if b"\x00" in data[:8192]:
-            return f"fichier binaire refusé : {file!r}", True
+            return mt.pick(mt.SKILL_FILE_BINARY).format(file=repr(file)), True
         try:
             content = data.decode("utf-8")
         except UnicodeDecodeError:
-            return f"fichier non textuel refusé : {file!r}", True
+            return mt.pick(mt.SKILL_FILE_NOT_TEXT).format(file=repr(file)), True
         payload: dict[str, Any] = {"name": entry.name, "file": rel, "content": content}
         if entry.warning:
             payload["warning"] = entry.warning
@@ -605,12 +604,11 @@ class SkillToolSource:
         guard = _guard_module()
         if guard is None:
             self._emit(event="install_refused", source=source, reason="scanner indisponible")
-            return ("installation impossible ici : le scanner de sécurité des compétences n'est pas disponible "
-                    "(rien n'a été installé)", True)
+            return mt.pick(mt.SKILL_NO_SCANNER), True
         if source.startswith("github:"):
             ident, scan_source = source[len("github:"):].strip("/"), None
             if len(ident.split("/")) < 2 or ".." in ident.split("/"):
-                return "source github invalide : github:<owner>/<repo>[/<chemin>]", True
+                return mt.pick(mt.SKILL_BAD_GITHUB), True
             if ident.count("/") == 1:
                 ident += "/"
             scan_source = ident.rstrip("/")
@@ -626,17 +624,17 @@ class SkillToolSource:
                     resolve_and_check(ident, enforce_ports=True)
                 except SsrfBlocked as e:
                     self._emit(event="install_refused", source=source, reason=_clean(f"adresse refusée : {e}"))
-                    return f"compétence introuvable à cette source : {source}", True
+                    return mt.pick(mt.SKILL_SOURCE_NOT_FOUND).format(source=source), True
         elif source.startswith("official/") and len(source.split("/")) >= 2 and ".." not in source.split("/"):
             ident, scan_source, kind = source, "official", "official"
         else:
-            return "source non reconnue : github:<owner>/<repo>[/<chemin>], URL https, ou official/<famille>/<nom>", True
+            return mt.pick(mt.SKILL_BAD_SOURCE), True
         try:
             from tools import skills_hub
             from tools.skills_hub_install import install_from_quarantine, quarantine_bundle
 
             if not self._same(Path(skills_hub._skills_dir()), self.user_root):
-                return "installation refusée : le dossier d'état des compétences ne correspond pas à $NOKKER_HOME", True
+                return mt.pick(mt.SKILL_STATE_DIR_MISMATCH), True
             if kind == "github":
                 from tools.skills_hub_github import GitHubAuth, GitHubSource
                 src = GitHubSource(auth=GitHubAuth())
@@ -650,7 +648,7 @@ class SkillToolSource:
             bundle = src.fetch(ident)
             if bundle is None:
                 self._emit(event="install_refused", source=source, reason="introuvable")
-                return f"compétence introuvable à cette source : {source}", True
+                return mt.pick(mt.SKILL_SOURCE_NOT_FOUND).format(source=source), True
             q = quarantine_bundle(bundle)
         except Exception as e:  # noqa: BLE001
             self._emit(event="install_refused", source=source, reason=_clean(e))
@@ -664,12 +662,12 @@ class SkillToolSource:
                 shutil.rmtree(q, ignore_errors=True)
                 self._emit(event="install_refused", source=source, name=bundle.name, verdict=result.verdict,
                            trust=result.trust_level, reason=_clean(reason))
-                return f"installation REFUSÉE par le scanner.\n{report}", True
+                return mt.pick(mt.SKILL_SCAN_REFUSED).format(report=report), True
             dest = install_from_quarantine(q, bundle.name, category or "", bundle, result, prov)
         except Exception as e:  # noqa: BLE001
             shutil.rmtree(q, ignore_errors=True)
             self._emit(event="install_refused", source=source, reason=_clean(e))
-            return _clean(f"installation échouée : {type(e).__name__}: {e}"), True
+            return _clean(mt.pick(mt.SKILL_INSTALL_FAILED).format(error=f"{type(e).__name__}: {e}")), True
         with self._lock:
             self._cache.clear()
         self._emit(event="installed", source=source, name=bundle.name, path=str(dest), verdict=result.verdict,
@@ -684,14 +682,13 @@ class SkillToolSource:
             cands = [e for e in self._all_in(user) if e.name == name.strip()]
             entry = cands[0] if cands else None
         if entry is None or not self._same(entry.root, user):
-            return (f"retrait refusé : {name!r} n'est pas une compétence installée par l'utilisateur "
-                    f"(seule {user} est modifiable)"), True
+            return mt.pick(mt.SKILL_REMOVE_REFUSED).format(name=repr(name), user=user), True
         target = entry.path
         if target.is_symlink():
-            return "retrait refusé : le dossier de la compétence est un lien symbolique", True
+            return mt.pick(mt.SKILL_REMOVE_SYMLINK), True
         real, base = os.path.realpath(target), os.path.realpath(user)
         if real == base or not real.startswith(base + os.sep):
-            return "retrait refusé : chemin hors de la racine utilisateur", True
+            return mt.pick(mt.SKILL_REMOVE_OUTSIDE), True
         shutil.rmtree(real)
         try:  # registre d'installation, au mieux
             from tools.skills_hub import HubLockFile

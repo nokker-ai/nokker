@@ -48,12 +48,12 @@ def _prices(settings: dict[str, Any]) -> Any:
 
 def _complete_fn(config: Any, tier: str, run_id: str) -> Any:
     """Appel d'un palier de la config (OpenAI-compatible), hors noyau : aucune trace, aucun outil."""
-    from nokker.providers.sokkan import SokkanProvider
+    from nokker.providers.select import tier_provider
 
     t = config.tiers.get(tier)
     if t is None:
         raise SystemExit(f"palier {tier!r} absent de la config")
-    provider = SokkanProvider(base_url=t.base_url, api_key=t.api_key(), model=t.model)
+    provider = tier_provider(t)  # SokkanProvider, sauf `format: anthropic`
 
     def complete(messages: list[dict[str, str]]) -> tuple[str, int, int]:
         comp = provider.complete(messages, [], reasoning=False, session_key=run_id, max_tokens=2048)

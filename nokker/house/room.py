@@ -36,6 +36,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nokker.core.loop import failure_person_text
 from nokker.core.ports import RouteDecision, RouteState, ToolContext, ToolSpec
 from nokker.core.turn import Effect, Tier, ToolResult, TurnInput
 from nokker.house.acl import (
@@ -187,7 +188,7 @@ class _RoomMemory:
     def recall_for(self, thread_id: str, query: str, k: int = 5) -> list[Any]:
         return self.recall(query, k)
 
-    def propose(self, thread_id: str, facts: list[str]) -> None:
+    def propose(self, thread_id: str, facts: list[str], provenance: str | None = None) -> None:
         return None
 
 
@@ -511,7 +512,7 @@ class HouseRoom:
 
     def _outcome(self, turn: Any) -> tuple[str, list[tuple[str, str]]]:
         scrub = getattr(getattr(self.kernel, "invariants", None), "scrub_output", None)
-        body = turn.reply or (turn.failure or {}).get("message") or ""
+        body = turn.reply or failure_person_text(turn.failure, getattr(turn, "lang", None) or None)
         body = scrub(body) if scrub is not None else body
         cards: list[tuple[str, str]] = []
         approvals = getattr(self.kernel, "approvals", None)

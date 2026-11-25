@@ -7,6 +7,7 @@ Ce qui est couvert (remplacé par une étiquette entre crochets) :
   - téléphones (`[téléphone]`) : suisses (international et national), et toute forme internationale `+CC …` d'au
     moins 8 chiffres ;
   - IBAN (`[iban]`, toute forme pays + 2 chiffres + blocs) et numéros AVS (`[avs]`) ;
+  - numéros de carte (Luhn, 12 à 19 chiffres) et valeurs des champs de carte : chiffres remplacés par « • » ;
   - adresses postales (`[adresse]`) : rue/avenue/chemin/route/place/boulevard/quai/impasse… suivi d'un nom propre et
     d'un numéro facultatif ; `…strasse|gasse|weg|platz 12` ; `12 Main Street` ; code postal + localité après une
     virgule, un saut de ligne ou `CH-` ;
@@ -25,23 +26,52 @@ import re
 from collections import Counter
 from typing import Any
 
+from nokker.payments.cardmask import mask_card_text
 from nokker.tools.web import _AVS_RE, _EMAIL_RE, _PHONE_CH_RE
 
 _UP = "A-ZÀ-ÖØ-Ý"
 _WORD = rf"[{_UP}][\w'’\-]+"
 _PHONE_INTL_RE = re.compile(r"\+\d{1,3}(?:[ .\-/]?\(?\d{1,4}\)?){2,6}")
 _IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){3,7}(?:[ ]?[A-Z0-9]{1,3})?\b")
+
+
+def _ci(fragment: str) -> str:
+    """Fragment de motif insensible à la casse SANS drapeau en ligne (chaque lettre → `[xX]`, échappements gardés) :
+    même sens que `(?i:…)`, dans le dialecte commun Python re / JS / NSRegularExpression des règles de masquage de
+    l'appareil (`nokker/redact/rules.py` reprend les motifs d'adresse de ce module tels quels)."""
+    out, i = [], 0
+    while i < len(fragment):
+        c = fragment[i]
+        if c == "\\":
+            out.append(fragment[i:i + 2])
+            i += 2
+            continue
+        out.append(f"[{c.lower()}{c.upper()}]" if c.lower() != c.upper() else c)
+        i += 1
+    return "".join(out)
+
+
+# Une seule borne de mot, en tête (même sens que `(?:\b<n°>…\s+)?\b<voie>` : entre `\s+` et la voie, la borne est
+# acquise) : le motif se transpose tel quel dans le dialecte de l'appareil (`nokker/redact/rules.py`).
 _STREET_FR_RE = re.compile(
-    rf"(?:\b\d{{1,4}}(?:\s?(?:bis|ter|[a-c]))?,?\s+)?"
-    rf"\b(?i:rue|avenue|av\.|chemin|ch\.|route|rte|place|boulevard|bd|quai|impasse|allée|sentier|passage|"
-    rf"ruelle|promenade|viale|piazza)\s+(?:(?i:de\s+la|de\s+l['’]|du|des|de|d['’]|della|del)\s*)?"
+    r"\b(?:\d{1,4}(?:\s?(?:bis|ter|[a-c]))?,?\s+)?"
+    r"(?:" + _ci(r"rue|avenue|av\.|chemin|ch\.|route|rte|place|boulevard|bd|quai|impasse|allée|sentier|passage|"
+                   r"ruelle|promenade|viale|piazza") + r")\s+(?:(?:"
+    + _ci(r"de\s+la|de\s+l['’]|du|des|de|d['’]|della|del") + r")\s*)?"
     rf"{_WORD}(?:[\s\-]{_WORD}){{0,3}}(?:\s*,?\s*\d{{1,4}}\s?[a-zA-Z]?\b)?")
 _STREET_DE_RE = re.compile(
     r"\b[A-ZÄÖÜ][\wäöüß\-]*(?:strasse|straße|gasse|weg|platz|allee|ring|rain|halde)\s+\d{1,4}\s?[a-zA-Z]?\b")
 _STREET_EN_RE = re.compile(
     r"\b\d{1,5}\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(?:Street|St\.|Avenue|Ave\.|Road|Rd\.|Lane|Ln\.|Drive|Dr\.|"
     r"Boulevard|Blvd\.|Way|Court|Ct\.)")
-_POSTAL_RE = re.compile(rf"(,\s*|\n\s*|\bCH-)([1-9]\d{{3}}\s+[{_UP}][a-zà-ÿ]{{2,}}(?:[\s\-][{_UP}][a-zà-ÿ]+)?)")
+# Code postal + localité : après une virgule ou un saut de ligne (`_POSTAL_RE`), ou après `CH-` en début de mot
+# (`_POSTAL_CH_RE`). Deux motifs plutôt qu'une alternative `(,\s*|\n\s*|\bCH-)` (même sens, appliqués l'un après l'autre) :
+# sans borne de mot au milieu, la partie postale se transpose dans le dialecte de l'appareil (`nokker/redact/rules.py`
+# l'accole aux voies).
+_POSTAL_SEP = r",\s*|\n\s*"
+_POSTAL_BODY = rf"[1-9]\d{{3}}\s+[{_UP}][a-zà-ÿ]{{2,}}(?:[\s\-][{_UP}][a-zà-ÿ]+)?"
+_POSTAL_RE = re.compile(rf"({_POSTAL_SEP})({_POSTAL_BODY})")
+_POSTAL_CH_RE = re.compile(rf"\b(CH-)({_POSTAL_BODY})")
 _HONORIFIC_RE = re.compile(
     rf"\b(M\.|Mme|Mlle|Monsieur|Madame|Mademoiselle|Herr|Frau|Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Prof\.?)(\s+)"
     rf"({_WORD}(?:\s+{_WORD})?)")
@@ -80,6 +110,12 @@ def scrub_pii(text: str, terms: list[str] | None = None, counts: Counter | None 
             c[label] += n
         return out
 
+    # Données de carte (PAYMENTS §2 bis) : chiffres masqués (« • »), avant l'IBAN dont la forme est voisine. Couvre
+    # aussi les arguments d'un appel refusé (un numéro tapé par le modèle reste dans le tour stocké).
+    masked = mask_card_text(text)
+    if masked != text:
+        c["carte"] += 1
+        text = masked
     text = sub(_EMAIL_RE, "email", text)
     text = sub(_IBAN_RE, "iban", text)
     text = sub(_AVS_RE, "avs", text)
@@ -90,6 +126,7 @@ def scrub_pii(text: str, terms: list[str] | None = None, counts: Counter | None 
     text = sub(_STREET_EN_RE, "adresse", text)
     text = sub(_STREET_FR_RE, "adresse", text)
     text = sub(_POSTAL_RE, "adresse", text, lambda m: m.group(1) + "[adresse]")
+    text = sub(_POSTAL_CH_RE, "adresse", text, lambda m: m.group(1) + "[adresse]")
     text = sub(_HONORIFIC_RE, "nom", text, lambda m: m.group(1) + m.group(2) + "[nom]")
     text = sub(_INTRO_RE, "nom", text, lambda m: m.group(1) + "[nom]")
     text = sub(_SIGNATURE_RE, "nom", text, lambda m: m.group(1) + "[nom]")

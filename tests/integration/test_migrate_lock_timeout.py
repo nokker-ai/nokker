@@ -12,7 +12,8 @@ import pytest
 from nokker.store.conn import migrate
 
 DSN = os.environ.get("NOKKER_TEST_PG_DSN")
-pytestmark = [pytest.mark.integration, pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN absent")]
+requires_pg = pytest.mark.skipif(not DSN, reason="NOKKER_TEST_PG_DSN non posé — pas de Postgres jetable")
+pytestmark = [pytest.mark.integration, requires_pg]
 
 
 def test_lock_timeout_aborts_a_blocked_migration(monkeypatch):

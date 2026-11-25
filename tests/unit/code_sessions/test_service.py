@@ -11,7 +11,7 @@ import pytest
 
 from nokker.code_sessions.config import CodeConfig
 from nokker.code_sessions.secrets import TenantSecrets
-from nokker.code_sessions.service import CodeError, CodeSessions
+from nokker.code_sessions.service import NO_SESSION, CodeError, CodeSessions
 from nokker.code_sessions.store import MemoryCodeStore
 from nokker.core.ports import ToolContext
 from nokker.tenancy.context import tenant_scope
@@ -188,7 +188,7 @@ def test_close_keeps_or_purges_the_workspace(svc, cluster):
     assert os.path.isdir(os.path.join(cluster.workspace_root, TA, ANA, a["id"]))
     assert not os.path.exists(os.path.join(cluster.workspace_root, TA, ANA, b["id"]))
     r = _call(svc, TA, ANA, f"{TA}:{a['id']}", "read_file", {"path": "x"})
-    assert r.is_error and "session" in r.content  # fil d'une session fermée : plus d'outils
+    assert r.is_error and r.content == NO_SESSION  # fil d'une session fermée : plus d'outils
 
 
 def test_repo_clone_with_a_named_credential_never_exposed(svc, cluster):
@@ -257,7 +257,7 @@ def test_restart_reopens_from_the_store(svc, cluster, fake_upstream):
 
 def test_tools_outside_a_code_session(svc):
     r = _call(svc, TA, ANA, f"{TA}:th_plain", "read_file", {"path": "x"})
-    assert r.is_error and "/v1/code/sessions" in r.content
+    assert r.is_error and r.content == NO_SESSION
     specs = {s.name for s in svc.tools().specs()}
     assert {"read_file", "write_file", "patch", "terminal", "search_files", "todo"} <= specs
 

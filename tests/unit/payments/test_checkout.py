@@ -152,10 +152,10 @@ def test_scene_agent_stops_at_payment_fills_no_card_field_and_hands_over(world):
     assert [n for n, _ in tools.browser.called] == ["browser_snapshot"]
     tool_texts = [m.content for m in turn.messages if m.role == "tool"]
     assert tool_texts[0].endswith(CHECKOUT_NOTICE)
-    assert "REFUSÉ par le noyau (payments:card_field" in tool_texts[1] and "numéro de carte" in tool_texts[1]
-    assert "REFUSÉ par le noyau (payments:card_field" in tool_texts[2] and "« cvc »" in tool_texts[2]
-    assert "REFUSÉ par le noyau (payments:checkout" in tool_texts[3]
-    assert "REFUSÉ par le noyau (payments:checkout" in tool_texts[4] and "payer" in tool_texts[4]
+    assert "Refusé : payments:card_field" in tool_texts[1] and "numéro de carte" in tool_texts[1]
+    assert "Refusé : payments:card_field" in tool_texts[2] and "« cvc »" in tool_texts[2]
+    assert "Refusé : payments:checkout" in tool_texts[3]
+    assert "Refusé : payments:checkout" in tool_texts[4] and "payer" in tool_texts[4]
     assert "EN ATTENTE D'APPROBATION HUMAINE (payments:to_pay" in tool_texts[5]
     with tenant_scope(TENANT[ALICE]):
         [card] = world.backend.pending()

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolSpec, call_effect
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, Turn, Verdict
 from nokker.household.model import GUARDIAN_RULE
@@ -73,7 +74,8 @@ class MinorGates:
 # que les skills des packs du web, qui restent ceux du compte).
 CODE_SESSION_TOOLS = frozenset({"terminal", "write_file", "patch", "read_file", "search_files", "checkpoint_create",
                                 "checkpoint_list", "checkpoint_diff", "checkpoint_restore", "delegate",
-                                "delegate_status", "delegate_cancel"})
+                                "delegate_status", "delegate_cancel",
+                                "execute_code"})  # bac à sable de la session du fil (§7.31) : jamais pour un mineur
 CODE_SESSION_SOURCES = frozenset({"builtin:code-skills"})
 
 
@@ -117,7 +119,7 @@ class FilteredSource:
         from nokker.core.turn import ToolResult
 
         if not any(s.name == name for s in self.specs()):
-            return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
         return self.inner.call(name, arguments, ctx)
 
     def __getattr__(self, name: str) -> Any:  # refresh, turn_done, available_for… : ceux de la source

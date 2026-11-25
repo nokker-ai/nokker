@@ -183,6 +183,7 @@ def get(server, path, host=None, headers=None):
     conn.request("GET", path, headers={"Host": host or server.authority, **(headers or {})})
     r = conn.getresponse()
     body = r.read() if "events" not in path else b""
+    conn.close()  # les en-têtes de `r` restent lisibles ; sinon ResourceWarning (prise cliente non fermée)
     return r.status, body, r
 
 
@@ -340,6 +341,7 @@ def test_live_update_reaches_the_screen_by_sse(world):
     rest = b""
     while b"event: end" not in rest:
         rest += r.fp.readline()
+    conn.close()
     assert w.svc.bubble_state(cid)["status"] == "stopped" and w.salon.quit == 1
 
 
@@ -522,7 +524,10 @@ def test_airplay_backend_runs_its_own_loop():
     b = AirPlayBackend(lib=lib)
     screens = b.discover()
     assert screens[0].paired is False and screens[0].caps == ("image",)
-    assert asyncio.get_event_loop_policy() is not None
+    # la boucle propre du backend est fermée : aucune boucle ne reste en cours dans le fil appelant
+    # (asyncio.get_event_loop_policy est dépréciée en 3.14, retirée en 3.16)
+    with pytest.raises(RuntimeError):
+        asyncio.get_running_loop()
 
 
 # ─────────────────────────────── home-bridge / home-discovery ───────────────────────────────
@@ -578,6 +583,7 @@ def test_core_reaches_the_lan_only_through_named_bridge_operations(world, tmp_pa
             load({"HOME_CONFIG": str(tmp_path / "absent.yaml")})  # pas de jeton : la passerelle ne démarre pas
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_common_bridge_serves_cast_ops_only_when_home_yaml_allows_it(tmp_path):
@@ -607,6 +613,7 @@ def test_common_bridge_serves_cast_ops_only_when_home_yaml_allows_it(tmp_path):
         assert e.value.code == "unauthorized"
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_discovery_is_a_subcommand_of_the_common_bridge(monkeypatch):

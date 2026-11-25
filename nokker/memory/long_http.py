@@ -18,6 +18,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from nokker.memory.provenance import PERSON
 from nokker.memory.tenant_long import LongMemory, LongMemoryError
 
 _NOTE = re.compile(r"^/v1/memory/long/notes/([a-z0-9][a-z0-9-]{1,120})(/audience)?$")
@@ -67,7 +68,7 @@ def dispatch(method: str, full_path: str, account_id: str, body: Any) -> tuple[i
                 return _err(400, "bad_body", "corps {scope, kind?, title, text, audience?}")
             out = svc.write(account_id, scope=str(data.get("scope") or "user"), kind=str(data.get("kind") or "fact"),
                             title=str(data.get("title") or ""), text=str(data.get("text") or ""),
-                            audience=str(data.get("audience") or "all"))
+                            audience=str(data.get("audience") or "all"), provenance=PERSON)  # geste de la personne
             return (202 if "pending" in out else 200 if out.get("duplicate") else 201), out
         m = _NOTE.match(path)
         if m and not m.group(2) and method == "DELETE":

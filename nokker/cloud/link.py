@@ -291,6 +291,9 @@ class Machine:
     # Présence signalée par le relais (`POST /v1/gateway/presence`) : heure de la fermeture du tunnel, None = en ligne
     # ou inconnu. Une charge reçue APRÈS cette heure vaut retour en ligne (docs/LOKKAL.md §7.19).
     offline_at: float | None = None
+    # Nature (migration 077) : `lokkal` (machine Lokkal, tunnel, inférence) ou `phone` (nœud téléphone, P7,
+    # docs/LOKKAL-PHONE.md §3 : son jeton ne vaut QUE sur /v1/gateway/phone/*, avec la preuve de sa clé).
+    kind: str = "lokkal"
 
 
 @dataclass
@@ -367,7 +370,8 @@ class MemoryLinkStore:
     def tenant_has_machine(self, tenant: str) -> bool:
         """Au moins une machine liée (jeton relevé) et non révoquée pour ce locataire."""
         with self.lock:
-            return any(m.tenant == tenant and not m.revoked and m.token_sha256 for m in self.machines.values())
+            return any(m.tenant == tenant and not m.revoked and m.token_sha256 and m.kind != "phone"
+                       for m in self.machines.values())
 
     def seen(self, machine_id: str, at: float) -> None:
         with self.lock:
@@ -428,7 +432,8 @@ class LinkService:
             logging.getLogger("nokker.cloud.link").warning("on_change(%s) en échec", tenant, exc_info=True)
 
     def has_machine(self, tenant: str) -> bool:
-        """Le locataire a-t-il au moins une machine liée et non révoquée ? (outils Lokkal du compte)"""
+        """Le locataire a-t-il au moins une machine Lokkal liée et non révoquée ? (outils Lokkal du compte ; un nœud
+        téléphone n'en est pas une, P7)"""
         return bool(self.store.tenant_has_machine(tenant))
 
     def presence(self, machine: Machine, online: bool) -> None:
@@ -488,6 +493,19 @@ class LinkService:
             self.store.save_request(req)
             return {"state": "approved", "machine_id": m.id, "host": host}
 
+    def add_phone(self, account: str, tenant: str, name: str) -> tuple[Machine, str]:
+        """Nœud téléphone (P7a), après sa carte forte d'inscription : une machine `phone` et son jeton, rendu une fois.
+        Son « hôte » n'est pas routable (`<id>.phone.invalid`) : aucune passerelle, aucun tunnel."""
+        with self._lock:
+            mid = f"mc_{uuid.uuid4().hex[:16]}"
+            m = Machine(id=mid, account=account, tenant=tenant, name=name, host=f"{mid}.phone.invalid",
+                        token_sha256="", created_at=self.clock(), kind="phone")
+            self.store.add_machine(m)
+            token = secrets.token_urlsafe(32)
+            self.store.set_token(m.id, _sha(token))
+        self._changed(tenant)
+        return m, token
+
     def pending(self, user_code: str) -> dict[str, Any] | None:
         """Le flux en attente pour ce code, SANS effet de bord (page /link : montrer la machine avant d'approuver) ;
         None pour un code inconnu comme expiré (pas d'oracle)."""
@@ -529,12 +547,17 @@ class LinkService:
         self._changed(m.tenant)
         return True
 
-    def machines_of(self, account: str) -> list[Machine]:
-        return self.store.of_account(account)
+    def machines_of(self, account: str, *, phones: bool = False) -> list[Machine]:
+        """Machines Lokkal du compte ; `phones` : avec ses nœuds téléphone (P7). Par défaut SANS : délégation,
+        placement, tunnel, pages et outils Lokkal ne visent jamais un téléphone."""
+        return [m for m in self.store.of_account(account) if phones or m.kind != "phone"]
 
-    def machine_of(self, account: str, machine_id: str) -> Machine | None:
+    def phones_of(self, account: str) -> list[Machine]:
+        return [m for m in self.store.of_account(account) if m.kind == "phone"]
+
+    def machine_of(self, account: str, machine_id: str, *, phones: bool = False) -> Machine | None:
         """La machine non révoquée de CE compte, sinon None (sans dire si elle existe ailleurs)."""
-        return next((m for m in self.store.of_account(account) if m.id == machine_id), None)
+        return next((m for m in self.machines_of(account, phones=phones) if m.id == machine_id), None)
 
     def machine_by_host(self, host: str) -> Machine | None:
         """La machine NON révoquée qui porte ce nom de passerelle (`<nom>.nokker.app`), sinon None. Pour le relais
@@ -542,7 +565,7 @@ class LinkService:
         if not host:
             return None
         m = self.store.by_host(host.lower())
-        return m if m is not None and not m.revoked else None
+        return m if m is not None and not m.revoked and m.kind != "phone" else None
 
     def report_load(self, machine: Machine, raw: Any) -> dict[str, Any] | None:
         """Charge envoyée par la machine (`POST /v1/gateway/machine/load`), nettoyée puis gardée (une ligne courante
@@ -566,9 +589,10 @@ class LinkService:
         self.store.set_resources(machine.id, machine.tenant, res, self.clock())
         return res
 
-    def machines_with_load(self, account: str, tenant: str) -> list[Machine]:
-        """Les machines du compte (« mes machines »), chacune avec sa dernière charge et son inventaire connus."""
-        machines = self.store.of_account(account)
+    def machines_with_load(self, account: str, tenant: str, *, phones: bool = False) -> list[Machine]:
+        """Les machines du compte (« mes machines »), chacune avec sa dernière charge et son inventaire connus ;
+        `phones` : avec les nœuds téléphone (écran « mes machines » seulement)."""
+        machines = self.machines_of(account, phones=phones)
         ids = [m.id for m in machines]
         loads = self.store.loads_of(tenant, ids) if machines else {}
         res_of = getattr(self.store, "resources_of", None)
@@ -587,7 +611,7 @@ class LinkService:
         return out
 
     def revoke_machine(self, account: str, machine_id: str) -> bool:
-        m = self.machine_of(account, machine_id)
+        m = self.machine_of(account, machine_id, phones=True)  # « mes machines » : un téléphone se retire aussi
         if m is None:
             return False
         self.store.revoke(m.id)

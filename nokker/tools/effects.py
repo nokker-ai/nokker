@@ -25,6 +25,9 @@ from nokker.qa.secrets import KnownSecrets, redact
 # ─────────────────────────────── table par défaut ───────────────────────────────
 #
 # Dérivée d'un banc interne (ids des outils stubés) et du canari. Un nom absent de cette table → WRITE (défaut prudent).
+# Les entrées `send_email_reply`, `send_email_forward` et `send_telegram_message` ne portent aucun outil local : ce sont des
+# noms de banc et des noms que les modèles produisent. Elles restent comme FILET fail-closed : un outil MCP ou de skill
+# homonyme garde l'effet SEND_EXTERNAL (allowlist, liste fermée du relecteur) au lieu de retomber sur WRITE. Ne pas les retirer.
 
 DEFAULT_EFFECTS: dict[str, Effect] = {
     # calendar_* (nina-calendar / workspace MCP)
@@ -76,6 +79,8 @@ DEFAULT_EFFECTS: dict[str, Effect] = {
     "browser_console_messages": Effect.READ,
     "browser_network_requests": Effect.READ,
     "browser_status": Effect.READ,
+    # V3 « Agent qui montre » : désigne un élément sur l'image en direct, aucun geste (nokker/browserlive/point.py)
+    "browser_point": Effect.READ,
     "browser_click": Effect.WRITE,
     "browser_fill": Effect.WRITE,
     "browser_submit": Effect.SEND_EXTERNAL,
@@ -86,6 +91,11 @@ DEFAULT_EFFECTS: dict[str, Effect] = {
     # outils qui renvoient une valeur de secret en clair (banc `credentiels-pas-de-fuite`)
     "grafana_get_credentials": Effect.SECRET,
     "vaultwarden_get": Effect.SECRET,
+    # sites_* (sites connectés, docs/CONNECTED-SITES.md §8 ; lots L0/L1 : connexion et lecture seulement)
+    "sites_connect": Effect.WRITE,
+    "sites_list": Effect.READ,
+    "sites_read": Effect.READ,
+    "sites_search": Effect.READ,
     # web_* (recherche web sans clé, tools/web.py — P1, 18.10.2026)
     "web_search": Effect.READ,
     "web_fetch": Effect.READ,
@@ -144,6 +154,41 @@ ARGUMENT_EFFECTS: dict[str, Callable[[dict], Effect]] = {
     "calendar_update": _calendar_effect,
     "browser_handle_dialog": _dialog_effect,
 }
+
+
+# ─────────────────────────────── où va le texte d'un appel (garde `masked_value`, P9b) ───────────────────────────────
+#
+# L'effet dit ce qu'un appel CHANGE ; la garde des valeurs masquées sur l'appareil (`nokker/redact/guard.py`) doit aussi
+# savoir OÙ son texte part. Trois compléments nommés, lus avec l'effet de CET appel :
+#   - saisie dans une page ou un service tiers, même classée WRITE : les gestes navigateur du modèle qui tapent ou
+#     choisissent (`payments/gates.py::BROWSER_INPUT`, même liste que les règles de paiement), la connexion d'un site
+#     (`sites_connect` tape l'identifiant sur le site), et tout outil MCP d'une app tierce qui déclare WRITE (un outil
+#     MCP absent de la table ci-dessus : ceux de la table sont des connecteurs du compte, classés ici) ;
+#   - effet WRITE qui reste DANS le fil : `delegate` (sous-agent sur `<fil>/sa-<id>`, compte rendu rendu au fil, chacun
+#     de ses appels passant par la même garde) ; tout autre WRITE persiste hors du fil (mémoire, fichiers, brouillons,
+#     agenda, kanban, notes, points de reprise…) ;
+#   - classés READ mais qui emportent leur texte hors du fil : `session_send` (écrit à un autre fil), `agent_draft`
+#     (consignes d'un agent Crew qui vivra hors du fil), `memory_note` (note proposée en quarantaine : persiste au-delà du fil
+#     dès qu'elle est validée ; effet READ voulu, la validation de la personne est la carte — nokker/memory/long_note.py).
+THIRD_PARTY_SITE_INPUT = frozenset({"sites_connect"})
+THREAD_SCOPED = frozenset({"delegate"})
+LEAVES_THREAD = frozenset({"session_send", "agent_draft", "memory_note"})
+
+
+def third_party_input(name: str, spec: Any, effect: Effect) -> bool:
+    """Vrai si l'appel (effet `effect`) saisit du texte dans une page ou un service tiers (voir ci-dessus)."""
+    from nokker.payments.gates import BROWSER_INPUT
+
+    if name in BROWSER_INPUT or name in THIRD_PARTY_SITE_INPUT:
+        return True
+    source = str(getattr(spec, "source", "") or "")
+    return effect is Effect.WRITE and source.startswith("mcp:") and name not in DEFAULT_EFFECTS
+
+
+def persists_beyond_thread(name: str, effect: Effect, declared: Effect | None = None) -> bool:
+    """Vrai si l'appel garde son texte au-delà du fil courant (voir ci-dessus). `effect` : effet de CET appel ;
+    `declared` : effet déclaré de l'outil (un `calendar_create` avec invités est un envoi ET une écriture gardée)."""
+    return (Effect.WRITE in (effect, declared) and name not in THREAD_SCOPED) or name in LEAVES_THREAD
 
 
 @dataclass
@@ -230,4 +275,6 @@ class SecretScrubbingToolSource:
         return result
 
 
-__all__ = ["ARGUMENT_EFFECTS", "DEFAULT_EFFECTS", "EffectsTable", "SecretScrubbingToolSource", "redact_tool_result"]
+__all__ = ["ARGUMENT_EFFECTS", "DEFAULT_EFFECTS", "LEAVES_THREAD", "THIRD_PARTY_SITE_INPUT", "THREAD_SCOPED",
+           "EffectsTable", "SecretScrubbingToolSource", "persists_beyond_thread", "redact_tool_result",
+           "third_party_input"]

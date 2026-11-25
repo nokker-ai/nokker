@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.plan.service import BRIEF_TOOL, Plan
@@ -65,8 +66,8 @@ class PlanToolSource:
                 return ToolResult(call_id="", name=name,
                                   content=json.dumps(self.plan.brief_data(ctx.sender), ensure_ascii=False))
         except PlanError as e:
-            return ToolResult(call_id="", name=name, content=f"refusé : {e.message}", is_error=True)
-        return ToolResult(call_id="", name=name, content=f"outil inconnu : {name}", is_error=True)
+            return ToolResult(call_id="", name=name, content=mt.pick(mt.TOOL_REFUSED).format(error=e.message), is_error=True)
+        return ToolResult(call_id="", name=name, content=mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), is_error=True)
 
     def _get(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         card_id = str(arguments.get("card_id") or "")

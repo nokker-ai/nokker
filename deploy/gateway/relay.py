@@ -5,7 +5,8 @@ Un Lokkal ouvre une connexion SORTANTE `wss://relay.nokker.app/v1/tunnel` (jeton
 JSON (`req` / `res` / `body` / `cancel` / `ping`).
 
 Le relais filtre AVANT la machine : sur `/v1/*`, seul un jeton d'accès ou de délégation de nokker.ai, signé, du MÊME
-compte que la machine, passe ; hors `/v1`, GET/HEAD seulement (fichiers de l'interface) ; jamais de jeton local ;
+compte que la machine, passe (seule exception : `GET /v1/cast/<id>/frame?exp=&sig=`, URL signée par le noyau, voir
+CAST_FRAME_PATH_RE) ; hors `/v1`, GET/HEAD seulement (fichiers de l'interface) ; jamais de jeton local ;
 cookies retirés dans les deux sens. Pages : origine séparée, CSP `sandbox` + `frame-ancestors`, entrée par un jeton de
 pages à usage unique (`/_auth`), puis cookie `__Host-nk_pg` (onglet) ou capacité d'URL `/_s/<cap>/` (iframe, `embed=1` :
 pas de cookie tiers, qui ne passe plus une fois nokker.app sur la PSL ni depuis nokker.ai).
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import itertools
@@ -77,6 +79,20 @@ STRIP_REQ = HOP | {"cookie", "x-forwarded-for", "x-forwarded-host", "x-forwarded
                    "x-nokker-relay", "x-nokker-account", "x-nokker-local", "forwarded", "cf-connecting-ip",
                    "cf-ray", "cf-visitor", "cf-ipcountry", "cdn-loop", "cf-access-jwt-assertion"}
 STRIP_RES = HOP | {"set-cookie"}
+# Cadre d'un aperçu d'écran (docs/SCREEN-CAST.md, noyau `GET /v1/cast/{id}/frame?exp=&sig=`) : la SEULE route /v1 qui
+# passe sans jeton signé de nokker.ai, parce qu'un `<iframe src>` ne pose jamais `Authorization`. La preuve est l'URL
+# signée par le noyau (HMAC, 2 min), vérifiée par le noyau. Motif exact sur le chemin BRUT (rien de décodé : ni %2F, ni
+# `..`, ni barre finale), GET seulement, requête faite d'exactement `exp` et `sig`, une fois chacun, rien d'autre.
+CAST_FRAME_PATH_RE = re.compile(r"^/v1/cast/cast_[0-9a-f]{12}/frame$")
+# Écran de passation d'un site connecté (docs/CONNECTED-SITES.md §4.3), depuis le téléphone : le SEUL WebSocket qui
+# traverse le tunnel (trames wsopen / wsok / ws / wsclose). Chemin exact, ticket de `sites-chrome` dans l'URL (le
+# relais retire les cookies) : le ticket décide, côté machine ; ni jeton, ni compte ne partent.
+SCREEN_WS_RE = re.compile(r"^/sites/screen/st_[a-z0-9]{10}/websockify$")
+SCREEN_TICKET_RE = re.compile(r"^ticket=[A-Za-z0-9_-]{20,64}$")
+SCREEN_WS_MAX = 2              # flux d'écran simultanés par machine
+SCREEN_WS_MAX_S = 20 * 60      # durée maximale d'un flux (le ticket vaut 15 min)
+SCREEN_WS_CHUNK = 256 * 1024
+CAST_FRAME_QS_RE = re.compile(r"^(?:exp=[0-9]{10,12}&sig=[0-9a-f]{32}|sig=[0-9a-f]{32}&exp=[0-9]{10,12})$")
 PAGES_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
 PAGES_TOKEN_MAX_TTL = 60          # jeton de pages : exp − iat (BUBBLES §10.3)
 CAP_TTL = 3600                    # capacité d'URL des iframes
@@ -330,6 +346,7 @@ class Tunnel:
         self.ids = itertools.count(1)
         self.slots = asyncio.Semaphore(MAX_IN_FLIGHT)
         self.closed = asyncio.Event()
+        self.screens = 0  # flux d'écran ouverts (SCREEN_WS_MAX)
 
     async def send(self, frame: dict) -> None:
         if self.ws.closed:
@@ -379,6 +396,21 @@ def unb64(s: str | None) -> bytes:
 def bearer(req: web.Request) -> str | None:
     h = req.headers.get("Authorization", "")
     return h[7:].strip() if h[:7].lower() == "bearer " else None
+
+
+def is_screen_ws(req: web.Request) -> bool:
+    """`GET /sites/screen/st_…/websockify?ticket=…` avec `Upgrade: websocket`, exactement."""
+    path, sep, qs = req.raw_path.partition("?")
+    return req.method == "GET" and req.headers.get("Upgrade", "").lower() == "websocket" and bool(sep) \
+        and bool(SCREEN_WS_RE.match(path)) and bool(SCREEN_TICKET_RE.match(qs))
+
+
+def is_cast_frame(req: web.Request) -> bool:
+    """`GET /v1/cast/<id>/frame?exp=<n>&sig=<hex>`, exactement (voir CAST_FRAME_PATH_RE)."""
+    if req.method != "GET":
+        return False
+    path, sep, qs = req.raw_path.partition("?")
+    return bool(sep) and bool(CAST_FRAME_PATH_RE.match(path)) and bool(CAST_FRAME_QS_RE.match(qs))
 
 
 def looks_local(tok: str) -> bool:
@@ -520,8 +552,8 @@ class Relay:
                     continue
                 if f.get("t") == "ping":
                     await t.send({"t": "pong"})
-                elif f.get("t") in ("res", "body", "cancel"):
-                    t.deliver(f)
+                elif f.get("t") in ("res", "body", "cancel", "wsok", "ws", "wsclose"):
+                    t.deliver(f)  # ws* : flux d'écran (screen_ws), livrés seulement à un flux ouvert par le relais
         finally:
             keep.cancel()
             if self.reg.drop(t):                 # remplacé par une connexion plus récente : toujours en ligne
@@ -557,6 +589,11 @@ class Relay:
     # ---- requêtes du navigateur
     async def app(self, req: web.Request, t: Tunnel) -> web.StreamResponse:
         tenant = None
+        if is_screen_ws(req):
+            return await self.screen_ws(req, t)
+        if is_cast_frame(req):
+            # Sans jeton : ni Authorization ni compte ne partent vers la machine ; seule la signature de l'URL décide.
+            return await self.forward(req, t, req.raw_path, None, extra={}, strip=frozenset({"authorization"}))
         if req.path.startswith("/v1/") or req.path == "/v1":
             tok = bearer(req)
             if not tok or looks_local(tok) or req.headers.get("X-Nokker-Local"):
@@ -571,6 +608,58 @@ class Relay:
         elif req.method not in ("GET", "HEAD"):
             return web.Response(status=405, text="méthode refusée\n")
         return await self.forward(req, t, req.path_qs, tenant, extra={})
+
+    async def screen_ws(self, req: web.Request, t: Tunnel) -> web.StreamResponse:
+        """Pont WebSocket navigateur ↔ tunnel ↔ écran noVNC de `sites-chrome` (via le web de la machine). La machine
+        vérifie le ticket et ouvre le flux local (`wsok`) ; sinon 403, rien n'est accepté côté navigateur."""
+        if t.closed.is_set():
+            return web.Response(status=502, text="machine hors ligne\n")
+        if t.screens >= SCREEN_WS_MAX:
+            return web.Response(status=503, text="écran déjà ouvert\n", headers={"Retry-After": "5"})
+        sid = next(t.ids)
+        st = t.streams[sid] = Stream()
+        t.screens += 1
+        proto = [p.strip() for p in req.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()][:2]
+        try:
+            await t.send({"t": "wsopen", "id": sid, "path": req.raw_path, "protocols": proto})
+            f = await asyncio.wait_for(st.queue.get(), 15)
+            if f.get("t") != "wsok":
+                return web.Response(status=403 if f.get("t") == "wsclose" else 502, text="écran fermé\n",
+                                    headers={"Cache-Control": "no-store"})
+            ws = web.WebSocketResponse(protocols=tuple(proto), max_msg_size=SCREEN_WS_CHUNK * 4, heartbeat=30)
+            await ws.prepare(req)
+
+            async def up() -> None:  # navigateur → machine
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        data = msg.data
+                    elif msg.type == aiohttp.WSMsgType.TEXT:
+                        data = msg.data.encode()
+                    else:
+                        break
+                    for i in range(0, len(data), SCREEN_WS_CHUNK):
+                        await t.send({"t": "ws", "id": sid, "data": b64(data[i:i + SCREEN_WS_CHUNK])})
+
+            async def down() -> None:  # machine → navigateur
+                while True:
+                    g = await st.queue.get()
+                    if g.get("t") != "ws":
+                        return
+                    await ws.send_bytes(unb64(g.get("data")))
+
+            tasks = [asyncio.create_task(up()), asyncio.create_task(down())]
+            await asyncio.wait(tasks, timeout=SCREEN_WS_MAX_S, return_when=asyncio.FIRST_COMPLETED)
+            for task in tasks:
+                task.cancel()
+            await ws.close()
+            return ws
+        except (asyncio.TimeoutError, TunnelClosed):
+            return web.Response(status=502, text="machine injoignable\n")
+        finally:
+            t.screens -= 1
+            t.streams.pop(sid, None)
+            with contextlib.suppress(TunnelClosed, ConnectionError):
+                await t.send({"t": "wsclose", "id": sid})
 
     def pages_headers(self, name: str) -> dict:
         fa = f"https://{name}.{self.s.domain} {self.s.frame_ancestors}".strip()
@@ -880,12 +969,12 @@ class Relay:
 
     async def forward(self, req: web.Request, t: Tunnel, path: str, tenant: str | None, extra: dict,
                       pages_host: str | None = None, location_prefix: str | None = None,
-                      response_timeout: float | None = None) -> web.StreamResponse:
+                      response_timeout: float | None = None, strip: frozenset = frozenset()) -> web.StreamResponse:
         if t.closed.is_set():
             return web.Response(status=502, text="machine hors ligne\n")
         if req.content_length and req.content_length > MAX_BODY:
             return web.Response(status=413, text="corps trop gros\n")
-        headers = [[k, v] for k, v in req.headers.items() if k.lower() not in STRIP_REQ]
+        headers = [[k, v] for k, v in req.headers.items() if k.lower() not in STRIP_REQ and k.lower() not in strip]
         headers += [["Host", f"{t.machine.name}.{self.s.domain}" if pages_host is None else pages_host],
                     ["X-Nokker-Relay", "1"],
                     ["X-Forwarded-For", req.headers.get("CF-Connecting-IP", req.remote or "")],
@@ -972,9 +1061,74 @@ class Relay:
             pass
 
 
+# CORS de `<nom>.nokker.app/v1/*` (docs/LOKKAL-PHONE.md §1.2 point 1) : la liste unique des sessions (web
+# d'app.nokker.ai, app native iOS `capacitor://localhost`, Android `https://localhost`) appelle chaque machine en
+# direct. Origines EXACTES, jamais d'écho ; `Authorization` seulement : aucun cookie, JAMAIS `Allow-Credentials`.
+# `/_gw/*` (cookie de renouvellement) et les pages restent sans CORS. Les en-têtes CORS venus de la machine sont
+# retirés : c'est le relais seul qui les pose.
+CORS_ORIGINS = frozenset({"https://app.nokker.ai", "capacitor://localhost", "https://localhost"})
+CORS_METHODS = "GET, POST, PUT, PATCH, DELETE"
+CORS_ALLOW_HEADERS = ("Authorization", "Content-Type", "X-Session-Id", "X-Nokker-Stream-Tokens", "Last-Event-ID",
+                      "User-Agent", "X-Nokker-Surface")
+_CORS_ALLOWED_LOWER = frozenset(h.lower() for h in CORS_ALLOW_HEADERS)
+CORS_EXPOSE = "Retry-After"
+CORS_MAX_AGE = 600
+
+
+def cors_applies(relay: Relay, req: web.Request) -> bool:
+    where = relay.parse_host(req.headers.get("Host", ""))
+    return where is not None and where[0] == "app" and (req.path == "/v1" or req.path.startswith("/v1/"))
+
+
+def is_preflight(relay: Relay, req: web.Request) -> bool:
+    """Pré-vérification CORS d'un navigateur (Origin ET Access-Control-Request-Method) ; un autre `OPTIONS` suit le
+    chemin ordinaire (jeton exigé, 401)."""
+    return req.method == "OPTIONS" and bool(req.headers.get("Origin")) \
+        and bool(req.headers.get("Access-Control-Request-Method")) and cors_applies(relay, req)
+
+
+def cors_preflight(req: web.Request) -> web.Response:
+    """`OPTIONS` sur `/v1/*` d'une passerelle : répondu par le relais, sans tunnel ni jeton (le navigateur n'en
+    envoie pas) ; 403 sans en-tête CORS hors liste."""
+    origin = req.headers.get("Origin", "")
+    method = req.headers.get("Access-Control-Request-Method", "").upper()
+    asked = [h.strip().lower() for h in req.headers.get("Access-Control-Request-Headers", "").split(",") if h.strip()]
+    if origin not in CORS_ORIGINS or method not in CORS_METHODS.split(", ") \
+            or any(h not in _CORS_ALLOWED_LOWER for h in asked):
+        return web.Response(status=403, headers={"Cache-Control": "no-store", "Vary": "Origin"})
+    return web.Response(status=204, headers={
+        "Access-Control-Allow-Origin": origin, "Vary": "Origin", "Access-Control-Allow-Methods": CORS_METHODS,
+        "Access-Control-Allow-Headers": ", ".join(CORS_ALLOW_HEADERS), "Access-Control-Max-Age": str(CORS_MAX_AGE),
+        "Cache-Control": "no-store"})
+
+
 def make_app(relay: Relay) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY)
-    app.router.add_route("*", "/{tail:.*}", relay.handle)
+
+    async def route(req: web.Request) -> web.StreamResponse:
+        if is_preflight(relay, req):
+            return cors_preflight(req)
+        return await relay.handle(req)
+
+    async def cors_headers(req: web.Request, resp: web.StreamResponse) -> None:
+        if is_preflight(relay, req):
+            return  # pré-vérification : réponse du relais, déjà complète
+        for k in [k for k in resp.headers if k.lower().startswith("access-control-")]:
+            del resp.headers[k]  # la machine ne pose jamais de CORS : le relais seul
+        if not cors_applies(relay, req):
+            return
+        # `Vary: Origin` sur TOUTE réponse de /v1/* d'une passerelle (relecture navigateur) : un cache ne sert jamais à
+        # l'app une réponse sans CORS, ni l'inverse ; les en-têtes CORS seulement pour une origine de la liste
+        vary = resp.headers.get("Vary", "")
+        if "origin" not in vary.lower():
+            resp.headers["Vary"] = f"{vary}, Origin" if vary else "Origin"
+        origin = req.headers.get("Origin", "")
+        if origin in CORS_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Expose-Headers"] = CORS_EXPOSE
+
+    app.router.add_route("*", "/{tail:.*}", route)
+    app.on_response_prepare.append(cors_headers)
     return app
 
 

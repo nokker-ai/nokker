@@ -26,13 +26,15 @@ DEFAULT_THRESHOLD = 5
 DEFAULT_WINDOW_DAYS = 30
 MAX_SUGGESTIONS = 20
 
-APPROVED = frozenset({"approved", "executed", "failed"})  # « failed » : approuvée, l'outil a échoué ensuite
+APPROVED = frozenset({"approved", "executing", "executed", "failed", "interrupted"})  # « failed » / « interrupted » : approuvée, l'outil a échoué ou son issue est inconnue
 REJECTED = "rejected"
 
 # Familles jamais proposées (le test `test_forbidden_families_never_suggested` les parcourt toutes).
 FORBIDDEN_EFFECTS = frozenset({"destructive", "send_bulk"})
 FORBIDDEN_RULES = frozenset({
     "pages:publish",                       # sortie vers le public : clé d'appareil à chaque fois
+    "wall:publish",                        # écran du mur (V7) : une carte par version publiée
+    "home:unasked",                        # action de la maison que personne n'a demandée : une carte à chaque fois
     "household:guardian",                  # profil mineur : son représentant décide chaque carte
     "permissions:relayed_connector",       # connecteur relayé : une carte par appel
     "permissions:relayed_strong",          # tour venu du web : carte forte au téléphone

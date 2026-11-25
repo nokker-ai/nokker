@@ -42,6 +42,9 @@ class Presence:
     rooms: dict[str, RoomState] = field(default_factory=dict)
     guests: bool = False  # mode « invités présents » du foyer (interrupteur, ou réglage du noyau)
     ok: bool = True  # False : présence illisible (source absente, panne) → prudence maximale
+    # Membres sortis de la zone « Maison » de leur téléphone (zones de l'app, nokker/zones/presence.py) ; une pièce où
+    # un capteur les voit encore l'emporte (la maison fait foi pour les pièces).
+    away: frozenset[str] = frozenset()
 
     def room_of(self, account_id: str) -> str | None:
         found = [r for r, st in self.rooms.items() if account_id in st.members]

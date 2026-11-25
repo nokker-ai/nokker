@@ -145,14 +145,15 @@ def test_aggregates_by_tier_and_verdicts_by_decision():
 def test_aggregates_filter_by_day():
     import datetime as dt
 
-    ledger = InMemoryLedger(prices=load_from_yaml())
+    now = dt.datetime(2026, 11, 18, 11, 0, tzinfo=dt.timezone.utc)  # horloge figée : insensible à minuit
+    ledger = InMemoryLedger(prices=load_from_yaml(), clock=lambda: now)
     ledger.record("f", 0, make_call())
     # Force une date d'hier sur le dernier enregistrement pour vérifier le filtre --day.
-    yesterday = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)
+    yesterday = now - dt.timedelta(days=1)
     old = ledger._calls[-1]
     ledger._calls[-1] = old.__class__(**{**old.__dict__, "created_at": yesterday})
     ledger.record("f", 1, make_call())
 
-    today = dt.datetime.now(dt.timezone.utc).date()
+    today = now.date()
     agg_today = ledger.aggregates(day=today)
     assert agg_today.n_calls == 1

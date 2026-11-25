@@ -23,9 +23,18 @@ from nokker.core.turn import Effect, ToolResult
 
 TOOL = "lokkal_session"
 _SPEC = {"type": "object", "required": ["cwd", "task"], "properties": {
-    "machine": {"type": "string", "description": "nom de la machine liée (facultatif s'il n'y en a qu'une)"},
+    "machine": {"type": "string", "description": "nom de la machine liée, tel que le message de l'utilisateur ou le bloc "
+                                                  "[Environnement] le donne (facultatif s'il n'y en a qu'une)"},
     "cwd": {"type": "string", "description": "dossier de travail sur la machine (sous une racine déclarée)"},
     "task": {"type": "string", "description": "la tâche à faire, en entier"}}}
+
+# Texte vu du modèle : sans ce vocabulaire il disait « un outil session, pas de détail » à « tu tournes sur Lokkal ? ».
+DESCRIPTION = ("Ouvre une session de travail sur une MACHINE LIÉE et lui confie une tâche. Une machine liée est un Lokkal "
+               "(Nokker installé sur l'ordinateur de l'utilisateur, avec son bac à sable) relié à son compte ; toi, tu "
+               "tournes dans le cloud (nokker.ai). La tâche s'exécute sur cette machine, dans le dossier `cwd` ; l'outil "
+               "rend la réponse finale et le fil de la session, que l'utilisateur retrouve dans la liste des sessions de l'application, "
+               "avec le filtre de cette machine. Une carte d'approbation est présentée la première fois ; la machine doit être "
+               "allumée et reliée.")
 
 
 @dataclass
@@ -41,8 +50,7 @@ class LokkalSessionTools:
         return self.links.has_machine(tenant_id)
 
     def specs(self) -> list[ToolSpec]:
-        return [ToolSpec(name=TOOL, description="Confie une tâche à ta machine liée (Nokker Lokkal), dans un dossier ; "
-                                                "rend sa réponse.", parameters=_SPEC, effect=Effect.DESTRUCTIVE)]
+        return [ToolSpec(name=TOOL, description=DESCRIPTION, parameters=_SPEC, effect=Effect.DESTRUCTIVE)]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         def out(text: str, error: bool = False) -> ToolResult:

@@ -395,7 +395,7 @@ class AgentEngine:
                 continue  # ses cartes sont sur sa machine (X15) : c'est elle qui dira la suite
             with tenant_scope(tid):
                 cards = [self.approvals.get(i) for i in run.approvals]
-                if any(c is not None and c.status in ("pending", "approved") for c in cards):
+                if any(c is not None and c.status in ("pending", "approved", "executing") for c in cards):
                     continue
                 if any(c is not None and c.status == "expired" for c in cards):
                     self._finish(run, "failed", "carte expirée sans décision")
@@ -558,8 +558,10 @@ class AgentEngine:
 
     def _turn(self, rk: Any, a: Agent, run: AgentRun, text: str) -> Turn:
         with self._thread_lock(run.thread_id or ""), secrets_scope(a.secrets):
+            resolve = getattr(rk, "resolve_lang", None)  # langue résolue à la soumission : compte, puis fil, puis fr
+            lang = resolve(run.thread_id or "", a.created_by) if resolve is not None else None
             return rk.run_turn(TurnInput(thread_id=run.thread_id or "", user_text=text, channel=AGENT_CHANNEL,
-                                         sender=a.created_by))
+                                         sender=a.created_by, lang=lang))
 
     def _after_turn(self, run_id: str, turn: Turn) -> None:
         run = self.store.get_run(run_id)

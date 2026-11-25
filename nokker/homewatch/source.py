@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from nokker.core.ports import ToolContext, ToolSpec
+from nokker.core import model_texts as mt
+from nokker.core.ports import APPROVED_LIVE, ToolContext, ToolSpec
 from nokker.core.turn import Decision, Effect, Gate, ToolCall, ToolResult, Turn, Verdict
 from nokker.homewatch.client import BridgeClient, BridgeError
 from nokker.homewatch.policy import WatchPolicy
@@ -118,6 +119,55 @@ def _clean(v: Any, limit: int) -> str:
     s = "" if v is None else str(v)
     s = "".join(c if c.isprintable() else " " for c in s).replace("|", "/")
     return " ".join(s.split())[:limit]
+
+
+# Lignes « Caméras » du brief (docs/HOME-WATCH.md §7, relecture du 06.11) : le niveau en MOTS et entre parenthèses
+# (« inconnu » se lisait « un inconnu à l'Entrée ») ; « déjà notifiés » seulement s'il y a eu du dangereux.
+LEVEL_WORDS = {"dangereux": "dangereux", "suspect": "suspect", "normal": "normal", "inconnu": "non résumé"}
+BRIEF_TEXTS = {
+    "cameras_head": "Caméras : {n} événement(s) (dangereux {d}{notified} ; suspect {s} ; normal {o} ; non résumé {u}).",
+    "notified": ", déjà notifiés",
+    "camera_line": "- {heure} {camera} ({niveau}) : {titre}",
+    "no_title": "(sans résumé)",
+}
+
+
+def level_word(level: Any) -> str:
+    """Le niveau en MOTS, partout où un humain ou le modèle le lit (brief, veille_cameras, bulle) ; le code reste dans
+    les données (`niveau` du state)."""
+    return LEVEL_WORDS.get(str(level or "inconnu"), LEVEL_WORDS["inconnu"])
+
+
+def brief_texts_sha256() -> str:
+    """Empreinte des gabarits caméra du brief (en-tête, ligne, mots des niveaux)."""
+    return hashlib.sha256(json.dumps({"BRIEF_TEXTS": BRIEF_TEXTS, "LEVEL_WORDS": LEVEL_WORDS}, ensure_ascii=False,
+                                     sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def camera_lines(rows: list[dict[str, Any]], fmt: Callable[[Any], str]) -> list[str]:
+    """Lignes « Caméras » du brief : veille du foyer (Lokkal) et caméra du nœud maison du téléphone au cloud (P10c,
+    nokker/cloud/phone_camera.py, chaque élément « non résumé »)."""
+    counts = {lv: sum(1 for r in rows if r.get("niveau") == lv) for lv in LEVELS}
+    lines = [BRIEF_TEXTS["cameras_head"].format(
+        n=len(rows), d=counts["dangereux"], notified=BRIEF_TEXTS["notified"] if counts["dangereux"] else "",
+        s=counts["suspect"], o=counts["normal"], u=counts["inconnu"])]
+    order = {"dangereux": 0, "suspect": 1, "inconnu": 2, "normal": 3}
+    for r in sorted(rows, key=lambda r: (order.get(r.get("niveau") or "inconnu", 9), -(r.get("start") or 0)))[:10]:
+        lines.append(BRIEF_TEXTS["camera_line"].format(
+            heure=fmt(r.get("start")), camera=_clean(r.get("camera"), 40),
+            niveau=level_word(r.get("niveau")),
+            titre=_clean(r.get("title"), 140) or BRIEF_TEXTS["no_title"]))
+    return lines
+
+
+def brief_block(lines: list[str], errs: Any, hours: int, scrub: Callable[[str], str]) -> str | None:
+    """Bloc `maison_veille` du brief : en-tête, consigne DONNÉE et clôture `home-watch-brief` (textes inchangés)."""
+    if errs and lines:
+        lines = [*lines, "Relève en échec : " + ", ".join(sorted(errs)) + "."]
+    if not lines:
+        return None
+    return (f"[Veille du foyer, dernières {hours} h] {DATA_NOTICE}\n"
+            + untrusted_block("home-watch-brief", scrub("\n".join(lines))))
 
 
 def mask_mac(mac: str) -> str:
@@ -235,7 +285,7 @@ class HomeWatchSource:
         except BridgeError as e:
             self.journal.write("error", ctx.sender, {"tool": name}, "failed", reason=e.code, thread_id=ctx.thread_id)
             return _result(name, f"veille : passerelle du foyer indisponible ({e})", True)
-        return _result(name, f"outil inconnu : {name}", True)
+        return _result(name, mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
 
     def _fmt(self, ts: float | None, date: bool = False) -> str:
         if not ts:
@@ -244,7 +294,7 @@ class HomeWatchSource:
         return d.strftime("%Y-%m-%d %H:%M" if date else "%H:%M")
 
     def _review_line(self, r: dict[str, Any]) -> str:
-        bits = [self._fmt(r.get("start"), date=True), _clean(r.get("camera"), 40), r.get("niveau") or "inconnu",
+        bits = [self._fmt(r.get("start"), date=True), _clean(r.get("camera"), 40), level_word(r.get("niveau")),
                 _clean(r.get("title"), 160) or "(sans résumé)"]
         if r.get("summary"):
             bits.append(_clean(r.get("summary"), 300))
@@ -370,7 +420,7 @@ class HomeWatchSource:
             return "carte introuvable"
         if card.tool_name != name or card.rule != STRONG_RULE or card.strength != "strong":
             return "carte d'une autre nature (règle home_watch:strong attendue)"
-        if card.status != "approved":
+        if card.status not in APPROVED_LIVE:
             return f"carte non approuvée ({card.status})"
         if card.decided_via not in HUMAN_STRONG_VIA:
             return f"preuve insuffisante ({card.decided_via}) : passkey ou Mini App exigée"
@@ -390,7 +440,7 @@ class HomeWatchSource:
         if why:
             self.journal.write("direct", ctx.sender, {"camera": camera}, "refused", reason=why,
                                thread_id=ctx.thread_id)
-            return _result("veille_direct", f"refusé : {why}", True)
+            return _result("veille_direct", mt.pick(mt.TOOL_REFUSED).format(error=why), True)
         until = self.clock() + LIVE_WINDOW_S
         bid = None
         if self.hub is not None:
@@ -420,7 +470,7 @@ class HomeWatchSource:
             why = "action ou cible non déclarée"
         if why:
             self.journal.write("action", ctx.sender, what, "refused", reason=why, thread_id=ctx.thread_id)
-            return _result("veille_action", f"refusé : {why}", True)
+            return _result("veille_action", mt.pick(mt.TOOL_REFUSED).format(error=why), True)
         out = self.client.action(ACTIONS[action][0], target)
         self.journal.write("action", ctx.sender, what, "executed", approval_id=ctx.approval_id,
                            thread_id=ctx.thread_id)
@@ -575,14 +625,7 @@ class HomeWatchSource:
         since = self.clock() - hours * 3600
         lines: list[str] = []
         if self.policy.can(sender, "cameras"):
-            rows = self.store.reviews(self.tenant, since)
-            counts = {lv: sum(1 for r in rows if r.get("niveau") == lv) for lv in LEVELS}
-            lines.append(f"Caméras : {len(rows)} événement(s) (dangereux {counts['dangereux']}, déjà notifiés ; "
-                         f"suspect {counts['suspect']} ; normal {counts['normal']} ; non résumé {counts['inconnu']}).")
-            order = {"dangereux": 0, "suspect": 1, "inconnu": 2, "normal": 3}
-            for r in sorted(rows, key=lambda r: (order.get(r.get("niveau") or "inconnu", 9), -(r.get("start") or 0)))[:10]:
-                lines.append(f"- {self._fmt(r.get('start'))} {_clean(r.get('camera'), 40)} {r.get('niveau')} : "
-                             f"{_clean(r.get('title'), 140) or '(sans résumé)'}")
+            lines.extend(camera_lines(self.store.reviews(self.tenant, since), self._fmt))
         if self.policy.can(sender, "reseau"):
             new = self.store.new_devices(self.tenant, since)
             if new:
@@ -594,13 +637,7 @@ class HomeWatchSource:
             if systems:
                 lines.append("NAS :")
                 lines.extend("  " + ln for ln in self._nas_text(systems).splitlines())
-        errs = self.store.errors(self.tenant)
-        if errs and lines:
-            lines.append("Relève en échec : " + ", ".join(sorted(errs)) + ".")
-        if not lines:
-            return None
-        return (f"[Veille du foyer, dernières {hours} h] {DATA_NOTICE}\n"
-                + untrusted_block("home-watch-brief", self.scrub("\n".join(lines))))
+        return brief_block(lines, self.store.errors(self.tenant), hours, self.scrub)
 
     # ── bulles et médias (l'écran local charge l'image à la passerelle) ──
     def _review_bubbles(self, ctx: ToolContext, rows: list[dict[str, Any]]) -> int:
@@ -610,7 +647,7 @@ class HomeWatchSource:
         for r in rows:
             try:
                 self.hub.create_kernel_bubble(ctx.thread_id, kind=BUBBLE_KIND,
-                                              title=f"{_clean(r.get('camera'), 40)} — {r.get('niveau')}",
+                                              title=f"{_clean(r.get('camera'), 40)} — {level_word(r.get('niveau'))}",
                                               state={"kind": "camera_review", "review_id": r["id"],
                                                      "camera": r.get("camera"), "start": r.get("start"),
                                                      "niveau": r.get("niveau"), "title": _clean(r.get("title"), 160),

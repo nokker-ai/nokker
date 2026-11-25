@@ -31,8 +31,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from nokker.memory import provenance as P
 from nokker.memory.consolidation import model as M
 from nokker.memory.consolidation.stores import StoreError
+from nokker.redact.markers import unmark
 from nokker.tenancy.context import INTERNAL_TENANT, current_tenant
 
 log = logging.getLogger("nokker.memory.consolidation")
@@ -120,7 +122,13 @@ def _same(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
     if a is None or b is None:
         return a is b
     keys = ("title", "body", "kind", "audience", "origin", "scope", "household_id", "author_account")
-    return all(a.get(k) == b.get(k) for k in keys) and abs(float(a["updated_at"]) - float(b["updated_at"])) < 1e-6
+    return (all(a.get(k) == b.get(k) for k in keys) and _prov(a) == _prov(b)
+            and abs(float(a["updated_at"]) - float(b["updated_at"])) < 1e-6)
+
+
+def _prov(n: dict[str, Any]) -> str:
+    """Provenance d'un instantané ; un instantané d'avant la migration 080 n'en porte pas : `unknown_legacy`."""
+    return str(n.get("provenance") or P.UNKNOWN_LEGACY)
 
 
 def _partition(n: dict[str, Any]) -> tuple[str, str | None, str]:
@@ -168,7 +176,7 @@ class Consolidator:
             from nokker.qa.secrets import redact
 
             t = redact(t).text
-        return t
+        return unmark(t)  # un marqueur de l'appareil est numéroté par fil : il ne passe jamais dans la mémoire (P9b)
 
     def _ask(self, actor: Actor, system: str, user: str) -> tuple[dict[str, Any] | None, str | None]:
         """Un appel modèle, compté au ledger dans le locataire du compte (fil `consolidation-<compte>`)."""
@@ -293,8 +301,10 @@ class Consolidator:
         if merged is not None and not user_origin(keep) and keep["name"] not in protected:
             title, text = merged
             if (title, text) != (keep["title"], keep["body"]):
-                changes.append({"name": keep["name"], "action": "update", "before": keep,
-                                "after": self._rewritten(keep, title, text)})
+                # texte réécrit à partir de toutes les notes du groupe : tiers dès que l'une l'est
+                after = self._rewritten(keep, title, text)
+                after["provenance"] = P.combine(_prov(n) for n in [keep, *drops])
+                changes.append({"name": keep["name"], "action": "update", "before": keep, "after": after})
         for d in drops:
             changes.append({"name": d["name"], "action": "archive", "before": d, "after": None})
         if keep["name"] not in protected:
@@ -402,8 +412,9 @@ class Consolidator:
                 changes.append({"name": by["name"], "action": "annotate",
                                 "text": ANN_SUPERSEDES.format(title=target["title"])})
         else:
-            changes.append({"name": target["name"], "action": "update", "before": target,
-                            "after": self._rewritten(target, fixed[0], fixed[1])})
+            after = self._rewritten(target, fixed[0], fixed[1])
+            after["provenance"] = P.combine([_prov(target), _prov(by)])  # corrigée d'après `by` : sa teinte suit
+            changes.append({"name": target["name"], "action": "update", "before": target, "after": after})
             changes.append({"name": target["name"], "action": "annotate",
                             "text": ANN_CORRECTED.format(by=by["title"])})
         touched.update([target["name"], by["name"]])
@@ -432,23 +443,32 @@ class Consolidator:
             source = "\n".join(f"{e.title} {e.summary}" for e in eps)
             if got is None or not _grounded(got, source) or norm(got[1]) in existing:
                 continue
-            snap = self._new_note("fact", got[0], got[1], actor, f"consolidation:episodes:{thread_id}")
+            # Résumé de ces épisodes : leur provenance (reclassée d'après la trace par les signaux), tiers dès que l'un
+            # l'est ; un mélange d'épisodes d'avant la provenance sans trace de tiers reste `unknown_legacy`.
+            # Puis provenance PAR FAIT d'après les tours (si les signaux les portent), ce mélange en repli.
+            prov = P.combine(getattr(e, "provenance", "") for e in eps)
+            trace = [t for e in eps for t in (getattr(e, "trace", None) or [])]
+            if trace:
+                prov = P.fact_provenance(got[1], trace, prov)
+            snap = self._new_note("fact", got[0], got[1], actor, f"consolidation:episodes:{thread_id}", prov)
             out.append(_Planned(kind="summarize", scope="user", household_id=None,
                                 reason=f"{len(eps)} épisodes clos depuis plus de "
                                        f"{int(self.settings.episode_age_days)} jours",
                                 evidence={"thread_id": thread_id, "episodes": [e.id for e in eps],
-                                          "titles": [e.title for e in eps]},
+                                          "titles": [self._s(e.title) for e in eps]},
                                 changes=[{"name": snap["name"], "action": "create", "before": None, "after": snap}]))
         return out, model
 
-    def _new_note(self, kind: str, title: str, text: str, actor: Actor, origin: str) -> dict[str, Any]:
+    def _new_note(self, kind: str, title: str, text: str, actor: Actor, origin: str,
+                  provenance: str | None) -> dict[str, Any]:
         from nokker.memory.tenant_long import note_name
 
         now = float(self.clock())
         vec, model = self.embed(title, text) if self.embed is not None else (None, None)
         return {"name": note_name(kind, title, text, now), "scope": "user", "household_id": None, "audience": "all",
                 "kind": kind, "title": title, "body": text, "author_account": actor.account_id, "origin": origin,
-                "embed_model": model, "embedding": vec, "created_at": now, "updated_at": now}
+                "embed_model": model, "embedding": vec, "created_at": now, "updated_at": now,
+                "provenance": P.for_new_fact(provenance)}
 
     # ── leçons (ReasoningBank) ──
     def _lessons(self, actor: Actor, since: float, used: set[Any],
@@ -478,7 +498,8 @@ class Consolidator:
             seen_src.add(i)
             title = M.LESSON_TITLE[kind].format(title=got[0])[:MAX_TITLE]
             origin = f"consolidation:lesson:{s['thread_id']}#T{s.get('turn', '')}"
-            snap = self._new_note("feedback", title, got[1], actor, origin)
+            # Leçon : provenance de la situation (signaux) ; absente = doute = tiers.
+            snap = self._new_note("feedback", title, got[1], actor, origin, s.get("provenance"))
             out.append(_Planned(kind="lesson", scope="user", household_id=None,
                                 reason={"correction": "correction de l'utilisateur", "refused": "action refusée",
                                         "failed": "action échouée"}[s["source"]],

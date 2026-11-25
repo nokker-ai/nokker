@@ -158,10 +158,15 @@ def test_household_quota_refuses_an_opening_call_before_the_router(world):
     mt = _machine(w, w.mem)
     for text in ("un", "deux", "trois"):
         assert _post(w.port, _opens(text), mt)[0] == 200
+    deadline = time.monotonic() + 5  # le comptage suit l'envoi de la réponse, dans le fil du serveur
+    while time.monotonic() < deadline and len([r for r in w.ledger.fetch_calls() if r.household_id]) < 3:
+        time.sleep(0.02)
+    assert _used(w) == 3  # le quota lit le ledger : les trois tours y sont avant le quatrième appel
     FakeRouter.seen.clear()
     status, out = _post(w.port, _opens("quatre"), mt)
     assert status == 403 and out["error"]["code"] == "quota_exceeded"
     assert "foyer" in out["error"]["message"] and "3 messages par jour" in out["error"]["message"]
+    assert out["error"]["retry_at"] == "2026-10-27T12:00:00Z"  # fin du jour de quota du foyer
     assert FakeRouter.seen == []  # rien n'est parti vers le Router
     # La suite d'un tour déjà commencé n'est pas coupée (un tour commencé finit, comme dans le noyau).
     assert _post(w.port, _follow_up(), mt)[0] == 200

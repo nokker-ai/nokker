@@ -7,12 +7,22 @@
 #   web         l'interface web (même code que nokker.ai), /v1 relayé vers `core` : http://127.0.0.1:${NOKKER_PORT}
 #   postgres    pgvector ; deux bases (nokker, corthexis), rôles de deploy/postgres/roles.sql (RLS comme en bêta)
 #   embed       llama.cpp CPU, EmbeddingGemma-300M Q8_0 (même modèle que la mémoire de nokker.ai : index compatibles)
-#   dockerproxy seule voie du noyau vers docker : n'accepte que les bacs à sable étiquetés nokker.sandbox (sandboxd/)
+#   dockerproxy seule voie du noyau vers docker : n'accepte que les bacs à sable étiquetés nokker.sandbox ET
+#               nokker.instance=<NOKKER_INSTANCE> (sandboxd/)
 #   egress      seule sortie des bacs à sable ; plages privées refusées (box, LAN, Postgres, métadonnées cloud)
 #   roles, migrate, grants   à chaque démarrage : rôles SQL (admin), migrations (propriétaire), droits de nouveau
 #   openbao, vault-unseal    profil `vault` (install.sh --vault, COMPOSE_PROFILES=vault dans .env) : coffre OpenBao
 #               des secrets du noyau, et son compagnon qui le descelle (mode auto) ; vault-init (profil vault-init,
 #               lancé une fois par l'installeur) l'initialise. La part et le root token n'entrent jamais dans `core`.
+#   payagent, paychrome, testshop   profil `pay` (éteint par défaut ; docs/PAY-AGENT.md §11) : l'agent de paiement
+#               « ta carte » (la carte de la personne dans le coffre, montage `payagent/` que le noyau ne lit pas), son
+#               navigateur de checkout DÉDIÉ (CDP sur `paynet`, jamais celui du modèle) et un marchand de TEST sans PSP ;
+#               vault-pay-init (profil pay-init, une fois) donne à l'agent son AppRole, coffre neuf ou existant.
+#   sites-chrome profil `sites` (éteint par défaut ; docs/CONNECTED-SITES.md §3.1) : navigateurs des sites connectés,
+#               un enfant par connecteur (Xvfb, Chrome, profil en tmpfs, écran noVNC) ; MCP pour le noyau (jeton
+#               NOKKER_SITES_BROWSER_TOKEN), écrans pour le web (ticket à usage d'une passation) ; plages privées refusées.
+#   desktop     profil `desktop` (install.sh --desktop ; docs/DESKTOP.md) : bureau isolé (Xvfb, gnome-text-editor, Thunar)
+#               que le noyau pilote par l'arbre d'accessibilité ; amd64 seulement, aucune sortie (desktopnet)
 #   ollama, local-llm-pull   profil `local-llm` (install.sh --local-llm, COMPOSE_PROFILES=local-llm) : moteur
 #               d'inférence local (Ollama, CPU) et le job qui tire le modèle NOKKER_LOCAL_LLM_MODEL ; le noyau le
 #               détecte (NOKKER_OLLAMA_URLS) et /setup le propose comme modèle local. Aucun port publié.
@@ -26,6 +36,12 @@
 #   coreout     core ↔ egress seulement — interne : la sortie de core (modèles, canaux, forges) passe par egress, qui
 #               refuse les plages privées (box, NAS, métadonnées cloud) ; core n'a plus de route directe
 #   outbound    egress, embed et ollama (téléchargement des modèles)
+#   paynet      payagent ↔ paychrome ↔ testshop (profil pay) — interne : ni Internet, ni le noyau
+#   sitesnet    core ↔ sites-chrome (profil sites) — interne : le noyau reste sans route directe vers Internet
+#   sitesscreen web ↔ sites-chrome — interne : écrans de passation (/sites/screen/<id>/, ticket du noyau)
+#   sitesout    sites-chrome seul : sortie directe par le réseau de la machine (§3.1), plages privées refusées par
+#               son proxy
+#   desktopnet  core ↔ desktop (profil desktop) — interne : le bureau isolé n'a aucune sortie
 name: nokker
 
 x-hardening: &hardening
@@ -48,11 +64,17 @@ services:
     user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
     environment:
       NOKKER_CONFIG: /etc/nokker/config.yaml
+      # langue de repli du noyau, posée dans .env par install.sh (fr, en, de, it) ; entre guillemets : interpolation
+      NOKKER_LANG: "${NOKKER_LANG:-en}"
+      # ACCORD (docs/ACCORD-DEVICE.md, drapeau local.accord.enabled) : adresse d'écoute du WSS DANS le conteneur ; vide = pas
+      # de port. core n'est que sur des réseaux internes : rien n'est joignable depuis le LAN tant qu'aucun relais n'est posé.
+      NOKKER_ACCORD_BIND: "${NOKKER_ACCORD_BIND:-}"
       # Un seul dossier d'état (jeton local, réglages, coffre, skills, points de retour) : ~/.nokker/state de l'hôte,
       # là où la commande `nokker` lit le jeton local.
       NOKKER_HOME: /opt/data
       HERMES_HOME: /opt/data
       NOKKER_LOCAL_SECRET_KEY: ${NOKKER_LOCAL_SECRET_KEY:?}   # coffre local (Fernet) ; sans elle, il refuse d'écrire
+      NOKKER_CONNECTOR_KEY: ${NOKKER_CONNECTOR_KEY:-}         # identifiants de connecteurs (Fernet) ; vide = connecteurs éteints
       NOKKER_PG_DSN: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/nokker
       CORTHEXIS_DATABASE_URL: postgresql://nokker_app:${NOKKER_APP_PASSWORD:?}@postgres:5432/corthexis
       CORTHEXIS_EMBED_URLS: http://embed:8080
@@ -69,15 +91,22 @@ services:
       HTTPS_PROXY: http://egress:3128
       http_proxy: http://egress:3128
       https_proxy: http://egress:3128
-      NO_PROXY: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
-      no_proxy: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge
+      NO_PROXY: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge,payagent,sites-chrome
+      no_proxy: localhost,127.0.0.1,core,web,postgres,embed,ollama,openbao,dockerproxy,egress,home-bridge,payagent,sites-chrome
       # Réseau des bacs à sable de CETTE installation (config : code.network_name_env), le seul que le proxy accepte.
       NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_HOST_WORKSPACE: ${NOKKER_HOST_WORKSPACE:?}       # local.code.roots_env (liste « : »)
       # local.allowed_hosts_env : Host acceptés (web relayé + API directe ; 127.0.0.1:8742 = sonde de santé dans le
       # container, un littéral de bouclage qu'un navigateur ne peut pas forger) ; plus tard <nom>.nokker.app
+      NOKKER_WEB_URL: http://127.0.0.1:${NOKKER_PORT:-7420}   # page /setup du web (garde « aucun modèle »)
       NOKKER_ALLOWED_HOSTS: 127.0.0.1:8742,${NOKKER_ALLOWED_HOSTS:-127.0.0.1:${NOKKER_PORT:-7420},localhost:${NOKKER_PORT:-7420},127.0.0.1:${NOKKER_API_PORT:-8742},localhost:${NOKKER_API_PORT:-8742}}
       NOKKER_SANDBOX_IMAGE: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
+      # Sites connectés (drapeau local.sites + profil `sites`) : navigateurs et écrans de passation (§3.1, §4.3)
+      NOKKER_SITES: ${NOKKER_SITES:-0}   # install.sh --sites : allume local.sites sans réécrire config.yaml
+      NOKKER_SITES_BROWSER_URL: http://sites-chrome:8119
+      NOKKER_DESKTOP: ${NOKKER_DESKTOP:-0}   # install.sh --desktop : allume local.desktop (enabled_env), profil `desktop`
+      NOKKER_DESKTOP_MODE: ${NOKKER_DESKTOP_MODE:-virtual}   # session : --desktop-session (unité systemd --user, pas de profil)
+      NOKKER_SITES_BROWSER_TOKEN: ${NOKKER_SITES_BROWSER_TOKEN:-}
       APPROVALS_ENC_KEY: ${NOKKER_APPROVALS_KEY:?}
       ROUTER_KEY: ${NOKKER_ROUTER_KEY:-}
       # Modèle local (setup.py, détection Ollama, premier qui répond) : le service `ollama` du profil local-llm, puis
@@ -85,10 +114,18 @@ services:
       # Passerelle du foyer (profil home, docs/LOKKAL-HOME-BRIDGE.md) : jointe seulement si URL et jeton sont posés.
       NOKKER_HOME_BRIDGE_URL: ${NOKKER_HOME_BRIDGE_URL:-}
       NOKKER_HOME_BRIDGE_TOKEN: ${NOKKER_HOME_BRIDGE_TOKEN:-}
+      # Nina en direct (nina_live, docs/AVATAR.md §5) : clés lues par le noyau dans SON environnement, posées dans .env
+      # (0600) par le propriétaire ; vides = nina_live sans clé (aucun appel sortant). Jamais dans config.yaml.
+      NOKKER_RUNWAY_API_KEY: ${NOKKER_RUNWAY_API_KEY:-}
+      NOKKER_ELEVENLABS_API_KEY: ${NOKKER_ELEVENLABS_API_KEY:-}
+      NOKKER_NINA_LIVE_LLM_SECRET: ${NOKKER_NINA_LIVE_LLM_SECRET:-}
       NOKKER_OLLAMA_URLS: ${NOKKER_OLLAMA_URLS:-http://ollama:11434,http://127.0.0.1:11434}   # pas host.docker.internal : core est fermé à l'hôte et au LAN (home-bridge)
       # Coffre (LOKKAL §7 X4) : `file` (vault.bin, NOKKER_LOCAL_SECRET_KEY) sans le profil vault ; `openbao` avec. Le
       # noyau ne reçoit que role_id et secret_id de l'AppRole nokker-core, en fichiers (rien dans l'environnement).
       NOKKER_SECRETS_PROVIDER: ${NOKKER_SECRETS_PROVIDER:-file}
+      # Agent de paiement (profil pay) : jeton du noyau vers l'agent, secret des rappels signés ; vides sans le profil.
+      NOKKER_PAY_AGENT_TOKEN: ${NOKKER_PAY_AGENT_TOKEN:-}
+      NOKKER_PAY_AGENT_CALLBACK_SECRET: ${NOKKER_PAY_AGENT_CALLBACK_SECRET:-}
       NOKKER_OPENBAO_ADDR: http://openbao:8200
       NOKKER_OPENBAO_ROLE_ID_FILE: /run/nokker-vault/role_id
       NOKKER_OPENBAO_SECRET_ID_FILE: /run/nokker-vault/secret_id
@@ -99,7 +136,7 @@ services:
       # Dossier de travail AU MÊME CHEMIN que sur l'hôte : le chemin que le noyau voit est celui que le démon monte
       # dans le bac à sable (local.code.roots), sans table de correspondance.
       - ${NOKKER_HOST_WORKSPACE:?}:${NOKKER_HOST_WORKSPACE:?}
-    networks: [internal, dockerapi, coreout]
+    networks: [internal, dockerapi, coreout, sitesnet, desktopnet]
     # API locale pour la commande `nokker` de l'hôte ; le noyau vérifie le Host (local.allowed_hosts) et le jeton.
     # Pas de port publié : core n'est que sur des réseaux internes ; `web` relaie 127.0.0.1:${NOKKER_API_PORT}.
     read_only: true
@@ -119,9 +156,45 @@ services:
     depends_on: {core: {condition: service_healthy}}
     volumes:
       - ./web/lokkal.conf:/etc/nginx/conf.d/default.conf:ro
-    networks: [internal, front]   # un port n'est publié que depuis un réseau non interne : `front`, rien d'autre dessus
+      - ./web/security-headers.conf:/etc/nginx/snippets/lokkal-security-headers.conf:ro
+    networks: [internal, front, sitesscreen]   # un port n'est publié que depuis un réseau non interne : `front` ; sitesscreen : écrans des sites connectés
     ports: ["127.0.0.1:${NOKKER_PORT:-7420}:8080", "127.0.0.1:${NOKKER_API_PORT:-8742}:8742"]   # web, et API du noyau relayée
     mem_limit: 128m
+
+  accord-relay:
+    # ACCORD (docs/ACCORD-DEVICE.md §1) : relais TCP du LAN vers le WSS du noyau (core:8443), TLS de bout en bout. Profil
+    # `accord`, allumé par install.sh SEULEMENT quand NOKKER_ACCORD_LAN (IP:port explicite) est posé dans .env ; jamais
+    # publié par défaut. Même image que web (nginx avec stream), sa propre conf principale ; web n'est pas touché.
+    <<: *hardening
+    image: ${NOKKER_WEB_IMAGE:-ghcr.io/nokker-ai/nokker-web}:${NOKKER_VERSION}
+    profiles: [accord]
+    user: "101:101"            # utilisateur nginx de l'image : aucune capacité, port non privilégié
+    read_only: true
+    tmpfs: ["/tmp:size=1m"]
+    entrypoint: ["nginx", "-c", "/etc/nginx/accord-stream.conf", "-g", "daemon off;"]
+    depends_on: {core: {condition: service_healthy}}
+    volumes:
+      - ./web/accord-stream.conf:/etc/nginx/accord-stream.conf:ro
+    networks: [internal, front]   # internal : joindre core ; front (non interne) : seul réseau d'où un port se publie
+    ports: ["${NOKKER_ACCORD_LAN:-127.0.0.1:0}:8443"]   # valeur posée par install.sh ; repli inerte (profil éteint)
+    mem_limit: 32m
+
+  sites-chrome:
+    <<: *hardening
+    # Image PRIVÉE (docs/CONNECTED-SITES.md §3.1.1), PAR DIGEST : tirée et vérifiée (cosign) par l'installeur seul,
+    # jamais par compose (pull_policy never ; `compose pull` ne la voit pas : profil allumé après le tirage)
+    image: ${NOKKER_SITES_CHROME_IMAGE:-nokker-sites-chrome-absent}@${NOKKER_SITES_CHROME_DIGEST:-sha256:0000000000000000000000000000000000000000000000000000000000000000}
+    pull_policy: never
+    profiles: [sites]
+    init: true
+    environment:
+      NOKKER_SITES_BROWSER_TOKEN: ${NOKKER_SITES_BROWSER_TOKEN:-}   # vide : le gestionnaire refuse de démarrer (≥ 32 car.)
+    shm_size: 1g          # profils déchiffrés des sites actifs (/dev/shm, RAM) et mémoire partagée de Chrome
+    tmpfs: ["/tmp:size=256m", "/home/sites:size=64m,uid=10002,gid=10002"]   # racine en lecture seule : HOME de Chrome en RAM
+    read_only: true
+    networks: [sitesnet, sitesscreen, sitesout]
+    mem_limit: 3g         # ≈ 0,7 Go par site actif (Chrome), 4 sites actifs au plus
+    pids_limit: 1024
 
   postgres:
     <<: *hardening
@@ -138,7 +211,9 @@ services:
     networks: [internal]
     mem_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d nokker"]
+      # -h 127.0.0.1 : pendant l'initdb, le serveur temporaire de l'image n'écoute que sur le socket (listen_addresses
+      # vide) ; sans -h, postgres est « healthy » trop tôt et `roles` (TCP) est refusé (WSL, rc.9.3, 04.11).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d nokker"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -180,6 +255,7 @@ services:
       PGDATABASE: nokker
       NOKKER_OWNER_PASSWORD: ${NOKKER_OWNER_PASSWORD:?}
       NOKKER_APP_PASSWORD: ${NOKKER_APP_PASSWORD:?}
+      NOKKER_PAY_AGENT_PASSWORD: ${NOKKER_PAY_AGENT_PASSWORD:-}   # profil pay seulement (sql/roles.sh)
     volumes: &sql
       - ./sql:/sql:ro
     networks: [internal]
@@ -219,6 +295,10 @@ services:
       NOKKER_HOST_SKILLS: ${NOKKER_HOST_SKILLS:-}
       NOKKER_SANDBOX_NETWORK: ${NOKKER_SANDBOX_NETWORK:-nokker-sandbox}
       NOKKER_SANDBOX_EGRESS: http://egress:3128
+      # Identité du noyau (même valeur que state/instance-id, posée dans .env par install.sh) : le proxy ne sert QUE les
+      # bacs étiquetés nokker.instance=<elle> (docs/HOST-EMBED.md « Instance et ménage »).
+      NOKKER_HOST_VOLUMES: ${NOKKER_HOST_VOLUMES:-}   # 1 = volume nommé nokker-<instance>-… monté par sous-dossier (host_volumes)
+      NOKKER_INSTANCE: "${NOKKER_INSTANCE:?NOKKER_INSTANCE absent du .env : relancer install.sh --update}"
       NOKKER_SANDBOX_IMAGES: ${NOKKER_SANDBOX_IMAGE:-ghcr.io/nokker-ai/sandbox:${NOKKER_VERSION}}
     volumes:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
@@ -230,6 +310,11 @@ services:
     image: ${NOKKER_SANDBOXD_IMAGE:-ghcr.io/nokker-ai/sandboxd}:${NOKKER_VERSION}
     command: ["python3", "egress.py"]
     read_only: true
+    # Hôtes ssh déclarés (docs/en/ops.md) : liste écrite par le noyau (state/egress/ssh-hosts.json, 0640), lue par le
+    # groupe de l'utilisateur ; rien d'autre du dossier d'état (ni coffre, ni jeton local).
+    group_add: ["${NOKKER_GID:?}"]
+    volumes:
+      - ${NOKKER_STATE_DIR:?}/egress:/etc/nokker/egress:ro
     networks: [sandbox, coreout, outbound]
     mem_limit: 64m
 
@@ -306,6 +391,84 @@ services:
       - ./vault/unseal:/vault/unseal
       - ./vault/approle:/vault/approle
     networks: [internal]
+
+  # ---- profil pay (agent de paiement « ta carte », docs/PAY-AGENT.md §11) — éteint par défaut ------------------
+  # COMPOSE_PROFILES=…,pay dans .env (jamais `--profile pay up` : il remplacerait vault/local-llm le temps de l'appel).
+  # Images pas encore publiées : construites sur la machine (pull_policy: never ; `compose pull` les ignore). Variables en
+  # `:-` (compose interpole TOUT le fichier, profils éteints compris) : l'agent refuse de démarrer à moitié configuré.
+  vault-pay-init:
+    <<: *hardening
+    profiles: [pay-init]
+    restart: "no"
+    image: ${NOKKER_OPENBAO_IMAGE:-openbao/openbao:2.4.1}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    entrypoint: ["/bin/sh", "/vault/pay-init.sh"]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      HOME: /tmp
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./vault/pay-init.sh:/vault/pay-init.sh:ro
+      - ./vault/unseal:/vault/unseal:ro
+      - ./vault/approle-pay:/vault/approle-pay      # À PART : jamais monté dans core
+    networks: [internal]
+
+  payagent:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_PAYAGENT_IMAGE:-ghcr.io/nokker-ai/pay-agent}:${NOKKER_VERSION}
+    pull_policy: never
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"   # lit ./vault/approle-pay (0600, à l'utilisateur)
+    depends_on:
+      grants: {condition: service_completed_successfully}
+      paychrome: {condition: service_started}
+    environment:
+      PAYAGENT_ISSUER: own_card
+      PAYAGENT_KERNEL_TOKEN: ${NOKKER_PAY_AGENT_TOKEN:-}
+      PAYAGENT_CALLBACK_URL: http://core:8742/v1/payments/agent/events
+      PAYAGENT_CALLBACK_HOST: 127.0.0.1:8742   # Host admis par le noyau (local.allowed_hosts)
+      PAYAGENT_CALLBACK_SECRET: ${NOKKER_PAY_AGENT_CALLBACK_SECRET:-}
+      PAYAGENT_WEBAUTHN_ORIGIN: http://localhost:${NOKKER_PORT:-7420}   # passkey locale (rpId localhost)
+      PAYAGENT_DSN: postgresql://nokker_pay_agent:${NOKKER_PAY_AGENT_PASSWORD:-}@postgres:5432/nokker
+      PAYAGENT_CURRENCIES: CHF,EUR
+      NOKKER_OPENBAO_ADDR: http://openbao:8200
+      NOKKER_OPENBAO_ROLE_ID_FILE: /run/payagent-vault/role_id
+      NOKKER_OPENBAO_SECRET_ID_FILE: /run/payagent-vault/secret_id
+      PAYAGENT_CHECKOUT_CDP_URL: http://paychrome:9223
+      PAYAGENT_TEST_HTTP_HOSTS: ${NOKKER_PAY_TEST_HTTP_HOSTS:-}   # marchand de test seulement (shop.nokker.test)
+    volumes:
+      - ./vault/approle-pay:/run/payagent-vault:ro
+    networks: [internal, paynet]
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 384m
+
+  paychrome:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_PAYCHROME_IMAGE:-ghcr.io/nokker-ai/pay-chrome}:${NOKKER_VERSION}
+    pull_policy: never
+    environment:
+      HOME: /tmp
+    read_only: true
+    tmpfs: [/tmp]
+    shm_size: 256m
+    networks: [paynet]     # aucune sortie : le marchand de test seulement (un vrai marchand : par egress, à venir)
+    mem_limit: 768m
+
+  testshop:
+    <<: *hardening
+    profiles: [pay]
+    image: ${NOKKER_TESTSHOP_IMAGE:-python:3.12-alpine}
+    user: "65534:65534"
+    entrypoint: ["python3", "/shop/shop.py", "--port", "8099"]
+    read_only: true
+    volumes:
+      - ./testshop:/shop:ro
+    networks:
+      paynet: {aliases: [shop.nokker.test]}
+    mem_limit: 64m
 
   # ---- profil local-llm -----------------------------------------------------------------------------------
   ollama:
@@ -389,6 +552,35 @@ services:
     volumes: [home-sock:/run/home]
     mem_limit: 128m
 
+  desktop:
+    <<: *hardening
+    # Bureau, mode virtual (docs/DESKTOP.md, deploy/desktop/README.md) : un bureau isolé (Xvfb, gnome-text-editor,
+    # Thunar) piloté par l'arbre d'accessibilité (agent-desktop épinglé). Image publique signée (lokkal-images), amd64
+    # seulement. Aucune sortie : `desktopnet` seul, vers core:8742 en annonçant le Host 127.0.0.1:8742 (déjà admis).
+    # Sous l'uid de la personne : ~/.nokker/desktop/files (le seul dossier qu'il voit) et state (clé du nœud) lui
+    # appartiennent ; /home/desk et le dossier d'exécution en tmpfs à son uid.
+    profiles: [desktop]
+    image: ${NOKKER_DESKTOP_IMAGE:-ghcr.io/nokker-ai/nokker-desktop}:${NOKKER_VERSION}
+    platform: linux/amd64
+    init: true
+    depends_on: {core: {condition: service_healthy}}
+    user: "${NOKKER_UID:?}:${NOKKER_GID:?}"
+    read_only: true
+    tmpfs:
+      - /run/nokker-desktop:mode=0700,uid=${NOKKER_UID:?},gid=${NOKKER_GID:?}
+      - /home/desk:mode=0700,uid=${NOKKER_UID:?},gid=${NOKKER_GID:?}
+      - /tmp
+    volumes:
+      - ./desktop/state:/state
+      - ./desktop/files:/home/desk/files
+    environment:
+      NOKKER_CORE_URL: http://core:8742
+      NOKKER_CORE_HOST: 127.0.0.1:8742
+      NOKKER_DESKTOP_NAME: ${NOKKER_DESKTOP_NAME:-bureau}
+      NOKKER_DESKTOP_MODE: virtual
+    networks: [desktopnet]
+    mem_limit: 1g
+
 volumes:
   home-state:
   home-sock:
@@ -407,3 +599,8 @@ networks:
     internal: true
   outbound: {}
   front: {}
+  paynet: {internal: true}   # profil pay : payagent ↔ paychrome ↔ testshop
+  sitesnet: {internal: true}      # core ↔ sites-chrome (profil sites)
+  sitesscreen: {internal: true}   # web ↔ sites-chrome : écrans de passation
+  sitesout: {}                    # sites-chrome seul : sortie directe (plages privées refusées par son proxy)
+  desktopnet: {internal: true}    # core ↔ desktop (profil desktop) : aucune sortie

@@ -165,6 +165,7 @@ def lokkal(tmp_path):
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     yield port, api, approvals, (bot, telegram_init_data)
     httpd.shutdown()
+    httpd.server_close()
 
 
 def _sign_with_phone(port, approvals, card_id, bot, init_data_of, decision="approve"):

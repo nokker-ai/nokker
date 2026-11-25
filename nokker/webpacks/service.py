@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext
 from nokker.tools.packs import (
     _NAME, PACKS_ROOT, AgentTemplate, Pack, PackError, load_all, load_pack, resolve_agent,
@@ -485,7 +486,7 @@ class WebPacks:
             if known:
                 return (f"REFUSÉ : le contenu de la compétence {name!r} a changé depuis l'installation ; réinstalle "
                         "le pack (pack_install) pour une nouvelle vérification"), True
-            return f"compétence introuvable : {name!r} (skill_list pour voir les noms)", True
+            return mt.pick(mt.SKILL_NOT_FOUND).format(name=repr(name)), True
         entry = _Entry(name=e["name"], category=e["category"], description=e["description"], source=e["source"],
                        path=e["_path"], trusted=True, root=e["_path"].parent.parent)
         if file:

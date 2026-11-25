@@ -225,8 +225,13 @@ def test_total_budget_does_not_shorten_the_single_observed_recovery_case():
 def test_concurrency_429_waits_for_a_free_slot_without_spending_retries(monkeypatch):
     """20.10.2026 : « too many concurrent requests for this key (max 4) » — une place se libère quand un autre appel
     finit ; on attend au lieu d'abandonner (3 réessais en 3 s puis escalade, vu en réel)."""
+    import threading
+
     sleeps = []
-    monkeypatch.setattr("nokker.providers.sokkan.time.sleep", lambda s: sleeps.append(s))
+    me = threading.get_ident()
+    # `nokker.providers.sokkan.time` EST le module `time` global : sans ce filtre, le sleep(30) d'un thread de fond d'un autre
+    # test (mémoire longue en attente) atterrit dans `sleeps` (vu en suite complète, 8788 « 30.0 »).
+    monkeypatch.setattr("nokker.providers.sokkan.time.sleep", lambda s: sleeps.append(s) if threading.get_ident() == me else None)
     answers = iter([429] * 5 + [200])
 
     def handler(request):

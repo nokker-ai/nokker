@@ -48,14 +48,19 @@ def test_yaml_keys_load(tmp_path):
     assert c.billing_enabled and c.billing_prices == {"solo": "price_1"} and c.billing_plans["solo"]["deep_per_day"] == 40
 
 
-def test_beta_coupon_key_is_empty_by_default_and_reaches_checkout(monkeypatch, tmp_path):
-    assert NokkerConfig().billing_coupon == ""
+def test_beta_coupon_key_is_per_account_and_the_global_one_is_gone(monkeypatch, tmp_path):
+    """C16 : `billing_beta_coupon` (Solo, par compte éligible) remplace `billing_coupon`, qui n'est plus une clé connue :
+    une config qui le porterait encore arrête le démarrage au lieu de remiser tout le monde en silence."""
+    assert NokkerConfig().billing_beta_coupon == "" and not hasattr(NokkerConfig(), "billing_coupon")
     p = tmp_path / "c.yaml"
+    p.write_text("billing_enabled: true\nbilling_prices: {solo: price_1}\nbilling_beta_coupon: COUPON_TEST\n")
+    assert load_config(str(p)).billing_beta_coupon == "COUPON_TEST"
     p.write_text("billing_enabled: true\nbilling_prices: {solo: price_1}\nbilling_coupon: COUPON_TEST\n")
-    assert load_config(str(p)).billing_coupon == "COUPON_TEST"
+    with pytest.raises(TypeError):
+        load_config(str(p))
     monkeypatch.setenv("NOKKER_STRIPE_SECRET_KEY", "sk_test_x")
     monkeypatch.setenv("NOKKER_STRIPE_WEBHOOK_SECRET", "whsec_x")
-    server.configure_billing(cfg(billing_enabled=True, billing_coupon="COUPON_TEST"))
-    assert http.service().coupon == "COUPON_TEST"
+    server.configure_billing(cfg(billing_enabled=True, billing_beta_coupon="COUPON_TEST"))
+    assert http.service().beta_coupon == "COUPON_TEST" and http.service().grants is not None
     server.configure_billing(cfg(billing_enabled=True))
-    assert http.service().coupon == ""
+    assert http.service().beta_coupon == ""

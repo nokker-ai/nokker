@@ -55,7 +55,7 @@ def test_add_by_secret_name_list_and_remove(src, tmp_path):
     r, _ = call(src, "mcp_server_add", name="memory", url="https://other.example.com/mcp")
     assert r.is_error  # nom de config.yaml
     r, out = call(src, "mcp_server_remove", name="tracker")
-    assert out == {"removed": "tracker", "active": "au prochain redémarrage du noyau"}
+    assert out == {"removed": "tracker", "active": "au prochain redémarrage de Nokker"}
     r, _ = call(src, "mcp_server_remove", name="memory")
     assert r.is_error
 

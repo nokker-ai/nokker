@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,6 +97,39 @@ def test_endpoint(base_url: str, api_key: str | None, timeout_s: float = 8.0) ->
     return {"ok": True, "models": models, "latency_ms": ms}
 
 
+def test_anthropic_endpoint(base_url: str, api_key: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
+    """Comme `test_endpoint`, pour un point d'accès au format Anthropic : `GET <base_url>/v1/models`, clé en
+    `x-api-key`. La clé n'est jamais renvoyée."""
+    from nokker.providers.anthropic import DEFAULT_VERSION
+
+    base = base_url.rstrip("/")
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    headers = {"anthropic-version": DEFAULT_VERSION}
+    if api_key:
+        headers["x-api-key"] = api_key
+    t0 = time.monotonic()
+    try:
+        r = httpx.get(url, timeout=timeout_s, headers=headers)
+    except httpx.HTTPError as e:
+        return {"ok": False, "models": [], "latency_ms": None, "error": type(e).__name__}
+    ms = int((time.monotonic() - t0) * 1000)
+    if r.status_code != 200:
+        return {"ok": False, "models": [], "latency_ms": ms, "error": f"HTTP {r.status_code}"}
+    try:
+        models = sorted(str(m.get("id")) for m in (r.json().get("data") or []) if m.get("id"))
+    except (ValueError, AttributeError):
+        models = []
+    return {"ok": True, "models": models, "latency_ms": ms}
+
+
+def byok_format(raw: Any) -> str:
+    """Format d'une entrée byok : absent = `openai` ; `anthropic` = `/v1/messages` (docs/NOKKAN-ANTHROPIC.md)."""
+    value = str(raw or "openai").strip().lower()
+    if value not in ("openai", "anthropic"):
+        raise ValueError("byok : format openai | anthropic")
+    return value
+
+
 def detect_local_models(candidates: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     out = []
     for base in candidates or ollama_candidates():
@@ -115,7 +150,15 @@ class LocalSetup:
     vault: LocalVault
     detect: Any = detect_local_models
     test: Any = test_endpoint
+    test_anthropic: Any = test_anthropic_endpoint  # entrées byok `format: anthropic`
     state: dict[str, Any] = field(default_factory=dict)
+    # Modèle affiché pour « router » sans choix explicite : le palier Ship de la config (posé par `serve`). Le lien
+    # ne fige alors AUCUN modèle : Ship et Deep gardent les paliers de la config (Nina sur Ship, Deep en escalade).
+    router_default: str = ""
+    # Vrai quand un palier de la config sert déjà (sa clé est dans l'environnement : posé par `serve`). Une entrée byok
+    # ajoutée sans `default` ne devient alors pas le défaut et ne remplace ni Ship ni Deep à chaud : byok ne sert que
+    # le fil ou le défaut que la personne choisit. None (défaut) : le comportement d'avant (docs/LOKKAL.md §7.1).
+    tiers_ready: Any = None
 
     def __post_init__(self) -> None:
         if self.state_path.is_file():
@@ -134,9 +177,10 @@ class LocalSetup:
         names = set(self.vault.names())
         return {"done": bool(self.state["done"]),
                 "models": {"router": {"linked": "router" in names, "account": self.state.get("account"),
-                                      "model": self.state.get("router_model") or "qwen/qwen3.5-397b-a17b"},
+                                      "model": self.state.get("router_model") or self.router_default or None},
                            "byok": [{"name": b["name"], "base_url": b["base_url"], "model": b.get("model"),
-                                     "ok": b.get("ok"), "has_key": f"byok:{b['name']}" in names}
+                                     "ok": b.get("ok"), "models": b.get("models") or [], "has_key": f"byok:{b['name']}" in names,
+                                     **({"format": b["format"]} if b.get("format") else {})}
                                     for b in self.state["byok"]],
                            "local": self.detect()},
                 "default": self.state["default"],
@@ -147,35 +191,160 @@ class LocalSetup:
         base = str(body.get("base_url") or "")
         if not base.startswith(("http://", "https://")):
             return {"ok": False, "models": [], "latency_ms": None, "error": "base_url http(s) requise"}
-        return self.test(base, body.get("api_key") or None)
+        test = self.test_anthropic if byok_format(body.get("format")) == "anthropic" else self.test
+        return test(base, body.get("api_key") or None)
 
     def put_models(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Enregistre les BYOK (clé au coffre, jamais dans l'état) et le modèle par défaut."""
+        """Enregistre les BYOK (clé au coffre, jamais dans l'état) et le modèle par défaut. Tout est validé avant
+        d'écrire : un refus (ValueError, 400) ne touche ni l'état ni le coffre."""
+        entries = self.state["byok"]
+        keys: dict[str, str] = {}
         if "byok" in body:
-            kept = []
+            entries = []
             for b in body.get("byok") or []:
                 name, base = str(b.get("name") or "").strip(), str(b.get("base_url") or "").strip()
                 if not name or not base.startswith(("http://", "https://")):
                     raise ValueError("byok : name et base_url http(s) requis")
+                fmt = byok_format(b.get("format"))
                 if b.get("api_key"):
-                    self.vault.put(f"byok:{name}", str(b["api_key"]))
-                kept.append({"name": name, "base_url": base, "model": b.get("model"), "ok": b.get("ok")})
-            for old in self.state["byok"]:  # une entrée retirée de la liste emporte sa clé du coffre
-                if old["name"] not in {k["name"] for k in kept}:
-                    self.vault.delete(f"byok:{old['name']}")
-            self.state["byok"] = kept
+                    keys[name] = str(b["api_key"])
+                model = str(b["model"]).strip() if isinstance(b.get("model"), str) and b["model"].strip() else None
+                ok, models = b.get("ok") if isinstance(b.get("ok"), bool) else None, None
+                if ok is None:  # pas de verdict du client : le point d'accès est testé ici (jamais la clé renvoyée)
+                    prev = next((x for x in self.state["byok"] if x["name"] == name), None)
+                    key = keys.get(name) or self.vault.get(f"byok:{name}") or None
+                    if (prev is not None and prev["base_url"] == base and prev.get("ok") is not None
+                            and not keys.get(name) and byok_format(prev.get("format")) == fmt):
+                        ok, models = prev["ok"], prev.get("models")
+                    else:
+                        t = (self.test_anthropic if fmt == "anthropic" else self.test)(base, key)
+                        ok, models = bool(t.get("ok")), list(t.get("models") or [])
+                elif isinstance(b.get("models"), list):
+                    models = [str(m) for m in b["models"]]
+                entry = {"name": name, "base_url": base, "model": model, "ok": ok}
+                if models:
+                    entry["models"] = models
+                if fmt == "anthropic":  # absent = openai : l'état d'une entrée d'avant ne change pas
+                    entry["format"] = fmt
+                entries.append(entry)
+        by_name = {e["name"]: e for e in entries}
+        default = self.state["default"]
         if "default" in body:
-            d = str(body["default"])
-            if not (d == "router" or d.startswith(("byok:", "local:"))):
+            default = str(body["default"])
+            if not (default == "router" or default.startswith(("byok:", "local:"))):
                 raise ValueError("default : router | byok:<nom> | local:<url>|<modèle>")
-            self.state["default"] = d
+        if default and default.startswith("byok:"):
+            entry = by_name.get(default[5:])
+            if entry is None:
+                if "default" in body:
+                    raise ValueError(f"default : aucune entrée byok « {default[5:]} »")
+                default = None  # l'entrée par défaut a été retirée : le défaut est vidé
+            elif not entry.get("model"):
+                if "default" in body:
+                    raise ValueError(f"default : l'entrée byok « {default[5:]} » n'a pas de modèle")
+                default = None
+        if default is None and self.state["default"] is None and "default" not in body:
+            tested = [e for e in entries if e.get("ok") and (e.get("model") or e.get("models"))]
+            serving = bool(self.tiers_ready()) if callable(self.tiers_ready) else False
+            if len(entries) == 1 and len(tested) == 1 and not serving:  # une seule entrée testée, pas de défaut donné : la sienne
+                e = tested[0]
+                e["model"] = e.get("model") or e["models"][0]
+                default = f"byok:{e['name']}"
+        # Écriture.
+        for name, key in keys.items():
+            self.vault.put(f"byok:{name}", key)
+        for old in self.state["byok"]:  # une entrée retirée de la liste emporte sa clé du coffre
+            if old["name"] not in by_name:
+                self.vault.delete(f"byok:{old['name']}")
+        self.state["byok"] = entries
+        self.state["default"] = default
+        if self.state["done"] and not self.usable():
+            self.state["done"] = False  # plus aucun modèle : la configuration est à refaire
         self._save()
         return self.view()
+
+    def usable(self) -> bool:
+        """Un modèle par défaut utilisable existe (clé du Router au coffre, ou entrée byok / modèle local avec modèle)."""
+        try:
+            chosen = self.provider_for_default()
+        except SecretsError:
+            return False
+        # « router » sans modèle choisi : les paliers de la config servent (modèle vide voulu)
+        return chosen is not None and (bool(chosen[2]) or self.state.get("default") == "router")
+
+    def has_model(self, tier_keys: bool = False) -> bool:
+        """Au moins un modèle joignable en principe : compte relié au Router, entrée byok avec modèle, modèle par défaut
+        utilisable, ou (`tier_keys`) palier de la config dont la clé est dans l'environnement. `done` n'y compte pas."""
+        try:
+            if "router" in self.vault.names() or self.usable():
+                return True
+        except SecretsError:
+            pass
+        return tier_keys or any(b.get("model") for b in self.state["byok"])
 
     def done(self) -> dict[str, Any]:
         self.state["done"] = True
         self._save()
         return {"done": True}
+
+    def model_catalog(self) -> dict[str, tuple[str, str, bool]]:
+        """Modèles que la personne peut choisir pour UN fil : modèle -> (base_url, clé, clé_de_la_personne). Entrées byok
+        (modèle choisi et modèles testés ; clé de l'entrée), puis modèle du compte relié au Router (clé du lien, qui
+        n'est pas celle de la personne), puis modèle local par défaut. Le premier à nommer un modèle le garde. Les clés
+        ne sortent pas de la machine (l'appelant en fait un fournisseur) ; coffre illisible : entrées sans clé omises."""
+        out: dict[str, tuple[str, str, bool]] = {}
+        for b in self.state["byok"]:
+            try:
+                key = self.vault.get(f"byok:{b['name']}") or ""
+            except SecretsError:
+                continue
+            for m in [b.get("model"), *(b.get("models") or [])]:
+                if m:
+                    out.setdefault(str(m), (b["base_url"], key, True))
+        try:
+            router_key = self.vault.get("router")
+        except SecretsError:
+            router_key = None
+        model = self.state.get("router_model") or self.router_default
+        if router_key and model:
+            out.setdefault(model, (self.state.get("inference_base") or ROUTER_URL, router_key, False))
+        d = self.state.get("default") or ""
+        if d.startswith("local:"):
+            url, _, m = d[6:].partition("|")
+            if m:
+                out.setdefault(m, (url.rstrip("/") + "/v1", "", True))
+        return out
+
+    def model_format(self, model: str) -> str:
+        """Format de l'API d'un modèle de `model_catalog` : celui de l'entrée byok qui le nomme la première (même ordre
+        que le catalogue), `anthropic` si elle le déclare ; sinon `openai` (Router, modèle local, modèle inconnu)."""
+        for b in self.state["byok"]:
+            try:
+                self.vault.get(f"byok:{b['name']}")
+            except SecretsError:
+                continue  # entrée omise du catalogue : elle ne nomme rien
+            if model in [b.get("model"), *(b.get("models") or [])]:
+                return byok_format(b.get("format"))
+        return "openai"
+
+    def default_format(self) -> str:
+        """Format de l'API du modèle par défaut choisi : `anthropic` pour une entrée byok qui le déclare, sinon
+        `openai` (Router, modèle local, entrée byok sans format)."""
+        d = self.state.get("default") or ""
+        if d.startswith("byok:"):
+            b = next((x for x in self.state["byok"] if x["name"] == d[5:]), None)
+            return byok_format(b.get("format")) if b else "openai"
+        return "openai"
+
+    def default_models(self) -> list[str] | None:
+        """Modèles que le point d'accès du défaut `byok:` a rendus à son dernier sondage (`GET /models`), ou None quand on
+        ne peut pas le savoir (défaut non byok, entrée sans sondage réussi, catalogue vide)."""
+        d = self.state.get("default") or ""
+        if not d.startswith("byok:"):
+            return None
+        b = next((x for x in self.state["byok"] if x["name"] == d[5:]), None)
+        names = [str(m) for m in (b.get("models") if b else None) or []]
+        return names if (b and b.get("ok") is not False and names) else None
 
     def provider_for_default(self) -> tuple[str, str, str] | None:
         """(base_url, clé, modèle) du modèle par défaut choisi, ou None s'il n'y en a pas encore."""
@@ -185,7 +354,8 @@ class LocalSetup:
         if d == "router":
             key = self.vault.get("router")
             base = self.state.get("inference_base") or ROUTER_URL
-            return (base, key, self.state.get("router_model") or "qwen/qwen3.5-397b-a17b") if key else None
+            # modèle vide : « les paliers de la config » (default_model_applier), jamais un modèle figé ici
+            return (base, key, self.state.get("router_model") or "") if key else None
         if d.startswith("byok:"):
             name = d[5:]
             b = next((x for x in self.state["byok"] if x["name"] == name), None)
@@ -214,6 +384,20 @@ def _notice(raw: Any) -> dict[str, Any] | None:
             "reason": reason[:500] if isinstance(reason, str) and reason else None,
             "appeal": {k: str(appeal[k])[:300] for k in ("fr", "en") if isinstance(appeal.get(k), str)} or None}
 
+def _err(code: str, message: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message}}
+
+
+# Valeurs rendues à l'installeur, qui les lit avec `sed` (deploy/lokkal/install.sh, `sites_field`) : ASCII imprimable
+# sans guillemet ni barre oblique inverse (donc sans échappement JSON possible), non vides ; registre = hôte[:port].
+_SAFE_VALUE = re.compile(r'^[\x21\x23-\x5b\x5d-\x7e]{1,512}$')
+_REGISTRY_HOST = re.compile(r"^[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+
+
+def _arm64(arch: str) -> bool:
+    return str(arch or "").lower() in ("aarch64", "arm64", "armv8", "armv8l")
+
+
 @dataclass
 class LocalLink:
     """Lien de Lokkal avec un compte nokker.ai, par flux d'appareil (docs/LOKKAL.md §7.2), côté machine.
@@ -234,6 +418,7 @@ class LocalLink:
     # Appelé (sans argument) une fois que la clé et le jeton de machine sont au coffre : la clé du lien et le tunnel
     # sont pris en compte sans redémarrage (LocalApi.link_approved). Une panne ici ne casse pas la réponse du lien.
     on_approved: Any = None
+    machine_arch: Any = platform.machine  # architecture de l'hôte (le conteneur du noyau tourne en natif) ; tests
 
     def _http(self) -> Any:
         return self.client or httpx.Client(timeout=10.0)
@@ -259,6 +444,53 @@ class LocalLink:
             return r.json() if r.status_code == 200 else None
         except (httpx.HTTPError, ValueError):
             return None
+
+    def sites_registry(self) -> tuple[int, dict[str, Any]]:
+        """Identifiants de LECTURE de l'image privée `sites-chrome` (docs/CONNECTED-SITES.md §3.1.1), demandés à
+        nokker.ai avec le jeton de machine (`POST /v1/lokkal/sites-registry`) et rendus tels quels à l'appelant
+        (installeur, CLI) : ni le coffre, ni l'état, ni le journal n'en gardent rien. (statut, corps) ; erreurs
+        `{error: {code, message}}` : unsupported_arch 400, not_linked 409, forbidden 403, quota_exceeded 429 (+
+        retry_after_s), sites_registry_unavailable 503, link_unavailable 503. L'installeur lit la réponse avec `sed` :
+        une valeur qui contiendrait un guillemet, une barre oblique inverse ou un caractère de contrôle n'est jamais
+        rendue (503 sites_registry_unavailable plutôt que du JSON échappé)."""
+        if _arm64(self.machine_arch()):  # Google Chrome n'existe qu'en amd64 sous Linux : refus avant tout appel
+            return 400, _err("unsupported_arch", "sites connectés : hôte amd64 seulement (Google Chrome n'existe "
+                                                 "pas en arm64 sous Linux)")
+        token = self.setup.vault.get("machine_token")
+        if not token:
+            return 409, _err("not_linked", "machine non liée à un compte nokker.ai")
+        try:
+            r = self._http().post(self.base_url.rstrip("/") + "/v1/lokkal/sites-registry", json={},
+                                  headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError:
+            return 503, _err("link_unavailable", "nokker.ai injoignable")
+        # 502/503/504 : passerelle ou service de nokker.ai en panne (page HTML du CDN comprise, vu le 06.11 sur un
+        # vrai 502 Cloudflare) : registre indisponible pour l'instant, PAS un lien coupé
+        if r.status_code in (502, 503, 504):
+            return 503, _err("sites_registry_unavailable", "registre privé des sites connectés indisponible")
+        try:
+            body = r.json()
+        except ValueError:
+            return 503, _err("link_unavailable", "réponse illisible de nokker.ai")
+        if not isinstance(body, dict):
+            return 503, _err("link_unavailable", "réponse illisible de nokker.ai")
+        if r.status_code == 200:
+            out = {k: body.get(k) for k in ("registry", "username", "password", "expires_at")}
+            if not all(isinstance(v, str) and _SAFE_VALUE.match(v) for v in out.values()) \
+                    or not _REGISTRY_HOST.match(out["registry"]):
+                logger.warning("sites-registry : réponse de nokker.ai inutilisable par l'installeur (valeur vide ou "
+                               "caractère interdit) : refusée")
+                return 503, _err("sites_registry_unavailable", "identifiants du registre inutilisables")
+            return 200, out
+        if r.status_code == 429:
+            wait = body.get("retry_after_s")
+            out = _err("quota_exceeded", "trop de demandes d'accès aujourd'hui : réessayer plus tard")
+            out["retry_after_s"] = wait if isinstance(wait, int) and not isinstance(wait, bool) and wait > 0 else 3600
+            return 429, out
+        if r.status_code in (400, 403):  # nœud téléphone (phone_scope), compte refusé
+            return 403, _err("forbidden", "accès à l'image refusé par nokker.ai (compte ou machine)")
+        # 401 (jeton de machine révoqué : lien coupé) et tout autre statut
+        return 503, _err("link_unavailable", "lien avec nokker.ai coupé ou refusé")
 
     def pages_public(self, ttl_s: float = 300.0) -> bool:
         """nokker.ai dit-il que ce compte peut publier des pages (abonné ou compte vérifié, §7.26) ? Lu dans

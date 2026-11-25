@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nokker import bg_stop
+
 logger = logging.getLogger("nokker.homebridge.knock")
 
 KINDS = ("knock", "clap", "deck", "nfc")
@@ -125,6 +127,8 @@ class KnockBridge:
     def __init__(self, cfg: KnockConfig, events: KnockEvents | None = None):
         self.cfg = cfg
         self.events = events or KnockEvents()
+        self._srv: socket.socket | None = None
+        self._sock_lock = threading.Lock()
 
     # ── opérations nommées (noyau → passerelle) ──
     def op_events(self, p: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +169,7 @@ class KnockBridge:
                 self.events.push(ev)
 
     def serve_socket(self) -> threading.Thread:
+        self.close()  # un 2e appel ferme l'ancienne écoute avant d'en ouvrir une autre : jamais deux fils pour un socket
         path = self.cfg.socket_path
         if os.path.exists(path):
             os.unlink(path)
@@ -175,6 +180,9 @@ class KnockBridge:
         finally:
             os.umask(old)
         srv.listen(4)
+        with self._sock_lock:
+            self._srv = srv
+        bg_stop.track(self)
 
         def client(conn: socket.socket) -> None:
             buf = b""
@@ -192,12 +200,31 @@ class KnockBridge:
 
         def loop() -> None:
             while True:
-                conn, _ = srv.accept()
+                try:
+                    conn, _ = srv.accept()
+                except OSError:  # socket fermée par `close()`
+                    return
                 threading.Thread(target=client, args=(conn,), daemon=True, name="knock-audio-conn").start()
 
         t = threading.Thread(target=loop, daemon=True, name="knock-audio-sock")
+        self._sock_thread = t
         t.start()
         return t
+
+    def close(self) -> None:
+        """Ferme la socket d'écoute et attend la fin de son fil ; idempotent."""
+        with self._sock_lock:
+            srv, self._srv = self._srv, None
+        if srv is None:
+            return
+        try:
+            srv.shutdown(socket.SHUT_RDWR)  # réveille l'`accept` bloqué (Linux)
+        except OSError:
+            pass
+        srv.close()
+        t = getattr(self, "_sock_thread", None)
+        if t is not None and t is not threading.current_thread():
+            t.join(2.0)
 
     # ── satellite → passerelle (écoute du foyer) ──
     def accept_satellite(self, sat_id: str, token: str, body: Any) -> bool:

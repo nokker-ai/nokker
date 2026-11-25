@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
+from nokker.tenancy.context import start_thread_in_context
 from nokker.core.ports import ToolContext
 from nokker.core.turn import ToolResult
 from nokker.qa.permissions import Mode, Rule
@@ -283,9 +285,8 @@ class HookRunner:
         for h in self.hooks_for(ctx.thread_id, "pre_tool", name, arguments):
             code, output = self._run(ctx.thread_id, h, {"tool": name, "arguments": self._scrub_value(arguments)})
             if code != 0:
-                why = output.strip() or ("délai dépassé" if code == 124 else "sans message")
-                return (f"BLOQUÉ par un hook pre_tool ({h.source}, {h.match}, code {code}) : {why}\n"
-                        "L'outil n'a pas été exécuté.")
+                why = output.strip() or (mt.pick(mt.HOOK_TIMEOUT) if code == 124 else mt.pick(mt.HOOK_NO_MESSAGE))
+                return mt.pick(mt.HOOK_BLOCKED).format(source=h.source, match=h.match, code=code, why=why)
         return None
 
     def post_tool(self, name: str, arguments: dict[str, Any], ctx: ToolContext, result: ToolResult,
@@ -324,12 +325,12 @@ class HookRunner:
         t0 = time.monotonic()
         why = hardline_reason(hook.command)
         if why:  # jamais exécutable, même écrite par l'utilisateur
-            code, output = None, f"commande refusée (jamais exécutée) : {why}"
+            code, output = None, mt.pick(mt.HOOK_COMMAND_REFUSED).format(why=why)
         else:
             try:
                 code, output = self.sandbox(thread_id, hook.command, stdin, hook.timeout_s)
             except Exception as e:  # noqa: BLE001 — un bac à sable en panne : le hook a échoué, la session continue
-                code, output = None, f"le hook n'a pas pu tourner : {type(e).__name__}: {e}"
+                code, output = None, mt.pick(mt.HOOK_FAILED).format(error=f"{type(e).__name__}: {e}")
         output = _clip(self.scrub(str(output or "")), OUTPUT_CHARS)
         data = {"thread_id": thread_id, "event": hook.event, "match": hook.match, "source": hook.source,
                 "exit_code": code, "duration_ms": int((time.monotonic() - t0) * 1000), "timed_out": code == 124}
@@ -359,7 +360,7 @@ class HookRunner:
         if not self.background:
             fn()
             return
-        threading.Thread(target=fn, name="nokker-hook", daemon=True).start()
+        start_thread_in_context(fn, name="nokker-hook")
 
     def wrap(self, registry: Any) -> HookedTools:
         return HookedTools(inner=registry, runner=self)

@@ -144,7 +144,7 @@ class SessionActor:
     @classmethod
     def of(cls, account: Any, auth_via: str | None, auth_at: float | None) -> SessionActor:
         return cls(tenant_id=account.tenant_id, account_id=account.account_id, email=account.email,
-                   auth_via=auth_via or "", auth_at=float(auth_at or 0.0), lang=getattr(account, "lang", "fr"),
+                   auth_via=auth_via or "", auth_at=float(auth_at or 0.0), lang=getattr(account, "lang", None) or "fr",
                    status=getattr(account, "status", "active"), created_at=getattr(account, "created_at", None))
 
 

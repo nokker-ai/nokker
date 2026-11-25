@@ -76,6 +76,7 @@ def test_existing_and_hidden_rules_are_not_proposed():
     {"rule": "ops:prod"},
     {"rule": "ops:prod:db"},
     {"rule": "pages:publish"},
+    {"rule": "home:unasked", "tool": "maison_action_forte"},
     {"rule": "household:guardian"},
     {"rule": "permissions:relayed_connector"},
     {"rule": "permissions:relayed_strong"},

@@ -82,7 +82,8 @@ def ledger_catalog_total_chf(ledger: LedgerBackend, day: date, prices: PriceCata
     """Reprix chaque appel du ledger au tarif catalogue — ignore le `chf` déjà stocké (mode interne)."""
     total_usd = 0.0
     for c in ledger.fetch_calls(day=day, thread_id=thread_id):
-        usd = prices.cost_usd(c.model, c.new_tokens, c.cached_tokens, c.completion_tokens)
+        usd = prices.cost_usd(c.model, c.new_tokens, c.cached_tokens, c.completion_tokens, c.cache_write_tokens,
+                              c.cache_ttl)
         if usd is not None:
             total_usd += usd
     return prices.usd_to_chf(total_usd)

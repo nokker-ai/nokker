@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from nokker.core import model_texts as mt
 from nokker.core.ports import ToolContext, ToolSource, ToolSpec
 from nokker.core.turn import Effect, ToolResult
 from nokker.pages.store import PageError, PageMeta, PageStore
@@ -22,7 +23,7 @@ from nokker.tools.checkpoints import WORKSPACE_MOUNT, _written_paths, host_path
 logger = logging.getLogger("nokker.pages.tools")
 
 SOURCE = "builtin:pages"
-PAGE_TOOLS = ("page_create",)
+PAGE_TOOLS = ("page_create", "design_check")
 _DATA = re.compile(r"<!-- nokker:page -->\s*(\{.*?\})\s*<!-- /nokker:page -->", re.S)
 _SPEC = ToolSpec(
     name="page_create",
@@ -34,6 +35,17 @@ _SPEC = ToolSpec(
         "path": {"type": "string", "description": "le fichier .html, relatif au dossier de travail"},
         "title": {"type": "string", "description": "titre court de la bulle"}}},
     effect=Effect.WRITE, core=True, source=SOURCE)
+# Lot V8 : plancher de design d'une page (nokker/design/floor.py). Texte vu par le modèle : relu avant le gel.
+_CHECK_SPEC = ToolSpec(
+    name="design_check",
+    description=("Vérifie une page HTML du dossier de travail contre le plancher de design (jetons de couleur, focus "
+                 "visible, mouvement réduit, contraste, étiquettes, ressources externes…) sans la modifier. Rend les "
+                 "écarts « plancher » (à corriger) et « réflexe » (à corriger ou à justifier). Un résultat propre "
+                 "n'est pas une preuve de qualité : relis aussi le code de la page, et ce qui ne se voit qu'au rendu, "
+                 "demande-le à la personne."),
+    parameters={"type": "object", "required": ["path"], "properties": {
+        "path": {"type": "string", "description": "le fichier .html, relatif au dossier de travail"}}},
+    effect=Effect.READ, core=False, source=SOURCE)
 
 
 def page_block(meta: PageMeta) -> str:
@@ -59,36 +71,44 @@ def _relative(path: str, mount: str) -> str:
 
 
 class PageToolSource:
-    def __init__(self, store: PageStore, root_of: Callable[[str], Path | None], mount: str = WORKSPACE_MOUNT) -> None:
+    def __init__(self, store: PageStore, root_of: Callable[[str], Path | None], mount: str = WORKSPACE_MOUNT,
+                 design_check: bool = False) -> None:
         self.store, self.root_of, self.mount = store, root_of, mount
+        self.design_check = design_check  # `local.design_check` (V8), éteint par défaut
 
     def specs(self) -> list[ToolSpec]:
-        return [_SPEC]
+        return [_SPEC, _CHECK_SPEC] if self.design_check else [_SPEC]
 
     def call(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         def out(text: str, error: bool = False) -> ToolResult:
             return ToolResult(call_id="", name=name, content=text, is_error=error)
 
-        if name != "page_create":
-            return out(f"outil inconnu : {name}", True)
+        if name not in PAGE_TOOLS or (name == "design_check" and not self.design_check):
+            return out(mt.pick(mt.UNKNOWN_TOOL_BARE).format(name=name), True)
         root = self.root_of(ctx.thread_id)
         if root is None:
-            return out("aucun dossier de travail pour ce fil", True)
+            return out(mt.pick(mt.NO_WORKSPACE), True)
         path = str(arguments.get("path") or "").strip()
         if not path:
-            return out("argument manquant : path", True)
+            return out(mt.pick(mt.MISSING_ARG).format(name="path"), True)
         rel = _relative(path, self.mount)
         full = Path(host_path(Path(root), rel, self.mount)).resolve()
         if full != Path(root).resolve() and Path(root).resolve() not in full.parents:
-            return out(f"REFUSÉ : {path!r} est hors du dossier de travail", True)
+            return out(mt.pick(mt.PAGE_OUTSIDE_ROOT).format(path=repr(path)), True)
         if not full.is_file():
-            return out(f"fichier introuvable : {path} (écris-le d'abord avec write_file)", True)
+            return out(mt.pick(mt.PAGE_FILE_NOT_FOUND).format(path=path), True)
+        if name == "design_check":
+            from nokker.design.floor import MAX_BYTES, check, report
+
+            if full.stat().st_size > MAX_BYTES:
+                return out(mt.pick(mt.PAGE_TOO_BIG).format(path=rel), True)
+            return out(report(check(full.read_text(encoding="utf-8", errors="replace"))))
         try:
             meta = self.store.create(ctx.thread_id, rel, str(arguments.get("title") or ""), full.read_bytes())
         except PageError as e:
             return out(f"REFUSÉ : {e}", True)
-        return out(f"page {meta.page_id} « {meta.title} », version {meta.version}, privée ; elle est affichée dans "
-                   f"le chat et suit les modifications de {rel}.\n{page_block(meta)}")
+        return out(mt.pick(mt.PAGE_PUBLISHED).format(page_id=meta.page_id, title=meta.title, version=meta.version, rel=rel)
+                   + f"\n{page_block(meta)}")
 
 
 class PagingToolSource:

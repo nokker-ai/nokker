@@ -200,3 +200,24 @@ def test_build_policy_reads_the_vision_of_the_served_tiers():
     assert p.choose(state("merci !", thread="b2")).tier is Tier.SMALL
     providers.pop(Tier.SHIP)
     assert p.choose(image_state("merci !", thread="b3")).tier is Tier.DEEP
+
+
+
+def test_ack_alone_is_trivial_on_the_first_turn_only():
+    """05.11 (machine de test) : « OK » en session neuve partait sur Ship et explorait le dossier. Au premier tour il n'y a rien à
+    approuver : trivial. Plus loin, il peut répondre à « je supprime ? » : jamais trivial (GO)."""
+    for text in ("OK", "ok !", "d'accord", "Parfait", "super", "top 👍", "ok merci", "noté", "compris"):
+        assert classify_rules(text, first_turn=True).task is TaskClass.TRIVIAL, text
+    for text in ("ok", "d'accord", "parfait", "noté"):
+        assert classify_rules(text).task is not TaskClass.TRIVIAL, text
+        assert classify_rules(text, TaskClass.CONVERSATION).task is not TaskClass.TRIVIAL, text
+    for text in ("ok vas-y", "d'accord, supprime-le", "ok pour l'envoi", "ok, lance les tests", "parfait, publie",
+                 "ok et le déploiement ?"):
+        assert classify_rules(text, first_turn=True).task is not TaskClass.TRIVIAL, text
+
+
+def test_policy_marks_the_first_turn_from_the_turn_index():
+    p = policy()
+    assert p.choose(state("OK", thread="a", index=0)).tier is Tier.SMALL
+    assert p.choose(state("OK", thread="b", index=3)).tier is not Tier.SMALL
+    assert p.choose(state("d'accord", thread="c", index=2)).tier is not Tier.SMALL

@@ -242,15 +242,18 @@ def handle_glance_owner(h: Any, method: str, path: str, account_id: str, tenant_
         if path == GLANCE + "/pair" and method == "POST":
             body = _body(h) or {}
             name = body.get("name") if isinstance(body, dict) else None
+            surface = body.get("surface", "glasses") if isinstance(body, dict) else "glasses"
             if who is not None:  # rattachée au foyer : un adulte du foyer peut la révoquer
-                out = a.glance.offer(account_id, who.household_tenant, who.household_id, str(name or ""))
+                out = a.glance.offer(account_id, who.household_tenant, who.household_id, str(name or ""), surface)
             else:
-                out = a.glance.offer(account_id, tenant_id, "", str(name or ""))
+                out = a.glance.offer(account_id, tenant_id, "", str(name or ""), surface)
             _json(h, 201, out)
         elif path == GLANCE + "/devices" and method == "GET":
             _json(h, 200, a.glance.devices(account_id))
         elif m and method == "DELETE":
             _json(h, 200, a.glance.revoke(account_id, m.group(1)))
+        elif m and method == "PATCH":  # écran mural (P10b) : brief et titre montrés ou non
+            _json(h, 200, a.glance.set_show_brief(account_id, m.group(1), _body(h)))
         else:
             raise DisplayError(404, "not_found", "not found")
     except DisplayError as e:

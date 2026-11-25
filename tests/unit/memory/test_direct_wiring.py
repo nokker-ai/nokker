@@ -274,3 +274,62 @@ def test_healthz_and_local_memory_route_report_the_long_memory(fake_cx, tmp_path
         assert _req(port, "/healthz")[1]["memory"] == "down"  # le noyau répond toujours 200
     finally:
         httpd.shutdown()
+
+
+def test_local_memory_count_follows_a_forget_at_once_and_carries_checked_at(fake_cx, tmp_path, monkeypatch):
+    """Le compteur de notes de GET /v1/local/memory ne retarde pas sur la base (cache de 15 s périmé à chaque écriture,
+    oubli, décision de quarantaine ou fin d'indexation) ; `checked_at` (ISO 8601 UTC) est ajouté à la réponse."""
+    import re
+    import threading
+    import time
+    from http.server import ThreadingHTTPServer
+
+    from nokker.api.server import make_handler
+    from nokker.local.api import LOCAL_OWNER
+    from tests.unit.test_local_api import _api, _req
+
+    monkeypatch.setenv("NOKKER_MEMORY_MODE", "direct")
+    fake_cx["stats"]["notes"] = 5
+    pm, _engine = make_memory(tmp_path)
+    tools = ProjectMemoryTools(pm)
+    said = "retiens pour toujours : mon fuseau horaire est Europe/Zurich"
+    pm.core_block("th_web", 3, said)
+    ok = tools.call("memory_note", {"kind": "fact", "title": "Fuseau horaire", "text": "Europe/Zurich",
+                                    "derived_from": "user", "scope": "user", "quote": "mon fuseau horaire est "
+                                    "Europe/Zurich"}, ctx("th_web", 3))
+    assert not ok.is_error, ok.content
+    name = ok.content.split()[2]
+    kernel = build_kernel(_cfg())
+    api = _api(tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(kernel, {api.token: LOCAL_OWNER}, local_api=api))
+    port = httpd.server_address[1]
+    api.allowed_hosts = frozenset({f"127.0.0.1:{port}"})
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        _s, first = _req(port, "/v1/local/memory", token=api.token)
+        assert first["store"]["notes"] == 5 and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", first["checked_at"])
+        assert list(first)[:2] == ["mode", "ok"]  # structure existante inchangée : le champ est ajouté
+        # Sans invalidation le cache de 15 s répondrait encore 5 : la base passe à 4 puis la personne oublie la note.
+        fake_cx["stats"] = {**fake_cx["stats"], "notes": 4}
+        again = _req(port, "/v1/local/memory", token=api.token)[1]
+        assert again["store"]["notes"] == 5 and again["checked_at"] == first["checked_at"]  # copie gardée, datée
+        time.sleep(1.1)
+        forgot = tools.call("memory", {"action": "forget", "name": name}, ctx("th_web", 4))
+        assert not forgot.is_error, forgot.content
+        after = _req(port, "/v1/local/memory", token=api.token)[1]
+        assert after["store"]["notes"] == 4 and after["checked_at"] > first["checked_at"]
+        # une fin d'indexation (la base change) et une décision de quarantaine périment aussi la copie
+        fake_cx["stats"] = {**fake_cx["stats"], "notes": 6}
+        cx.invalidate_status()
+        assert _req(port, "/v1/local/memory", token=api.token)[1]["store"]["notes"] == 6
+        fake_cx["stats"] = {**fake_cx["stats"], "notes": 7}
+        from nokker.learning.pending import PendingMemory
+        from nokker.learning.store import MemoryLearningStore
+
+        pending = PendingMemory(store=MemoryLearningStore(), account_of_thread=lambda tid: "acc")
+        held = pending.hold_note(thread_id="th_q", turn_index=1, kind="fact", scope="user", title="Fait", text="Un fait.",
+                                 derived_from="user", project="u-local", links=[])
+        pending.decide("acc", held.id, False, "owner")  # refusée : rien n'est écrit, la copie est périmée quand même
+        assert _req(port, "/v1/local/memory", token=api.token)[1]["store"]["notes"] == 7
+    finally:
+        httpd.shutdown()

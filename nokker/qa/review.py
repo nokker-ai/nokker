@@ -24,6 +24,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.core.model_texts import NOT_DONE_MARKS as _NOT_DONE_MARKS
+from nokker.core.model_texts import judge_language_line
+from nokker.core.refusal import is_refusal
 from nokker.core.turn import Turn
 
 logger = logging.getLogger("nokker.qa.review")
@@ -41,7 +44,7 @@ def _result_ok(content: str) -> bool:
     try:
         data = json.loads(content)
     except (TypeError, ValueError):
-        return not (content or "").startswith(("REFUSÉ", "EN ATTENTE", "ESCALADÉ", "argument manquant"))
+        return not (is_refusal(content) or (content or "").startswith(_NOT_DONE_MARKS))
     return not (isinstance(data, dict) and data.get("error"))
 
 
@@ -140,7 +143,7 @@ class DiffReviewer:
         if not diff:
             return None
         prompt = REVIEW_PROMPT.format(request=(turn.input.text or "")[:4000], diff=diff,
-                                      commands=last_commands(turn) or "(aucune)")
+                                      commands=last_commands(turn) or "(aucune)") + judge_language_line()
         t0 = time.monotonic()
         try:
             data = self.transport.post({"messages": [{"role": "user", "content": prompt}],
@@ -232,7 +235,7 @@ class CardAdvisor:
             return None
         args = json.dumps(arguments or {}, ensure_ascii=False)[:1500]
         prompt = ADVICE_PROMPT.format(request=(turn.input.text or "")[:2000], tool=tool_name, arguments=args,
-                                      reason=(reason or "")[:300])
+                                      reason=(reason or "")[:300]) + judge_language_line()
         t0 = time.monotonic()
         self.last_usage, self.last_model = {}, ""
         try:

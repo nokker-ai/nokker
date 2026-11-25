@@ -8,9 +8,21 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.context.keyitems import key_line
 from nokker.context.manager import ContextManager, day_of
+from nokker.context.summarize import _key_texts
 from nokker.context.text import clip, first_sentences
 from nokker.context.types import DaySummary, Summarizer, estimate_tokens, new_day_id
+from nokker.memory.provenance import (
+    UNKNOWN_LEGACY,
+    combine,
+    fact_provenance,
+    for_new_fact,
+    of_turns,
+    propose_facts,
+    reclassify_legacy,
+)
+from nokker.redact.markers import unmark
 
 logger = logging.getLogger("nokker.context.consolidate")
 
@@ -62,8 +74,17 @@ class Consolidator:
         res = self.refiner.summarize(turns, previous=ep.summary)
         if res.model is None:  # repli extractif : on garde l'existant, on réessaiera à la prochaine consolidation
             return
+        # Le résumé raffiné et les faits viennent de la transcription COMPLÈTE (résultats d'outils compris) : leur
+        # provenance est celle des tours. L'épisode d'avant la provenance n'est reclassé que vers tiers (trace).
+        facts_from = of_turns(turns)
+        ep.provenance = (reclassify_legacy(ep.provenance, turns) if ep.provenance == UNKNOWN_LEGACY
+                         else combine([ep.provenance, facts_from]))
         ep.title = mgr._clean(res.title)[:120] or ep.title
         ep.summary = mgr._clean(res.summary) or ep.summary
+        if mgr.budgets.summary_key_items:  # un résumé LLM perd les noms de fichiers : la ligne d'éléments clés est recopiée
+            key = mgr._clean(key_line(_key_texts(turns), min(600, max(0, int(mgr.budgets.summary_key_chars)))))
+            if key and key not in ep.summary:
+                ep.summary = f"{ep.summary} {key}"
         ep.summary_tokens = estimate_tokens(ep.summary)
         ep.keywords = [mgr._clean(k) for k in res.keywords][:16] or ep.keywords
         ep.refined = True
@@ -71,7 +92,17 @@ class Consolidator:
         mgr.reindex_episode(ep.id)  # le résumé raffiné repart dans l'index sémantique
         report.refined.append(ep.id)
         if res.facts and self.memory is not None:
-            self.memory.propose(thread_id, [mgr._clean(f) for f in res.facts])
+            # Provenance PAR FAIT (recouvrement lexical avec les tours, nokker/memory/provenance.py::fact_provenance) ;
+            # repli : celle de l'épisode. Une décision de la personne n'hérite pas du web_search voisin.
+            # Provenance calculée sur le fait encore MARQUÉ (les tours gardent leurs marqueurs : comparable) ;
+            # mémoire longue = hors du fil : on stocke le fait démarqué, aucun marqueur de l'appareil n'y entre (P9b).
+            by_prov: dict[str, list[str]] = {}
+            for f in res.facts:
+                fact = mgr._clean(f)
+                prov = fact_provenance(fact, turns, for_new_fact(facts_from))
+                by_prov.setdefault(prov, []).append(unmark(fact))
+            for prov, facts in by_prov.items():
+                propose_facts(self.memory, thread_id, facts, prov)
             report.facts_proposed += len(res.facts)
 
     def _days(self, thread_id: str, now: float, report: ConsolidationReport) -> None:

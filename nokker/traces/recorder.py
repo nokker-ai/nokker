@@ -235,6 +235,7 @@ class TraceRecorder:
                 "response": message_dict(comp.message),
                 "msg_at": len(turn.messages), "verdict_at": len(turn.verdicts),
                 "tier": getattr(call.tier, "value", call.tier), "model": call.model, "reasoning": call.reasoning,
+                "model_served": getattr(call, "model_served", None), "upstream": getattr(call, "upstream", None),
                 "latency_s": round(float(call.latency_s or 0.0), 3), "route_reason": call.route_reason,
                 "tokens": {"prompt": usage.prompt, "cached": usage.cached if usage.cached_reported else None,
                            "completion": usage.completion},
@@ -248,6 +249,7 @@ class TraceRecorder:
         usage = call.usage
         entry = {"kind": kind, "prompt": strip_images(copy_json(messages)), "response": message_dict(comp.message),
                  "tier": getattr(call.tier, "value", call.tier), "model": call.model,
+                 "model_served": getattr(call, "model_served", None), "upstream": getattr(call, "upstream", None),
                  "latency_s": round(float(call.latency_s or 0.0), 3), "route_reason": call.route_reason,
                  "tokens": {"prompt": usage.prompt, "cached": usage.cached if usage.cached_reported else None,
                             "completion": usage.completion},
@@ -269,7 +271,8 @@ class TraceRecorder:
                 "account_id": turn.sender, "kernel_sha": self.kernel_sha, "target": self.target,
                 "recorded_at": now, "prompt": prompt, "tools": [], "completion": completion,
                 "meta": {"tenant_type": tenant_type, "channel": turn.channel, "side": c["kind"], "tier": c["tier"],
-                         "model": c["model"], "reasoning": False, "latency_s": c["latency_s"], "tokens": c["tokens"],
+                         "model": c["model"], "model_served": c.get("model_served"), "upstream": c.get("upstream"), "reasoning": False,
+                         "latency_s": c["latency_s"], "tokens": c["tokens"],
                          "route_reason": c["route_reason"], "finish_reason": c["finish_reason"],
                          "gates_and_invariants": [], "approvals": [], "escalation": {"call": False, "turn": False},
                          "secret_seals": {"count": len(secret_handles(completion)),
@@ -330,6 +333,7 @@ class TraceRecorder:
                 "recorded_at": now, "prompt": prompt, "tools": c["tools"], "completion": completion,
                 "meta": {
                     "tenant_type": tenant_type, "channel": turn.channel, "tier": c["tier"], "model": c["model"],
+                    "model_served": c.get("model_served"), "upstream": c.get("upstream"),
                     "reasoning": c["reasoning"], "latency_s": c["latency_s"], "tokens": c["tokens"],
                     "route_reason": c["route_reason"], "finish_reason": c["finish_reason"],
                     "gates_and_invariants": triggered(window),

@@ -73,3 +73,15 @@ def test_internal_tenant_registry_is_untouched():
     links, tools = _setup()
     _link(links, "us_alice", "tn_ninabot")
     assert not _names(tools, "tn_ninabot") & LOKKAL  # l'interne a son propre registre, sans ces sources
+
+
+def test_lokkal_session_description_explains_linked_machines_to_the_model():
+    """Texte vu du modèle : « machine liée », Lokkal et cloud y sont définis (il répondait « un outil session, pas de
+    détail » à « tu tournes sur Lokkal ? »), et aucune description ne laisse un identifiant opaque."""
+    from nokker.cloud.lokkal_session import DESCRIPTION
+
+    spec = LokkalSessionTools(links=LinkService(), signer=Signer.generate()).specs()[0]
+    assert spec.description == DESCRIPTION
+    for word in ("machine liée", "Lokkal", "cloud", "nokker.ai", "liste des sessions de l'application"):
+        assert word in DESCRIPTION
+    assert "[Environnement]" in spec.parameters["properties"]["machine"]["description"]

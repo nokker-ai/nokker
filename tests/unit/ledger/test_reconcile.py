@@ -12,11 +12,19 @@ from nokker.ledger.reconcile import (
 )
 from tests.unit.ledger.test_costs import make_call
 
-TODAY = dt.datetime.now(dt.timezone.utc).date()
+# Horloge figée : le « jour » du ledger est la date UTC de `created_at` (costs.py, fetch_calls). Calculer TODAY à
+# l'import avec l'heure réelle puis laisser le ledger dater avec l'heure réelle fait échouer la suite si elle
+# traverse minuit UTC (01:00/02:00 CET) entre la collecte et le test.
+FIXED_NOW = dt.datetime(2026, 11, 18, 11, 0, tzinfo=dt.timezone.utc)  # 2026-11-18 12:00 CET
+TODAY = FIXED_NOW.date()
+
+
+def _fixed_clock() -> dt.datetime:
+    return FIXED_NOW
 
 
 def _ledger_with_known_cost(chf: float) -> InMemoryLedger:
-    ledger = InMemoryLedger(prices=load_from_yaml())
+    ledger = InMemoryLedger(prices=load_from_yaml(), clock=_fixed_clock)
     ledger.record("f", 0, make_call(chf=chf))
     return ledger
 
@@ -55,7 +63,7 @@ def test_reconcile_unknown_mode_raises():
 
 def test_reconcile_catalog_mode_reprices_from_scratch_ignoring_stored_chf():
     """Le `chf` stocké peut être 0 (compte interne) : le mode catalogue reprix l'appel lui-même."""
-    ledger = InMemoryLedger(prices=load_from_yaml())
+    ledger = InMemoryLedger(prices=load_from_yaml(), clock=_fixed_clock)
     ledger.record("f", 0, make_call(chf=0.0, model="qwen/qwen3.8-27b", prompt=1_000_000, cached=0, completion=0))
     r = reconcile(ledger, TODAY, mode="catalog")
     assert r.ledger_chf == pytest.approx(0.0)  # ce qui est stocké
@@ -118,3 +126,21 @@ def test_reconcile_router_mode_with_broker_sqlite(tmp_path):
     ledger = _ledger_with_known_cost(0.01)
     r = reconcile(ledger, TODAY, mode="router", broker_sqlite_path=db, account_id="acct_x")
     assert r.within_tolerance
+
+
+# ───────────────────────── régression : minuit ─────────────────────────
+
+
+def test_reconcile_stable_across_midnight_with_frozen_clock():
+    """Le ledger daté avant minuit UTC reste réconcilié sur son jour, même si l'horloge réelle passe minuit."""
+    cell = [dt.datetime(2026, 11, 17, 23, 59, 59, tzinfo=dt.timezone.utc)]  # juste avant minuit UTC
+    ledger = InMemoryLedger(prices=load_from_yaml(), clock=lambda: cell[0])
+    ledger.record("f", 0, make_call(chf=0.01))
+    day = cell[0].date()
+    cell[0] = dt.datetime(2026, 11, 18, 0, 0, 1, tzinfo=dt.timezone.utc)  # juste après : le « maintenant » change
+    r = reconcile(ledger, day, mode="router", router_total_usd=0.01 * 1.25)
+    assert r.within_tolerance and r.ledger_chf == pytest.approx(0.01)
+    # Preuve du flake d'origine : avec l'horloge qui avance, un enregistrement daté « maintenant » change de jour.
+    ledger.record("f", 1, make_call(chf=0.01))
+    assert ledger_total_chf(ledger, day) == pytest.approx(0.01)
+    assert ledger_total_chf(ledger, cell[0].date()) == pytest.approx(0.01)

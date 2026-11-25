@@ -292,3 +292,96 @@ def test_vision_capability_from_config_and_hedged(tmp_path):
 def test_lokkal_config_declares_vision_on_the_397b():
     cfg = load_config(str(Path(__file__).resolve().parents[3] / "deploy" / "lokkal" / "core-config.yaml"))
     assert all(t.vision for t in cfg.tiers.values() if "397b" in t.model.lower())
+
+
+# ───────────────────────────── image lue par un outil (r44) ─────────────────────────────
+
+
+@dataclass
+class ReadingProvider:
+    vision: bool
+    model: str = "qwen/qwen3.5-397b-a17b"
+    seen: list = field(default_factory=list)
+
+    def complete(self, messages, tools, *, reasoning, session_key, max_tokens=2048):
+        self.seen.append(messages)
+        if len(self.seen) == 1:
+            from nokker.core.turn import ToolCall
+
+            return Completion(message=Message(role="assistant", tool_calls=[
+                ToolCall(id="r1", name="read_file", arguments={"path": "cap.png"})]), usage=Usage(prompt=10),
+                model=self.model, latency_s=0.01)
+        return Completion(message=Message(role="assistant", content="rouge"), usage=Usage(prompt=10),
+                          model=self.model, latency_s=0.01)
+
+
+def _reading_kernel(tmp_path, vision: bool, data: bytes):
+    from nokker.core.ports import ToolSpec
+    from nokker.core.turn import Effect, ToolResult
+    from nokker.tools.code import _image_of
+    from nokker.tools.registry import Registry, StaticToolSource
+    from nokker.tools.result_fence import fence_file_result
+
+    def read(args, ctx):
+        r = {"is_image": True, "base64_content": b64(data), "mime_type": "image/png", "file_size": len(data),
+             "dimensions": "2x2"}
+        res = ToolResult("", "read_file", fence_file_result("read_file", args, json.dumps(r)))
+        res.images = _image_of(r, args["path"])
+        return res
+
+    spec = ToolSpec(name="read_file", description="lire un fichier", parameters={"type": "object"}, effect=Effect.READ)
+    prov = ReadingProvider(vision=vision)
+    store = ImageStore(tmp_path / "images")
+    k = Kernel(store=MemoryStore(), context=_engine(tmp_path), memory=NullMem(), invariants=AllowInvariants(),
+               gates=AllowGates(), escalator=NoEscalator(), policy=ShipOnlyPolicy(), providers={Tier.SHIP: prov},
+               tools=Registry(sources=[StaticToolSource(entries=[(spec, read)])]), ledger=InMemoryLedger(),
+               images=store)
+    return k, prov
+
+
+def test_image_read_by_a_tool_never_goes_as_base64_text_and_joins_the_turn_as_an_image(tmp_path):
+    data = png()
+    k, prov = _reading_kernel(tmp_path, vision=True, data=data)
+    turn = k.run_turn(TurnInput(thread_id="th", user_text="lis cap.png"))
+    assert turn.reply == "rouge"
+    tool_msg = next(m for m in prov.seen[1] if m.get("role") == "tool")
+    assert tool_msg["content"] == f"Fichier cap.png :\nimage image/png, {len(data)} octets, 2×2"
+    assert b64(data) not in tool_msg["content"]
+    parts = [p for m in prov.seen[1] if isinstance(m.get("content"), list) for p in m["content"]]
+    assert any(p.get("type") == "image_url" and p["image_url"]["url"] == f"data:image/png;base64,{b64(data)}"
+               for p in parts)
+    assert [i.name for i in turn.images] == ["cap.png"]
+
+
+def test_image_read_by_a_tool_on_a_tier_without_vision_is_a_note(tmp_path):
+    k, prov = _reading_kernel(tmp_path, vision=False, data=png())
+    k.run_turn(TurnInput(thread_id="th", user_text="lis cap.png"))
+    seen = json.dumps(prov.seen[1], ensure_ascii=False)
+    assert "base64" not in seen and "[image jointe non lue : modèle sans vision" in seen
+
+
+def test_tool_image_is_marked_tool_for_clients_and_invisible_to_the_model(tmp_path):
+    from nokker.threads.export import build_export
+
+    data = png()
+    k, prov = _reading_kernel(tmp_path, vision=True, data=data)
+    turn = k.run_turn(TurnInput(thread_id="th", user_text="lis cap.png"))
+    [img] = turn.images
+    assert img.origin == "tool:read_file" and img.from_tool
+    stored = k.store.history("th")[0]
+    assert stored.images == [img] and turn_to_dict(stored)["images"][0]["origin"] == "tool:read_file"
+    assert turn_from_dict(json.loads(json.dumps(turn_to_dict(stored)))).images[0].origin == "tool:read_file"
+    # la personne : sans origin (comme avant r44)
+    own = ImageRef(sha256="a" * 64, media_type="image/png", size=1, name="x.png")
+    assert "origin" not in own.to_dict() and not own.from_tool
+    # export privé (et miroir, historique : même to_dict) : l'image porte sa provenance ; partage public : comptée à part
+    stored.images = [own, img]
+    doc = build_export({"title": "t"}, [stored], scrub=lambda s: s, effect_of=lambda n: None)
+    user = next(m for m in doc["messages"] if m["role"] == "user")
+    assert [i.get("origin") for i in user["images"]] == [None, "tool:read_file"]
+    pub = build_export({"title": "t"}, [stored], scrub=lambda s: s, effect_of=lambda n: None, public=True)
+    user = next(m for m in pub["messages"] if m["role"] == "user")
+    assert user["images_count"] == 1 and user["tool_images_count"] == 1
+    # le modèle : même partie image qu'une pièce jointe de la personne, aucune trace de provenance
+    sent = json.dumps(prov.seen[1], ensure_ascii=False)
+    assert "tool:read_file" not in sent and "origin" not in sent

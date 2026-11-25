@@ -72,6 +72,17 @@ def test_ambient_displays_and_boards(pg, pod_env):  # noqa: F811
     assert not d.store.revoke_owned(bob.account_id, got["device"]["id"], 1.0)
     g.revoke(alice.account_id, got["device"]["id"])
     assert g.resolve(got["token"]) is None
+    # écran mural (082) : surface fixée à l'appairage, show_brief faux, changé par le titulaire seul, sous RLS
+    wall = g.claim(g.offer(alice.account_id, A, "tp_a", "Cuisine", "wall")["code"])
+    wid = wall["device"]["id"]
+    w = g.resolve(wall["token"])
+    assert (w.surface, w.show_brief) == ("wall", False)
+    with pytest.raises(Exception):
+        g.set_show_brief(bob.account_id, wid, {"show_brief": True})  # pas à lui : 404
+    assert g.set_show_brief(alice.account_id, wid, {"show_brief": True})["show_brief"] is True
+    assert g.resolve(wall["token"]).show_brief is True
+    old = next(x for x in g.devices(alice.account_id)["devices"] if x["id"] == got["device"]["id"])
+    assert old["surface"] == "glasses" and old["show_brief"] is True  # lignes d'avant 082 : lunettes, tout montré
     assert apply_migrations(pg["owner"], strict=True)  # rejouée sans erreur
 
 

@@ -72,6 +72,9 @@ class PendingNote:
     decided_at: str | None = None
     decided_by: str | None = None
     result: str | None = None  # nom de la note écrite à l'approbation
+    # Provenance d'un fait de `propose` (nokker/memory/provenance.py), transmise à l'approbation ; "" pour une
+    # `memory_note` ; `unknown_legacy` pour une note rangée avant la provenance (migration 080).
+    provenance: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

@@ -16,7 +16,7 @@ from psycopg.types.json import Jsonb
 from nokker.approvals.base import BaseApprovals
 from nokker.approvals.types import Device, Session
 from nokker.core.ports import Approval
-from nokker.store.conn import TenantConn, connect_admin, migrate
+from nokker.store.conn import AdminConn, TenantConn, known_tenants, migrate
 
 MIGRATION_SQL = (Path(__file__).parent / "migrations" / "0001_approvals.sql").read_text(encoding="utf-8")
 # Marques des règles suggérées (docs/APPROVALS.md §7) : migration du store, rejouée aussi ici (après la table approvals).
@@ -25,6 +25,17 @@ SUGGESTIONS_SQL = (Path(__file__).parent.parent / "store" / "migrations"
 # Relecteur automatique (docs/APPROVALS.md §8) : colonne `auto_review` de la carte.
 AUTO_REVIEW_SQL = (Path(__file__).parent.parent / "store" / "migrations"
                    / "051_approval_auto_review.sql").read_text(encoding="utf-8")
+# Code stable du motif de la carte : colonne `reason_code` (nullable).
+REASON_CODE_SQL = (Path(__file__).parent.parent / "store" / "migrations"
+                   / "087_approval_reason_code.sql").read_text(encoding="utf-8")
+
+# Statut `executing` : colonne `executing_at` (nullable).
+EXECUTING_SQL = (Path(__file__).parent.parent / "store" / "migrations"
+                 / "091_approval_executing.sql").read_text(encoding="utf-8")
+
+# Cible lisible figée de la carte : colonne `target` (nullable).
+TARGET_SQL = (Path(__file__).parent.parent / "store" / "migrations"
+              / "095_approval_target.sql").read_text(encoding="utf-8")
 
 _ENC_KEY_ENV = "NOKKER_APPROVALS_ENC_KEY"
 
@@ -45,24 +56,25 @@ def _enc_approval(a: Approval) -> dict[str, Any]:
             "status": a.status, "created_at": a.created_at, "expires_at": a.expires_at,
             "decided_by": a.decided_by, "decided_via": a.decided_via, "decided_at": a.decided_at,
             "result_summary": a.result_summary, "error": a.error, "call_id": a.call_id,
-            "auto_review": Jsonb(a.auto_review) if a.auto_review is not None else None}
+            "auto_review": Jsonb(a.auto_review) if a.auto_review is not None else None,
+            "reason_code": a.reason_code, "executing_at": a.executing_at, "target": a.target}
 
 
 def _row_to_approval(row: tuple) -> Approval:
     (aid, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, reason, advice,
      status, created_at, expires_at, decided_by, decided_via, decided_at, result_summary, error, call_id,
-     auto_review) = row
+     auto_review, reason_code, executing_at, target) = row
     return Approval(id=aid, thread_id=thread_id, turn_index=turn_index, channel=channel, tool_name=tool_name,
-                    arguments=dict(arguments), args_sha256=args_sha256, strength=strength, rule=rule,
+                    arguments=dict(arguments), reason_code=reason_code, args_sha256=args_sha256, strength=strength, rule=rule,
                     reason=reason or "", advice=advice, status=status, created_at=created_at,
                     expires_at=expires_at, decided_by=decided_by, decided_via=decided_via,
                     decided_at=decided_at, result_summary=result_summary, error=error, call_id=call_id,
-                    auto_review=dict(auto_review) if auto_review else None)
+                    auto_review=dict(auto_review) if auto_review else None, executing_at=executing_at, target=target)
 
 
 _APPROVAL_COLUMNS = ("id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, strength, rule, "
                     "reason, advice, status, created_at, expires_at, decided_by, decided_via, decided_at, "
-                    "result_summary, error, call_id, auto_review")
+                    "result_summary, error, call_id, auto_review, reason_code, executing_at, target")
 
 
 @dataclass
@@ -72,12 +84,12 @@ class PgApprovals(BaseApprovals):
     def __post_init__(self) -> None:
         if not self.dsn:
             raise ValueError("PgApprovals requiert un DSN Postgres")
-        migrate(self.dsn, MIGRATION_SQL, SUGGESTIONS_SQL, AUTO_REVIEW_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
+        migrate(self.dsn, MIGRATION_SQL, SUGGESTIONS_SQL, AUTO_REVIEW_SQL, REASON_CODE_SQL, EXECUTING_SQL, TARGET_SQL)  # en propriétaire, puis la RLS (nokker/store/conn.py)
         self._db = TenantConn(self.dsn)
         # Tables d'authentification (devices, sessions, totp_secrets, used_nonces) : hors RLS, lues AVANT de connaître
         # le locataire (verify_session, login_challenge, create_session). Même DSN, donc même rôle nokker_app, mais une
         # connexion à part qui ne porte jamais app.tenant_id ; filtrage par compte dans base.py.
-        self._auth = connect_admin(self.dsn, autocommit=True)
+        self._auth_db = AdminConn(self.dsn)  # même reconnexion à l'acquisition que `_db`, sans locataire
         self._lock = threading.Lock()
         self._fernet = _fernet_or_none()
 
@@ -85,9 +97,13 @@ class PgApprovals(BaseApprovals):
     def _conn(self) -> Any:
         return self._db.get()  # app.tenant_id = locataire courant, reposé à chaque usage (NoTenant hors scope)
 
+    @property
+    def _auth(self) -> Any:
+        return self._auth_db.get()
+
     def close(self) -> None:
         self._db.close()
-        self._auth.close()
+        self._auth_db.close()
 
     # ─────────────────────── approbations ───────────────────────
 
@@ -103,14 +119,15 @@ class PgApprovals(BaseApprovals):
             cur.execute(
                 "INSERT INTO approvals (id, thread_id, turn_index, channel, tool_name, arguments, args_sha256, "
                 "strength, rule, reason, advice, status, created_at, expires_at, decided_by, decided_via, "
-                "decided_at, result_summary, error, call_id, auto_review) "
+                "decided_at, result_summary, error, call_id, auto_review, reason_code, executing_at, target) "
                 "VALUES (%(id)s, %(thread_id)s, %(turn_index)s, %(channel)s, %(tool_name)s, %(arguments)s, "
                 "%(args_sha256)s, %(strength)s, %(rule)s, %(reason)s, %(advice)s, %(status)s, %(created_at)s, "
                 "%(expires_at)s, %(decided_by)s, %(decided_via)s, %(decided_at)s, %(result_summary)s, %(error)s, %(call_id)s, "
-                "%(auto_review)s) "
+                "%(auto_review)s, %(reason_code)s, %(executing_at)s, %(target)s) "
                 "ON CONFLICT (id) DO UPDATE SET status=%(status)s, decided_by=%(decided_by)s, "
                 "decided_via=%(decided_via)s, decided_at=%(decided_at)s, result_summary=%(result_summary)s, "
-                "error=%(error)s, arguments=%(arguments)s, args_sha256=%(args_sha256)s, auto_review=%(auto_review)s",
+                "error=%(error)s, arguments=%(arguments)s, args_sha256=%(args_sha256)s, auto_review=%(auto_review)s, "
+                "executing_at=%(executing_at)s",
                 {**d, "arguments": Jsonb(d["arguments"])})
 
     def _list_pending_approvals(self, user: str | None) -> list[Approval]:
@@ -118,6 +135,18 @@ class PgApprovals(BaseApprovals):
             cur.execute(f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE status = 'pending'")
             rows = cur.fetchall()
         return [_row_to_approval(r) for r in rows]
+
+    def _interrupt_stale_rows(self, cutoff: float, exclude: frozenset[str] = frozenset()) -> list[Approval]:
+        # UPDATE conditionnel : atomique (deux processus ne passent jamais la même carte), sous la RLS du locataire courant.
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("UPDATE approvals SET status = 'interrupted' WHERE status = 'executing' "
+                        "AND COALESCE(executing_at, decided_at, created_at) < %s AND NOT (id = ANY(%s)) "
+                        f"RETURNING {_APPROVAL_COLUMNS}", (cutoff, list(exclude)))
+            rows = cur.fetchall()
+        return [_row_to_approval(r) for r in rows]
+
+    def tenants(self) -> list[str] | None:
+        return known_tenants(self.dsn)
 
     def _list_history(self, since: float) -> list[Approval]:
         with self._lock, self._conn.cursor() as cur:
@@ -146,6 +175,12 @@ class PgApprovals(BaseApprovals):
         with self._lock, self._conn.cursor() as cur:
             cur.execute("INSERT INTO approval_events (approval_id, event_type, data) VALUES (%s, %s, %s)",
                         (approval_id, event_type, Jsonb(data)))
+
+    def _load_events(self, approval_id: str) -> list[tuple[str, dict]]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT event_type, data FROM approval_events WHERE approval_id = %s ORDER BY id",
+                        (approval_id,))
+            return [(t, dict(d or {})) for t, d in cur.fetchall()]
 
     # ─────────────────────── nonces ───────────────────────
 

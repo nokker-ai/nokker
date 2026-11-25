@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nokker.tenancy.context import INTERNAL_TENANT, current_tenant_or_none, tenant_scope
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,12 +23,16 @@ class HomeBubbleWatcher:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
+    _tenant: str = field(default=INTERNAL_TENANT, init=False)
 
     def track(self, entity_id: str, bubble_id: str) -> None:
         with self._lock:
             self._tracked.setdefault(entity_id, set()).add(bubble_id)
             if self._thread is None or not self._thread.is_alive():
                 self._stop.clear()
+                # Un fil de fond n'hérite pas du locataire de l'appelant : Lokkal n'a que le locataire interne, mais
+                # les bulles sont en Postgres sous RLS (NoTenant sans scope : « connexion perdue » toutes les 10 s).
+                self._tenant = current_tenant_or_none() or INTERNAL_TENANT
                 self._thread = threading.Thread(target=self._run, name="nokker-home-bubbles", daemon=True)
                 self._thread.start()
 
@@ -78,6 +84,10 @@ class HomeBubbleWatcher:
             self.push(eid, state)
 
     def _run(self) -> None:
+        with tenant_scope(self._tenant):
+            self._run_scoped()
+
+    def _run_scoped(self) -> None:
         delay = 2.0
         while not self._stop.is_set() and self.tracked():
             session = None

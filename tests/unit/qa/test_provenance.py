@@ -281,8 +281,8 @@ def test_registry_is_bounded_and_keeps_user_requests():
 def test_kernel_refusal_text_seen_by_model_names_the_source():
     r = harness.Run(scenarios.ATTACKS[3], {"enabled": True}).go()  # A04
     tool_msgs = [m["content"] for m in r.parent.seen[-1] if m.get("role") == "tool"]
-    refused = [c for c in tool_msgs if c.startswith("REFUSÉ par le noyau (provenance:fetch: provenance : ")]
-    assert refused and refused[0].endswith("est refusée.). Ne pas réessayer autrement.")
+    refused = [c for c in tool_msgs if c.startswith("Refusé : provenance:fetch: provenance : ")]
+    assert refused and refused[0].endswith("est refusée. Ne le réessaie pas et ne cherche pas à le contourner.")
     assert "vise un hôte connu seulement par une page ou une recherche web (web_search, tour 0)" in refused[0]
 
 

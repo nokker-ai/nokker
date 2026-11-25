@@ -39,11 +39,12 @@ from nokker.tools import checkpoints as ck
 from tests.unit.test_local_tool_call import _server
 from tests.unit.test_loop_contract import kernel, tc
 
-PLAN_TEXT = "REFUSÉ par le noyau (permissions:plan: mode plan : lecture seule). Ne pas réessayer autrement."
+PLAN_TEXT = ("Refusé : mode plan, lecture seule. Ne le réessaie sous aucune forme ; décris l'action dans ton plan. "
+             "Dis simplement à la personne que tu es en mode plan : tu peux lire et proposer, mais rien n'est modifié tant qu'elle ne change pas de mode.")
 
 
-def _req(port, path, *, token=None, body=None, method=None):
-    headers = {"Content-Type": "application/json"}
+def _req(port, path, *, token=None, body=None, method=None, headers_extra=None):
+    headers = {"Content-Type": "application/json", **(headers_extra or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers, method=method,
@@ -85,11 +86,11 @@ def test_plan_refusal_keeps_the_model_text_and_adds_reason_for_clients():
     turn = k.run_turn(TurnInput("t1", "agrandis le disque"))
     assert tools.called == []
     tool_msg = next(m for m in turn.messages if m.role == "tool")
-    assert tool_msg.content == PLAN_TEXT  # texte vu par le modèle : identique à avant
+    assert tool_msg.content == PLAN_TEXT  # texte vu par le modèle : le motif, sans le nom de règle interne
     assert all("plan_mode" not in json.dumps(m) for m in ship.seen[1])  # le code ne part jamais au modèle
     assert results[0].content == PLAN_TEXT and results[0].reason == "plan_mode"
     v = next(v for v in turn.verdicts if v.decision is Decision.DENY)
-    assert v.rule == "permissions:plan" and v.reason == "mode plan : lecture seule" and v.code == "plan_mode"
+    assert v.rule == "permissions:plan" and v.reason == "mode plan, lecture seule" and v.code == "plan_mode"
 
 
 def test_tool_result_event_carries_the_reason_only_on_a_coded_refusal():
@@ -135,7 +136,7 @@ def test_direct_call_refused_by_plan_mode_says_why(tmp_path):
         status, body = _req(port, "/v1/local/tools/call", token=api.token,
                             body={"thread_id": thread, "name": "checkpoint_create", "arguments": {"reason": "x"}})
         assert status == 200 and body["is_error"] and body["reason"] == "plan_mode"
-        assert body["content"] == "refusé par le noyau (permissions:plan: mode plan : lecture seule)"
+        assert body["content"] == "Refusé : mode plan, lecture seule."
         assert l3.calls == []
     finally:
         httpd.shutdown()
@@ -216,13 +217,15 @@ def test_turn_failure_codes_from_the_loop():
 
 def test_turn_done_error_refused_cancelled_fields():
     hub, seen = _hub()
-    hub.turn_done(_turn(failure={"code": "tier_unavailable", "message": "palier ship indisponible : HTTP 502"}))
+    hub.turn_done(_turn(failure={"code": "tier_unavailable", "message": "palier ship indisponible : HTTP 502",
+                                  "person_message": "Le modèle de Nokker ne répond pas (service indisponible)."}))
     hub.turn_done(_turn(verdicts=[Verdict(gate=Gate.ACTION, decision=Decision.DENY, layer=1, rule="permissions:plan",
                                           code="plan_mode")]))
     hub.turn_done(_turn(error="cancelled"))
     hub.turn_done(_turn(verdicts=[Verdict(gate=Gate.SWITCH, decision=Decision.DENY, layer=1, rule="porte")]))
     done = [d for n, d in seen if n == "turn.done"]
-    assert done[0]["error"] == {"code": "tier_unavailable", "message": "palier ship indisponible : HTTP 502"}
+    assert done[0]["error"] == {"code": "tier_unavailable",
+                                "message": "Le modèle de Nokker ne répond pas (service indisponible)."}
     assert "refused" not in done[0] and "cancelled" not in done[0]
     assert done[1]["refused"] is True and "error" not in done[1]
     assert done[2]["cancelled"] is True and "error" not in done[2]
@@ -336,3 +339,66 @@ def test_checkpoint_created_before_a_tool_has_its_code(tmp_path):
     wrap.call("terminal", {"command": "make"}, ToolContext(thread_id="th", turn_index=1, channel="cli"))
     assert events[0][1]["tool"] == "terminal" and events[0][1]["reason_code"] == "before_terminal"
     assert mgr.points[0]["reason"] == "avant terminal"  # la raison écrite au point ne change pas
+
+
+# ─────────────── rappel du mode courant dans le contexte du tour (par le vrai serveur) ───────────────
+
+PLAN_NOTE = ("Mode actuel de cette session : plan. Tu peux lire, chercher et tenir la liste todo, mais pas écrire ni "
+             "exécuter. Ce mode prime sur d'anciens refus « lecture seule » ou « mode plan » de l'historique : si le "
+             "mode a changé, il est indiqué ici.")
+EDITS_NOTE = "Mode actuel de cette session : accept_edits. Il prime sur d'anciens refus de l'historique."
+
+
+def test_mode_note_follows_the_session_mode_between_two_turns_through_the_real_server(tmp_path):
+    from datetime import datetime
+
+    from nokker.api.server import mode_note_hook
+    from nokker.context.engine import ZURICH, ContextEngineV0
+    from nokker.core.ports import Completion
+    from nokker.core.turn import Usage
+
+    httpd, port, api, kernel_, _, _, l3, _, thread = _server(tmp_path)
+    prefix = tmp_path / "prefix.md"
+    prefix.write_text("PREFIXE-STABLE", encoding="utf-8")
+    sent: list[list[dict]] = []
+
+    class Model:
+        def complete(self, messages, tools, *, reasoning, session_key, max_tokens=2048):
+            sent.append(messages)
+            return Completion(message=Message("assistant", content="ok"), usage=Usage(prompt=1), model="t",
+                              latency_s=0.0)
+
+    try:
+        perms = LocalPermissions(mode=Mode.PLAN)
+        api.permissions = perms
+        kernel_.gates = PermissionGates(inner=kernel_.gates, permissions=perms)
+        ctx = ContextEngineV0(tools=kernel_.tools, prefix_path=str(prefix),
+                              now_fn=lambda: datetime(2026, 11, 15, tzinfo=ZURICH))
+        ctx.mode_note = mode_note_hook(perms)
+        kernel_.context = ctx
+        kernel_.providers = {Tier.SHIP: Model(), Tier.DEEP: Model()}
+
+        def chat(text):
+            return _req(port, "/v1/chat/completions", token=api.token, headers_extra={"X-Session-Id": thread},
+                        body={"messages": [{"role": "user", "content": text}]})
+
+        assert chat("premier")[0] == 200
+        first = sent[-1]
+        assert PLAN_NOTE in first[-1]["content"] and EDITS_NOTE not in first[-1]["content"]
+        status, body = _req(port, f"/v1/local/sessions/{thread}/mode", token=api.token, body={"mode": "accept_edits"},
+                            method="PUT")
+        assert status == 200 and body["mode"] == "accept_edits"
+        assert chat("second")[0] == 200
+        second = sent[-1]
+        flat = "\n".join(str(m.get("content")) for m in second)
+        assert EDITS_NOTE in second[-1]["content"]
+        assert PLAN_NOTE not in second[-1]["content"]
+        assert second[-1]["content"].endswith("second")  # en fin de contexte : dans l'en-tête du tour, avant le message
+        assert second[-1]["content"].index(EDITS_NOTE) < second[-1]["content"].index("second")
+        # le préfixe stable (message système) ne porte aucune note de mode et ne change pas d'un tour à l'autre
+        assert second[0]["role"] == "system" and first[0] == second[0]
+        assert "Mode actuel de cette session" not in second[0]["content"] and "PREFIXE-STABLE" in second[0]["content"]
+        # l'historique rejoue l'en-tête du tour 1 tel quel (figé), donc la note de plan n'y est pas recalculée
+        assert flat.count(EDITS_NOTE) == 1
+    finally:
+        httpd.shutdown()
